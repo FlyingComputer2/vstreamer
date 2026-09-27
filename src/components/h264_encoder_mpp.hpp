@@ -108,7 +108,7 @@ private:
     int64_t              enc_au_capture_mono_ns = 0;
     bool                 enc_au_key = false;
 
-    static constexpr int enc_slot_count = 4;
+    static constexpr int enc_slot_count = 8;
     struct enc_slot
     {
         void   *frm = nullptr;

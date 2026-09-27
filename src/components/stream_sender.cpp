@@ -91,7 +91,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len)
     if (len > k_stream_payload_max)
     {
         std::lock_guard<std::mutex> lock(mu);
-        dropped++;
+        dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const size_t wire_len = k_stream_header_len + len;
@@ -100,7 +100,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len)
     if (nullptr == buf)
     {
         std::lock_guard<std::mutex> lock(mu);
-        dropped++;
+        dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     /* stream_sequence is stamped in send_thread_main() so each egress datagram gets a
@@ -125,7 +125,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len)
     if (evicted)
     {
         std::lock_guard<std::mutex> lock(mu);
-        dropped++;
+        dropped.fetch_add(1, std::memory_order_relaxed);
     }
     q_cv.notify_one();
 }
@@ -284,11 +284,8 @@ void stream_sender::send_thread_main()
         {
             continue;
         }
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            pkts_sent++;
-            bytes_sent += static_cast<uint64_t>(n);
-        }
+        pkts_sent.fetch_add(1, std::memory_order_relaxed);
+        bytes_sent.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
     }
 }
 
@@ -421,7 +418,7 @@ int stream_sender::input(uint8_t port, const data_packet &in)
         if (oversized)
         {
             fec_oversized++;
-            dropped++;
+            dropped.fetch_add(1, std::memory_order_relaxed);
         }
         update_kbps_window(ingress_rate_t0, ingress_rate_bytes, ingress_kbps, ingress_bytes);
         return 0;
@@ -432,7 +429,7 @@ int stream_sender::input(uint8_t port, const data_packet &in)
     if (nullptr == buf)
     {
         std::lock_guard<std::mutex> lock(mu);
-        dropped++;
+        dropped.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
     std::memcpy(buf, src.buf.data, src.buf.size);
@@ -455,7 +452,7 @@ int stream_sender::input(uint8_t port, const data_packet &in)
         std::lock_guard<std::mutex> lock(mu);
         if (evicted)
         {
-            dropped++;
+            dropped.fetch_add(1, std::memory_order_relaxed);
         }
         update_kbps_window(ingress_rate_t0, ingress_rate_bytes, ingress_kbps, ingress_bytes);
     }
@@ -752,23 +749,27 @@ int stream_sender::query(std::string_view key, std::string_view *value) const
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
                           " in_rate=%.1f fec_oversized=%" PRIu64 " fec=k=%d,n=%d",
-                          pkts_sent, bytes_sent, dropped, static_cast<double>(ingress_kbps),
-                          fec_oversized, fec_k, fec_n);
+                          pkts_sent.load(std::memory_order_relaxed),
+                          bytes_sent.load(std::memory_order_relaxed),
+                          dropped.load(std::memory_order_relaxed),
+                          static_cast<double>(ingress_kbps), fec_oversized, fec_k, fec_n);
         }
         else
         {
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
                           " in_rate=%.1f",
-                          pkts_sent, bytes_sent, dropped, static_cast<double>(ingress_kbps));
+                          pkts_sent.load(std::memory_order_relaxed),
+                          bytes_sent.load(std::memory_order_relaxed),
+                          dropped.load(std::memory_order_relaxed),
+                          static_cast<double>(ingress_kbps));
         }
         query_buf = buf;
         *value = query_buf;
         return 0;
     }
     if ("peer_udp_packet_received" == key || "peer_fec_packet_received" == key ||
-        "peer_udp_gap_count" == key || "peer_fec_gap_count" == key ||
-        "peer_fec_air_shard_received" == key)
+        "peer_udp_gap_count" == key || "peer_fec_gap_count" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         uint64_t n = 0;
@@ -784,13 +785,9 @@ int stream_sender::query(std::string_view key, std::string_view *value) const
         {
             n = peer.udp_gap_count;
         }
-        else if ("peer_fec_gap_count" == key)
-        {
-            n = peer.fec_gap_count;
-        }
         else
         {
-            n = peer.fec_air_shard_received;
+            n = peer.fec_gap_count;
         }
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);

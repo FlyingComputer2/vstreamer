@@ -6,17 +6,21 @@
 #error "noise_source requires -DENABLE_NOISE_SOURCE=ON"
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <string_view>
+#include <vector>
 
 #include "core/component_source.hpp"
+#include "core/noise_fft2.hpp"
 
 namespace vstreamer
 {
 
-/* Synthetic MJPEG or NV12 snow (rover camera noise path). Default 416x240 MJPEG. */
+/* Synthetic NV12: bandwidth-shaped spectrum → SIMD IFFT (PFFFT). Default 416x240@30. */
 class noise_source : public component_source
 {
 public:
@@ -32,6 +36,8 @@ public:
     int  open() override;
     void close() override;
 
+    void stop_pregenerate();
+
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
     int configure(uint64_t key, int64_t value) override;
@@ -41,11 +47,16 @@ public:
     int query(std::string_view key, std::string_view *value) const override;
 
 private:
-    int  ensure_encoder_locked();
-    void free_encoder_locked();
-    int  make_jpeg_locked(int64_t frame_pts, uint8_t **out, size_t *out_sz);
-    int  make_nv12_locked(uint8_t **out, size_t *out_sz);
-    void pace_locked(int timeout_ms);
+    int  fill_nv12_locked(uint8_t *dst, size_t dst_sz);
+    void pace_unlocked(int fps, int timeout_ms);
+    void invalidate_pregenerated_locked();
+    int  ensure_pregenerated_locked();
+    void join_pregenerate_worker();
+    void kick_pregenerate_async_locked();
+
+    std::atomic<bool> pregen_cancel {false};
+
+    static constexpr int k_pregenerate_max = 128;
 
     mutable std::mutex mu;
     bool               opened = false;
@@ -53,18 +64,31 @@ private:
     int width = 416;
     int height = 240;
     int fps = 30;
-    bool output_nv12 = false;
+    /* Spatial bandwidth 0..100 (0 = flat gray, 100 = full-rate noise). */
+    int noise_bandwidth = 100;
+    int noise_block_size = 0;
+    int pregenerate_count = 0;
 
     int64_t pts = 0;
     double  due_sec = 0;
-
-    /* Opaque libav handles; typed in the .cpp. */
-    void *enc = nullptr;
-    void *avframe = nullptr;
-    void *pkt = nullptr;
-    int   enc_w = 0;
-    int   enc_h = 0;
     uint32_t rng = 1;
+
+    std::vector<uint8_t> scratch_chroma;
+    std::vector<std::vector<uint8_t>> pregenerated;
+    bool                              pregen_ready = false;
+    int                               pregen_w = 0;
+    int                               pregen_h = 0;
+    int                               pregen_bandwidth = 0;
+    size_t                            pregen_cursor = 0;
+    std::atomic<bool> pregenerating {false};
+    std::atomic<int>  pregen_build_n {0};
+    std::atomic<int>  pregen_build_total {0};
+
+    std::thread pregen_worker;
+
+    noise_fft2_plan fft;
+    noise_fft2_plan fft_chroma_u;
+    noise_fft2_plan fft_chroma_v;
 
     mutable std::string query_buf;
 };

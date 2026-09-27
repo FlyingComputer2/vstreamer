@@ -16,6 +16,14 @@ inline constexpr int k_chan_console = 5090; /* UDP console: impairment + pipelin
 /* Default forward-path cap (stream_sender → stream_receiver). 0 = unlimited. */
 inline constexpr double k_chan_default_max_kbps = 0.0;
 
+/* max_kbps rate-drop window (ms); budget = max_kbps * (drop_dt_ms / 1000) kilobits. */
+inline constexpr int k_chan_default_drop_dt_ms = 1000;
+inline constexpr int k_chan_min_drop_dt_ms = 1;
+inline constexpr int k_chan_max_drop_dt_ms = 3'600'000;
+
+/* Per-direction ingress datagram queue (0 = forward immediately). */
+inline constexpr int k_chan_default_queue_depth = 32;
+
 /* Default MPP CBR target for stream_sdl (metrics use kbps). */
 inline constexpr int k_encoder_default_cbr_kbps = 20'000;
 inline constexpr int k_encoder_default_cbr_bps = k_encoder_default_cbr_kbps * 1000;

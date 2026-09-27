@@ -11,27 +11,14 @@
 #include <mutex>
 #include <thread>
 
-extern "C"
-{
-#include <libavcodec/avcodec.h>
-#include <libavutil/frame.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/mem.h>
-}
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace vstreamer
 {
 namespace
 {
-
-/* Random 1080p MJPEG can exceed 2 MiB at default qscale. */
-constexpr size_t k_max_jpeg = 8ULL * 1024ULL * 1024ULL;
-
-double now_sec()
-{
-    using clock = std::chrono::steady_clock;
-    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
-}
 
 uint32_t rng32(uint32_t *state)
 {
@@ -43,30 +30,108 @@ uint32_t rng32(uint32_t *state)
     return *state;
 }
 
-void fill_plane_rand(uint8_t *p, int linesize, int w, int h, uint32_t *rng)
+double now_sec()
 {
-    for (int y = 0; y < h; y++)
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+void interleave_uv_from_planes(const uint8_t *u, const uint8_t *v, int luma_w, int chroma_h,
+                               uint8_t *uv)
+{
+    const int cw = luma_w / 2;
+    for (int y = 0; y < chroma_h; y++)
     {
-        uint8_t *row = p + static_cast<size_t>(y) * static_cast<size_t>(linesize);
-        int      x = 0;
-        for (; x + 4 <= w; x += 4)
+        const uint8_t *urow = u + static_cast<size_t>(y) * static_cast<size_t>(cw);
+        const uint8_t *vrow = v + static_cast<size_t>(y) * static_cast<size_t>(cw);
+        uint8_t       *drow = uv + static_cast<size_t>(y) * static_cast<size_t>(luma_w);
+        for (int x = 0; x < cw; x++)
         {
-            uint32_t r = rng32(rng);
-            row[x] = static_cast<uint8_t>(r);
-            row[x + 1] = static_cast<uint8_t>(r >> 8);
-            row[x + 2] = static_cast<uint8_t>(r >> 16);
-            row[x + 3] = static_cast<uint8_t>(r >> 24);
-        }
-        if (x < w)
-        {
-            uint32_t r = rng32(rng);
-            for (; x < w; x++)
-            {
-                row[x] = static_cast<uint8_t>(r);
-                r >>= 8;
-            }
+            drow[2 * x] = urow[x];
+            drow[2 * x + 1] = vrow[x];
         }
     }
+}
+
+int fill_nv12_chroma_ifft(noise_fft2_plan *fft_u, noise_fft2_plan *fft_v, uint8_t *uv, int luma_w,
+                          int luma_h, int bandwidth, uint32_t *rng_u, uint32_t *rng_v,
+                          std::vector<uint8_t> &tmp)
+{
+    const int chroma_h = luma_h / 2;
+    const int cw = luma_w / 2;
+    const size_t plane_sz = static_cast<size_t>(cw) * static_cast<size_t>(chroma_h);
+    tmp.resize(plane_sz * 2U);
+    uint8_t *u = tmp.data();
+    uint8_t *v = u + plane_sz;
+
+    int r_u = 0;
+    int r_v = 0;
+    std::thread tu(
+        [&]
+        {
+            r_u = fft_u->synthesize_plane(u, cw, chroma_h, bandwidth, rng_u);
+        });
+    std::thread tv(
+        [&]
+        {
+            r_v = fft_v->synthesize_plane(v, cw, chroma_h, bandwidth, rng_v);
+        });
+    tu.join();
+    tv.join();
+
+    if (r_u < 0)
+    {
+        return r_u;
+    }
+    if (r_v < 0)
+    {
+        return r_v;
+    }
+    interleave_uv_from_planes(u, v, luma_w, chroma_h, uv);
+    return 0;
+}
+
+int parse_noise_bandwidth(std::string_view v, int *out)
+{
+    if (nullptr == out)
+    {
+        return -EINVAL;
+    }
+    int64_t n = 0;
+    std::string tmp(v);
+    if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 0 || n > 100)
+    {
+        return -EINVAL;
+    }
+    *out = static_cast<int>(n);
+    return 0;
+}
+
+int parse_noise_block_size(std::string_view v, int *out)
+{
+    if (nullptr == out)
+    {
+        return -EINVAL;
+    }
+    int64_t n = 0;
+    std::string tmp(v);
+    if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 0 || n > 256)
+    {
+        return -EINVAL;
+    }
+    *out = static_cast<int>(n);
+    return 0;
+}
+
+bool key_is_noise_bandwidth(std::string_view key)
+{
+    return key == "noise-bandwidth" || key == "noise_bandwidth" || key == "noise-randomness" ||
+           key == "noise_randomness" || key == "randomness";
+}
+
+bool key_is_noise_block_size(std::string_view key)
+{
+    return key == "noise-block-size" || key == "noise_block_size";
 }
 
 int parse_size(std::string_view s, int *w, int *h)
@@ -116,6 +181,39 @@ noise_source::~noise_source()
     close();
 }
 
+void noise_source::join_pregenerate_worker()
+{
+    if (pregen_worker.joinable())
+    {
+        pregen_worker.join();
+    }
+}
+
+void noise_source::stop_pregenerate()
+{
+    pregen_cancel.store(true, std::memory_order_release);
+    join_pregenerate_worker();
+    pregen_cancel.store(false, std::memory_order_release);
+}
+
+void noise_source::kick_pregenerate_async_locked()
+{
+    if (pregenerate_count <= 0 || pregen_ready || pregen_worker.joinable())
+    {
+        return;
+    }
+    pregen_worker = std::thread(
+        [this]
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!opened || pregenerate_count <= 0)
+            {
+                return;
+            }
+            (void)ensure_pregenerated_locked();
+        });
+}
+
 std::string noise_source::name() const
 {
     return "noise";
@@ -123,104 +221,7 @@ std::string noise_source::name() const
 
 media_kind_e noise_source::output_kind() const
 {
-    std::lock_guard<std::mutex> lock(mu);
-    return output_nv12 ? media_kind_e::NV12 : media_kind_e::MJPEG;
-}
-
-int noise_source::ensure_encoder_locked()
-{
-    if (enc && enc_w == width && enc_h == height)
-    {
-        return 0;
-    }
-    free_encoder_locked();
-
-    const AVCodec *codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
-    if (nullptr == codec)
-    {
-        return -ENOENT;
-    }
-
-    AVCodecContext *enc = avcodec_alloc_context3(codec);
-    if (nullptr == enc)
-    {
-        return -ENOMEM;
-    }
-    enc->width = width;
-    enc->height = height;
-    enc->pix_fmt = AV_PIX_FMT_YUVJ420P;
-    enc->time_base = AVRational{1, 1};
-    enc->flags |= AV_CODEC_FLAG_QSCALE;
-    /* Random snow MJPEG is huge at low q; favor throughput on bench / rover resolutions. */
-    const int pixels = width * height;
-    if (pixels >= 1920 * 1080)
-    {
-        enc->global_quality = 31 * FF_QP2LAMBDA;
-    }
-    else if (pixels >= 1280 * 720)
-    {
-        enc->global_quality = 24 * FF_QP2LAMBDA;
-    }
-    else
-    {
-        enc->global_quality = 10 * FF_QP2LAMBDA;
-    }
-    if (avcodec_open2(enc, codec, nullptr) < 0)
-    {
-        avcodec_free_context(&enc);
-        return -EIO;
-    }
-
-    AVFrame *frame = av_frame_alloc();
-    AVPacket *pkt = av_packet_alloc();
-    if (nullptr == frame || nullptr == pkt)
-    {
-        av_frame_free(&frame);
-        av_packet_free(&pkt);
-        avcodec_free_context(&enc);
-        return -ENOMEM;
-    }
-    frame->format = AV_PIX_FMT_YUVJ420P;
-    frame->width = width;
-    frame->height = height;
-    if (av_frame_get_buffer(frame, 32) < 0)
-    {
-        av_frame_free(&frame);
-        av_packet_free(&pkt);
-        avcodec_free_context(&enc);
-        return -ENOMEM;
-    }
-
-    this->enc = enc;
-    this->avframe = frame;
-    this->pkt = pkt;
-    enc_w = width;
-    enc_h = height;
-    return 0;
-}
-
-void noise_source::free_encoder_locked()
-{
-    if (avframe)
-    {
-        AVFrame *f = static_cast<AVFrame *>(avframe);
-        av_frame_free(&f);
-        avframe = nullptr;
-    }
-    if (pkt)
-    {
-        AVPacket *p = static_cast<AVPacket *>(pkt);
-        av_packet_free(&p);
-        pkt = nullptr;
-    }
-    if (enc)
-    {
-        AVCodecContext *e = static_cast<AVCodecContext *>(enc);
-        avcodec_free_context(&e);
-        enc = nullptr;
-    }
-    enc_w = 0;
-    enc_h = 0;
+    return media_kind_e::NV12;
 }
 
 int noise_source::open()
@@ -230,32 +231,96 @@ int noise_source::open()
     {
         return 0;
     }
-    if (!output_nv12)
-    {
-        int r = ensure_encoder_locked();
-        if (r < 0)
-        {
-            return r;
-        }
-    }
     pts = 0;
     due_sec = 0;
     opened = true;
+    kick_pregenerate_async_locked();
     return 0;
 }
 
 void noise_source::close()
 {
+    stop_pregenerate();
     std::lock_guard<std::mutex> lock(mu);
-    free_encoder_locked();
     opened = false;
     due_sec = 0;
+    scratch_chroma.clear();
+    invalidate_pregenerated_locked();
+    fft.reset();
+    fft_chroma_u.reset();
+    fft_chroma_v.reset();
 }
 
-int noise_source::make_nv12_locked(uint8_t **out, size_t *out_sz)
+void noise_source::invalidate_pregenerated_locked()
 {
-    *out = nullptr;
-    *out_sz = 0;
+    pregenerated.clear();
+    pregen_ready = false;
+    pregen_w = 0;
+    pregen_h = 0;
+    pregen_bandwidth = 0;
+    pregen_cursor = 0;
+    pregenerating.store(false, std::memory_order_relaxed);
+    pregen_build_n.store(0, std::memory_order_relaxed);
+    pregen_build_total.store(0, std::memory_order_relaxed);
+    if (pregenerate_count > 0)
+    {
+        pregen_build_total.store(pregenerate_count, std::memory_order_release);
+    }
+}
+
+int noise_source::ensure_pregenerated_locked()
+{
+    if (pregenerate_count <= 0)
+    {
+        return 0;
+    }
+    if (pregen_ready && pregen_w == width && pregen_h == height &&
+        pregen_bandwidth == noise_bandwidth &&
+        pregenerated.size() == static_cast<size_t>(pregenerate_count))
+    {
+        return 0;
+    }
+
+    invalidate_pregenerated_locked();
+    const size_t nv12_sz =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 3U / 2U;
+    pregenerated.resize(static_cast<size_t>(pregenerate_count));
+    pregen_build_total.store(pregenerate_count, std::memory_order_release);
+    pregen_build_n.store(1, std::memory_order_release);
+    pregenerating.store(true, std::memory_order_release);
+    std::fprintf(stderr, "noise_source: pregenerating %d NV12 frame(s) %dx%d bandwidth=%d\n",
+                 pregenerate_count, width, height, noise_bandwidth);
+    for (int i = 0; i < pregenerate_count; i++)
+    {
+        if (pregen_cancel.load(std::memory_order_acquire))
+        {
+            invalidate_pregenerated_locked();
+            return -ECANCELED;
+        }
+        pregen_build_n.store(i + 1, std::memory_order_release);
+        pregenerated[static_cast<size_t>(i)].resize(nv12_sz);
+        const int r =
+            fill_nv12_locked(pregenerated[static_cast<size_t>(i)].data(), nv12_sz);
+        if (r < 0)
+        {
+            invalidate_pregenerated_locked();
+            return r;
+        }
+    }
+    pregenerating.store(false, std::memory_order_release);
+    pregen_build_n.store(0, std::memory_order_release);
+    pregen_build_total.store(0, std::memory_order_release);
+    pregen_ready = true;
+    pregen_w = width;
+    pregen_h = height;
+    pregen_bandwidth = noise_bandwidth;
+    pregen_cursor = 0;
+    std::fprintf(stderr, "noise_source: pregenerate loop ready (%zu bytes/frame)\n", nv12_sz);
+    return 0;
+}
+
+int noise_source::fill_nv12_locked(uint8_t *dst, size_t dst_sz)
+{
     if (width < 2 || height < 2 || (width % 2) != 0 || (height % 2) != 0)
     {
         return -EINVAL;
@@ -263,72 +328,53 @@ int noise_source::make_nv12_locked(uint8_t **out, size_t *out_sz)
 
     const size_t y_sz = static_cast<size_t>(width) * static_cast<size_t>(height);
     const size_t nv12_sz = y_sz + y_sz / 2ULL;
-    auto        *buf = static_cast<uint8_t *>(std::malloc(nv12_sz));
-    if (nullptr == buf)
+    if (dst_sz < nv12_sz || nullptr == dst)
     {
-        return -ENOMEM;
+        return -EINVAL;
     }
 
-    fill_plane_rand(buf, width, width, height, &rng);
-    fill_plane_rand(buf + y_sz, width, width, height / 2, &rng);
-    *out = buf;
-    *out_sz = nv12_sz;
-    return 0;
+    if (noise_bandwidth <= 0)
+    {
+        std::memset(dst, 128, nv12_sz);
+        return 0;
+    }
+
+    uint32_t rng_luma = rng;
+    uint32_t rng_u = rng32(&rng);
+    uint32_t rng_v = rng32(&rng);
+
+    int r_y = 0;
+    int r_c = 0;
+#ifdef _OPENMP
+#pragma omp parallel sections
+    {
+#pragma omp section
+        {
+            r_y = fft.synthesize_plane(dst, width, height, noise_bandwidth, &rng_luma);
+        }
+#pragma omp section
+        {
+            r_c = fill_nv12_chroma_ifft(&fft_chroma_u, &fft_chroma_v, dst + y_sz, width, height,
+                                        noise_bandwidth, &rng_u, &rng_v, scratch_chroma);
+        }
+    }
+#else
+    r_y = fft.synthesize_plane(dst, width, height, noise_bandwidth, &rng_luma);
+    r_c = fill_nv12_chroma_ifft(&fft_chroma_u, &fft_chroma_v, dst + y_sz, width, height,
+                                noise_bandwidth, &rng_u, &rng_v, scratch_chroma);
+#endif
+    rng ^= rng_luma ^ rng_u ^ rng_v;
+
+    if (r_y < 0)
+    {
+        return r_y;
+    }
+    return r_c;
 }
 
-int noise_source::make_jpeg_locked(int64_t frame_pts, uint8_t **out, size_t *out_sz)
+void noise_source::pace_unlocked(int fps_val, int timeout_ms)
 {
-    *out = nullptr;
-    *out_sz = 0;
-    int r = ensure_encoder_locked();
-    if (r < 0)
-    {
-        return r;
-    }
-
-    auto *enc = static_cast<AVCodecContext *>(this->enc);
-    auto *frame = static_cast<AVFrame *>(this->avframe);
-    auto *pkt = static_cast<AVPacket *>(this->pkt);
-
-    if (av_frame_make_writable(frame) < 0)
-    {
-        return -EIO;
-    }
-    fill_plane_rand(frame->data[0], frame->linesize[0], width, height, &rng);
-    fill_plane_rand(frame->data[1], frame->linesize[1], width / 2, height / 2, &rng);
-    fill_plane_rand(frame->data[2], frame->linesize[2], width / 2, height / 2, &rng);
-    frame->pts = frame_pts;
-
-    if (avcodec_send_frame(enc, frame) < 0)
-    {
-        return -EIO;
-    }
-    av_packet_unref(pkt);
-    if (avcodec_receive_packet(enc, pkt) < 0)
-    {
-        return -EIO;
-    }
-    if (pkt->size <= 0 || static_cast<size_t>(pkt->size) > k_max_jpeg)
-    {
-        std::fprintf(stderr, "noise_source: MJPEG size %d exceeds max %zu\n", pkt->size,
-                     k_max_jpeg);
-        return -EIO;
-    }
-
-    auto *buf = static_cast<uint8_t *>(std::malloc(static_cast<size_t>(pkt->size)));
-    if (nullptr == buf)
-    {
-        return -ENOMEM;
-    }
-    std::memcpy(buf, pkt->data, static_cast<size_t>(pkt->size));
-    *out = buf;
-    *out_sz = static_cast<size_t>(pkt->size);
-    return 0;
-}
-
-void noise_source::pace_locked(int timeout_ms)
-{
-    int fps = this->fps > 0 ? this->fps : 30;
+    int fps = fps_val > 0 ? fps_val : 30;
     double period = 1.0 / static_cast<double>(fps);
     double t0 = now_sec();
     if (due_sec <= 0)
@@ -369,62 +415,72 @@ void noise_source::pace_locked(int timeout_ms)
 
 int noise_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
 {
-    std::unique_lock<std::mutex> lock(mu);
-    if (!opened)
-    {
-        return -EBADF;
-    }
+    join_pregenerate_worker();
 
-    const int64_t frame_pts = pts;
-    pts++;
+    int     fps_val = 0;
+    int     w = 0;
+    int     h = 0;
+    int64_t frame_pts = 0;
 
-    if (output_nv12)
     {
-        uint8_t *nv12 = nullptr;
-        size_t   nsz = 0;
-        int      r = make_nv12_locked(&nv12, &nsz);
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened)
+        {
+            return -EBADF;
+        }
+
+        fps_val = fps;
+        w = width;
+        h = height;
+        frame_pts = pts;
+        pts++;
+
+        const size_t y_sz = static_cast<size_t>(w) * static_cast<size_t>(h);
+        const size_t nv12_sz = y_sz + y_sz / 2ULL;
+
+        int r = ensure_pregenerated_locked();
         if (r < 0)
         {
             pts--;
             return r;
         }
 
+        auto *buf = static_cast<uint8_t *>(std::malloc(nv12_sz));
+        if (nullptr == buf)
+        {
+            pts--;
+            return -ENOMEM;
+        }
+
+        if (pregenerate_count > 0 && pregen_ready)
+        {
+            const size_t idx = pregen_cursor % pregenerated.size();
+            pregen_cursor++;
+            std::memcpy(buf, pregenerated[idx].data(), nv12_sz);
+        }
+        else
+        {
+            r = fill_nv12_locked(buf, nv12_sz);
+            if (r < 0)
+            {
+                std::free(buf);
+                pts--;
+                return r;
+            }
+        }
+
         auto fd = std::make_unique<frame_data>();
         fd->kind = media_kind_e::NV12;
-        fd->width = width;
-        fd->height = height;
+        fd->width = w;
+        fd->height = h;
         fd->pts = frame_pts;
         fd->capture_mono_ns = steady_mono_ns();
         fd->key = true;
-        fd->buf.reset(nv12, nsz, [](uint8_t *p) { std::free(p); });
+        fd->buf.reset(buf, nv12_sz, [](uint8_t *p) { std::free(p); });
         out.reset(std::move(fd));
-
-        lock.unlock();
-        pace_locked(timeout_ms);
-        return 0;
     }
 
-    uint8_t *jpeg = nullptr;
-    size_t   jsz = 0;
-    int      r = make_jpeg_locked(frame_pts, &jpeg, &jsz);
-    if (r < 0)
-    {
-        pts--;
-        return r;
-    }
-
-    auto fd = std::make_unique<frame_data>();
-    fd->kind = media_kind_e::MJPEG;
-    fd->width = width;
-    fd->height = height;
-    fd->pts = frame_pts;
-    fd->capture_mono_ns = steady_mono_ns();
-    fd->key = true;
-    fd->buf.reset(jpeg, jsz, [](uint8_t *p) { std::free(p); });
-    out.reset(std::move(fd));
-
-    lock.unlock();
-    pace_locked(timeout_ms);
+    pace_unlocked(fps_val, timeout_ms);
     return 0;
 }
 
@@ -446,6 +502,7 @@ int noise_source::configure(std::string_view key, std::string_view *value)
     }
     std::string_view v = *value;
 
+    join_pregenerate_worker();
     std::lock_guard<std::mutex> lock(mu);
     if (key == "size")
     {
@@ -458,6 +515,7 @@ int noise_source::configure(std::string_view key, std::string_view *value)
         }
         width = w;
         height = h;
+        invalidate_pregenerated_locked();
         return 0;
     }
     if (key == "fps")
@@ -476,14 +534,44 @@ int noise_source::configure(std::string_view key, std::string_view *value)
     {
         if (v == "nv12" || v == "NV12")
         {
-            output_nv12 = true;
             return 0;
         }
-        if (v != "mjpeg" && v != "mjpg" && v != "MJPEG" && v != "MJPG")
+        return -EINVAL;
+    }
+    if (key_is_noise_bandwidth(key))
+    {
+        int r = 0;
+        int pr = parse_noise_bandwidth(v, &r);
+        if (pr < 0)
+        {
+            return pr;
+        }
+        noise_bandwidth = r;
+        invalidate_pregenerated_locked();
+        return 0;
+    }
+    if (key == "pregenerate-frames" || key == "pregenerate-frame" ||
+        key == "pregenerate_frames" || key == "pregenerate_frame")
+    {
+        int64_t n = 0;
+        std::string tmp(v);
+        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 0 || n > k_pregenerate_max)
         {
             return -EINVAL;
         }
-        output_nv12 = false;
+        pregenerate_count = static_cast<int>(n);
+        invalidate_pregenerated_locked();
+        return 0;
+    }
+    if (key_is_noise_block_size(key))
+    {
+        int r = 0;
+        int pr = parse_noise_block_size(v, &r);
+        if (pr < 0)
+        {
+            return pr;
+        }
+        noise_block_size = r;
         return 0;
     }
     return -EINVAL;
@@ -496,10 +584,33 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         return -EINVAL;
     }
 
+    if (key == "state")
+    {
+        const int n = pregen_build_n.load(std::memory_order_acquire);
+        const int total = pregen_build_total.load(std::memory_order_acquire);
+        thread_local std::string state_out;
+        if (total > 0)
+        {
+            const int shown = n > 0 ? n : 1;
+            char      buf[48];
+            if (std::snprintf(buf, sizeof(buf), "pregeneration_%d/%d", shown, total) < 0)
+            {
+                return -EINVAL;
+            }
+            state_out = buf;
+        }
+        else
+        {
+            state_out = "running";
+        }
+        *value = state_out;
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
     if (key == "status")
     {
-        query_buf = output_nv12 ? "noise_nv12" : "noise_mjpeg";
+        query_buf = "noise_nv12";
         *value = query_buf;
         return 0;
     }
@@ -527,7 +638,75 @@ int noise_source::query(std::string_view key, std::string_view *value) const
     }
     if (key == "format")
     {
-        query_buf = output_nv12 ? "nv12" : "mjpeg";
+        query_buf = "nv12";
+        *value = query_buf;
+        return 0;
+    }
+    if (key_is_noise_bandwidth(key))
+    {
+        char buf[16];
+        if (key_format_i64(noise_bandwidth, buf, sizeof(buf)) < 0)
+        {
+            return -EINVAL;
+        }
+        query_buf = buf;
+        *value = query_buf;
+        return 0;
+    }
+    if (key == "pregenerate-frames" || key == "pregenerate-frame" ||
+        key == "pregenerate_frames" || key == "pregenerate_frame")
+    {
+        char buf[16];
+        if (key_format_i64(pregenerate_count, buf, sizeof(buf)) < 0)
+        {
+            return -EINVAL;
+        }
+        query_buf = buf;
+        *value = query_buf;
+        return 0;
+    }
+    if (key == "noise-fft-grid" || key == "noise_fft_grid")
+    {
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%dx%d", fft.last_fft_w(), fft.last_fft_h()) < 0)
+        {
+            return -EINVAL;
+        }
+        query_buf = buf;
+        *value = query_buf;
+        return 0;
+    }
+    if (key == "noise-internal-size" || key == "noise_internal_size")
+    {
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%dx%d", width, height) < 0)
+        {
+            return -EINVAL;
+        }
+        query_buf = buf;
+        *value = query_buf;
+        return 0;
+    }
+    if (key == "noise-luma-block-size" || key == "noise_luma_block_size")
+    {
+        query_buf = "1";
+        *value = query_buf;
+        return 0;
+    }
+    if (key == "noise-fft-simd" || key == "noise_fft_simd")
+    {
+        query_buf = fft.simd_arch();
+        *value = query_buf;
+        return 0;
+    }
+    if (key_is_noise_block_size(key))
+    {
+        char buf[16];
+        if (key_format_i64(noise_block_size, buf, sizeof(buf)) < 0)
+        {
+            return -EINVAL;
+        }
+        query_buf = buf;
         *value = query_buf;
         return 0;
     }
@@ -539,13 +718,13 @@ int noise_source::query(std::string_view key, std::string_view *value) const
     }
     if (key == "media_type")
     {
-        query_buf = output_nv12 ? "raw" : "mjpeg";
+        query_buf = "raw";
         *value = query_buf;
         return 0;
     }
     if (key == "pixel_type")
     {
-        query_buf = output_nv12 ? "raw" : "mjpeg";
+        query_buf = "nv12";
         *value = query_buf;
         return 0;
     }

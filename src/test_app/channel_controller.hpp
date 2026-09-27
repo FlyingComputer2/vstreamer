@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <netinet/in.h>
 
@@ -50,6 +52,9 @@ public:
 
     void set_pipeline_metrics(const vstreamer::metrics *source);
     void set_pipeline_metrics_refresh(std::function<void()> refresh);
+    /* UDP metrics: sync live counters from atomics, then metrics::to_string() (must stay fast). */
+    void set_pipeline_metrics_sync_live(std::function<void()> sync_live);
+    void set_source_state_metrics_refresh(std::function<void()> refresh);
     void set_encode_target(vstreamer::component_coder *encoder);
     /* Non-blocking: handlers queue work for the encode thread (preferred). */
     void set_encode_command_handlers(std::function<bool(int kbps)> set_cbr_kbps,
@@ -58,10 +63,16 @@ public:
     void set_stream_sender(vstreamer::stream_sender *sender);
 
     void set_max_kbps(double kbps);
+    void set_drop_dt_ms(int ms);
     void set_constant_loss(double pct);
+    void set_queue_depth(int depth);
 
     [[nodiscard]] double max_kbps() const;
+    [[nodiscard]] int drop_dt_ms() const;
     [[nodiscard]] double constant_loss() const;
+    [[nodiscard]] int queue_depth() const;
+    /* Forward-path ingress datagrams waiting to egress (relay thread only mutates). */
+    [[nodiscard]] size_t forward_queue_size() const;
 
     struct forward_stats
     {
@@ -71,10 +82,15 @@ public:
         uint64_t bytes_out = 0;
         uint64_t dropped_rate = 0;
         uint64_t dropped_loss = 0;
+        uint64_t dropped_queue = 0;
     };
 
     /* Forward-path relay counters (stream_sender → stream_receiver leg). */
     [[nodiscard]] forward_stats forward_stats_snapshot() const;
+    [[nodiscard]] const std::atomic<uint64_t> &forward_bytes_out_counter() const
+    {
+        return fwd.bytes_out;
+    }
 
 private:
     struct direction_state
@@ -90,12 +106,16 @@ private:
 
         uint32_t rng = 1;
 
-        uint64_t pkts_in = 0;
-        uint64_t pkts_out = 0;
-        uint64_t bytes_in = 0;
-        uint64_t bytes_out = 0;
-        uint64_t dropped_rate = 0;
-        uint64_t dropped_loss = 0;
+        std::atomic<uint64_t> pkts_in {0};
+        std::atomic<uint64_t> pkts_out {0};
+        std::atomic<uint64_t> bytes_in {0};
+        std::atomic<uint64_t> bytes_out {0};
+        std::atomic<uint64_t> dropped_rate {0};
+        std::atomic<uint64_t> dropped_loss {0};
+        std::atomic<uint64_t> dropped_queue {0};
+
+        std::deque<std::vector<uint8_t>> ingress_queue;
+        std::atomic<size_t>              ingress_queue_len {0};
     };
 
     int setup_direction(direction_state &dir, int ingress_port, const char *egress_host,
@@ -107,7 +127,19 @@ private:
     void stop_console();
     bool should_drop_rate(direction_state &dir, size_t pkt_bytes);
     bool should_drop_loss(direction_state &dir);
-    void forward_packet(direction_state &dir, const uint8_t *buf, size_t n);
+    void accept_ingress(direction_state &dir, const uint8_t *buf, size_t n);
+    enum class egress_status
+    {
+        ok,
+        rate_limited,
+        loss_dropped,
+        no_route,
+        send_failed,
+    };
+    egress_status try_egress_one(direction_state &dir, const uint8_t *buf, size_t n);
+    void egress_packet(direction_state &dir, const uint8_t *buf, size_t n);
+    void flush_ingress_queue(direction_state &dir);
+    void reset_rate_windows(double t);
     void handle_console_line(const char *line, int reply_fd, const sockaddr_in &reply);
     void send_pipeline_metrics(int reply_fd, const sockaddr_in &reply);
 
@@ -125,10 +157,14 @@ private:
 
     mutable std::mutex cfg_mu;
     double max_kbps_limit = 0.;
+    int    rate_drop_dt_ms = k_chan_default_drop_dt_ms;
     double loss_pct = 0.;
+    size_t ingress_queue_depth = static_cast<size_t>(k_chan_default_queue_depth);
 
     const vstreamer::metrics *pipeline_metrics = nullptr;
-    std::function<void()>     pipeline_metrics_refresh;
+    std::function<void()> pipeline_metrics_refresh;
+    std::function<void()> pipeline_metrics_sync_live;
+    std::function<void()> source_state_metrics_refresh;
     vstreamer::component_coder *encode_target = nullptr;
     std::function<bool(int kbps)> encode_set_cbr_kbps;
     std::function<bool(int qp)>   encode_set_qp;

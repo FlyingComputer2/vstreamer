@@ -53,6 +53,27 @@ public:
 
     [[nodiscard]] stream_receiver_counters link_counters_snapshot() const;
 
+    [[nodiscard]] const std::atomic<uint64_t> &peer_udp_packet_received_counter() const
+    {
+        return udp_packet_received;
+    }
+    [[nodiscard]] const std::atomic<uint64_t> &peer_fec_packet_received_counter() const
+    {
+        return fec_packet_received;
+    }
+    [[nodiscard]] const std::atomic<uint64_t> &peer_udp_gap_count_counter() const
+    {
+        return udp_gap_count;
+    }
+    [[nodiscard]] const std::atomic<uint64_t> &peer_fec_gap_count_counter() const
+    {
+        return fec_gap_count;
+    }
+    [[nodiscard]] const std::atomic<uint64_t> &egress_payload_bytes_counter() const
+    {
+        return recv_bytes;
+    }
+
 private:
     void recv_thread_main();
     void stop_recv_thread();
@@ -73,16 +94,15 @@ private:
     std::deque<data_packet> payload_queue;
     static constexpr size_t k_queue_depth = 4096;
 
-    uint64_t udp_packet_received = 0;
-    uint64_t fec_packet_received = 0;
-    uint64_t udp_gap_count = 0;
+    std::atomic<uint64_t> udp_packet_received {0};
+    std::atomic<uint64_t> fec_packet_received {0};
+    std::atomic<uint64_t> udp_gap_count {0};
     /* Post-FEC output: undelivered app packets after RS (see take_fail_lost_app_pkts). */
-    uint64_t fec_gap_count = 0;
+    std::atomic<uint64_t> fec_gap_count {0};
     /* Wire air shards before RS (stream_sequence loss uses udp_gap_count). */
-    uint64_t fec_air_shard_received = 0;
 
-    uint64_t recv_bytes = 0;
-    uint64_t recv_wire_bytes = 0;
+    std::atomic<uint64_t> recv_bytes {0};
+    std::atomic<uint64_t> recv_wire_bytes {0};
 
     double   egress_rate_t0 = 0.;
     uint64_t egress_rate_bytes = 0;

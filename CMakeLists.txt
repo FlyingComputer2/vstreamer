@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(vstreamer LANGUAGES CXX)
+project(vstreamer LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -36,7 +36,26 @@ set(VSTREAMER_SOURCES
 )
 
 if(ENABLE_NOISE_SOURCE)
-    list(APPEND VSTREAMER_SOURCES src/components/noise_source.cpp)
+    add_executable(noise_fft_bench src/test_app/noise_fft_bench.cpp)
+    target_include_directories(noise_fft_bench PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+    )
+    target_link_libraries(noise_fft_bench PRIVATE vstreamer_source)
+    target_compile_options(noise_fft_bench PRIVATE -Wall -Wextra -Wpedantic)
+
+    set(PFFFT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(PFFFT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(PFFFT_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(PFFFT_USE_TYPE_DOUBLE OFF CACHE BOOL "" FORCE)
+    set(PFFFT_USE_SIMD ON CACHE BOOL "" FORCE)
+    set(INSTALL_PFFFT OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/pffft
+                     ${CMAKE_CURRENT_BINARY_DIR}/pffft EXCLUDE_FROM_ALL)
+    list(APPEND VSTREAMER_SOURCES
+        src/components/noise_source.cpp
+        src/core/noise_fft2.cpp
+    )
 endif()
 if(ENABLE_V4L2_SOURCE)
     list(APPEND VSTREAMER_SOURCES src/components/v4l2_source.cpp)
@@ -87,7 +106,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 
 set(VSTREAMER_LIBS)
-if(ENABLE_NOISE_SOURCE OR ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_CEDAR OR ENABLE_H264_ENCODER_INTEL OR ENABLE_MKV_SINK)
+if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_CEDAR OR ENABLE_H264_ENCODER_INTEL OR ENABLE_MKV_SINK)
     pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
     list(APPEND VSTREAMER_LIBS PkgConfig::LIBAV)
 endif()
@@ -111,6 +130,15 @@ configure_file(
 )
 
 add_library(vstreamer_source ${VSTREAMER_SOURCES})
+set(VSTREAMER_LSAN_HOOKS)
+if(CMAKE_CXX_FLAGS MATCHES "fsanitize=address")
+    add_library(vstreamer_lsan_hooks OBJECT src/core/lsan_default_options.cpp)
+    target_compile_options(vstreamer_lsan_hooks PRIVATE -fsanitize=address)
+    target_compile_definitions(vstreamer_lsan_hooks PRIVATE
+        "VSTREAMER_LSAN_SUPPRESSIONS_PATH=\"${CMAKE_CURRENT_SOURCE_DIR}/cmake/lsan_suppressions.txt\"")
+    set(VSTREAMER_LSAN_HOOKS vstreamer_lsan_hooks)
+    message(STATUS "vstreamer: LeakSanitizer suppressions for SDL/Mesa → cmake/lsan_suppressions.txt")
+endif()
 target_include_directories(vstreamer_source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated
@@ -121,6 +149,15 @@ endif()
 target_compile_options(vstreamer_source PRIVATE -Wall -Wextra -Wpedantic)
 if(TARGET isal_ec)
     target_link_libraries(vstreamer_source PUBLIC isal_ec)
+endif()
+if(TARGET PFFFT::PFFFT)
+    target_link_libraries(vstreamer_source PUBLIC PFFFT::PFFFT)
+endif()
+if(ENABLE_NOISE_SOURCE)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(vstreamer_source PUBLIC OpenMP::OpenMP_CXX)
+    endif()
 endif()
 
 message(STATUS "vstreamer components:")
@@ -179,7 +216,7 @@ if(ENABLE_TEST_STREAM_SDL)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
-    target_link_libraries(stream_sdl PRIVATE vstreamer_source)
+    target_link_libraries(stream_sdl PRIVATE vstreamer_source ${VSTREAMER_LSAN_HOOKS})
     target_compile_options(stream_sdl PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
@@ -205,6 +242,6 @@ if(ENABLE_TEST_UVC_JPEGDEC_KMSDRM OR ENABLE_TEST_UVC_JPEGDEC_DMKS)
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
-    target_link_libraries(uvc_jpegdec_kmsdrm PRIVATE vstreamer_source)
+    target_link_libraries(uvc_jpegdec_kmsdrm PRIVATE vstreamer_source ${VSTREAMER_LSAN_HOOKS})
     target_compile_options(uvc_jpegdec_kmsdrm PRIVATE -Wall -Wextra -Wpedantic)
 endif()

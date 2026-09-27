@@ -12,6 +12,11 @@ void metric_store(metric &m, uint64_t v)
     m.value = v;
 }
 
+void metric_store(metric &m, const std::atomic<uint64_t> &counter)
+{
+    metric_store(m, counter.load(std::memory_order_relaxed));
+}
+
 void metric_store(metric &m, int64_t v)
 {
     std::lock_guard<std::mutex> lock(m.mutex);

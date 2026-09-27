@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import socket
+import time
 
 
 def udp_console(
@@ -59,6 +60,12 @@ class Metrics:
         self._port = int(port)
         self._timeout = timeout
         self._values: dict[str, str] = {}
+        self._timestamp: float | None = None
+
+    @property
+    def timestamp(self) -> float | None:
+        """Monotonic time when the last successful refresh() completed."""
+        return self._timestamp
 
     def refresh(self) -> bool:
         reply = fetch_pipeline_metrics(self._host, self._port, self._timeout)
@@ -68,6 +75,7 @@ class Metrics:
         if not parsed:
             return False
         self._values = parsed
+        self._timestamp = time.monotonic()
         return True
 
     def __call__(self, name: str) -> float | None:

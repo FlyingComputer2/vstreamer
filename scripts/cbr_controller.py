@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Implementation of scripts/cbr_controller.human."""
-
 from __future__ import annotations
 
 import os
@@ -21,28 +19,21 @@ from utils import (  # noqa: E402
     Console,
     Delay,
     FecMap,
-    FirBoxcar,
     LPF,
     Metrics,
-    PID,
 )
-from utils.plot import PlotWS  # noqa: E402
+from utils.plot import PlotCsv, PlotFanout, PlotWS  # noqa: E402
 from utils.tune_console import TuneConsole  # noqa: E402
 
 _TUNE_HELP = """\
 commands (UDP text line):
   show | status
-  set <kp|ki|kd|recover-rate> <value>
-  kp|ki|kd|recover-rate <value>
-  reset          clear PID integral / derivative state
-  help
-example: echo -n 'set kp 0.35' | nc -u -w1 127.0.0.1 5092"""
+  record <file.csv>   start CSV log (plot series, one row per loop)
+  stop                stop CSV log
+  help"""
 
 
-def _make_tune_handler(
-    cbr_pid: PID,
-    recover_rate: list[float],
-) -> Callable[[str], str]:
+def _make_tune_handler(plot_csv: PlotCsv) -> Callable[[str], str]:
     def handle(line: str) -> str:
         parts = line.strip().split()
         if not parts:
@@ -51,41 +42,14 @@ def _make_tune_handler(
         if cmd in ("help", "?"):
             return _TUNE_HELP
         if cmd in ("show", "status"):
-            return (
-                f"kp={cbr_pid.kp} ki={cbr_pid.ki} kd={cbr_pid.kd} "
-                f"recover-rate={recover_rate[0]} cbr={cbr_pid.last}"
-            )
-        if cmd == "reset":
-            cbr_pid.reset()
-            return "ok pid reset"
-        key: str | None = None
-        val: float | None = None
-        if cmd == "set" and len(parts) >= 3:
-            key = parts[1].lower().replace("_", "-")
-            try:
-                val = float(parts[2])
-            except ValueError:
-                return f"bad value: {parts[2]}"
-        elif cmd in ("kp", "ki", "kd", "recover-rate") and len(parts) >= 2:
-            key = cmd
-            try:
-                val = float(parts[1])
-            except ValueError:
-                return f"bad value: {parts[1]}"
-        if key is not None and val is not None:
-            if key == "kp":
-                cbr_pid.set_gains(val, cbr_pid.ki, cbr_pid.kd)
-                return f"ok kp={val}"
-            if key == "ki":
-                cbr_pid.set_gains(cbr_pid.kp, val, cbr_pid.kd)
-                return f"ok ki={val}"
-            if key == "kd":
-                cbr_pid.set_gains(cbr_pid.kp, cbr_pid.ki, val)
-                return f"ok kd={val}"
-            if key == "recover-rate":
-                recover_rate[0] = val
-                return f"ok recover-rate={val}"
-            return f"unknown key: {key}"
+            rec = plot_csv.path or "-"
+            return f"record={rec}"
+        if cmd == "record":
+            if len(parts) < 2:
+                return "usage: record <file.csv>"
+            return plot_csv.start(" ".join(parts[1:]))
+        if cmd == "stop":
+            return plot_csv.stop()
         return f"unknown command: {line}"
 
     return handle
@@ -114,137 +78,169 @@ def main() -> int:
     a.default("host", "127.0.0.1")
     a.default("port", 5090)
     a.default("timeout", 2.5)
-    a.default("udp-loss-filter-cutoff", 0.1)
-    a.default("udp-loss-steady-fir-length", 128)
-    a.default("udp-loss-steady-min-packets", 8)
-    a.default("fec-loss-filter-cutoff", 0.1)
-    a.default("encode-rate-filter-cutoff", 0.1)
-    a.default("cbr-rate-filter-cutoff", 0.1)
+    a.default("udp-loss-filter-cutoff", 0.01)
+    a.default("fec-loss-filter-cutoff", 0.01)
+    a.default("encode-rate-filter-cutoff", 5)
+    a.default("encode-rate-filter-cutoff-long", 0.01)
     a.default("k", 6)
     a.default("n-gain", 1.2)
     a.default("n-max", 15)
-    a.default("kp", 1.0)
-    a.default("kd", 0.005)
-    a.default("ki", 0.01)
-    a.default("recover-rate", 1.1)
     a.default("cbr-min", 100)
     a.default("cbr-max", 20000)
     a.default("loop-rate", 10.0)
-    a.default("run-seconds", 0.0)
     a.default("tune-host", "127.0.0.1")
     a.default("tune-port", 5092)
+    a.default("ramp-rate-kbpsps", 50.0)
+    a.default("fall-rate-pct", 5.0)
+    a.default("rate-stable-eps-kbps", 300.0)
+    a.default("rate-stable-time-s", 5.0)
+    a.default("probe-interval-s", 30.0)
+    a.default("probe-duration-s", 5.0)
 
     _stop_other_controllers()
 
     loop_rate = a("loop-rate")
     dt = 1.0 / loop_rate
 
-    plot = PlotWS(a("plot-url"))
+    plot_csv = PlotCsv()
+    plot = PlotFanout(PlotWS(a("plot-url")), plot_csv)
     metric = Metrics(a("host"), a("port"), a("timeout"))
     console = Console(a("host"), a("port"), a("timeout"))
     lpf_udp_loss = LPF(loop_rate, a("udp-loss-filter-cutoff"))
-    fir_udp_loss_steady = FirBoxcar(a("udp-loss-steady-fir-length"))
     lpf_fec_loss = LPF(loop_rate, a("fec-loss-filter-cutoff"))
     lpf_encode_rate = LPF(loop_rate, a("encode-rate-filter-cutoff"))
-    lpf_cbr = LPF(loop_rate, a("cbr-rate-filter-cutoff"))
+    lpf_encode_rate_long = LPF(loop_rate, a("encode-rate-filter-cutoff-long"))
     fec_map = FecMap(a("k"), a("n-gain"))
     fec_clamp = Clamp(a("k"), a("n-max"))
     cbr_clamp = Clamp(a("cbr-min"), a("cbr-max"))
-    cbr_pid = PID(a("kp"), a("ki"), a("kd"), cbr_clamp, dt, cbr_clamp)
-    recover_rate_box = [float(a("recover-rate"))]
-    tune = TuneConsole(
-        a("tune-host"),
-        a("tune-port"),
-        _make_tune_handler(cbr_pid, recover_rate_box),
-    )
-    udp_received_delta = Delay(1)
-    fec_received_delta = Delay(1)
-    udp_gap_delta = Delay(1)
-    fec_gap_delta = Delay(1)
-    encode_delta = Delay(1)
-    steady_min_pkts = a("udp-loss-steady-min-packets")
-
+    tune = TuneConsole(a("tune-host"), a("tune-port"), _make_tune_handler(plot_csv))
+    d_udp_recv = Delay(1)
+    d_fec_recv = Delay(1)
+    d_udp_gap = Delay(1)
+    d_fec_gap = Delay(1)
+    d_encode = Delay(1)
+    loss_min_total = 8
+    ramp_rate_kbpsps = float(a("ramp-rate-kbpsps"))
+    fall_rate_pct = float(a("fall-rate-pct"))
+    cbr_max_abs = float(a("cbr-max"))
+    rate_stable_eps = float(a("rate-stable-eps-kbps"))
+    rate_stable_time_s = float(a("rate-stable-time-s"))
+    probe_interval_s = float(a("probe-interval-s"))
+    probe_duration_s = float(a("probe-duration-s"))
     console.line(f"set_fec_k {a('k')}")
+    metric.refresh()
+    s_cbr0 = metric("h264_encoder.cbr_kbps")
+    cbr_kbps = float(s_cbr0) if s_cbr0 is not None else float(a("cbr-min"))
+    cbr_kbps = cbr_clamp(cbr_kbps)
 
-    session_gap0: float | None = None
-    session_recv0: float | None = None
-
-    t0 = time.monotonic()
+    last_metrics_t: float | None = metric.timestamp
+    rate_stable = False
+    rate_stable_accum_s = 0.0
+    next_probe_at: float | None = None
+    probing_until: float | None = None
 
     try:
         while True:
-            if a("run-seconds") > 0 and time.monotonic() - t0 >= a("run-seconds"):
-                break
-
             tune.poll()
 
-            metric.refresh()
-            now_ = time.time()
-            udp_received_delta_ = udp_received_delta(
-                metric("stream_sender.peer_udp_packet_received")
+            loop_start = time.monotonic()
+            if not metric.refresh() or metric.timestamp is None:
+                time.sleep(max(0.0, dt - (time.monotonic() - loop_start)))
+                continue
+
+            if last_metrics_t is None:
+                last_metrics_t = metric.timestamp
+                time.sleep(max(0.0, dt - (time.monotonic() - loop_start)))
+                continue
+
+            metrics_dt = metric.timestamp - last_metrics_t
+            last_metrics_t = metric.timestamp
+            plot.set_time(time.time())
+
+            # metrics
+            s_udp_recv      = metric("stream_sender.peer_udp_packet_received")
+            s_peer_loss_udp = metric("stream_sender.peer_loss_udp_pct")
+            s_fec_recv = metric("stream_sender.peer_fec_packet_received")
+            s_udp_gap  = metric("stream_sender.peer_udp_gap_count")
+            s_fec_gap  = metric("stream_sender.peer_fec_gap_count")
+            s_encoded  = metric("h264_encoder.out_bytes")
+            s_cbr      = metric("h264_encoder.cbr_kbps")
+
+            # deltas (counters refreshed from atomics on each metrics UDP poll)
+            udp_received_delta_ = (
+                s_udp_recv - d_udp_recv(s_udp_recv) if s_udp_recv is not None else 0.0
             )
-            fec_received_delta_ = fec_received_delta(
-                metric("stream_sender.peer_fec_packet_received")
+            fec_received_delta_ = (
+                s_fec_recv - d_fec_recv(s_fec_recv) if s_fec_recv is not None else 0.0
             )
-            udp_gap_delta_ = udp_gap_delta(metric("stream_sender.peer_udp_gap_count"))
-            fec_gap_delta_ = fec_gap_delta(metric("stream_sender.peer_fec_gap_count"))
-            encode_delta_ = encode_delta(metric("h264_encoder.out_bytes"))
+            udp_gap_delta_ = s_udp_gap - d_udp_gap(s_udp_gap) if s_udp_gap is not None else 0.0
+            fec_gap_delta_ = s_fec_gap - d_fec_gap(s_fec_gap) if s_fec_gap is not None else 0.0
+            encoded_delta_ = (
+                s_encoded - d_encode(s_encoded) if s_encoded is not None else 0.0
+            )
+            encoded_rate_raw_ = (
+                encoded_delta_ / metrics_dt * 8.0 / 1000.0 if metrics_dt > 0.0 else 0.0
+            )
+
+            # losses (wire UDP: gaps / (gaps + received); matches stream_sdl interval_loss_pct)
             udp_total_ = udp_gap_delta_ + udp_received_delta_
             fec_total_ = fec_gap_delta_ + fec_received_delta_
-            loss_udp_raw_ = udp_gap_delta_ / udp_total_ if udp_total_ else 0.0
-            loss_fec_raw_ = fec_gap_delta_ / fec_total_ if fec_total_ else 0.0
+            if s_udp_recv is not None:
+                loss_udp_raw_ = (
+                    udp_gap_delta_ / udp_total_
+                    if udp_total_ >= loss_min_total
+                    else 0.0
+                )
+            elif s_peer_loss_udp is not None:
+                loss_udp_raw_ = s_peer_loss_udp / 100.0
+            else:
+                loss_udp_raw_ = 0.0
+            loss_fec_raw_ = (
+                fec_gap_delta_ / fec_total_ if fec_total_ >= loss_min_total else 0.0
+            )
+
             loss_udp_ = lpf_udp_loss(loss_udp_raw_)
             loss_fec_ = lpf_fec_loss(loss_fec_raw_)
-            encode_rate_ = lpf_encode_rate(encode_delta_ / dt * 8.0 / 1000.0)
+            encoded_rate_ = lpf_encode_rate(encoded_rate_raw_)
+            encoded_rate_long_ = lpf_encode_rate_long(encoded_rate_raw_)
 
-            plot("loss_udp", now_, loss_udp_)
-            plot("loss_fec", now_, loss_fec_)
-            plot("encode_rate", now_, encode_rate_)
+            plot("s_cbr", s_cbr)
+            plot("metrics_dt", metrics_dt)
 
-            gap_abs = metric("stream_sender.peer_udp_gap_count")
-            recv_abs = metric("stream_sender.peer_udp_packet_received")
-            loss_udp_session: float | None = None
-            if gap_abs is not None and recv_abs is not None:
-                if session_gap0 is None and gap_abs + recv_abs >= steady_min_pkts:
-                    session_gap0 = gap_abs
-                    session_recv0 = recv_abs
-                if session_gap0 is not None and session_recv0 is not None:
-                    dg = gap_abs - session_gap0
-                    dr = recv_abs - session_recv0
-                    session_denom = dg + dr
-                    if session_denom >= steady_min_pkts:
-                        loss_udp_session = dg / session_denom
+            plot("loss_udp_raw", loss_udp_raw_)
+            plot("loss_fec_raw", loss_fec_raw_)
+            plot("encoded_rate_raw", encoded_rate_raw_)
 
-            if udp_total_ > 0 and loss_udp_session is not None:
-                loss_udp_steady_state_ = fir_udp_loss_steady(loss_udp_session)
-            else:
-                loss_udp_steady_state_ = fir_udp_loss_steady.value
-            plot("loss_udp_steady_state", now_, loss_udp_steady_state_)
-            fec_n_preclamp_ = fec_map(loss_udp_steady_state_)
-            fec_n_ = fec_clamp(fec_n_preclamp_)
+            plot("loss_udp", loss_udp_)
+            plot("loss_fec", loss_fec_)
+            plot("encoded_rate", encoded_rate_)
+            plot("encoded_rate_long", encoded_rate_long_)
+
+            plot("fec_gap_delta", fec_gap_delta_)
+            plot("udp_gap_delta", udp_gap_delta_)
+
+            # calculate FEC N
+            fec_n_ = fec_clamp(fec_map(loss_udp_))
             plot("fec_n", fec_n_)
+            console.line(f"set_fec_n {fec_n_}")
 
-            if loss_fec_ > 0:
-                cbr_setpoint_ = encode_rate_ * (1.0 - loss_fec_)
+            # AIMD on FEC gaps (fec_gap_delta_ > 0 => loss this interval)
+            is_loss_ = fec_gap_delta_ > 0.0
+            plot("is_loss", float(is_loss_))
+
+            if is_loss_:
+                cbr_kbps *= 1.0 - fall_rate_pct / 100.0
             else:
-                cbr_setpoint_ = encode_rate_ * recover_rate_box[0]
-            cbr_error_ = cbr_setpoint_ - cbr_pid.last
-            cbr_ = cbr_pid(cbr_error_)
-            plot("cbr_error", now_, cbr_error_)
-            plot("cbr_setpoint", now_, cbr_setpoint_)
-            plot("cbr", now_, cbr_)
-            plot("kp", now_, cbr_pid.kp)
-            plot("ki", now_, cbr_pid.ki)
-            plot("kd", now_, cbr_pid.kd)
-            plot("recover_rate", now_, recover_rate_box[0])
+                cbr_kbps += ramp_rate_kbpsps * metrics_dt
+            cbr_kbps = cbr_clamp(cbr_kbps)
+            plot("cbr", cbr_kbps)
+            console("set_encode_cbr", cbr_kbps)
+
             plot.flush()
-
-            console("set_fec_n", fec_n_)
-            console("set_encode_cbr", cbr_)
-
-            time.sleep(dt)
+            time.sleep(max(0.0, dt - (time.monotonic() - loop_start)))
     finally:
         tune.close()
+        plot.close()
 
     return 0
 

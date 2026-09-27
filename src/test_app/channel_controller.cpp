@@ -78,11 +78,8 @@ void channel_controller::set_stream_sender(vstreamer::stream_sender *sender)
     stream_tx = sender;
 }
 
-void channel_controller::set_max_kbps(double kbps)
+void channel_controller::reset_rate_windows(double t)
 {
-    std::lock_guard<std::mutex> lock(cfg_mu);
-    max_kbps_limit = kbps < 0. ? 0. : kbps;
-    const double t = now_sec();
     {
         std::lock_guard<std::mutex> rlock(fwd.rate_mu);
         fwd.rate_window_start = t;
@@ -93,6 +90,35 @@ void channel_controller::set_max_kbps(double kbps)
         rev.rate_window_start = t;
         rev.rate_window_bytes = 0;
     }
+}
+
+void channel_controller::set_max_kbps(double kbps)
+{
+    {
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        max_kbps_limit = kbps < 0. ? 0. : kbps;
+    }
+    reset_rate_windows(now_sec());
+}
+
+void channel_controller::set_drop_dt_ms(int ms)
+{
+    {
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        if (ms < k_chan_min_drop_dt_ms)
+        {
+            rate_drop_dt_ms = k_chan_min_drop_dt_ms;
+        }
+        else if (ms > k_chan_max_drop_dt_ms)
+        {
+            rate_drop_dt_ms = k_chan_max_drop_dt_ms;
+        }
+        else
+        {
+            rate_drop_dt_ms = ms;
+        }
+    }
+    reset_rate_windows(now_sec());
 }
 
 void channel_controller::set_constant_loss(double pct)
@@ -112,10 +138,27 @@ void channel_controller::set_constant_loss(double pct)
     }
 }
 
+void channel_controller::set_queue_depth(int depth)
+{
+    std::lock_guard<std::mutex> lock(cfg_mu);
+    if (depth < 0)
+    {
+        ingress_queue_depth = 0;
+        return;
+    }
+    ingress_queue_depth = static_cast<size_t>(depth);
+}
+
 double channel_controller::max_kbps() const
 {
     std::lock_guard<std::mutex> lock(cfg_mu);
     return max_kbps_limit;
+}
+
+int channel_controller::drop_dt_ms() const
+{
+    std::lock_guard<std::mutex> lock(cfg_mu);
+    return rate_drop_dt_ms;
 }
 
 double channel_controller::constant_loss() const
@@ -124,24 +167,38 @@ double channel_controller::constant_loss() const
     return loss_pct;
 }
 
+int channel_controller::queue_depth() const
+{
+    std::lock_guard<std::mutex> lock(cfg_mu);
+    return static_cast<int>(ingress_queue_depth);
+}
+
+size_t channel_controller::forward_queue_size() const
+{
+    return fwd.ingress_queue_len.load(std::memory_order_relaxed);
+}
+
 channel_controller::forward_stats channel_controller::forward_stats_snapshot() const
 {
     forward_stats s;
-    s.pkts_in = fwd.pkts_in;
-    s.pkts_out = fwd.pkts_out;
-    s.bytes_in = fwd.bytes_in;
-    s.bytes_out = fwd.bytes_out;
-    s.dropped_rate = fwd.dropped_rate;
-    s.dropped_loss = fwd.dropped_loss;
+    s.pkts_in = fwd.pkts_in.load(std::memory_order_relaxed);
+    s.pkts_out = fwd.pkts_out.load(std::memory_order_relaxed);
+    s.bytes_in = fwd.bytes_in.load(std::memory_order_relaxed);
+    s.bytes_out = fwd.bytes_out.load(std::memory_order_relaxed);
+    s.dropped_rate = fwd.dropped_rate.load(std::memory_order_relaxed);
+    s.dropped_loss = fwd.dropped_loss.load(std::memory_order_relaxed);
+    s.dropped_queue = fwd.dropped_queue.load(std::memory_order_relaxed);
     return s;
 }
 
 bool channel_controller::should_drop_rate(direction_state &dir, size_t pkt_bytes)
 {
     double limit = 0.;
+    double window_sec = 0.;
     {
         std::lock_guard<std::mutex> lock(cfg_mu);
         limit = max_kbps_limit;
+        window_sec = static_cast<double>(rate_drop_dt_ms) / 1000.0;
     }
     if (limit <= 0.)
     {
@@ -150,13 +207,13 @@ bool channel_controller::should_drop_rate(direction_state &dir, size_t pkt_bytes
 
     const double t = now_sec();
     std::lock_guard<std::mutex> lock(dir.rate_mu);
-    if (dir.rate_window_start <= 0. || (t - dir.rate_window_start) >= 1.0)
+    if (dir.rate_window_start <= 0. || (t - dir.rate_window_start) >= window_sec)
     {
         dir.rate_window_start = t;
         dir.rate_window_bytes = 0;
     }
 
-    const double max_bytes = limit * 1000.0 / 8.0;
+    const double max_bytes = limit * 1000.0 / 8.0 * window_sec;
     if (static_cast<double>(dir.rate_window_bytes + pkt_bytes) > max_bytes)
     {
         return true;
@@ -185,25 +242,21 @@ bool channel_controller::should_drop_loss(direction_state &dir)
     return u < (pct / 100.0);
 }
 
-void channel_controller::forward_packet(direction_state &dir, const uint8_t *buf, size_t n)
+channel_controller::egress_status channel_controller::try_egress_one(direction_state &dir,
+                                                                     const uint8_t *buf, size_t n)
 {
-    dir.pkts_in++;
-    dir.bytes_in += static_cast<uint64_t>(n);
-
     if (should_drop_rate(dir, n))
     {
-        dir.dropped_rate++;
-        return;
+        return egress_status::rate_limited;
     }
     if (should_drop_loss(dir))
     {
-        dir.dropped_loss++;
-        return;
+        return egress_status::loss_dropped;
     }
 
     if (!dir.have_egress || dir.egress_fd < 0)
     {
-        return;
+        return egress_status::no_route;
     }
 
     const ssize_t sent =
@@ -211,9 +264,88 @@ void channel_controller::forward_packet(direction_state &dir, const uint8_t *buf
                sizeof(dir.egress_addr));
     if (sent == static_cast<ssize_t>(n))
     {
-        dir.pkts_out++;
-        dir.bytes_out += static_cast<uint64_t>(n);
+        dir.pkts_out.fetch_add(1, std::memory_order_relaxed);
+        dir.bytes_out.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+        return egress_status::ok;
     }
+    return egress_status::send_failed;
+}
+
+void channel_controller::egress_packet(direction_state &dir, const uint8_t *buf, size_t n)
+{
+    switch (try_egress_one(dir, buf, n))
+    {
+    case egress_status::rate_limited:
+        dir.dropped_rate.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case egress_status::loss_dropped:
+        dir.dropped_loss.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case egress_status::ok:
+    case egress_status::no_route:
+    case egress_status::send_failed:
+        break;
+    }
+}
+
+void channel_controller::accept_ingress(direction_state &dir, const uint8_t *buf, size_t n)
+{
+    dir.pkts_in.fetch_add(1, std::memory_order_relaxed);
+    dir.bytes_in.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+
+    size_t depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        depth = ingress_queue_depth;
+    }
+    if (0 == depth)
+    {
+        egress_packet(dir, buf, n);
+        return;
+    }
+
+    if (dir.ingress_queue.size() >= depth)
+    {
+        dir.ingress_queue.pop_front();
+        dir.dropped_queue.fetch_add(1, std::memory_order_relaxed);
+    }
+    dir.ingress_queue.emplace_back(buf, buf + n);
+    dir.ingress_queue_len.store(dir.ingress_queue.size(), std::memory_order_relaxed);
+}
+
+void channel_controller::flush_ingress_queue(direction_state &dir)
+{
+    size_t depth = 0;
+    {
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        depth = ingress_queue_depth;
+    }
+    if (0 == depth)
+    {
+        return;
+    }
+
+    bool hold_remainder = false;
+    while (!hold_remainder && !dir.ingress_queue.empty())
+    {
+        const std::vector<uint8_t> &pkt = dir.ingress_queue.front();
+        switch (try_egress_one(dir, pkt.data(), pkt.size()))
+        {
+        case egress_status::ok:
+            dir.ingress_queue.pop_front();
+            break;
+        case egress_status::loss_dropped:
+            dir.ingress_queue.pop_front();
+            dir.dropped_loss.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case egress_status::rate_limited:
+        case egress_status::no_route:
+        case egress_status::send_failed:
+            hold_remainder = true;
+            break;
+        }
+    }
+    dir.ingress_queue_len.store(dir.ingress_queue.size(), std::memory_order_relaxed);
 }
 
 void channel_controller::relay_thread_main()
@@ -253,11 +385,6 @@ void channel_controller::relay_thread_main()
             }
             continue;
         }
-        if (pr == 0)
-        {
-            continue;
-        }
-
         auto drain_ingress = [&](direction_state &dir) {
             while (!relay_stop.load())
             {
@@ -265,7 +392,7 @@ void channel_controller::relay_thread_main()
                     recv(dir.ingress_fd, buf, sizeof(buf), MSG_DONTWAIT);
                 if (n > 0)
                 {
-                    forward_packet(dir, buf, static_cast<size_t>(n));
+                    accept_ingress(dir, buf, static_cast<size_t>(n));
                     continue;
                 }
                 if (n < 0 && (EAGAIN == errno || EWOULDBLOCK == errno))
@@ -279,7 +406,7 @@ void channel_controller::relay_thread_main()
         int idx = 0;
         if (fwd.ingress_fd >= 0)
         {
-            if ((fds[idx].revents & POLLIN) != 0)
+            if (pr != 0 && (fds[idx].revents & POLLIN) != 0)
             {
                 drain_ingress(fwd);
             }
@@ -287,10 +414,16 @@ void channel_controller::relay_thread_main()
         }
         if (rev_enabled && rev.ingress_fd >= 0)
         {
-            if ((fds[idx].revents & POLLIN) != 0)
+            if (pr != 0 && (fds[idx].revents & POLLIN) != 0)
             {
                 drain_ingress(rev);
             }
+        }
+
+        flush_ingress_queue(fwd);
+        if (rev_enabled)
+        {
+            flush_ingress_queue(rev);
         }
     }
 }
@@ -303,6 +436,16 @@ void channel_controller::set_pipeline_metrics(const vstreamer::metrics *source)
 void channel_controller::set_pipeline_metrics_refresh(std::function<void()> refresh)
 {
     pipeline_metrics_refresh = std::move(refresh);
+}
+
+void channel_controller::set_pipeline_metrics_sync_live(std::function<void()> sync_live)
+{
+    pipeline_metrics_sync_live = std::move(sync_live);
+}
+
+void channel_controller::set_source_state_metrics_refresh(std::function<void()> refresh)
+{
+    source_state_metrics_refresh = std::move(refresh);
 }
 
 void channel_controller::set_encode_target(vstreamer::component_coder *encoder)
@@ -329,9 +472,15 @@ void channel_controller::send_pipeline_metrics(int reply_fd, const sockaddr_in &
         return;
     }
 
-    /* Snapshot only: refresh runs on stream_sdl metrics thread (not here). A full
-     * refresh on every UDP get blocked the console past short nc timeouts and looked
-     * like a blank blink with clear + poll loops. */
+    /* Live snapshot: fast counter sync, then copy/format metrics (not full update_pipeline_metrics). */
+    if (pipeline_metrics_sync_live)
+    {
+        pipeline_metrics_sync_live();
+    }
+    else if (source_state_metrics_refresh)
+    {
+        source_state_metrics_refresh();
+    }
     const std::string report = pipeline_metrics->to_string();
     if (report.empty())
     {
@@ -357,6 +506,7 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
     {
         static const char help_msg[] =
             "set_max_kbps <kbps>\n"
+            "set_drop_dt_ms <ms>\n"
             "set_constant_loss <pct>\n"
             "set_fec none\n"
             "set_fec_k <k>\n"
@@ -396,6 +546,25 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
             return;
         }
         set_max_kbps(v);
+        const char *msg = "ok\n";
+        sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
+               sizeof(reply));
+        return;
+    }
+
+    if (0 == std::strncmp(work, "set_drop_dt_ms ", 15))
+    {
+        const char *arg = work + 15;
+        char       *end = nullptr;
+        const long  v = std::strtol(arg, &end, 10);
+        if (end == arg || v < k_chan_min_drop_dt_ms || v > k_chan_max_drop_dt_ms)
+        {
+            const char *msg = "err bad value\n";
+            sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
+                   sizeof(reply));
+            return;
+        }
+        set_drop_dt_ms(static_cast<int>(v));
         const char *msg = "ok\n";
         sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                sizeof(reply));
@@ -648,6 +817,10 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
                    sizeof(reply));
             return;
         }
+        if (0 == std::strcmp(name, "source.state") && source_state_metrics_refresh)
+        {
+            source_state_metrics_refresh();
+        }
         std::string value;
         if (!pipeline_metrics->format_metric(name, &value))
         {
@@ -664,15 +837,24 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
 
     if (0 == std::strcmp(work, "stats"))
     {
-        char msg[320];
+        char msg[512];
         std::snprintf(msg, sizeof(msg),
                       "fwd in=%" PRIu64 " out=%" PRIu64 " drop_rate=%" PRIu64
-                      " drop_loss=%" PRIu64
+                      " drop_loss=%" PRIu64 " drop_queue=%" PRIu64
                       " | rev in=%" PRIu64 " out=%" PRIu64 " drop_rate=%" PRIu64
-                      " drop_loss=%" PRIu64 " | max_kbps=%.0f loss_pct=%.2f\n",
-                      fwd.pkts_in, fwd.pkts_out, fwd.dropped_rate, fwd.dropped_loss, rev.pkts_in,
-                      rev.pkts_out, rev.dropped_rate, rev.dropped_loss, max_kbps(),
-                      constant_loss());
+                      " drop_loss=%" PRIu64 " drop_queue=%" PRIu64
+                      " | max_kbps=%.0f drop_dt_ms=%d queue=%d loss_pct=%.2f\n",
+                      fwd.pkts_in.load(std::memory_order_relaxed),
+                      fwd.pkts_out.load(std::memory_order_relaxed),
+                      fwd.dropped_rate.load(std::memory_order_relaxed),
+                      fwd.dropped_loss.load(std::memory_order_relaxed),
+                      fwd.dropped_queue.load(std::memory_order_relaxed),
+                      rev.pkts_in.load(std::memory_order_relaxed),
+                      rev.pkts_out.load(std::memory_order_relaxed),
+                      rev.dropped_rate.load(std::memory_order_relaxed),
+                      rev.dropped_loss.load(std::memory_order_relaxed),
+                      rev.dropped_queue.load(std::memory_order_relaxed), max_kbps(), drop_dt_ms(),
+                      queue_depth(), constant_loss());
         sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                sizeof(reply));
         return;
@@ -782,6 +964,8 @@ int channel_controller::setup_direction(direction_state &dir, int ingress_port,
 
 void channel_controller::teardown_direction(direction_state &dir)
 {
+    dir.ingress_queue.clear();
+    dir.ingress_queue_len.store(0, std::memory_order_relaxed);
     if (dir.ingress_fd >= 0)
     {
         ::shutdown(dir.ingress_fd, SHUT_RDWR);
@@ -825,8 +1009,8 @@ int channel_controller::start(int ingress_port, const char *egress_host, int egr
     relay_stop = false;
     relay_thread = std::thread(&channel_controller::relay_thread_main, this);
 
-    std::fprintf(stderr, "channel_controller: fwd :%d -> %s:%d\n", ingress_port, egress_host,
-                 egress_port);
+    std::fprintf(stderr, "channel_controller: fwd :%d -> %s:%d (queue=%d)\n", ingress_port,
+                 egress_host, egress_port, queue_depth());
     if (rev_enabled)
     {
         std::fprintf(stderr, "channel_controller: rev :%d -> %s:%d\n", reverse_ingress_port,

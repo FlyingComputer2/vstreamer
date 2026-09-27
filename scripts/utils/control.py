@@ -2,9 +2,6 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from collections.abc import Callable
-
-ClampFn = Callable[[float], float]
 
 
 class FirBoxcar:
@@ -29,7 +26,31 @@ class FirBoxcar:
         return self._last_out
 
 
+def _fir_lowpass_taps(numtaps: int, cutoff: float, sample_rate: float) -> list[float]:
+    """Hamming-windowed sinc lowpass; unity gain at DC."""
+    n = max(3, int(numtaps) | 1)
+    fc = max(cutoff, 1e-9)
+    fs = max(sample_rate, 1e-9)
+    fn = fc / fs
+    mid = (n - 1) / 2.0
+    taps: list[float] = []
+    for i in range(n):
+        t = 2.0 * fn * (i - mid)
+        if abs(t) < 1e-12:
+            ideal = 2.0 * fn
+        else:
+            ideal = math.sin(math.pi * t) / (math.pi * t) * (2.0 * fn)
+        w = 0.54 - 0.46 * math.cos(2.0 * math.pi * i / (n - 1))
+        taps.append(ideal * w)
+    scale = sum(taps)
+    if abs(scale) < 1e-12:
+        return [1.0 / n] * n
+    return [t / scale for t in taps]
+
+
 class LPF:
+    """Causal FIR lowpass (Hamming window). `order` = tap count (odd); if <= 1, length ~ 3 RC time constants."""
+
     def __init__(
         self,
         sample_rate: float,
@@ -38,118 +59,118 @@ class LPF:
         order: int = 1,
         type: str = "lowpass",
     ) -> None:
-        del rolloff, order, type
-        dt = 1.0 / sample_rate
-        rc = 1.0 / (2.0 * math.pi * cutoff)
-        self._alpha = dt / (dt + rc)
-        self._y = 0.0
-        self._ready = False
+        del rolloff, type
+        if order > 1:
+            numtaps = max(3, int(order) | 1)
+        else:
+            rc = 1.0 / (2.0 * math.pi * max(cutoff, 1e-9))
+            numtaps = int(round(3.0 * rc * sample_rate)) | 1
+            numtaps = max(3, min(numtaps, 401))
+        self._taps = _fir_lowpass_taps(numtaps, cutoff, sample_rate)
+        self._buf: deque[float] = deque(maxlen=len(self._taps))
+        self._last_out = 0.0
+
+    @property
+    def num_taps(self) -> int:
+        return len(self._taps)
+
+    @property
+    def group_delay_samples(self) -> float:
+        return (len(self._taps) - 1) / 2.0
 
     def __call__(self, x: float) -> float:
-        if not self._ready:
-            self._y = x
-            self._ready = True
-            return x
-        self._y += self._alpha * (x - self._y)
-        return self._y
+        self._buf.append(x)
+        n = len(self._buf)
+        nt = len(self._taps)
+        hist = self._buf
+        y = 0.0
+        base = nt - n
+        for i in range(n):
+            y += self._taps[base + i] * hist[i]
+        self._last_out = y
+        return y
+
+    @property
+    def value(self) -> float:
+        return self._last_out
 
 
 class Delay:
+    """Return the sample from n loop steps ago; warm-up passes x through (so s - delay(s) is 0)."""
+
     def __init__(self, n: int) -> None:
-        self._hist: list[float | None] = [None] * max(1, n)
+        self._n = max(1, int(n))
+        self._hist: deque[float] = deque(maxlen=self._n)
 
     def __call__(self, x: float | None) -> float:
         if x is None:
             return 0.0
-        oldest = self._hist[-1]
-        self._hist = [x] + self._hist[:-1]
-        if oldest is None:
-            return 0.0
-        return x - oldest
+        if len(self._hist) < self._n:
+            out = x
+        else:
+            out = self._hist[0]
+        self._hist.append(x)
+        return out
+
+
+class CounterDelta:
+    """Per-loop delta of a monotonic counter; unchanged telemetry reads yield changed=False."""
+
+    def __init__(self) -> None:
+        self._prev: float | None = None
+
+    def __call__(self, x: float | None) -> tuple[float, bool]:
+        if x is None:
+            return 0.0, False
+        if self._prev is None:
+            self._prev = x
+            return 0.0, False
+        if x == self._prev:
+            return 0.0, False
+        delta = x - self._prev
+        self._prev = x
+        return delta, True
+
+
+class Clamp:
+    def __init__(self, min: float, max: float) -> None:
+        self._min = min
+        self._max = max
+
+    def set_max(self, max: float) -> None:
+        self._max = max
+
+    def __call__(self, x: float) -> float:
+        return max(self._min, min(self._max, x))
 
 
 class Integrator:
-    def __init__(self, clamp_function: ClampFn, dt: float) -> None:
-        self._clamp = clamp_function
+    """Euler integrate u (per-second units) with fixed dt; optional output clamp."""
+
+    def __init__(self, dt: float, output_clamp: Clamp | None = None) -> None:
         self._dt = dt
+        self._clamp = output_clamp
         self._state = 0.0
-        self._ceil: float | None = None
 
-    def max(self, ceiling: float) -> None:
-        """Upper limit for integrated CBR (may move down when encode rate drops)."""
-        self._ceil = ceiling
-        self._state = self._apply_bounds(self._state)
-
-    def _apply_bounds(self, x: float) -> float:
-        y = self._clamp(x)
-        if self._ceil is not None:
-            y = min(y, self._ceil)
-        return y
-
-    def __call__(self, rate: float) -> float:
-        self._state += rate * self._dt
-        self._state = self._apply_bounds(self._state)
+    @property
+    def value(self) -> float:
         return self._state
 
+    def reset(self, value: float = 0.0) -> None:
+        self._state = value
+        if self._clamp is not None:
+            self._state = self._clamp(self._state)
 
-class PID:
-    def __init__(
-        self,
-        kp: float,
-        ki: float,
-        kd: float,
-        integral_clamp_function: ClampFn,
-        dt: float,
-        output_clamp_function: ClampFn | None = None,
-    ) -> None:
-        self._kp, self._ki, self._kd = kp, ki, kd
-        self._integral_clamp = integral_clamp_function
-        self._output_clamp = output_clamp_function
-        self._dt = dt
-        self._integral = 0.0
-        self._prev_error: float | None = None
-        self._last_out = (
-            output_clamp_function(0.0) if output_clamp_function else 0.0
-        )
+    def set_max(self, max: float) -> None:
+        if self._clamp is not None:
+            self._clamp.set_max(max)
+            self._state = self._clamp(self._state)
 
-    @property
-    def last(self) -> float:
-        return self._last_out
-
-    @property
-    def kp(self) -> float:
-        return self._kp
-
-    @property
-    def ki(self) -> float:
-        return self._ki
-
-    @property
-    def kd(self) -> float:
-        return self._kd
-
-    def set_gains(self, kp: float, ki: float, kd: float) -> None:
-        self._kp, self._ki, self._kd = kp, ki, kd
-
-    def reset(self) -> None:
-        self._integral = 0.0
-        self._prev_error = None
-        self._last_out = (
-            self._output_clamp(0.0) if self._output_clamp else 0.0
-        )
-
-    def __call__(self, error: float) -> float:
-        self._integral += error * self._dt
-        self._integral = self._integral_clamp(self._integral)
-        d = 0.0
-        if self._prev_error is not None:
-            d = (error - self._prev_error) / self._dt
-        self._prev_error = error
-        out = self._kp * error + self._ki * self._integral + self._kd * d
-        if self._output_clamp is not None:
-            out = self._output_clamp(out)
-        self._last_out = out
-        return self._last_out
+    def __call__(self, u: float) -> float:
+        self._state += u * self._dt
+        if self._clamp is not None:
+            self._state = self._clamp(self._state)
+        return self._state
 
 
 class FecMap:
@@ -160,41 +181,3 @@ class FecMap:
     def __call__(self, loss_rate: float) -> float:
         p = min(max(loss_rate, 0.0), 0.999999)
         return self._gain * self._k / (1.0 - p)
-
-
-class Clamp:
-    def __init__(self, min: float, max: float) -> None:
-        self._min = min
-        self._max = max
-
-    def __call__(self, x: float) -> float:
-        return max(self._min, min(self._max, x))
-
-
-def recovery_g(loss: float) -> float:
-    gx = [
-             1.0, # 0
-            -1.0, # 10%
-            -2.0, # 20%
-            -3.0, # 30%
-            -4.0, # 40%
-            -5.0, # 50%
-            -6.0, # 60%
-            -7.0, # 70%
-            -8.0, # 80%
-            -9.0, # 90%
-            -10.0, # 100%
-    ]
-    # Decile index 0..10: [0%,10%) -> 0, [10%,20%) -> 1, ... 100% -> 10.
-    # Do not ceil(loss*100): any epsilon>0 would land in bucket 1 (-1.0).
-    L10 = min(10, math.floor(loss * 10.0 + 1e-12))
-    return gx[L10]
-
-
-class RecoveryRate:
-    def __init__(self, gain: float) -> None:
-        self._gain = gain
-
-    def __call__(self, loss: float) -> float:
-        x = min(max(loss, 0.0), 1.0)
-        return self._gain * recovery_g(x)

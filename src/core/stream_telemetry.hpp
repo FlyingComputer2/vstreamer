@@ -16,8 +16,6 @@ struct stream_receiver_counters
     uint64_t udp_gap_count = 0;
     /* Undelivered post-FEC output packets (RS block failure / missing data slots). */
     uint64_t fec_gap_count = 0;
-    /* Valid stream air shards received (wire, pre-FEC). */
-    uint64_t fec_air_shard_received = 0;
     /* 5-sample moving average of interval delta loss (percent). */
     double loss_udp_pct = 0.;
     double loss_fec_pct = 0.;

@@ -1,0 +1,14 @@
+# GPU / display stack (process-lifetime allocations; not vstreamer bugs).
+leak:*libSDL2*
+leak:*dri.so*
+leak:rockchip_dri
+leak:libSDL2
+leak:libEGL
+leak:libGL
+leak:libgbm
+leak:libdrm
+leak:libX11
+leak:libxcb
+leak:libgallium
+leak:swrast_dri
+leak:kms_swrast_dri

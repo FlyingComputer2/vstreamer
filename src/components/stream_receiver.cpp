@@ -49,9 +49,13 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
     }
 }
 
-void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, uint64_t &fec_gap_count)
+void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count)
 {
-    fec_gap_count += fec.take_fail_lost_app_pkts();
+    const uint64_t n = fec.take_fail_lost_app_pkts();
+    if (n > 0)
+    {
+        fec_gap_count.fetch_add(n, std::memory_order_relaxed);
+    }
     (void)fec.take_fail_missing_shards();
     (void)fec.take_decode_fail();
 }
@@ -126,8 +130,8 @@ void stream_receiver::enqueue_payload_copy(const uint8_t *data, size_t len)
     }
     {
         std::lock_guard<std::mutex> lock(mu);
-        fec_packet_received++;
-        recv_bytes += len;
+        fec_packet_received.fetch_add(1, std::memory_order_relaxed);
+        recv_bytes.fetch_add(len, std::memory_order_relaxed);
         if (evicted)
         {
             recv_dropped++;
@@ -154,8 +158,8 @@ void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
     std::vector<std::vector<uint8_t>> payloads;
     {
         std::lock_guard<std::mutex> lock(mu);
-        udp_packet_received++;
-        recv_wire_bytes += len;
+        udp_packet_received.fetch_add(1, std::memory_order_relaxed);
+        recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
 
         /* stream_header_s always prefixes the FEC shard (UDP gap telemetry). */
         const uint8_t *fec_buf = data;
@@ -163,16 +167,15 @@ void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
         if (stream_datagram_len_ok(len))
         {
             const uint16_t seq = stream_header_sequence_be16(data);
-            udp_gap_count +=
-                note_u16_forward_gap(seq, last_udp_seq, have_udp_seq);
+            const uint64_t dg = note_u16_forward_gap(seq, last_udp_seq, have_udp_seq);
+            if (dg > 0)
+            {
+                udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+            }
             const uint8_t *fec_ptr = stream_fec_shard(data, len, &fec_len);
             if (fec_ptr != nullptr)
             {
                 fec_buf = fec_ptr;
-            }
-            if (fec_len >= rs_block_erasure::k_header_len)
-            {
-                fec_air_shard_received++;
             }
         }
 
@@ -269,13 +272,11 @@ void stream_receiver::recv_thread_main()
 
 stream_receiver_counters stream_receiver::link_counters_snapshot() const
 {
-    std::lock_guard<std::mutex> lock(mu);
     stream_receiver_counters c;
-    c.udp_packet_received = udp_packet_received;
-    c.fec_packet_received = fec_packet_received;
-    c.udp_gap_count = udp_gap_count;
-    c.fec_gap_count = fec_gap_count;
-    c.fec_air_shard_received = fec_air_shard_received;
+    c.udp_packet_received = udp_packet_received.load(std::memory_order_relaxed);
+    c.fec_packet_received = fec_packet_received.load(std::memory_order_relaxed);
+    c.udp_gap_count = udp_gap_count.load(std::memory_order_relaxed);
+    c.fec_gap_count = fec_gap_count.load(std::memory_order_relaxed);
     return c;
 }
 
@@ -345,11 +346,10 @@ int stream_receiver::open()
     constexpr int k_sock_buf = 16 * 1024 * 1024;
     (void)setsockopt(recv_fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
 
-    udp_packet_received = 0;
-    fec_packet_received = 0;
-    udp_gap_count = 0;
-    fec_gap_count = 0;
-    fec_air_shard_received = 0;
+    udp_packet_received.store(0, std::memory_order_relaxed);
+    fec_packet_received.store(0, std::memory_order_relaxed);
+    udp_gap_count.store(0, std::memory_order_relaxed);
+    fec_gap_count.store(0, std::memory_order_relaxed);
     last_udp_seq = 0;
     have_udp_seq = false;
     fec_payload_sequence = 0;
@@ -466,29 +466,24 @@ int stream_receiver::query(std::string_view key, std::string_view *value) const
         return 0;
     }
     if ("udp_packet_received" == key || "fec_packet_received" == key || "udp_gap_count" == key ||
-        "fec_gap_count" == key || "fec_air_shard_received" == key)
+        "fec_gap_count" == key)
     {
-        std::lock_guard<std::mutex> lock(mu);
         uint64_t n = 0;
         if ("udp_packet_received" == key)
         {
-            n = udp_packet_received;
+            n = udp_packet_received.load(std::memory_order_relaxed);
         }
         else if ("fec_packet_received" == key)
         {
-            n = fec_packet_received;
+            n = fec_packet_received.load(std::memory_order_relaxed);
         }
         else if ("udp_gap_count" == key)
         {
-            n = udp_gap_count;
-        }
-        else if ("fec_gap_count" == key)
-        {
-            n = fec_gap_count;
+            n = udp_gap_count.load(std::memory_order_relaxed);
         }
         else
         {
-            n = fec_air_shard_received;
+            n = fec_gap_count.load(std::memory_order_relaxed);
         }
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
@@ -513,12 +508,15 @@ int stream_receiver::query(std::string_view key, std::string_view *value) const
         std::snprintf(buf, sizeof(buf),
                       "udp_packet_received=%" PRIu64 " fec_packet_received=%" PRIu64
                       " udp_gap_count=%" PRIu64 " fec_gap_count=%" PRIu64
-                      " fec_air_shard_received=%" PRIu64
                       " bytes=%" PRIu64 " wire_bytes=%" PRIu64 " dropped=%" PRIu64
                       " out_rate=%.1f fec_recovered=%" PRIu64 " fec_failures=%" PRIu64,
-                      udp_packet_received, fec_packet_received, udp_gap_count, fec_gap_count,
-                      fec_air_shard_received, recv_bytes,
-                      recv_wire_bytes, recv_dropped, static_cast<double>(egress_kbps), fec_rec,
+                      udp_packet_received.load(std::memory_order_relaxed),
+                      fec_packet_received.load(std::memory_order_relaxed),
+                      udp_gap_count.load(std::memory_order_relaxed),
+                      fec_gap_count.load(std::memory_order_relaxed),
+                      recv_bytes.load(std::memory_order_relaxed),
+                      recv_wire_bytes.load(std::memory_order_relaxed), recv_dropped,
+                      static_cast<double>(egress_kbps), fec_rec,
                       fec_lost);
         query_buf = buf;
         *value = query_buf;

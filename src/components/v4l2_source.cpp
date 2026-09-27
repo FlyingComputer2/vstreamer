@@ -579,7 +579,7 @@ int v4l2_source::open()
         key_format_i64(fps, fps_buf, sizeof(fps_buf));
         std::string_view fps_sv = fps_buf;
         noise.configure("fps", &fps_sv);
-        std::string_view fmt_sv = "mjpeg";
+        std::string_view fmt_sv = "nv12";
         noise.configure("format", &fmt_sv);
     }
 
@@ -594,17 +594,31 @@ int v4l2_source::open()
         noise_active = true;
         cap_retry_due = now_sec() + 1.0;
         std::fprintf(stderr,
-                     "v4l2_source: capture unavailable on %s; MJPEG noise fallback %dx%d@%d\n",
+                     "v4l2_source: capture unavailable on %s; NV12 noise fallback %dx%d@%d\n",
                      device.c_str(), width, height, fps);
+    }
+    else
+    {
+        /* Open embedded noise so pregenerate can run while UVC capture is live. */
+        (void)noise.open();
     }
     source_open = true;
     return 0;
 }
 
+void v4l2_source::interrupt_shutdown()
+{
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        capture_close_locked();
+    }
+    noise.stop_pregenerate();
+}
+
 void v4l2_source::close()
 {
+    interrupt_shutdown();
     std::lock_guard<std::mutex> lock(mu);
-    capture_close_locked();
     noise.close();
     noise_active = false;
     source_open = false;
@@ -760,7 +774,7 @@ int v4l2_source::output(uint8_t port, data_packet &out, int timeout_ms)
         }
         noise_active = true;
         std::fprintf(stderr,
-                     "v4l2_source: capture unavailable on %s; MJPEG noise fallback %dx%d@%d\n",
+                     "v4l2_source: capture unavailable on %s; NV12 noise fallback %dx%d@%d\n",
                      device.c_str(), width, height, fps);
     }
     /* Drop lock so console configure/query is not blocked by fps pacing. */
@@ -826,6 +840,10 @@ int v4l2_source::configure(std::string_view key, std::string_view *value)
         }
         width = w;
         height = h;
+        char size_buf[32];
+        std::snprintf(size_buf, sizeof(size_buf), "%dx%d", width, height);
+        std::string_view size_sv = size_buf;
+        noise.configure("size", &size_sv);
         return 0;
     }
     if (key == "fps")
@@ -842,6 +860,12 @@ int v4l2_source::configure(std::string_view key, std::string_view *value)
         std::string_view fps_sv = fps_buf;
         noise.configure("fps", &fps_sv);
         return 0;
+    }
+    if (key == "noise-bandwidth" || key == "noise-randomness" || key == "noise-block-size" ||
+        key == "pregenerate-frames" || key == "pregenerate-frame" ||
+        key == "pregenerate_frames" || key == "pregenerate_frame")
+    {
+        return noise.configure(key, value);
     }
     if (key.rfind("v4l2-ctl/", 0) == 0)
     {
@@ -870,7 +894,24 @@ int v4l2_source::query(std::string_view key, std::string_view *value) const
         return -EINVAL;
     }
 
-    std::lock_guard<std::mutex> lock(mu);
+    const bool noise_metric_key =
+        key == "state" || key == "noise-bandwidth" || key == "noise-randomness" ||
+        key == "noise-luma-block-size" || key == "noise-block-size" || key == "noise-fft-simd" ||
+        key == "noise-fft-grid" || key == "pregenerate-frames" || key == "pregenerate-frame" ||
+        key == "pregenerate_frames" || key == "pregenerate_frame";
+
+    std::unique_lock<std::mutex> lock(mu);
+    if (key == "state")
+    {
+        lock.unlock();
+        return noise.query(key, value);
+    }
+    if (noise_metric_key && noise_active && !capture_open)
+    {
+        lock.unlock();
+        return noise.query(key, value);
+    }
+
     if (key == "status")
     {
         if (capture_open)

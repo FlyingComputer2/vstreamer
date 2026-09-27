@@ -59,6 +59,15 @@ public:
     int configure(std::string_view key, std::string_view *value) override;
     int query(std::string_view key, std::string_view *value) const override;
 
+    [[nodiscard]] const std::atomic<uint64_t> &wire_pkts_sent_counter() const
+    {
+        return pkts_sent;
+    }
+    [[nodiscard]] const std::atomic<uint64_t> &wire_bytes_sent_counter() const
+    {
+        return bytes_sent;
+    }
+
 private:
     void send_thread_main();
     void stop_send_thread();
@@ -96,9 +105,9 @@ private:
     std::thread       send_thread;
     std::atomic<bool> send_stop {false};
 
-    uint64_t pkts_sent = 0;
-    uint64_t bytes_sent = 0;
-    uint64_t dropped = 0;
+    std::atomic<uint64_t> pkts_sent {0};
+    std::atomic<uint64_t> bytes_sent {0};
+    std::atomic<uint64_t> dropped {0};
 
     double   ingress_rate_t0 = 0.;
     uint64_t ingress_rate_bytes = 0;

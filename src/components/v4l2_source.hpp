@@ -41,6 +41,9 @@ class v4l2_source : public component_source
     int  open() override;
     void close() override;
 
+    /* Unblock capture select and stop embedded noise pregen (pipeline shutdown). */
+    void interrupt_shutdown();
+
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
     int configure(uint64_t key, int64_t value) override;

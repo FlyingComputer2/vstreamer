@@ -90,6 +90,14 @@ Defaults (override when the native type is not a string):
 | `uint64_t` CID | `configure(0x00980913, 40)` | `v4l2_source` |
 
 `query("status")` → `live` or `noise` (and optionally `WxH fps`).
+
+`noise_source` also supports `query("state")` → `running` or
+`pregeneration_n/N` while the pregenerate pool is built; mirrored as pipeline
+metric **`source.state`** (`get_metric source.state` on the console port).
+On **`v4l2_source`** noise fallback (capture down), `query("state")` and noise
+configure keys (`noise-bandwidth`, `pregenerate-frames`, …) forward to the
+embedded `noise_source` so **`uvc_jpegdec_kmsdrm`** shows pregen progress too.
+Do not use **`stream_sdl.status`** (always `running`); use **`source.state`**.
 `query("v4l2-ctl/<name>")` → current value as decimal.
 `query("v4l2-ctl")` → all readable `name=val` on the open device.
 `query(cid, &v)` → current control as `int64_t`.

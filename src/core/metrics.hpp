@@ -1,6 +1,7 @@
 #ifndef VSTREAMER_CORE_METRICS_HPP
 #define VSTREAMER_CORE_METRICS_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -18,6 +19,7 @@ struct metric
 };
 
 void metric_store(metric &m, uint64_t v);
+void metric_store(metric &m, const std::atomic<uint64_t> &counter);
 void metric_store(metric &m, int64_t v);
 void metric_store(metric &m, double v);
 void metric_store(metric &m, const std::string &v);
