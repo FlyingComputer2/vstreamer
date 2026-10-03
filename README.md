@@ -12,7 +12,8 @@ vstreamer/
 └── src/
     ├── components/   # plugins (V4L2, stream_*, rtp pay/depay, MKV, …)
     ├── core/         # packets, frames, factory, component interfaces
-    └── test_app/       # one subdirectory per app target (stream_sdl/, rs_fec_test/, …)
+    ├── apps/           # uvc_stream_sender, sdl_stream_receiver, apps_common
+    └── test_app/       # stream_sdl loopback bench, rs_fec_test/, …
 ```
 
 ## Build
@@ -37,3 +38,17 @@ either is switched OFF with a warning when `rockchip_mpp` is not found. `VSTREAM
 builds the GoogleTest suite; `ENABLE_TEST_STREAM_SDL` builds the loopback bench
 (`stream_sdl --display kmsdrm --source /dev/video0` for UVC on DRM/KMS).
 Full option table and component keys: [docs/vstreamer.md](docs/vstreamer.md#build).
+
+### Split sender / receiver (one host)
+
+With `out/full` (TX + RX components, `ENABLE_APP_UVC_STREAM_SENDER` / `ENABLE_APP_SDL_STREAM_RECEIVER` default ON):
+
+```bash
+# Terminal 1 — receive on UDP :5001, console :5091
+out/full/src/apps/sdl_stream_receiver/sdl_stream_receiver --listen 0.0.0.0:5001
+
+# Terminal 2 — send to peer, console :5090 (noise fallback if camera missing)
+out/full/src/apps/uvc_stream_sender/uvc_stream_sender --peer 127.0.0.1:5001 --device /dev/video0
+```
+
+`stream_sdl` remains the single-process loopback bench with channel emulator and self-test.

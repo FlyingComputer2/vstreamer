@@ -16,15 +16,15 @@ bool query_source_metric_string(vstreamer::component_source *src, const char *ke
 void store_source_pipeline_metrics(double source_out_fps, double source_out_kbps, const char *ts,
                                    vstreamer::jpeg_decoder_multicore *jdec);
 
-void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc,
-                             vstreamer::stream_sender &sender, vstreamer::stream_receiver &rcv,
+void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc,
+                             vstreamer::stream_sender *sender, vstreamer::stream_receiver *rcv,
                              vstreamer::component_sink *preview, bool kmsdrm,
                              pipeline_rate_state &rate, const channel_controller *channel,
                              vstreamer::jpeg_decoder_multicore *jdec, bool jpeg_active,
                              vstreamer::h264_decoder_mpp *dec);
 
-void sync_pipeline_metrics_live(const bench_diag &d, vstreamer::stream_sender &sender,
-                                h264_encoder_t &enc, vstreamer::stream_receiver *rcv,
+void sync_pipeline_metrics_live(const bench_diag &d, vstreamer::stream_sender *sender,
+                                h264_encoder_t *enc, vstreamer::stream_receiver *rcv,
                                 const channel_controller *channel);
 
 void telemetry_thread_main(vstreamer::stream_receiver *rcv);

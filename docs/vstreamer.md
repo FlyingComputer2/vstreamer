@@ -265,6 +265,25 @@ Lock-order rules are stated next to the mutexes in each header (`stream_sender`,
 Blocking calls are woken for shutdown by `close()` or component-specific hooks
 (`cancel_pending_io()` on the MPP codecs, `interrupt_shutdown()` on `v4l2_source`).
 
+## Running sender and receiver
+
+Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_OK` /
+`VSTREAMER_APP_RX_OK`; options `ENABLE_APP_UVC_STREAM_SENDER`, `ENABLE_APP_SDL_STREAM_RECEIVER`).
+
+| Binary | Default media | Default console | Half |
+|--------|---------------|-----------------|------|
+| `uvc_stream_sender` | UDP to `--peer` | `127.0.0.1:5090` | TX: UVC or noise fallback (640×480 @ 30), JPEG, encode, RTP, `stream_sender` |
+| `sdl_stream_receiver` | `--listen 0.0.0.0:5001` | `127.0.0.1:5091` | RX: `stream_receiver`, depay, MPP decode, SDL/kmsdrm |
+| `stream_sdl` | loopback + channel emulator | `127.0.0.1:5090` | both halves + link bench |
+
+One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
+`max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
+reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). See
+[latency_system_time.md](../aidocs/latency_system_time.md) for clock sync on multi-host links.
+
+Stage threads and metrics for TX/RX are shared via `vstreamer_bench_pipeline` (`stages.cpp`,
+`metrics_sync.cpp`) so `stream_sdl` and the split apps stay aligned.
+
 ## Bench app: `stream_sdl`
 
 `src/test_app/stream_sdl/` (`-DENABLE_TEST_STREAM_SDL=ON`) is the pipeline creator for the

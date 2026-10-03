@@ -12,13 +12,7 @@ endif()
 
 set(_stream_sdl_sources
     main.cpp
-    pipeline_state.cpp
-    diag.cpp
-    metrics_sync.cpp
-    stages.cpp
     self_test.cpp
-    channel_controller.cpp
-    link_emulator.cpp
-    bench_console.cpp
 )
 vstreamer_add_app(stream_sdl ${_stream_sdl_sources} LSAN COMMON)
+target_link_libraries(stream_sdl PRIVATE vstreamer_bench_pipeline)

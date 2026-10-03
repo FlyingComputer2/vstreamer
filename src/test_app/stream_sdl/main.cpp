@@ -799,11 +799,11 @@ int main(int argc, char **argv)
     pipeline_rate_state pipeline_rate;
     channel.set_pipeline_metrics(&g_pipeline_metrics);
     const auto refresh_pipeline_metrics = [&, jpeg_active = use_jpeg_decode]() {
-        update_pipeline_metrics(g_bench_diag, enc, sender, rcv, preview, kmsdrm, pipeline_rate,
+        update_pipeline_metrics(g_bench_diag, &enc, &sender, &rcv, preview, kmsdrm, pipeline_rate,
                                 &channel, jpeg_active ? &jdec : nullptr, jpeg_active, &dec);
     };
     channel.set_pipeline_metrics_sync_live([&]() {
-        sync_pipeline_metrics_live(g_bench_diag, sender, enc, &rcv, &channel);
+        sync_pipeline_metrics_live(g_bench_diag, &sender, &enc, &rcv, &channel);
     });
     channel.set_source_state_metrics_refresh([]() {
         std::string src_state = "running";
@@ -814,7 +814,7 @@ int main(int argc, char **argv)
         metric_store(*g_pipeline_metrics.get_metric("source.state"), src_state);
     });
     refresh_pipeline_metrics();
-    sync_pipeline_metrics_live(g_bench_diag, sender, enc, &rcv, &channel);
+    sync_pipeline_metrics_live(g_bench_diag, &sender, &enc, &rcv, &channel);
     if (channel.start_console(console_port) < 0)
     {
         std::fprintf(stderr, "channel_controller console failed\n");

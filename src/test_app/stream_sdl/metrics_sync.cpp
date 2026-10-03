@@ -9,6 +9,7 @@
 #include <string>
 
 #include "core/metrics.hpp"
+#include "core/stream_telemetry.hpp"
 
 namespace vstreamer::test_app
 {
@@ -134,8 +135,8 @@ void store_source_pipeline_metrics(double source_out_fps, double source_out_kbps
     }
     metric_store(*g_pipeline_metrics.get_metric("source.state"), src_state);
 }
-void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_sender &sender,
-                             stream_receiver &rcv, component_sink *preview, bool kmsdrm,
+void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_sender *sender,
+                             stream_receiver *rcv, component_sink *preview, bool kmsdrm,
                              pipeline_rate_state &rate,
                              const test_app::channel_controller *channel,
                              jpeg_decoder_multicore *jdec, bool jpeg_active,
@@ -170,8 +171,14 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
 
     std::string rcv_stats;
     std::string snd_stats;
-    (void)rcv.query("stats", &rcv_stats);
-    (void)sender.query("stats", &snd_stats);
+    if (nullptr != rcv)
+    {
+        (void)rcv->query("stats", &rcv_stats);
+    }
+    if (nullptr != sender)
+    {
+        (void)sender->query("stats", &snd_stats);
+    }
 
     const uint64_t rcv_bytes_now = apps::parse_stats_field(rcv_stats, "bytes");
     const uint64_t snd_pkts_now = apps::parse_stats_field(snd_stats, "pkts");
@@ -194,7 +201,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     const double nv12_gap_fps =
         jpeg_out_fps > enc_in_fps ? jpeg_out_fps - enc_in_fps : 0.0;
 
-    const int qp = query_encoder_qp(enc);
+    const int qp = (nullptr != enc) ? query_encoder_qp(*enc) : -1;
     const int qp_val = qp >= 0 ? qp : 0;
 
     const uint64_t nv12_q_drop = d.tx_nv12_q_drop.load();
@@ -289,22 +296,24 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
 
     const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
 
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.status"),
-                 "running");
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.display"),
-                 kmsdrm ? "kmsdrm" : "sdl");
-    if (kmsdrm)
-    {
-        const char *note = present_fps > 0.5 ? "kmsdrm presenting decoded frames"
-                                             : "kmsdrm active; waiting for decode/present";
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.note"), note);
-    }
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.pipeline_ok"),
-                 pipeline_flowing ? "yes" : "warming");
-
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.glass_latency_ms"),
-                 glass_ms);
+    if (nullptr != channel)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.status"),
+                     "running");
+        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.display"),
+                     kmsdrm ? "kmsdrm" : "sdl");
+        if (kmsdrm)
+        {
+            const char *note = present_fps > 0.5 ? "kmsdrm presenting decoded frames"
+                                                 : "kmsdrm active; waiting for decode/present";
+            metric_store(*g_pipeline_metrics.get_metric("stream_sdl.note"), note);
+        }
+        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.pipeline_ok"),
+                     pipeline_flowing ? "yes" : "warming");
+        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.glass_latency_ms"),
+                     glass_ms);
+    }
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
     metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
                  apps::g_latency_source_ms.load(std::memory_order_relaxed));
@@ -323,10 +332,13 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
                  apps::g_latency_present_ms.load(std::memory_order_relaxed));
 
-    store_source_pipeline_metrics(noise_fps, source_out_kbps, ts,
-                                  jpeg_active ? jdec : nullptr);
+    if (nullptr != sender)
+    {
+        store_source_pipeline_metrics(noise_fps, source_out_kbps, ts,
+                                      jpeg_active ? jdec : nullptr);
+    }
 
-    if (jpeg_active)
+    if (jpeg_active && nullptr != sender)
     {
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.status"), "active");
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.in_fps"), noise_fps);
@@ -361,98 +373,117 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_fps"), 0.0);
     }
 
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_fps"), jpeg_out_fps);
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.out_fps"), enc_q_pop_fps);
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.size"),
-                 static_cast<int64_t>(enc_q_depth));
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.latency_ms"),
-                 enc_q_latency_ms);
+    const uint64_t fec_recovered =
+        nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
+    const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
 
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_fps"), enc_in_fps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.dropped_fps"),
-                 nv12_gap_fps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.dropped_frames"),
-                 enc_dropped_frames_total);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_pps"), enc_pkt_ps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.qp"),
-                 static_cast<int64_t>(qp_val));
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"),
-                 query_component_latency_ms(enc));
-
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_kbps"), snd_in_kbps);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_k"),
-                 static_cast<int64_t>(query_u64(sender, "fec_k")));
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_n"),
-                 static_cast<int64_t>(query_u64(sender, "fec_n")));
-    const uint64_t fec_recovered = query_u64(rcv, "fec_recovered");
-    const uint64_t fec_failures = query_u64(rcv, "fec_failures");
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_recovered"),
-                 fec_recovered);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_failures"),
-                 fec_failures);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_oversized"),
-                 query_u64(sender, "fec_oversized"));
-
-    metric_store(*g_pipeline_metrics.get_metric("channel.forward_kbps"), ch_fwd_kbps);
-    metric_store(*g_pipeline_metrics.get_metric("channel.dropped_pps"), ch_drop_pps);
-    metric_store(*g_pipeline_metrics.get_metric("channel.dropped_kbps"), ch_drop_kbps);
-    const double ch_max_kbps = (nullptr != channel) ? channel->max_kbps() : 0.0;
-    const double ch_constant_loss_pct =
-        (nullptr != channel) ? channel->constant_loss() : 0.0;
-    metric_store(*g_pipeline_metrics.get_metric("channel.max_kbps"), ch_max_kbps);
-    metric_store(*g_pipeline_metrics.get_metric("channel.constant_loss_pct"),
-                 ch_constant_loss_pct);
-    const size_t ch_queue = (nullptr != channel) ? channel->forward_queue_size() : 0;
-    metric_store(*g_pipeline_metrics.get_metric("channel.queue"),
-                 static_cast<double>(ch_queue));
-
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.in_pps"), rx_pkt_ps);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_kbps"), rcv_out_kbps);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_recovered"),
-                 fec_recovered);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_failures"),
-                 fec_failures);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_hdr_errors"),
-                 query_u64(rcv, "fec_hdr_errors"));
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_kn_mismatch"),
-                 query_u64(rcv, "fec_kn_mismatch"));
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_evicted_blocks"),
-                 query_u64(rcv, "fec_evicted_blocks"));
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_rs_failures"),
-                 query_u64(rcv, "fec_rs_failures"));
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_missing_shards"),
-                 query_u64(rcv, "fec_missing_shards"));
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
-                 query_u64(rcv, "fec_late_blocks"));
-
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_pps"),
-                 dec_in_au_pps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_kbps"), dec_in_kbps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.depay_au_pps"),
-                 depay_au_pps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.dropped_pps"),
-                 dec_drop_pps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_fps"), dec_out_fps);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_kbps"),
-                 dec_nv12_out_kbps);
-    if (nullptr != dec)
+    if (nullptr != sender)
     {
-        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
-                     query_component_latency_ms(*dec));
-    }
-    else
-    {
-        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
-                     apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_fps"), jpeg_out_fps);
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.out_fps"), enc_q_pop_fps);
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.size"),
+                     static_cast<int64_t>(enc_q_depth));
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.latency_ms"),
+                     enc_q_latency_ms);
+
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_fps"), enc_in_fps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.dropped_fps"),
+                     nv12_gap_fps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.dropped_frames"),
+                     enc_dropped_frames_total);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_pps"), enc_pkt_ps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.qp"),
+                     static_cast<int64_t>(qp_val));
+        if (nullptr != enc)
+        {
+            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"),
+                         query_component_latency_ms(*enc));
+        }
+
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_kbps"), snd_in_kbps);
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_k"),
+                     static_cast<int64_t>(query_u64(*sender, "fec_k")));
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_n"),
+                     static_cast<int64_t>(query_u64(*sender, "fec_n")));
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_recovered"),
+                     fec_recovered);
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_failures"),
+                     fec_failures);
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_oversized"),
+                     query_u64(*sender, "fec_oversized"));
     }
 
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.in_fps"), present_fps);
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.in_frames"), sink_frames);
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.dropped_fps"),
-                 sink_drop_fps);
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.render_fps"), present_fps);
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.latency_ms"), glass_ms);
+    if (nullptr != channel)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("channel.forward_kbps"), ch_fwd_kbps);
+        metric_store(*g_pipeline_metrics.get_metric("channel.dropped_pps"), ch_drop_pps);
+        metric_store(*g_pipeline_metrics.get_metric("channel.dropped_kbps"), ch_drop_kbps);
+        const double ch_max_kbps = channel->max_kbps();
+        const double ch_constant_loss_pct = channel->constant_loss();
+        metric_store(*g_pipeline_metrics.get_metric("channel.max_kbps"), ch_max_kbps);
+        metric_store(*g_pipeline_metrics.get_metric("channel.constant_loss_pct"),
+                     ch_constant_loss_pct);
+        const size_t ch_queue = channel->forward_queue_size();
+        metric_store(*g_pipeline_metrics.get_metric("channel.queue"),
+                     static_cast<double>(ch_queue));
+    }
+
+    if (nullptr != rcv)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.in_pps"), rx_pkt_ps);
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_kbps"), rcv_out_kbps);
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_recovered"),
+                     fec_recovered);
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_failures"),
+                     fec_failures);
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_hdr_errors"),
+                     query_u64(*rcv, "fec_hdr_errors"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_kn_mismatch"),
+                     query_u64(*rcv, "fec_kn_mismatch"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_evicted_blocks"),
+                     query_u64(*rcv, "fec_evicted_blocks"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_rs_failures"),
+                     query_u64(*rcv, "fec_rs_failures"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_missing_shards"),
+                     query_u64(*rcv, "fec_missing_shards"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
+                     query_u64(*rcv, "fec_late_blocks"));
+    }
+
+    if (nullptr != dec || nullptr != rcv)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_pps"),
+                     dec_in_au_pps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_kbps"), dec_in_kbps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.depay_au_pps"),
+                     depay_au_pps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.dropped_pps"),
+                     dec_drop_pps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_fps"), dec_out_fps);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_kbps"),
+                     dec_nv12_out_kbps);
+        if (nullptr != dec)
+        {
+            metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
+                         query_component_latency_ms(*dec));
+        }
+        else
+        {
+            metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
+                         apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
+        }
+    }
+
+    if (nullptr != preview)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.in_fps"), present_fps);
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.in_frames"), sink_frames);
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.dropped_fps"),
+                     sink_drop_fps);
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.render_fps"), present_fps);
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.latency_ms"), glass_ms);
+    }
 
     rate.snap = now;
     rate.t0 = t_now;
@@ -484,6 +515,8 @@ struct receiver_loss_tracker
 
 receiver_loss_tracker g_rcv_loss;
 std::mutex            g_rcv_loss_mu;
+receiver_loss_tracker g_sender_peer_loss;
+std::mutex            g_sender_peer_loss_mu;
 
 double interval_loss_pct(uint64_t pkts_now, uint64_t gap_now, uint64_t pkts_prev, uint64_t gap_prev)
 {
@@ -562,28 +595,31 @@ void store_receiver_link_metrics(uint64_t udp_recv, uint64_t fec_recv, uint64_t 
 }
 
 /* UDP metrics poll: cumulative counters from live atomics (rates stay on update_pipeline_metrics). */
-void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender &sender,
+void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sender,
                                        const test_app::channel_controller *channel,
                                        stream_receiver *rcv)
 {
-    metric_store(*g_pipeline_metrics.get_metric("source.out_bytes"),
-                 d.tx_source_bytes);
-    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.in_frames"), d.tx_noise);
-    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_frames"),
-                 d.tx_jpeg_nv12);
-    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_bytes"),
-                 d.tx_jpeg_nv12_bytes);
-    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.dropped_frames"),
-                 d.tx_mjpeg_q_drop);
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_frames"),
-                 d.tx_jpeg_nv12);
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.out_frames"),
-                 d.tx_enc_nv12_popped);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_frames"), d.tx_nv12);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_packets"),
-                 sender.wire_pkts_sent_counter());
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_bytes"),
-                 sender.wire_bytes_sent_counter());
+    if (nullptr != sender)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("source.out_bytes"),
+                     d.tx_source_bytes);
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.in_frames"), d.tx_noise);
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_frames"),
+                     d.tx_jpeg_nv12);
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_bytes"),
+                     d.tx_jpeg_nv12_bytes);
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.dropped_frames"),
+                     d.tx_mjpeg_q_drop);
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_frames"),
+                     d.tx_jpeg_nv12);
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.out_frames"),
+                     d.tx_enc_nv12_popped);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_frames"), d.tx_nv12);
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_packets"),
+                     sender->wire_pkts_sent_counter());
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_bytes"),
+                     sender->wire_bytes_sent_counter());
+    }
     if (nullptr != channel)
     {
         metric_store(*g_pipeline_metrics.get_metric("channel.forward_bytes"),
@@ -602,23 +638,56 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender &sende
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_bytes"),
                      rcv->egress_payload_bytes_counter());
     }
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_packets"),
-                 d.rx_dec_in_ok);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_bytes"),
-                 d.rx_dec_in_bytes);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_frames"),
-                 d.rx_nv12_out);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_bytes"),
-                 d.rx_nv12_out_bytes);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.dropped_packets"),
-                 d.rx_dec_in_err.load(std::memory_order_relaxed) +
-                     d.rx_depay_err.load(std::memory_order_relaxed) +
-                     d.rx_au_q_drop.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.dropped_frames"),
-                 d.rx_present_q_drop);
+    if (nullptr != rcv)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_packets"),
+                     d.rx_dec_in_ok);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_bytes"),
+                     d.rx_dec_in_bytes);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_frames"),
+                     d.rx_nv12_out);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_bytes"),
+                     d.rx_nv12_out_bytes);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.dropped_packets"),
+                     d.rx_dec_in_err.load(std::memory_order_relaxed) +
+                         d.rx_depay_err.load(std::memory_order_relaxed) +
+                         d.rx_au_q_drop.load(std::memory_order_relaxed));
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.dropped_frames"),
+                     d.rx_present_q_drop);
+    }
 }
 
 /* UDP metrics poll: load live receiver atomics, update interval loss, publish (no staged copy). */
+void sync_sender_peer_link_metrics_live(stream_sender &sender)
+{
+    const stream_peer_link snap = sender.peer_link_snapshot();
+    if (!snap.have)
+    {
+        return;
+    }
+    const stream_link_counters cur = snap.report.counters;
+
+    double loss_udp = 0.;
+    double loss_fec = 0.;
+    {
+        std::lock_guard<std::mutex> lock(g_sender_peer_loss_mu);
+        update_receiver_loss_deltas(cur, g_sender_peer_loss);
+        loss_udp = g_sender_peer_loss.loss_udp_pct;
+        loss_fec = g_sender_peer_loss.loss_fec_pct;
+    }
+
+    store_receiver_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
+                                cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_age_ms"),
+                 static_cast<double>(snap.age_ms));
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_received"),
+                 snap.reports_received);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_lost"),
+                 snap.reports_lost);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_rejected"),
+                 snap.reports_rejected);
+}
+
 void sync_peer_link_metrics_live(stream_receiver &rcv)
 {
     const stream_link_counters cur = rcv.link_counters_snapshot();
@@ -646,7 +715,7 @@ struct metrics_serve_rate_state
 
 metrics_serve_rate_state g_metrics_serve_rate;
 
-void sync_pipeline_metrics_live(const bench_diag &d, stream_sender &sender, h264_encoder_t &enc,
+void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, h264_encoder_t *enc,
                                 stream_receiver *rcv,
                                 const test_app::channel_controller *channel)
 {
@@ -670,22 +739,32 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender &sender, h264
         g_metrics_serve_rate.prev_t = t_now;
         g_metrics_serve_rate.have = true;
     }
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_bytes"),
-                 d.tx_enc_out_bytes);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_packets"),
-                 d.tx_rtp_sock);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_kbps"),
-                 enc_out_kbps);
+    if (nullptr != sender)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_bytes"),
+                     d.tx_enc_out_bytes);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_packets"),
+                     d.tx_rtp_sock);
+        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_kbps"),
+                     enc_out_kbps);
+        if (nullptr != enc)
+        {
+            const int cbr_bps = query_encoder_cbr_bps(*enc);
+            if (cbr_bps >= 0)
+            {
+                metric_store(*g_pipeline_metrics.get_metric("h264_encoder.cbr_kbps"),
+                             static_cast<uint64_t>((cbr_bps + 500) / 1000));
+            }
+        }
+    }
     sync_cumulative_pipeline_counters(d, sender, channel, rcv);
     if (nullptr != rcv)
     {
         sync_peer_link_metrics_live(*rcv);
     }
-    const int cbr_bps = query_encoder_cbr_bps(enc);
-    if (cbr_bps >= 0)
+    else if (nullptr != sender)
     {
-        metric_store(*g_pipeline_metrics.get_metric("h264_encoder.cbr_kbps"),
-                     static_cast<uint64_t>((cbr_bps + 500) / 1000));
+        sync_sender_peer_link_metrics_live(*sender);
     }
 }
 

@@ -1,1 +1,23 @@
+include(${CMAKE_CURRENT_SOURCE_DIR}/common/app_capabilities.cmake)
+
 add_subdirectory(common)
+include(${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/pipeline_lib.cmake)
+
+option(ENABLE_APP_UVC_STREAM_SENDER "Build uvc_stream_sender" ON)
+option(ENABLE_APP_SDL_STREAM_RECEIVER "Build sdl_stream_receiver" ON)
+
+if(ENABLE_APP_UVC_STREAM_SENDER AND NOT VSTREAMER_APP_TX_OK)
+    message(STATUS "ENABLE_APP_UVC_STREAM_SENDER=OFF (TX component set incomplete)")
+    set(ENABLE_APP_UVC_STREAM_SENDER OFF)
+endif()
+if(ENABLE_APP_SDL_STREAM_RECEIVER AND NOT VSTREAMER_APP_RX_OK)
+    message(STATUS "ENABLE_APP_SDL_STREAM_RECEIVER=OFF (RX component set incomplete)")
+    set(ENABLE_APP_SDL_STREAM_RECEIVER OFF)
+endif()
+
+if(ENABLE_APP_UVC_STREAM_SENDER)
+    add_subdirectory(uvc_stream_sender)
+endif()
+if(ENABLE_APP_SDL_STREAM_RECEIVER)
+    add_subdirectory(sdl_stream_receiver)
+endif()

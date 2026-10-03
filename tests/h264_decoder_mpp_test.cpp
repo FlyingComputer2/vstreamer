@@ -7,12 +7,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <future>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace
@@ -152,6 +154,107 @@ TEST(H264DecoderMppTest, EncodeDecodeRoundTrip)
     run_body();
     done.set_value();
     watchdog.join();
+
+    dec.close();
+    enc.close();
+}
+
+TEST(H264DecoderMppTest, ResolutionSwitchFollowsEncoder)
+{
+    vstreamer::h264_encoder_mpp enc;
+    vstreamer::h264_decoder_mpp dec;
+    if (cfg(enc, "fps", "30") < 0 || cfg(enc, "rc", "fixqp") < 0 || cfg(enc, "qp", "36") < 0 ||
+        cfg(enc, "gop", "30") < 0 || cfg(dec, "fps", "30") < 0)
+    {
+        GTEST_SKIP() << "configure failed";
+    }
+    if (enc.open() < 0 || dec.open() < 0)
+    {
+        enc.close();
+        dec.close();
+        GTEST_SKIP() << "MPP open failed";
+    }
+
+    const int segments[][2] = {{640, 480}, {1920, 1080}, {640, 480}};
+    const int frames_per = 10;
+    std::vector<std::pair<int, int>> decoded_sizes;
+
+    auto drain_decoded = [&]() {
+        while (true)
+        {
+            vstreamer::data_packet nv12;
+            const int              orv = dec.output(0, nv12, 5);
+            if (orv != 0)
+            {
+                break;
+            }
+            if (nv12.get_type() == vstreamer::packet_kind_e::FRAME)
+            {
+                const auto &out = vstreamer::data_packet::cast<vstreamer::frame_data>(nv12);
+                if (out.kind == vstreamer::media_kind_e::NV12)
+                {
+                    decoded_sizes.emplace_back(out.width, out.height);
+                }
+            }
+        }
+    };
+
+    for (const auto &seg : segments)
+    {
+        char sz[32];
+        std::snprintf(sz, sizeof(sz), "%dx%d", seg[0], seg[1]);
+        if (cfg(enc, "size", sz) < 0 || cfg(dec, "size", sz) < 0)
+        {
+            dec.close();
+            enc.close();
+            GTEST_SKIP() << "size configure failed";
+        }
+        (void)enc.configure("idr", std::string_view("1"));
+
+        for (int frame = 0; frame < frames_per; ++frame)
+        {
+            const vstreamer::data_packet in = make_nv12(seg[0], seg[1], frame);
+            int                          ir = enc.input(0, in);
+            while (ir == -EAGAIN)
+            {
+                vstreamer::data_packet drain;
+                (void)enc.output(0, drain, 1);
+                ir = enc.input(0, in);
+            }
+            ASSERT_GE(ir, 0);
+            for (int attempt = 0; attempt < 50; ++attempt)
+            {
+                vstreamer::data_packet au;
+                const int              orv = enc.output(0, au, 20);
+                if (orv == 0)
+                {
+                    int dir = dec.input(0, au);
+                    for (int spin = 0; spin < 200 && dir == -EAGAIN; ++spin)
+                    {
+                        drain_decoded();
+                        dir = dec.input(0, au);
+                    }
+                    break;
+                }
+                if (orv != -EAGAIN)
+                {
+                    break;
+                }
+            }
+            drain_decoded();
+        }
+    }
+
+    EXPECT_GE(decoded_sizes.size(), static_cast<size_t>(frames_per * 3 - 5));
+    for (const auto &seg : segments)
+    {
+        const int w = seg[0];
+        const int h = seg[1];
+        const auto it =
+            std::find_if(decoded_sizes.begin(), decoded_sizes.end(),
+                         [w, h](const std::pair<int, int> &p) { return p.first == w && p.second == h; });
+        EXPECT_NE(it, decoded_sizes.end()) << "missing decoded size " << w << "x" << h;
+    }
 
     dec.close();
     enc.close();

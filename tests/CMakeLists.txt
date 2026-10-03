@@ -49,6 +49,24 @@ target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 include(GoogleTest)
 gtest_discover_tests(vstreamer_tests DISCOVERY_MODE PRE_TEST)
 
+if(TARGET uvc_stream_sender AND TARGET sdl_stream_receiver)
+    add_executable(split_apps_test split_apps_test.cpp)
+    target_compile_definitions(split_apps_test PRIVATE
+        UVC_STREAM_SENDER_BIN="$<TARGET_FILE:uvc_stream_sender>"
+        SDL_STREAM_RECEIVER_BIN="$<TARGET_FILE:sdl_stream_receiver>")
+    target_link_libraries(split_apps_test PRIVATE GTest::gtest_main)
+    target_compile_options(split_apps_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_dependencies(split_apps_test uvc_stream_sender sdl_stream_receiver)
+    gtest_discover_tests(
+        split_apps_test
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES
+            LABELS "hw"
+            TIMEOUT 60
+            RESOURCE_LOCK "mpp_hw"
+    )
+endif()
+
 if(ENABLE_H264_ENCODER_MPP AND ENABLE_H264_DECODER_MPP)
     add_executable(h264_decoder_mpp_hw_test h264_decoder_mpp_test.cpp)
     target_link_libraries(h264_decoder_mpp_hw_test PRIVATE GTest::gtest_main vstreamer_source)
