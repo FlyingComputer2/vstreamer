@@ -356,3 +356,34 @@ TEST(RsBlockErasureEmitTest, NextDeadlineAfterPartialPush)
 }
 
 
+
+/* Late parity for a block that already decoded while an earlier block was incomplete must not
+ * create a phantom partial block whose abandonment counts the whole block as lost again. */
+TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    const auto b0 = encode_block_apps(enc, 0, {1, 2, 3, 4});
+    const auto b1 = encode_block_apps(enc, 1, {5, 6, 7, 8});
+    vstreamer::fec_rx_payload_list out;
+    feed_append(dec, b0[0], &out); /* block 0: 1 of 6 shards, 3 apps truly lost */
+    for (size_t i = 0; i < 4; i++)
+    {
+        feed_append(dec, b1[i], &out); /* block 1 decodes while block 0 is incomplete */
+    }
+    for (size_t i = 4; i < 6; i++)
+    {
+        feed_append(dec, b1[i], &out); /* its parity arrives afterwards */
+    }
+    for (int round = 0; round < 2; round++)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        vstreamer::fec_rx_payload_list flush;
+        dec.poll_rx(&flush);
+        out.insert(out.end(), flush.begin(), flush.end());
+    }
+    EXPECT_EQ(5U, out.size());
+    EXPECT_EQ(3U, dec.take_fail_lost_app_pkts());
+    EXPECT_EQ(1U, dec.take_evicted_blocks()); /* block 0 expires; no phantom block 1 */
+}

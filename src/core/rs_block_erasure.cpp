@@ -1339,6 +1339,12 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
     {
         return;
     }
+    /* Already decoded and waiting for the head: a late (parity) shard is redundant. Creating a
+     * new rx block here would later be abandoned and count the whole block as lost again. */
+    if (ready_blocks.find(block_id) != ready_blocks.end())
+    {
+        return;
+    }
 
     auto it = rx_blocks.find(block_id);
     if (it == rx_blocks.end())
