@@ -22,7 +22,8 @@ void update_pipeline_metrics(const bench_diag &d, vstreamer::component_coder *en
                              vstreamer::component_sink *preview, bool kmsdrm,
                              pipeline_rate_state &rate, const channel_controller *channel,
                              vstreamer::component *jdec, bool jpeg_active,
-                             vstreamer::component *dec);
+                             vstreamer::component *dec,
+                             vstreamer::component_coder *depay = nullptr);
 
 void sync_pipeline_metrics_live(const bench_diag &d, vstreamer::stream_sender *sender,
                                 vstreamer::component_coder *enc, vstreamer::stream_receiver *rcv,

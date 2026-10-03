@@ -30,7 +30,8 @@
  * CLI: --chan-bind ADDR (channel UDP console + relay ingress bind; default 127.0.0.1)
  * UVC + kmsdrm (former uvc_jpegdec_kmsdrm target): stream_sdl --display kmsdrm --source /dev/video0
  * Metric latency.* / h264_encoder.latency_ms / h264_decoder.latency_ms /
- * sdl_sink.latency_ms / stream_sdl.glass_latency_ms (capture-to-stage ms).
+ * sdl_sink.latency_ms / stream_sdl.glass_latency_ms (capture → present, including across
+ * hosts via CLOCK_REALTIME on the wire; sender and receiver clocks must be synchronized).
  *
  * Per-stage latency lines (stderr): --diag or VSTREAMER_LOG_STAGE_LATENCY=1
  * Optional: VSTREAMER_STAGE_LATENCY_EVERY=N (log every Nth frame by pts, default 1).
@@ -704,14 +705,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    {
-        std::string epoch_ns;
-        if (0 == pay.query("capture_epoch_ns", &epoch_ns))
-        {
-            (void)cfg_str(depay, "capture_epoch_ns", epoch_ns.c_str());
-        }
-    }
-
     if (open_stage("h264_encoder rc", cfg_str(enc, "rc", enc_rc)) < 0)
     {
         return 1;
@@ -796,7 +789,8 @@ int main(int argc, char **argv)
     channel.set_pipeline_metrics(&g_pipeline_metrics);
     const auto refresh_pipeline_metrics = [&, jpeg_active = use_jpeg_decode]() {
         update_pipeline_metrics(g_bench_diag, &enc, &sender, &rcv, preview, kmsdrm, pipeline_rate,
-                                &channel, jpeg_active ? &jdec : nullptr, jpeg_active, &dec);
+                                &channel, jpeg_active ? &jdec : nullptr, jpeg_active, &dec,
+                                &depay);
     };
     channel.set_pipeline_metrics_sync_live([&]() {
         sync_pipeline_metrics_live(g_bench_diag, &sender, &enc, &rcv, &channel);

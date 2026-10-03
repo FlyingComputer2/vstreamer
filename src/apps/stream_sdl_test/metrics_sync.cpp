@@ -9,6 +9,8 @@
 #include "apps/stream_sdl_test/bench_stream_metrics.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
 
+#include <cstdlib>
+
 #include <string>
 
 #include "core/metrics.hpp"
@@ -58,6 +60,18 @@ template <typename Comp>
     return std::strtoull(v.c_str(), &end, 10);
 }
 
+template <typename Comp>
+[[nodiscard]] double query_double(const Comp &comp, const char *key)
+{
+    std::string v;
+    if (comp.query(key, &v) != 0)
+    {
+        return 0.0;
+    }
+    char *end = nullptr;
+    return std::strtod(v.c_str(), &end);
+}
+
 }  // namespace
 
 void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_sender *sender,
@@ -65,7 +79,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                              pipeline_rate_state &rate,
                              const test_app::channel_controller *channel,
                              component *jdec, bool jpeg_active,
-                             component *dec)
+                             component *dec, component_coder *depay)
 {
     std::lock_guard<std::mutex> update_lock(g_pipeline_metrics_update_mu);
     const auto t_now = std::chrono::steady_clock::now();
@@ -307,6 +321,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     stream_sdl_test::publish_channel_rate_metrics(channel, dt, rate.have_snap, prev_ch_bytes_in,
                                                   prev_ch_bytes_out, prev_ch_fwd_drops, ch);
 #endif
+
+    if (nullptr != depay)
+    {
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.capture_ts_rejected"),
+                     query_u64(*depay, "capture_ts_rejected"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.capture_skew_ms"),
+                     query_double(*depay, "capture_skew_ms"));
+    }
 
     if (nullptr != rcv)
     {
