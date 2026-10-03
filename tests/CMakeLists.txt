@@ -7,6 +7,7 @@ set(VSTREAMER_TEST_SOURCES
     cpu_map_test.cpp
     h264_level_test.cpp
     key_util_test.cpp
+    time_util_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
     stream_telemetry_test.cpp
