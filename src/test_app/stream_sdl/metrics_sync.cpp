@@ -500,6 +500,7 @@ constexpr int k_receiver_loss_avg_samples = 5;
 struct receiver_loss_tracker
 {
     stream_link_counters prev {};
+    uint32_t                 session = 0;
     bool                     have_prev = false;
     double                   udp_loss[k_receiver_loss_avg_samples] {};
     double                   fec_loss[k_receiver_loss_avg_samples] {};
@@ -555,8 +556,19 @@ void push_loss_sample(double sample, double *buf, int &n, double &avg_out)
     avg_out = sum / static_cast<double>(n);
 }
 
-void update_receiver_loss_deltas(const stream_link_counters &cur, receiver_loss_tracker &tr)
+void update_receiver_loss_deltas(const stream_link_counters &cur, uint32_t session,
+                                 receiver_loss_tracker &tr)
 {
+    /* Receiver reopened (new session) or counters went backwards: start a fresh window. */
+    if (tr.have_prev &&
+        (session != tr.session || cur.udp_packet_received < tr.prev.udp_packet_received ||
+         cur.udp_gap_count < tr.prev.udp_gap_count ||
+         cur.fec_packet_received < tr.prev.fec_packet_received ||
+         cur.fec_gap_count < tr.prev.fec_gap_count))
+    {
+        tr = receiver_loss_tracker {};
+    }
+    tr.session = session;
     if (tr.have_prev)
     {
         /* Wire (pre-FEC): UDP received + stream_sequence gaps. */
@@ -628,6 +640,15 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender &sende
                      in_pkts);
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_bytes"),
                      rcv->egress_payload_bytes_counter());
+        for (const char *key : {"telemetry_sent", "telemetry_send_errors"})
+        {
+            std::string val;
+            if (0 == rcv->query(key, &val))
+            {
+                metric_store(*g_pipeline_metrics.get_metric(std::string("stream_receiver.") + key),
+                             static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10)));
+            }
+        }
     }
     metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_packets"),
                  d.rx_dec_in_ok);
@@ -645,22 +666,35 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender &sende
                  d.rx_present_q_drop);
 }
 
-/* UDP metrics poll: load live receiver atomics, update interval loss, publish (no staged copy). */
-void sync_peer_link_metrics_live(stream_receiver &rcv)
+/* Peer link metrics come only from the sender's received link reports (never the receiver object):
+ * interval loss from report deltas, plus the report-path health metrics. */
+void sync_peer_link_metrics_live(stream_sender &sender)
 {
-    const stream_link_counters cur = rcv.link_counters_snapshot();
+    const stream_peer_link peer = sender.peer_link_snapshot();
+    const stream_link_counters cur = peer.have ? peer.report.counters : stream_link_counters {};
 
     double loss_udp = 0.;
     double loss_fec = 0.;
+    if (peer.have)
     {
         std::lock_guard<std::mutex> lock(g_rcv_loss_mu);
-        update_receiver_loss_deltas(cur, g_rcv_loss);
+        update_receiver_loss_deltas(cur, peer.report.session_id, g_rcv_loss);
         loss_udp = g_rcv_loss.loss_udp_pct;
         loss_fec = g_rcv_loss.loss_fec_pct;
     }
 
     store_receiver_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
                                 cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_age_ms"),
+                 static_cast<int64_t>(peer.age_ms));
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_received"),
+                 peer.reports_received);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_lost"),
+                 peer.reports_lost);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_rejected"),
+                 peer.reports_rejected);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_session"),
+                 static_cast<uint64_t>(peer.have ? peer.report.session_id : 0U));
 }
 
 struct metrics_serve_rate_state
@@ -704,10 +738,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender &sender, h264
     metric_store(*g_pipeline_metrics.get_metric("h264_encoder.out_kbps"),
                  enc_out_kbps);
     sync_cumulative_pipeline_counters(d, sender, channel, rcv);
-    if (nullptr != rcv)
-    {
-        sync_peer_link_metrics_live(*rcv);
-    }
+    sync_peer_link_metrics_live(sender);
     const int cbr_bps = query_encoder_cbr_bps(enc);
     if (cbr_bps >= 0)
     {
@@ -716,13 +747,13 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender &sender, h264
     }
 }
 
-void telemetry_thread_main(stream_receiver *rcv)
+void telemetry_thread_main(stream_sender *sender)
 {
     while (g_run.load())
     {
-        if (nullptr != rcv)
+        if (nullptr != sender)
         {
-            sync_peer_link_metrics_live(*rcv);
+            sync_peer_link_metrics_live(*sender);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }

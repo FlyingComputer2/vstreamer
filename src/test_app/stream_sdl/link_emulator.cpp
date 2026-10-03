@@ -181,6 +181,7 @@ link_emulator::forward_stats link_emulator::forward_stats_snapshot() const
     s.dropped_rate = fwd.dropped_rate.load(std::memory_order_relaxed);
     s.dropped_loss = fwd.dropped_loss.load(std::memory_order_relaxed);
     s.dropped_queue = fwd.dropped_queue.load(std::memory_order_relaxed);
+    s.dropped_no_route = fwd.dropped_no_route.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -194,6 +195,7 @@ link_emulator::forward_stats link_emulator::reverse_stats_snapshot() const
     s.dropped_rate = rev.dropped_rate.load(std::memory_order_relaxed);
     s.dropped_loss = rev.dropped_loss.load(std::memory_order_relaxed);
     s.dropped_queue = rev.dropped_queue.load(std::memory_order_relaxed);
+    s.dropped_no_route = rev.dropped_no_route.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -361,28 +363,15 @@ void link_emulator::relay_thread_main()
     while (!relay_stop.load())
     {
         pollfd fds[2];
-        int    nfds = 0;
+        fds[0].fd = fwd.ingress_fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+        /* Replies from the receiver arrive on the forward egress socket. */
+        fds[1].fd = fwd.egress_fd;
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
 
-        if (fwd.ingress_fd >= 0)
-        {
-            fds[nfds].fd = fwd.ingress_fd;
-            fds[nfds].events = POLLIN;
-            nfds++;
-        }
-        if (rev_enabled && rev.ingress_fd >= 0)
-        {
-            fds[nfds].fd = rev.ingress_fd;
-            fds[nfds].events = POLLIN;
-            nfds++;
-        }
-
-        if (nfds == 0)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-
-        const int pr = poll(fds, nfds, 50);
+        const int pr = poll(fds, 2, 50);
         if (pr < 0)
         {
             if (relay_stop.load())
@@ -391,47 +380,46 @@ void link_emulator::relay_thread_main()
             }
             continue;
         }
-        auto drain_ingress = [&](direction_state &dir) {
+
+        if (pr > 0 && (fds[0].revents & POLLIN) != 0)
+        {
             while (!relay_stop.load())
             {
-                const ssize_t n =
-                    recv(dir.ingress_fd, buf, sizeof(buf), MSG_DONTWAIT);
-                if (n > 0)
-                {
-                    accept_ingress(dir, buf, static_cast<size_t>(n));
-                    flush_ingress_queue(dir);
-                    continue;
-                }
-                if (n < 0 && (EAGAIN == errno || EWOULDBLOCK == errno))
+                sockaddr_in src {};
+                socklen_t   src_len = sizeof(src);
+                const ssize_t n = recvfrom(fwd.ingress_fd, buf, sizeof(buf), MSG_DONTWAIT,
+                                           reinterpret_cast<sockaddr *>(&src), &src_len);
+                if (n <= 0)
                 {
                     break;
                 }
-                break;
+                rev.egress_addr = src;
+                rev.have_egress = true;
+                accept_ingress(fwd, buf, static_cast<size_t>(n));
+                flush_ingress_queue(fwd);
             }
-        };
-
-        int idx = 0;
-        if (fwd.ingress_fd >= 0)
-        {
-            if (pr != 0 && (fds[idx].revents & POLLIN) != 0)
-            {
-                drain_ingress(fwd);
-            }
-            idx++;
         }
-        if (rev_enabled && rev.ingress_fd >= 0)
+        if (pr > 0 && (fds[1].revents & POLLIN) != 0)
         {
-            if (pr != 0 && (fds[idx].revents & POLLIN) != 0)
+            while (!relay_stop.load())
             {
-                drain_ingress(rev);
+                const ssize_t n = recv(fwd.egress_fd, buf, sizeof(buf), MSG_DONTWAIT);
+                if (n <= 0)
+                {
+                    break;
+                }
+                if (!rev.have_egress)
+                {
+                    rev.dropped_no_route.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                accept_ingress(rev, buf, static_cast<size_t>(n));
+                flush_ingress_queue(rev);
             }
         }
 
         flush_ingress_queue(fwd);
-        if (rev_enabled)
-        {
-            flush_ingress_queue(rev);
-        }
+        flush_ingress_queue(rev);
     }
 }
 
@@ -517,9 +505,7 @@ void link_emulator::teardown_direction(direction_state &dir)
     dir.have_egress = false;
 }
 
-int link_emulator::start(int ingress_port, const char *egress_host, int egress_port,
-                              int reverse_ingress_port, const char *reverse_egress_host,
-                              int reverse_egress_port)
+int link_emulator::start(int ingress_port, const char *egress_host, int egress_port)
 {
     stop_relay();
 
@@ -529,30 +515,19 @@ int link_emulator::start(int ingress_port, const char *egress_host, int egress_p
         return ret;
     }
 
-    rev_enabled = false;
-    if (reverse_ingress_port > 0 && nullptr != reverse_egress_host && reverse_egress_port > 0)
-    {
-        const int rret =
-            setup_direction(rev, reverse_ingress_port, reverse_egress_host, reverse_egress_port);
-        if (rret < 0)
-        {
-            teardown_direction(fwd);
-            return rret;
-        }
-        rev_enabled = true;
-        rev.rng = 0xA5A5A5A5u;
-    }
+    rev.ingress_fd = -1;
+    rev.egress_fd = fwd.ingress_fd;
+    std::memset(&rev.egress_addr, 0, sizeof(rev.egress_addr));
+    rev.have_egress = false;
+    rev.rng = 0xA5A5A5A5u;
 
     relay_stop = false;
     relay_thread = std::thread(&link_emulator::relay_thread_main, this);
 
-    std::fprintf(stderr, "channel_controller: fwd :%d -> %s:%d (queue=%d)\n", ingress_port,
-                 egress_host, egress_port, queue_depth());
-    if (rev_enabled)
-    {
-        std::fprintf(stderr, "channel_controller: rev :%d -> %s:%d\n", reverse_ingress_port,
-                     reverse_egress_host, reverse_egress_port);
-    }
+    std::fprintf(stderr,
+                 "channel_controller: fwd :%d -> %s:%d (queue=%d); rev = return path to the "
+                 "last fwd source\n",
+                 ingress_port, egress_host, egress_port, queue_depth());
     return 0;
 }
 
@@ -563,22 +538,15 @@ void link_emulator::stop_relay()
     {
         ::shutdown(fwd.ingress_fd, SHUT_RDWR);
     }
-    if (rev_enabled && rev.ingress_fd >= 0)
-    {
-        ::shutdown(rev.ingress_fd, SHUT_RDWR);
-    }
 
     if (relay_thread.joinable())
     {
         relay_thread.join();
     }
 
+    rev.egress_fd = -1; /* aliases fwd.ingress_fd; closed with fwd */
+    teardown_direction(rev);
     teardown_direction(fwd);
-    if (rev_enabled)
-    {
-        teardown_direction(rev);
-    }
-    rev_enabled = false;
     relay_stop = false;
 }
 

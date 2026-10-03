@@ -27,7 +27,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, vstreamer::stream_sender &s
                                 h264_encoder_t &enc, vstreamer::stream_receiver *rcv,
                                 const channel_controller *channel);
 
-void telemetry_thread_main(vstreamer::stream_receiver *rcv);
+void telemetry_thread_main(vstreamer::stream_sender *sender);
 
 int query_encoder_qp(h264_encoder_t &enc);
 int query_encoder_cbr_bps(h264_encoder_t &enc);

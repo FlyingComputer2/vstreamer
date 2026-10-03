@@ -71,7 +71,7 @@ TEST(LinkEmulatorTest, BurstNoImpairmentDeliversAll)
     ch.set_queue_depth(32);
     ch.set_max_kbps(0.);
     ch.set_constant_loss(0.);
-    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress, 0, nullptr, 0));
+    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress));
 
     const int send_fd = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(send_fd, 0);
@@ -114,7 +114,7 @@ TEST(LinkEmulatorTest, RateLimitAccounting)
     ch.set_max_kbps(50.);
     ch.set_drop_dt_ms(10);
     ch.set_constant_loss(0.);
-    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress, 0, nullptr, 0));
+    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress));
 
     const int send_fd = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(send_fd, 0);
@@ -142,4 +142,69 @@ TEST(LinkEmulatorTest, RateLimitAccounting)
     EXPECT_GT(stats.dropped_rate, 0U);
     EXPECT_EQ(stats.pkts_in,
               stats.pkts_out + stats.dropped_queue + stats.dropped_rate + stats.dropped_loss);
+}
+
+namespace
+{
+
+bool recv_from(int fd, int timeout_ms, sockaddr_in *from)
+{
+    pollfd pfd {fd, POLLIN, 0};
+    if (poll(&pfd, 1, timeout_ms) <= 0)
+    {
+        return false;
+    }
+    uint8_t   buf[2048];
+    socklen_t len = sizeof(*from);
+    return recvfrom(fd, buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(from), &len) > 0;
+}
+
+}  // namespace
+
+/* TT-T5 (D8): the reverse direction is the NAT-style return path of the forward flow. */
+TEST(LinkEmulatorTest, ReturnPathIsNatOfForwardFlow)
+{
+    constexpr int k_ingress = 19120;
+    constexpr int k_egress = 19121;
+    const int     b = bind_udp_loopback(k_egress); /* plays the receiver */
+    ASSERT_GE(b, 0);
+    const int a = socket(AF_INET, SOCK_DGRAM, 0); /* plays the sender (ephemeral port) */
+    ASSERT_GE(a, 0);
+
+    vstreamer::test_app::link_emulator ch;
+    ch.set_queue_depth(0);
+    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress));
+
+    sockaddr_in ingress {};
+    ingress.sin_family = AF_INET;
+    ingress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ingress.sin_port = htons(k_ingress);
+
+    /* 1. A → emulator → B. */
+    const uint8_t fwd_pkt[16] = {1};
+    ASSERT_EQ(16, sendto(a, fwd_pkt, sizeof(fwd_pkt), 0, reinterpret_cast<sockaddr *>(&ingress),
+                         sizeof(ingress)));
+    sockaddr_in emu_src {};
+    ASSERT_TRUE(recv_from(b, 500, &emu_src));
+
+    /* 2. B replies to the datagram's source; 3. A gets it from the emulator's ingress address. */
+    const uint8_t reply[48] = {2};
+    ASSERT_EQ(48, sendto(b, reply, sizeof(reply), 0, reinterpret_cast<sockaddr *>(&emu_src),
+                         sizeof(emu_src)));
+    sockaddr_in reply_src {};
+    ASSERT_TRUE(recv_from(a, 500, &reply_src));
+    EXPECT_EQ(htons(k_ingress), reply_src.sin_port);
+    EXPECT_EQ(htonl(INADDR_LOOPBACK), reply_src.sin_addr.s_addr);
+    EXPECT_EQ(1U, ch.reverse_stats_snapshot().pkts_out);
+
+    /* 4. Loss applies to the return path too. */
+    ch.set_constant_loss(100.);
+    ASSERT_EQ(48, sendto(b, reply, sizeof(reply), 0, reinterpret_cast<sockaddr *>(&emu_src),
+                         sizeof(emu_src)));
+    EXPECT_FALSE(recv_from(a, 200, &reply_src));
+    EXPECT_EQ(1U, ch.reverse_stats_snapshot().dropped_loss);
+
+    ch.stop();
+    close(a);
+    close(b);
 }
