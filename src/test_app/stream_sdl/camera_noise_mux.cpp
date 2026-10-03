@@ -1,6 +1,6 @@
-#include "test_app/camera_noise_mux.hpp"
+#include "test_app/stream_sdl/camera_noise_mux.hpp"
 
-#include "test_app/camera_noise_mux_logic.hpp"
+#include "test_app/stream_sdl/camera_noise_mux_logic.hpp"
 
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
 

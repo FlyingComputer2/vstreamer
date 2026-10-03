@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -42,12 +43,15 @@ public:
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    const char *presenter_video_driver() const;
+
     mutable std::mutex mu;
 
     bool opened = false;
     uint64_t frames_in = 0;
+    std::string video_driver = "auto";
 
-    sdl_nv12_presenter present {"sdl_sink", nullptr};
+    std::optional<sdl_nv12_presenter> present;
 };
 
 }  // namespace vstreamer

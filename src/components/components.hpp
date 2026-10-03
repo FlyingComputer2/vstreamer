@@ -36,7 +36,6 @@
 #endif
 
 #ifdef ENABLE_SDL_SINK
-#include "components/sdl_kmsdrm_sink.hpp"
 #include "components/sdl_sink.hpp"
 #endif
 

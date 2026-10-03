@@ -50,8 +50,8 @@ flowchart LR
 | decoder → `sdl_sink` | `FRAME` / NV12 |
 
 Factory names: `stream_receiver`, `rtp_h264_depay`, `h264_decoder_mpp`, `sdl_sink`
-(`display`), `sdl_kmsdrm_sink` (SDL `kmsdrm` on DRM/KMS). Build with
-`-DENABLE_SDL_SINK=ON` (requires SDL2).
+(`display`; configure `video_driver=kmsdrm` or factory aliases `sdl_kmsdrm` for DRM/KMS).
+Build with `-DENABLE_SDL_SINK=ON` (requires SDL2).
 
 ## Legacy aliases
 

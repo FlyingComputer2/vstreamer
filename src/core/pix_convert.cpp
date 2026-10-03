@@ -18,7 +18,7 @@ namespace
 
 void pad_nv12_right_columns(uint8_t *dy, uint8_t *duv, int w, int dst_w, int dst_h, int h)
 {
-    if (dst_w <= w || w < 2)
+    if (h > dst_h || dst_w <= w || w < 2)
     {
         return;
     }

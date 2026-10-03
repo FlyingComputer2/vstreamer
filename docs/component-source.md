@@ -96,7 +96,7 @@ Defaults (override when the native type is not a string):
 metric **`source.state`** (`get_metric source.state` on the console port).
 On **`v4l2_source`** noise fallback (capture down), `query("state")` and noise
 configure keys (`noise-bandwidth`, `pregenerate-frames`, …) forward to the
-embedded `noise_source` so **`uvc_jpegdec_kmsdrm`** shows pregen progress too.
+embedded `noise_source` so **`stream_sdl`** with `--source /dev/video0` shows pregen progress too.
 Do not use **`stream_sdl.status`** (always `running`); use **`source.state`**.
 `query("v4l2-ctl/<name>")` → current value as decimal.
 `query("v4l2-ctl")` → all readable `name=val` on the open device.

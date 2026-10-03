@@ -1,4 +1,4 @@
-#include "test_app/cpu_map.hpp"
+#include "test_app/stream_sdl/cpu_map.hpp"
 
 #include "core/key_util.hpp"
 

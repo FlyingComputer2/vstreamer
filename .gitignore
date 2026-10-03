@@ -1,3 +1,6 @@
+# Vendored copies (use FetchContent)
+third_party/
+
 # CMake / build trees
 build/
 build-*/

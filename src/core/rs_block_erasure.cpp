@@ -448,7 +448,6 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
     if (rxit != rx_blocks.end())
     {
         const rx_block_s& block = rxit->second;
-        const int         sn = expected_sdus(block);
         if (static_cast<int>(block.frags.size()) >= block.n)
         {
             give_up = true;

@@ -451,3 +451,125 @@ TEST(RtpH264Test, DepayComponentQueuesMultipleAus)
     EXPECT_EQ(0, depay.output(0, out, 0));
     depay.close();
 }
+
+std::vector<int> annexb_nal_types(const std::vector<uint8_t> &au)
+{
+    std::vector<int> types;
+    for (size_t i = 0; i + 4 < au.size(); ++i)
+    {
+        if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 0 && au[i + 3] == 1)
+        {
+            const size_t off = i + 4;
+            if (off < au.size())
+            {
+                types.push_back(static_cast<int>(au[off] & 0x1F));
+            }
+        }
+    }
+    return types;
+}
+
+std::vector<uint8_t> depack_packer_au(rtp_h264_packer &packer, const std::vector<uint8_t> &annexb)
+{
+    EXPECT_EQ(0, packer.pack_annexb(annexb.data(), annexb.size(), 1, 0));
+    std::vector<std::vector<uint8_t>> dgrams;
+    uint8_t                           buf[2048];
+    while (packer.pending())
+    {
+        const int n = packer.pop_datagram(buf, sizeof(buf));
+        EXPECT_GT(n, 0);
+        dgrams.emplace_back(buf, buf + n);
+    }
+    rtp_h264_depacketizer dep(30);
+    return depack_datagrams(dep, dgrams);
+}
+
+TEST(RtpH264Test, InjectCachedPpsBeforeIdrWhenSpsPresent)
+{
+    const uint8_t sps[] = {0x67, 0x42, 0x00, 0x1f};
+    const uint8_t pps[] = {0x68, 0xce, 0x38, 0x80};
+    const uint8_t idr[] = {0x65, 0x88, 0x84, 0x00, 0x10};
+
+    rtp_h264_config cfg;
+    cfg.mtu = 1400;
+    cfg.fps = 30;
+    rtp_h264_packer packer(cfg);
+
+    std::vector<uint8_t> prime;
+    append_nal(&prime, sps, sizeof(sps));
+    append_nal(&prime, pps, sizeof(pps));
+    append_nal(&prime, idr, sizeof(idr));
+    (void)depack_packer_au(packer, prime);
+
+    std::vector<uint8_t> au;
+    append_nal(&au, sps, sizeof(sps));
+    append_nal(&au, idr, sizeof(idr));
+    const std::vector<uint8_t> out = depack_packer_au(packer, au);
+    EXPECT_EQ(std::vector<int>({7, 8, 5}), annexb_nal_types(out));
+}
+
+TEST(RtpH264Test, InjectCachedParamsBeforeIdrOnly)
+{
+    const uint8_t sps[] = {0x67, 0x42, 0x00, 0x1f};
+    const uint8_t pps[] = {0x68, 0xce, 0x38, 0x80};
+    const uint8_t idr[] = {0x65, 0x88, 0x84, 0x00, 0x10};
+
+    rtp_h264_config cfg;
+    cfg.mtu = 1400;
+    cfg.fps = 30;
+    rtp_h264_packer packer(cfg);
+
+    std::vector<uint8_t> prime;
+    append_nal(&prime, sps, sizeof(sps));
+    append_nal(&prime, pps, sizeof(pps));
+    append_nal(&prime, idr, sizeof(idr));
+    (void)depack_packer_au(packer, prime);
+
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+    const std::vector<uint8_t> out = depack_packer_au(packer, au);
+    EXPECT_EQ(std::vector<int>({7, 8, 5}), annexb_nal_types(out));
+}
+
+TEST(RtpH264Test, NoInjectWhenSpsAndPpsPresent)
+{
+    const uint8_t sps[] = {0x67, 0x42, 0x00, 0x1f};
+    const uint8_t pps[] = {0x68, 0xce, 0x38, 0x80};
+    const uint8_t idr[] = {0x65, 0x88, 0x84, 0x00, 0x10};
+
+    rtp_h264_config cfg;
+    cfg.mtu = 1400;
+    cfg.fps = 30;
+    rtp_h264_packer packer(cfg);
+
+    std::vector<uint8_t> au;
+    append_nal(&au, sps, sizeof(sps));
+    append_nal(&au, pps, sizeof(pps));
+    append_nal(&au, idr, sizeof(idr));
+    const std::vector<uint8_t> out = depack_packer_au(packer, au);
+    EXPECT_EQ(std::vector<int>({7, 8, 5}), annexb_nal_types(out));
+}
+
+TEST(RtpH264Test, NoInjectOnNonIdrSlice)
+{
+    const uint8_t sps[] = {0x67, 0x42, 0x00, 0x1f};
+    const uint8_t pps[] = {0x68, 0xce, 0x38, 0x80};
+    const uint8_t idr[] = {0x65, 0x88, 0x84, 0x00, 0x10};
+    const uint8_t slice[] = {0x41, 0x9a, 0x24};
+
+    rtp_h264_config cfg;
+    cfg.mtu = 1400;
+    cfg.fps = 30;
+    rtp_h264_packer packer(cfg);
+
+    std::vector<uint8_t> prime;
+    append_nal(&prime, sps, sizeof(sps));
+    append_nal(&prime, pps, sizeof(pps));
+    append_nal(&prime, idr, sizeof(idr));
+    (void)depack_packer_au(packer, prime);
+
+    std::vector<uint8_t> au;
+    append_nal(&au, slice, sizeof(slice));
+    const std::vector<uint8_t> out = depack_packer_au(packer, au);
+    EXPECT_EQ(std::vector<int>({1}), annexb_nal_types(out));
+}
