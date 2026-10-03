@@ -266,6 +266,52 @@ TEST(RsBlockErasureEmitTest, PeerRestartResync)
     EXPECT_GE(out.size(), 310u);
 }
 
+/* Restarted peer whose random start id lands far *ahead* of emit_next (C3 resync, forward).
+ * The new blocks must be delivered on arrival: holding them for emit_hold_ms while the ids
+ * cross the half ring made the backward rebase discard them (loopback SenderRestartMidStream). */
+TEST(RsBlockErasureEmitTest, PeerRestartResyncForwardJump)
+{
+    for (const int offset : {10, 80, 120})
+    {
+        rs_block_erasure dec;
+        rs_block_erasure enc_a;
+        rs_block_erasure enc_b;
+        ASSERT_TRUE(enc_a.init(6, 8, 20));
+        ASSERT_TRUE(enc_b.init(6, 8, 20));
+
+        vstreamer::fec_rx_payload_list out;
+        for (int i = 0; i < 67; i++)
+        {
+            for (const auto &shard :
+                 encode_block_apps(enc_a, static_cast<uint16_t>(i), {1, 1, 1, 1, 1, 1}))
+            {
+                feed_append(dec, shard, &out);
+            }
+        }
+        ASSERT_EQ(out.size(), 67u * 6u);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        const int start = (66 + offset) & 0xFF;
+        for (int i = 0; i < 20; i++)
+        {
+            const int     id = (start + i) & 0xFF;
+            const uint8_t tag = static_cast<uint8_t>(100 + i);
+            vstreamer::fec_rx_payload_list step;
+            for (const auto &shard : encode_block_apps(enc_b, static_cast<uint16_t>(id),
+                                                       {tag, tag, tag, tag, tag, tag}))
+            {
+                feed_append(dec, shard, &step);
+            }
+            ASSERT_EQ(step.size(), 6u) << "offset " << offset << ": restart block " << i
+                                       << " (id " << id << ") not delivered on arrival";
+            for (const auto &row : step)
+            {
+                EXPECT_EQ(row.u8()[0], tag);
+            }
+        }
+    }
+}
+
 TEST(RsBlockErasureEmitTest, RingEvictsStalePartial)
 {
     rs_block_erasure enc;
@@ -308,4 +354,5 @@ TEST(RsBlockErasureEmitTest, NextDeadlineAfterPartialPush)
     enc.flush(&air);
     EXPECT_FALSE(enc.next_deadline(&dl));
 }
+
 

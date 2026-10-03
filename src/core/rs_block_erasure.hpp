@@ -215,6 +215,7 @@ private:
     void touch_newest(uint16_t block_id);
     void ring_evict_stale(fec_rx_payload_list* out);
     void maybe_resync_on_late_shard(uint16_t block_id);
+    void maybe_rebase_after_silence(uint16_t block_id);
     void clear_state_behind(uint16_t base_id);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
     void on_block_decoded(uint16_t block_id, int released_before, fec_rx_payload_list payloads,
@@ -252,6 +253,8 @@ private:
     bool                                      newest_set = false;
     std::chrono::steady_clock::time_point     last_payload_emit{};
     bool                                      have_payload_emit = false;
+    std::chrono::steady_clock::time_point     last_shard_rx{};
+    bool                                      have_shard_rx = false;
     std::chrono::steady_clock::time_point     later_block_since{};
     bool                                      later_block_waiting = false;
 
