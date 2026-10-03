@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <poll.h>
 #include <random>
 #include <thread>
 #include <vector>
@@ -255,6 +256,112 @@ void stream_sender::stop_send_thread()
     }
 }
 
+void stream_sender::stop_telemetry_thread()
+{
+    if (telemetry_thread.joinable())
+    {
+        telemetry_stop = true;
+        telemetry_thread.join();
+        telemetry_stop = false;
+    }
+}
+
+void stream_sender::handle_link_report(const stream_link_report &report)
+{
+    std::lock_guard<std::mutex> lock(peer_mu);
+    if (peer_have && report.session_id == peer_session)
+    {
+        const int32_t diff = static_cast<int32_t>(report.report_seq - peer_last_seq);
+        if (diff <= 0)
+        {
+            peer_reports_rejected++;
+            return;
+        }
+        if (diff > 1)
+        {
+            peer_reports_lost += static_cast<uint64_t>(diff - 1);
+        }
+    }
+    peer_report = report;
+    peer_session = report.session_id;
+    peer_last_seq = report.report_seq;
+    peer_have = true;
+    peer_report_at = std::chrono::steady_clock::now();
+    peer_reports_received++;
+}
+
+void stream_sender::telemetry_thread_main()
+{
+    uint8_t buf[512];
+    while (!telemetry_stop.load(std::memory_order_relaxed))
+    {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            fd = send_fd;
+        }
+        if (fd < 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        pollfd pfd {};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        const int pr = poll(&pfd, 1, 50);
+        if (telemetry_stop.load(std::memory_order_relaxed))
+        {
+            break;
+        }
+        if (pr <= 0)
+        {
+            continue;
+        }
+
+        const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT | MSG_TRUNC);
+        if (n <= 0)
+        {
+            continue;
+        }
+        if (n != static_cast<ssize_t>(k_stream_link_report_len))
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        stream_link_report rep {};
+        if (stream_link_report_decode(buf, static_cast<size_t>(n), &rep) < 0)
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        handle_link_report(rep);
+    }
+}
+
+stream_peer_link stream_sender::peer_link_snapshot() const
+{
+    stream_peer_link snap {};
+    std::lock_guard<std::mutex> lock(peer_mu);
+    snap.have = peer_have;
+    snap.report = peer_report;
+    snap.reports_received = peer_reports_received;
+    snap.reports_lost = peer_reports_lost;
+    snap.reports_rejected = peer_reports_rejected;
+    if (!peer_have)
+    {
+        snap.age_ms = -1;
+        return snap;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - peer_report_at)
+                        .count();
+    snap.age_ms = ms;
+    return snap;
+}
+
 void stream_sender::send_thread_main()
 {
     sockaddr_in dst {};
@@ -396,6 +503,14 @@ int stream_sender::open()
         return -EINVAL;
     }
 
+    std::string local_copy;
+    bool        telemetry = true;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        local_copy = local_spec;
+        telemetry = telemetry_on;
+    }
+
     const int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
     {
@@ -404,6 +519,38 @@ int stream_sender::open()
 
     constexpr int k_sock_buf = 16 * 1024 * 1024;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &k_sock_buf, sizeof(k_sock_buf));
+
+    sockaddr_in bind_addr {};
+    bind_addr.sin_family = AF_INET;
+    const bool ephemeral_local = local_copy.empty() || local_copy == "0.0.0.0:0" ||
+                                 local_copy == ":0";
+    if (ephemeral_local)
+    {
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind_addr.sin_port = 0;
+    }
+    else
+    {
+        char local_host[128];
+        int  local_port = 0;
+        if (parse_host_port(local_copy, local_host, sizeof(local_host), &local_port) < 0)
+        {
+            ::close(fd);
+            return -EINVAL;
+        }
+        bind_addr.sin_port = htons(static_cast<uint16_t>(local_port));
+        if (resolve_ipv4_bind_addr(local_host, true, &bind_addr.sin_addr) < 0)
+        {
+            ::close(fd);
+            return -EINVAL;
+        }
+    }
+    if (bind(fd, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
+    {
+        const int err = errno;
+        ::close(fd);
+        return -err;
+    }
 
     sockaddr_in dst_in {};
     if (resolve_ipv4_destination(host, port, &dst_in) < 0)
@@ -446,6 +593,12 @@ int stream_sender::open()
         send_stop = false;
         send_thread = std::thread(&stream_sender::send_thread_main, this);
 
+        telemetry_stop = false;
+        if (telemetry)
+        {
+            telemetry_thread = std::thread(&stream_sender::telemetry_thread_main, this);
+        }
+
         std::fprintf(stderr, "stream_sender: udp://%s:%d mtu=%d\n", host, port, mtu_local);
     }
     return 0;
@@ -453,6 +606,8 @@ int stream_sender::open()
 
 void stream_sender::close()
 {
+    telemetry_stop = true;
+    stop_telemetry_thread();
     stop_send_thread();
     disable_fec();
 
@@ -464,6 +619,11 @@ void stream_sender::close()
     }
     have_dst = false;
     opened = false;
+
+    {
+        std::lock_guard<std::mutex> plock(peer_mu);
+        peer_have = false;
+    }
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);
@@ -611,8 +771,57 @@ void stream_sender::disable_fec()
     enqueue_fec_air(&air);
 }
 
+namespace
+{
+
+bool parse_on_off(std::string_view value, bool *out)
+{
+    if (nullptr == out)
+    {
+        return false;
+    }
+    if ("on" == value || "ON" == value)
+    {
+        *out = true;
+        return true;
+    }
+    if ("off" == value || "OFF" == value)
+    {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 int stream_sender::configure(std::string_view key, std::string_view value)
 {
+    if ("telemetry" == key)
+    {
+        bool on = false;
+        if (!parse_on_off(value, &on))
+        {
+            return -EINVAL;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        telemetry_on = on;
+        return 0;
+    }
+    if ("local" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        local_spec.assign(value.data(), value.size());
+        return 0;
+    }
     if ("stream" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -774,6 +983,135 @@ int stream_sender::query(std::string_view key, std::string *value) const
         *value = stream_spec;
         return 0;
     }
+    if ("local" == key)
+    {
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            fd = send_fd;
+        }
+        if (fd < 0)
+        {
+            return -ENOTSUP;
+        }
+        sockaddr_in bound {};
+        socklen_t   len = sizeof(bound);
+        if (getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &len) < 0)
+        {
+            return -errno;
+        }
+        char host[INET_ADDRSTRLEN];
+        const char *hip = inet_ntop(AF_INET, &bound.sin_addr, host, sizeof(host));
+        if (nullptr == hip)
+        {
+            return -EINVAL;
+        }
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%s:%u", hip,
+                      static_cast<unsigned>(ntohs(bound.sin_port)));
+        *value = buf;
+        return 0;
+    }
+    if ("telemetry" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        *value = telemetry_on ? "on" : "off";
+        return 0;
+    }
+    if ("peer_udp_packet_received" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have)
+        {
+            return -ENOTSUP;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      peer_report.counters.udp_packet_received);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_fec_packet_received" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have)
+        {
+            return -ENOTSUP;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      peer_report.counters.fec_packet_received);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_udp_gap_count" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have)
+        {
+            return -ENOTSUP;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_report.counters.udp_gap_count);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_fec_gap_count" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have)
+        {
+            return -ENOTSUP;
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_report.counters.fec_gap_count);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_report_age_ms" == key)
+    {
+        const stream_peer_link snap = peer_link_snapshot();
+        char                   buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRId64, snap.age_ms);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_reports_received" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_reports_received);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_reports_lost" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_reports_lost);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_reports_rejected" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_reports_rejected);
+        *value = buf;
+        return 0;
+    }
+    if ("peer_session" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have)
+        {
+            return -ENOTSUP;
+        }
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%" PRIu32, peer_session);
+        *value = buf;
+        return 0;
+    }
     if ("in_rate" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -832,27 +1170,42 @@ int stream_sender::query(std::string_view key, std::string *value) const
             std::lock_guard<std::mutex> flock(fec_mu);
             fec_on = fec.enabled();
         }
+        stream_peer_link peer {};
+        {
+            std::lock_guard<std::mutex> plock(peer_mu);
+            peer.have = peer_have;
+            if (peer_have)
+            {
+                peer.report = peer_report;
+            }
+            peer.reports_received = peer_reports_received;
+            peer.reports_lost = peer_reports_lost;
+            peer.reports_rejected = peer_reports_rejected;
+        }
         std::lock_guard<std::mutex> lock(mu);
-        char buf[320];
+        char buf[480];
         if (fec_on)
         {
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " in_rate=%.1f fec_oversized=%" PRIu64 " fec=k=%d,n=%d",
+                          " in_rate=%.1f fec_oversized=%" PRIu64 " fec=k=%d,n=%d"
+                          " peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
                           pkts_sent.load(std::memory_order_relaxed),
                           bytes_sent.load(std::memory_order_relaxed),
                           dropped.load(std::memory_order_relaxed),
-                          static_cast<double>(ingress_kbps), fec_oversized, fec_k, fec_n);
+                          static_cast<double>(ingress_kbps), fec_oversized, fec_k, fec_n,
+                          peer.reports_received, peer.reports_lost, peer.reports_rejected);
         }
         else
         {
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " in_rate=%.1f",
+                          " in_rate=%.1f peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
                           pkts_sent.load(std::memory_order_relaxed),
                           bytes_sent.load(std::memory_order_relaxed),
                           dropped.load(std::memory_order_relaxed),
-                          static_cast<double>(ingress_kbps));
+                          static_cast<double>(ingress_kbps), peer.reports_received,
+                          peer.reports_lost, peer.reports_rejected);
         }
         *value = buf;
         return 0;

@@ -7,6 +7,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -21,6 +22,7 @@
 #include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
 #include "core/rs_block_erasure.hpp"
+#include "core/stream_telemetry.hpp"
 
 namespace vstreamer
 {
@@ -59,6 +61,8 @@ public:
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
+    [[nodiscard]] stream_peer_link peer_link_snapshot() const;
+
     [[nodiscard]] const std::atomic<uint64_t> &wire_pkts_sent_counter() const
     {
         return pkts_sent;
@@ -71,6 +75,9 @@ public:
 private:
     void send_thread_main();
     void stop_send_thread();
+    void stop_telemetry_thread();
+    void telemetry_thread_main();
+    void handle_link_report(const stream_link_report &report);
     void pace_wire_send(size_t bytes);
     void enqueue_wire_copy(const uint8_t *data, size_t len);
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
@@ -89,6 +96,8 @@ private:
     bool               opened = false;
 
     std::string stream_spec;
+    std::string local_spec = "0.0.0.0:0";
+    bool        telemetry_on = true;
     int         mtu = 1400;
     int         max_datagram = 1472;
 
@@ -110,6 +119,18 @@ private:
 
     std::thread       send_thread;
     std::atomic<bool> send_stop {false};
+    std::thread       telemetry_thread;
+    std::atomic<bool> telemetry_stop {false};
+
+    mutable std::mutex peer_mu;
+    bool               peer_have = false;
+    stream_link_report peer_report {};
+    std::chrono::steady_clock::time_point peer_report_at {};
+    uint32_t           peer_session = 0;
+    uint32_t           peer_last_seq = 0;
+    uint64_t           peer_reports_received = 0;
+    uint64_t           peer_reports_lost = 0;
+    uint64_t           peer_reports_rejected = 0;
 
     std::atomic<uint64_t> pkts_sent {0};
     std::atomic<uint64_t> bytes_sent {0};
