@@ -8,14 +8,14 @@ link-report path and surfaced as `stream_sender.peer_*` metrics (see [pipeline-f
 
 ### RTP capture timestamp extension
 
-`rtp_h264_pay` stamps a one-byte RFC 5285 extension (id **1**, 8 bytes) with capture time as
-**nanoseconds since the packer epoch** (`steady_mono_ns()` at `open()`). Query
-`capture_epoch_ns` on the payloader; configure the same value on `rtp_h264_depay` via
-`capture_epoch_ns` so `frame_data.capture_mono_ns = epoch + rel` on output.
+`rtp_h264_pay` stamps a one-byte RFC 5285 extension (id **2**, 8 bytes big-endian) with the
+capture instant as **CLOCK_REALTIME** nanoseconds since the Unix epoch. `rtp_h264_depay` maps
+that value to local monotonic time when emitting each access unit so downstream stages keep using
+`frame_data.capture_mono_ns` for latency.
 
-That absolute mapping is only meaningful **in-process** (e.g. `stream_sdl` wires pay → depay).
-Cross-host receivers should treat `capture_mono_ns` as 0 unless a future side channel defines the
-epoch.
+**Clock requirements:** sender and receiver hosts must be time-synchronized (chrony, NTP, or
+PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
+estimate or correct offset in-band.
 
 ## Forward datagram (after FEC + RTP)
 
@@ -32,7 +32,7 @@ shard on the wire. Systematic shards add a 2 B big-endian payload length before 
 | FEC shard header | 4 | `block_id`, `shard_index`, `k`, `n` (see `rs_block_erasure`) |
 | Length prefix | 2 | Systematic shards only; BE byte count of following RTP datagram |
 | RTP fixed header | 12 | PT 96, marker on AU boundary; SSRC from payloader |
-| RTP extension | 16 | RFC 5285: id 1, 8 B relative capture ns (BE) |
+| RTP extension | 16 | RFC 5285: id 2, 8 B CLOCK_REALTIME capture ns (BE) |
 | Payload | var | Single NAL, STAP-A, or FU-A |
 
 `stream_receiver` strips FEC and length, then passes **`sock_data`** to `rtp_h264_depay` with

@@ -57,6 +57,14 @@ Factory names: `stream_receiver`, `rtp_h264_depay`, `h264_decoder_mpp`, `sdl_sin
 (`display`; configure `video_driver=kmsdrm` or factory aliases `sdl_kmsdrm` for DRM/KMS).
 Build with `-DENABLE_SDL_SINK=ON` (requires SDL2).
 
+### Latency (capture → present)
+
+Inside each host, stages measure delay with the local monotonic clock
+(`capture_mono_ns` on frames, deltas via `steady_mono_ns()`). On the wire, `rtp_h264_pay` converts
+capture time to **CLOCK_REALTIME** in the RTP extension; `rtp_h264_depay` converts back to local
+monotonic on output. Glass latency (`stream_sdl.glass_latency_ms`, `latency.glass_ms`) is
+capture → display and is meaningful across hosts when clocks are synchronized.
+
 ## Legacy aliases
 
 `stream_sink` / `stream_source` factory names map to `stream_sender` /

@@ -182,7 +182,6 @@ FU-A, capture-time header extension).
 |-----|-----|------------------|
 | `mtu` | C | 31..65507, default 1400 |
 | `fps` | C | 1..120, default 30 (90 kHz timestamps) |
-| `capture_epoch_ns` | Q | epoch of the capture-time extension |
 | `datagrams_dropped`, `pool_misses` | Q | counters |
 
 **`rtp_h264_depay`** — RTP → H.264 AU.
@@ -190,8 +189,8 @@ FU-A, capture-time header extension).
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `fps` | C | 1..120, default 30 |
-| `capture_epoch_ns` | C | set to the payloader's value (same process only) |
 | `au_dropped`, `nal_dropped`, `loss`, `need_idr`, `rtp_reordered` | Q | counters |
+| `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
 **`stream_sender`** — UDP egress with RS block-erasure FEC, pacing and a bounded queue. Threads:
 `input()` (caller), the send thread, and `configure()`. Lock order `mu` → `fec_mu`.
