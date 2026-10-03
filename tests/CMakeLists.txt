@@ -8,6 +8,7 @@ set(VSTREAMER_TEST_SOURCES
     h264_level_test.cpp
     key_util_test.cpp
     peer_link_metrics_test.cpp
+    stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
     shared_sized_buffer_test.cpp
