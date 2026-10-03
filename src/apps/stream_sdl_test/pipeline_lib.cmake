@@ -2,7 +2,7 @@ if(TARGET vstreamer_bench_pipeline)
     return()
 endif()
 
-set(_bench_pipeline_dir ${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl)
+set(_bench_pipeline_dir ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test)
 set(_bench_core
     ${_bench_pipeline_dir}/pipeline_state.cpp
     ${_bench_pipeline_dir}/diag.cpp
@@ -12,6 +12,7 @@ set(_bench_core
 if(VSTREAMER_APP_TX_OK AND VSTREAMER_APP_RX_OK)
     add_library(vstreamer_bench_pipeline STATIC
         ${_bench_core}
+        ${_bench_pipeline_dir}/bench_stream_metrics.cpp
         ${_bench_pipeline_dir}/channel_controller.cpp
         ${_bench_pipeline_dir}/link_emulator.cpp
         ${_bench_pipeline_dir}/bench_console.cpp

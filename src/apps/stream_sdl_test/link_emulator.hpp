@@ -11,7 +11,7 @@
 
 #include <netinet/in.h>
 
-#include "test_app/stream_sdl/channel_ports.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
 
 namespace vstreamer::test_app
 {

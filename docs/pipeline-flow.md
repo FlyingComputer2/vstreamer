@@ -4,7 +4,7 @@ Pad notation: `node.pad` — `A -> B.0` means A’s output links to B’s input 
 
 **App binaries:** `uvc_stream_sender` and `sdl_stream_receiver` implement the rover TX and GS RX
 graphs below. `stream_sdl` runs both graphs in one process plus the UDP channel emulator; all three
-link the same `vstreamer_bench_pipeline` stage/metrics code in `src/test_app/stream_sdl/`.
+link the same `vstreamer_bench_pipeline` stage/metrics code in `src/apps/stream_sdl_test/`.
 
 ## Rover (transmit)
 

@@ -3,7 +3,7 @@
 #include "apps/common/rx/rx_stages.hpp"
 
 #include "apps/common/stage_latency.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <cerrno>
 #include <cstdio>

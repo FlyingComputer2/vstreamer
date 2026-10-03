@@ -3,8 +3,8 @@
 
 #include "apps/common/rx/rx_metrics.hpp"
 #include "apps/common/tx/tx_metrics.hpp"
-#include "test_app/stream_sdl/channel_controller.hpp"
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/channel_controller.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 #include "apps/common/queues.hpp"
 
 #include "components/components.hpp"

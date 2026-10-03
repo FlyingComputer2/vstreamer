@@ -1,4 +1,4 @@
-#include "test_app/stream_sdl/link_emulator.hpp"
+#include "apps/stream_sdl_test/link_emulator.hpp"
 
 #include <gtest/gtest.h>
 

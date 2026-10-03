@@ -1,6 +1,6 @@
 #include "apps/common/tx/tx_metrics.hpp"
 
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <cstdlib>
 #include <mutex>

@@ -72,10 +72,19 @@ app_console &pipeline_controller::console()
     return console_;
 }
 
+void pipeline_controller::bind_legacy_run(std::atomic<bool> *legacy_run)
+{
+    legacy_run_ = legacy_run;
+}
+
 void pipeline_controller::request_stop()
 {
     stop_requested_.store(true, std::memory_order_release);
     run_.store(false, std::memory_order_release);
+    if (nullptr != legacy_run_)
+    {
+        legacy_run_->store(false, std::memory_order_release);
+    }
 }
 
 void pipeline_controller::install_signal_handlers()
@@ -106,6 +115,10 @@ void pipeline_controller::metrics_loop()
 void pipeline_controller::run()
 {
     run_.store(true, std::memory_order_release);
+    if (nullptr != legacy_run_)
+    {
+        legacy_run_->store(true, std::memory_order_release);
+    }
     stop_requested_.store(false, std::memory_order_release);
 
     g_active_controller = this;
@@ -124,6 +137,10 @@ void pipeline_controller::run()
     }
 
     run_.store(false, std::memory_order_release);
+    if (nullptr != legacy_run_)
+    {
+        legacy_run_->store(false, std::memory_order_release);
+    }
 
     if (metrics_thread_.joinable())
     {

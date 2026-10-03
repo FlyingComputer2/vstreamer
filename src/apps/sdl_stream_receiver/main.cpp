@@ -1,11 +1,12 @@
 #include "apps/common/app_console.hpp"
+#include "apps/common/pipeline_controller.hpp"
 #include "apps/common/cpu_map.hpp"
 #include "apps/common/queues.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "components/components.hpp"
-#include "test_app/stream_sdl/metrics_sync.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
-#include "test_app/stream_sdl/stages.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
+#include "apps/stream_sdl_test/stages.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -31,7 +32,8 @@ void usage(const char *prog)
                  "  --max-datagram N      default 1476\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5091\n"
                  "  --no-telemetry\n"
-                 "  --diag\n",
+                 "  --diag\n"
+                 "  --help\n",
                  prog);
 }
 
@@ -163,8 +165,11 @@ int main(int argc, char **argv)
     apps::present_frame_queue present_q(present_q_depth, g_run);
     apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
 
-    pipeline_rate_state rate;
-    apps::app_console   console;
+    pipeline_rate_state       rate;
+    apps::pipeline_controller ctrl;
+    ctrl.bind_legacy_run(&g_run);
+    ctrl.set_diag_enabled(diag);
+    apps::app_console &console = ctrl.console();
     console.set_bind_host(console_host.c_str());
     console.set_pipeline_metrics(&g_pipeline_metrics);
     console.set_pipeline_metrics_sync_live([&]() {
@@ -175,40 +180,35 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::signal(SIGINT, [](int) { g_run = false; });
-    std::signal(SIGTERM, [](int) { g_run = false; });
-    g_run = true;
-
-    std::thread rx_thr(rx_net_thread_main, &rcv, &depay, &au_q, &g_bench_diag);
-    std::thread dec_thr(decode_thread_main, &dec, &present_q, &au_q, &g_bench_diag);
-    std::thread present_thr(present_thread_main, preview, &present_q, width, height, kmsdrm,
-                            defer_sdl, &g_bench_diag);
-    std::thread tel_thr(telemetry_thread_main, &rcv);
-    std::thread metrics_thr([&]() {
-        while (g_run.load())
-        {
-            update_pipeline_metrics(g_bench_diag, nullptr, nullptr, &rcv, preview, kmsdrm, rate,
-                                    nullptr, nullptr, false, &dec);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+    ctrl.add_stage("rx_net", "rx",
+                   [&](std::atomic<bool> & /*run*/) {
+                       rx_net_thread_main(&rcv, &depay, &au_q, &g_bench_diag);
+                   });
+    ctrl.add_stage("decode", "rx",
+                   [&](std::atomic<bool> & /*run*/) {
+                       decode_thread_main(&dec, &present_q, &au_q, &g_bench_diag);
+                   });
+    ctrl.add_stage("present", "",
+                   [&](std::atomic<bool> & /*run*/) {
+                       present_thread_main(preview, &present_q, width, height, kmsdrm, defer_sdl,
+                                           &g_bench_diag);
+                   });
+    ctrl.add_stage("telemetry", "",
+                   [&](std::atomic<bool> & /*run*/) {
+                       telemetry_thread_main(&rcv);
+                   });
+    ctrl.add_metrics_sync([&]() {
+        update_pipeline_metrics(g_bench_diag, nullptr, nullptr, &rcv, preview, kmsdrm, rate,
+                                nullptr, nullptr, false, &dec);
     });
 
     std::fprintf(stderr, "sdl_stream_receiver: listen %s console %s:%d\n", listen,
                  console_host.c_str(), console_port);
-    while (g_run.load())
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    ctrl.run();
 
-    g_run = false;
     rcv.close();
     au_q.wake();
     present_q.wake();
-    rx_thr.join();
-    dec_thr.join();
-    present_thr.join();
-    tel_thr.join();
-    metrics_thr.join();
     console.stop();
     depay.close();
     dec.close();

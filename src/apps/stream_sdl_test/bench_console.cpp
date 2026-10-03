@@ -1,7 +1,7 @@
-#include "test_app/stream_sdl/bench_console.hpp"
+#include "apps/stream_sdl_test/bench_console.hpp"
 
 #include "apps/common/tx/tx_console.hpp"
-#include "test_app/stream_sdl/link_emulator.hpp"
+#include "apps/stream_sdl_test/link_emulator.hpp"
 
 #include "components/stream_sender.hpp"
 #include "core/component_coder.hpp"

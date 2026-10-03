@@ -1,12 +1,13 @@
 /* metrics_sync.cpp — split from stream_sdl (P11-T4). */
 
-#include "test_app/stream_sdl/metrics_sync.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
 
 #include "apps/common/app_metrics.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/tx_metrics.hpp"
 #include "apps/common/rx/rx_metrics.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/bench_stream_metrics.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <string>
 
@@ -191,27 +192,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     {
         enc_q_latency_ms = static_cast<double>(enc_q_depth) * 1000.0 / jpeg_out_fps;
     }
-    double       ch_fwd_kbps = 0.0;
-    uint64_t     ch_fwd_drops = 0;
-    double       ch_drop_pps = 0.0;
-    double       ch_drop_kbps = 0.0;
+    uint64_t ch_fwd_drops = 0;
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
-    ch_fwd_kbps =
-        ch.bytes_out > prev_ch_bytes_out
-            ? static_cast<double>(ch.bytes_out - prev_ch_bytes_out) * 8.0 / dt / 1000.0
-            : 0.0;
     ch_fwd_drops = ch.dropped_rate + ch.dropped_loss + ch.dropped_queue;
-    ch_drop_pps = apps::rate_per_sec(ch_fwd_drops, prev_ch_fwd_drops, dt);
-    if (rate.have_snap && dt > 0.0 && ch.bytes_in >= prev_ch_bytes_in &&
-        ch.bytes_out >= prev_ch_bytes_out)
-    {
-        const uint64_t din = ch.bytes_in - prev_ch_bytes_in;
-        const uint64_t dout = ch.bytes_out - prev_ch_bytes_out;
-        if (din > dout)
-        {
-            ch_drop_kbps = static_cast<double>(din - dout) * 8.0 / dt / 1000.0;
-        }
-    }
 #endif
 
     uint64_t sink_frames = now.rx_present_ok;
@@ -230,40 +213,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
 
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
-    if (nullptr != channel)
-    {
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.status"),
-                     "running");
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.display"),
-                     kmsdrm ? "kmsdrm" : "sdl");
-        if (kmsdrm)
-        {
-            const char *note = present_fps > 0.5 ? "kmsdrm presenting decoded frames"
-                                                 : "kmsdrm active; waiting for decode/present";
-            metric_store(*g_pipeline_metrics.get_metric("stream_sdl.note"), note);
-        }
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.pipeline_ok"),
-                     pipeline_flowing ? "yes" : "warming");
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.glass_latency_ms"),
-                     glass_ms);
-    }
-    metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
-    metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
-                 apps::g_latency_source_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
-                 apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"),
-                 apps::g_latency_enc_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"),
-                 apps::g_latency_enc_out_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
-                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
-                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
-                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
-                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
+    stream_sdl_test::publish_stream_sdl_status_metrics(channel, kmsdrm, present_fps,
+                                                       pipeline_flowing, glass_ms);
+    apps::rx::publish_latency_metrics(glass_ms);
 
     if (nullptr != sender)
     {
@@ -348,20 +300,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     }
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
-    if (nullptr != channel)
-    {
-        metric_store(*g_pipeline_metrics.get_metric("channel.forward_kbps"), ch_fwd_kbps);
-        metric_store(*g_pipeline_metrics.get_metric("channel.dropped_pps"), ch_drop_pps);
-        metric_store(*g_pipeline_metrics.get_metric("channel.dropped_kbps"), ch_drop_kbps);
-        const double ch_max_kbps = channel->max_kbps();
-        const double ch_constant_loss_pct = channel->constant_loss();
-        metric_store(*g_pipeline_metrics.get_metric("channel.max_kbps"), ch_max_kbps);
-        metric_store(*g_pipeline_metrics.get_metric("channel.constant_loss_pct"),
-                     ch_constant_loss_pct);
-        const size_t ch_queue = channel->forward_queue_size();
-        metric_store(*g_pipeline_metrics.get_metric("channel.queue"),
-                     static_cast<double>(ch_queue));
-    }
+    stream_sdl_test::publish_channel_rate_metrics(channel, dt, rate.have_snap, prev_ch_bytes_in,
+                                                  prev_ch_bytes_out, prev_ch_fwd_drops, ch);
 #endif
 
     if (nullptr != rcv)

@@ -2,7 +2,7 @@
 #define VSTREAMER_APPS_RX_RX_STAGES_HPP
 
 #include "apps/common/queues.hpp"
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include "components/components.hpp"
 

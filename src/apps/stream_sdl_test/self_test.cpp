@@ -1,10 +1,10 @@
 /* self_test.cpp — split from stream_sdl (P11-T4). */
 
-#include "test_app/stream_sdl/self_test.hpp"
+#include "apps/stream_sdl_test/self_test.hpp"
 
-#include "test_app/stream_sdl/diag.hpp"
-#include "test_app/stream_sdl/metrics_sync.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <cinttypes>
 
@@ -12,7 +12,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "test_app/stream_sdl/channel_ports.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
 
 namespace vstreamer::test_app
 {

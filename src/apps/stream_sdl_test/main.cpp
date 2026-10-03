@@ -40,17 +40,18 @@
 #include "apps/common/tx/source_selector.hpp"
 #include "apps/common/tx/source_selector_query_source.hpp"
 #endif
-#include "test_app/stream_sdl/channel_controller.hpp"
-#include "test_app/stream_sdl/channel_ports.hpp"
+#include "apps/stream_sdl_test/channel_controller.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
 #include "apps/common/cpu_map.hpp"
+#include "apps/common/pipeline_controller.hpp"
 #include "apps/common/queues.hpp"
 #include "apps/common/stage_latency.hpp"
-#include "test_app/stream_sdl/diag.hpp"
-#include "test_app/stream_sdl/encoder_types.hpp"
-#include "test_app/stream_sdl/metrics_sync.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
-#include "test_app/stream_sdl/self_test.hpp"
-#include "test_app/stream_sdl/stages.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
+#include "apps/stream_sdl_test/encoder_types.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
+#include "apps/stream_sdl_test/self_test.hpp"
+#include "apps/stream_sdl_test/stages.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -878,7 +879,11 @@ int main(int argc, char **argv)
     apps::present_frame_queue present_q(present_q_depth, g_run);
     apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
 
-    std::thread source_thr;
+    apps::pipeline_controller ctrl;
+    ctrl.bind_legacy_run(&g_run);
+    ctrl.set_diag_enabled(diag_log);
+    const int jpeg_workers = static_cast<int>(g_cpu_map.jpeg_workers.size());
+
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
     if (use_uvc_selector)
     {
@@ -889,59 +894,80 @@ int main(int argc, char **argv)
             [&](data_packet &&pkt) {
                 (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
             });
-        source_thr = std::thread(source_stage_selector_main, uvc_selector.get(), &mjpeg_q, &nv12_q,
-                                 &g_bench_diag);
+        ctrl.add_stage("source", "source",
+                       [&, sel = uvc_selector.get()](std::atomic<bool> & /*run*/) {
+                           source_stage_selector_main(sel, &mjpeg_q, &nv12_q, &g_bench_diag);
+                       });
     }
     else
 #endif
     {
-        source_thr = std::thread(source_stage_main, source, &mjpeg_q, &nv12_q, &g_bench_diag);
+        ctrl.add_stage("source", "source",
+                       [&, src = source](std::atomic<bool> & /*run*/) {
+                           source_stage_main(src, &mjpeg_q, &nv12_q, &g_bench_diag);
+                       });
     }
-    std::thread jpeg_thr;
     if (use_jpeg_decode)
     {
-        jpeg_thr = std::thread(jpeg_stage_main, &jdec, &mjpeg_q, &nv12_q, &g_bench_diag,
-                               static_cast<int>(g_cpu_map.jpeg_workers.size()));
+        ctrl.add_stage("jpeg", "jpeg", [&, jw = jpeg_workers](std::atomic<bool> & /*run*/) {
+            jpeg_stage_main(&jdec, &mjpeg_q, &nv12_q, &g_bench_diag, jw);
+        });
     }
-    std::thread encode_thr(encode_stage_main, &enc, &pay, &sender, &nv12_q, &g_bench_diag);
-    std::thread tel(telemetry_thread_main, &rcv);
-    std::thread metrics_thr([&, jpeg_active = use_jpeg_decode]() {
-        int bench_log_ticks = 0;
-        while (g_run.load())
+    ctrl.add_stage("encode", "encode", [&](std::atomic<bool> & /*run*/) {
+        encode_stage_main(&enc, &pay, &sender, &nv12_q, &g_bench_diag);
+    });
+    ctrl.add_stage("telemetry", "",
+                   [&](std::atomic<bool> & /*run*/) { telemetry_thread_main(&rcv); });
+    ctrl.add_metrics_sync([&]() {
+        static int bench_log_ticks = 0;
+        refresh_pipeline_metrics();
+        if (g_bench_metrics_log.load())
         {
-            refresh_pipeline_metrics();
-            if (g_bench_metrics_log.load())
+            ++bench_log_ticks;
+            if (bench_log_ticks >= 5)
             {
-                ++bench_log_ticks;
-                if (bench_log_ticks >= 5)
-                {
-                    bench_log_ticks = 0;
-                    log_bench_rate_line(pipeline_rate, enc, g_bench_diag);
-                }
+                bench_log_ticks = 0;
+                log_bench_rate_line(pipeline_rate, enc, g_bench_diag);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
-    std::thread present_thr(present_thread_main, preview, &present_q, width, height, kmsdrm,
-                            defer_sdl_to_present, &g_bench_diag);
-    std::thread rx_net(rx_net_thread_main, &rcv, &depay, &au_q, &g_bench_diag);
-    std::thread decode_thr(decode_thread_main, &dec, &present_q, &au_q, &g_bench_diag);
+    ctrl.add_stage("present", "",
+                   [&](std::atomic<bool> & /*run*/) {
+                       present_thread_main(preview, &present_q, width, height, kmsdrm,
+                                           defer_sdl_to_present, &g_bench_diag);
+                   });
+    ctrl.add_stage("rx_net", "rx", [&](std::atomic<bool> & /*run*/) {
+        rx_net_thread_main(&rcv, &depay, &au_q, &g_bench_diag);
+    });
+    ctrl.add_stage("decode", "rx", [&](std::atomic<bool> & /*run*/) {
+        decode_thread_main(&dec, &present_q, &au_q, &g_bench_diag);
+    });
+    if (!self_test && diag_log)
+    {
+        ctrl.add_stage("diag", "",
+                       [&](std::atomic<bool> &run) {
+                           while (run.load())
+                           {
+                               log_bench_diag(g_bench_diag, rcv, sender, enc, &channel);
+                               for (int i = 0; i < 20 && run.load(); ++i)
+                               {
+                                   std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                               }
+                           }
+                       });
+    }
 
     bool self_test_ok = true;
     if (self_test)
     {
+        std::thread runner([&]() { ctrl.run(); });
         self_test_ok = run_self_test(enc, preview, rcv, sender, console_port, &channel);
+        ctrl.request_stop();
+        runner.join();
     }
     else
     {
-        while (g_run.load())
-        {
-            if (diag_log)
-            {
-                log_bench_diag(g_bench_diag, rcv, sender, enc, &channel);
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-        }
+        ctrl.run();
     }
 
     shutdown_pipeline(enc, dec, sender, rcv, use_jpeg_decode ? &jdec : nullptr,
@@ -949,17 +975,8 @@ int main(int argc, char **argv)
                       &nv12_q);
     present_q.wake();
     au_q.wake();
-    source_thr.join();
-    if (jpeg_thr.joinable())
-    {
-        jpeg_thr.join();
-    }
-    encode_thr.join();
-    tel.join();
-    metrics_thr.join();
-    rx_net.join();
-    decode_thr.join();
-    present_thr.join();
+    mjpeg_q.wake_shutdown();
+    nv12_q.wake_shutdown();
     channel.stop();
     source->close();
     if (use_jpeg_decode)

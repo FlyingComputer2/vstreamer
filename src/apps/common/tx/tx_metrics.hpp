@@ -3,7 +3,7 @@
 
 #include <string>
 
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include "core/component_coder.hpp"
 #include "core/component_source.hpp"

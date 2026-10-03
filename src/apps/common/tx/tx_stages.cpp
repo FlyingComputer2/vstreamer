@@ -4,8 +4,8 @@
 
 #include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/source_selector.hpp"
-#include "test_app/stream_sdl/encoder_types.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/encoder_types.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <cerrno>
 #include <cstdio>

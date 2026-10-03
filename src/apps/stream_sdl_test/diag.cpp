@@ -1,11 +1,11 @@
 /* diag.cpp — split from stream_sdl (P11-T4). */
 
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include "apps/common/app_metrics.hpp"
-#include "test_app/stream_sdl/channel_controller.hpp"
-#include "test_app/stream_sdl/channel_ports.hpp"
-#include "test_app/stream_sdl/metrics_sync.hpp"
+#include "apps/stream_sdl_test/channel_controller.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
 
 #include <cinttypes>
 #include <cmath>

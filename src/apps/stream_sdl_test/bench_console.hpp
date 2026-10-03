@@ -5,7 +5,7 @@
 
 #include "apps/common/app_console.hpp"
 #include "apps/common/tx/tx_console.hpp"
-#include "test_app/stream_sdl/channel_ports.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
 
 namespace vstreamer
 {

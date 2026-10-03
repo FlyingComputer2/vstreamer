@@ -1,6 +1,6 @@
 /* pipeline_state.cpp — split from stream_sdl (P11-T4). */
 
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include "components/components.hpp"
 

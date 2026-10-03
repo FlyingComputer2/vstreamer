@@ -10,9 +10,9 @@ if(NOT ENABLE_H264_ENCODER_MPP AND NOT ENABLE_H264_ENCODER_CEDAR AND NOT ENABLE_
     message(FATAL_ERROR "ENABLE_TEST_STREAM_SDL requires ENABLE_H264_ENCODER_MPP, CEDAR, or INTEL")
 endif()
 
-set(_stream_sdl_sources
+set(_stream_sdl_test_sources
     main.cpp
     self_test.cpp
 )
-vstreamer_add_app(stream_sdl ${_stream_sdl_sources} LSAN COMMON)
-target_link_libraries(stream_sdl PRIVATE vstreamer_bench_pipeline)
+vstreamer_add_app(stream_sdl_test ${_stream_sdl_test_sources} LSAN COMMON)
+target_link_libraries(stream_sdl_test PRIVATE vstreamer_bench_pipeline)

@@ -1,4 +1,4 @@
-#include "test_app/stream_sdl/channel_controller.hpp"
+#include "apps/stream_sdl_test/channel_controller.hpp"
 
 namespace vstreamer::test_app
 {

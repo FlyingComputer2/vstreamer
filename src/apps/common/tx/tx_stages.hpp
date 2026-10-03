@@ -2,13 +2,13 @@
 #define VSTREAMER_APPS_TX_TX_STAGES_HPP
 
 #include "apps/common/queues.hpp"
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include "components/components.hpp"
 
 #if defined(ENABLE_H264_ENCODER_MPP) || defined(ENABLE_H264_ENCODER_CEDAR) || \
     defined(ENABLE_H264_ENCODER_INTEL)
-#include "test_app/stream_sdl/encoder_types.hpp"
+#include "apps/stream_sdl_test/encoder_types.hpp"
 #endif
 
 namespace vstreamer::apps::tx

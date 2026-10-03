@@ -5,7 +5,7 @@
 #include "apps/common/queues.hpp"
 #include "apps/common/rx/rx_state.hpp"
 #include "apps/common/tx/tx_state.hpp"
-#include "test_app/stream_sdl/diag.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include <atomic>
 #include <mutex>

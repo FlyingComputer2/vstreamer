@@ -7,6 +7,3 @@ if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
     add_subdirectory(rs_block_id_pace_test)
 endif()
 
-if(ENABLE_TEST_STREAM_SDL)
-    add_subdirectory(stream_sdl)
-endif()

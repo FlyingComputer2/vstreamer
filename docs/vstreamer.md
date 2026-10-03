@@ -3,7 +3,7 @@
 VStreamer is a C++17 library of independent video **components** (sources, coders, sinks) and
 the bench apps that wire them into a low-latency H.264-over-UDP path with Reed–Solomon FEC.
 The target is a rover camera (UVC → H.264 → radio) and a ground-station viewer (radio → decode
-→ display). Today one bench app, `stream_sdl`, runs both ends in one process over loopback.
+→ display). Today the loopback bench binary `stream_sdl_test` runs both ends in one process over loopback.
 
 This page describes the code as it is. Designed-but-not-built pieces (feedback plugin, config
 loader, core console, rover/winject wiring) are listed under
@@ -274,19 +274,20 @@ Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_O
 |--------|---------------|-----------------|------|
 | `uvc_stream_sender` | UDP to `--peer` | `127.0.0.1:5090` | TX: UVC or noise fallback (640×480 @ 30), JPEG, encode, RTP, `stream_sender` |
 | `sdl_stream_receiver` | `--listen 0.0.0.0:5001` | `127.0.0.1:5091` | RX: `stream_receiver`, depay, MPP decode, SDL/kmsdrm |
-| `stream_sdl` | loopback + channel emulator | `127.0.0.1:5090` | both halves + link bench |
+| `stream_sdl_test` | loopback + channel emulator | `127.0.0.1:5090` | both halves + link bench |
 
 One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
 `max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
 reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). See
 [latency_system_time.md](../aidocs/latency_system_time.md) for clock sync on multi-host links.
 
-Stage threads and metrics for TX/RX are shared via `vstreamer_bench_pipeline` (`stages.cpp`,
-`metrics_sync.cpp`) so `stream_sdl` and the split apps stay aligned.
+Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
+`tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
+so `stream_sdl_test` and the split apps stay aligned.
 
-## Bench app: `stream_sdl`
+## Bench app: `stream_sdl_test`
 
-`src/test_app/stream_sdl/` (`-DENABLE_TEST_STREAM_SDL=ON`) is the pipeline creator for the
+`src/apps/stream_sdl_test/` (`-DENABLE_TEST_STREAM_SDL=ON`) is the pipeline creator for the
 loopback bench: it builds and configures every component, sizes the payloader MTU from
 `stream_sender` `max_input`, and runs both ends plus a UDP link emulator in one process.
 
@@ -298,21 +299,22 @@ source → [jpeg] → encoder → rtp_h264_pay → stream_sender ─▶ link_emu
 | File | Role |
 |------|------|
 | `main.cpp` | CLI/env parsing, component construction and wiring, thread start/join |
-| `stages.{hpp,cpp}` | per-stage thread loops (source, jpeg, encode, rx, decode, present) |
-| `queues.hpp` | bounded drop-oldest queues between stages |
+| `apps/common/tx/tx_stages.*`, `rx/rx_stages.*` | per-stage thread loops |
+| `apps/common/queues.*` | bounded drop-oldest queues between stages |
 | `metrics_sync.{hpp,cpp}`, `diag.{hpp,cpp}` | pipeline metrics and `--diag` lines |
 | `link_emulator.{hpp,cpp}` | UDP relay with rate cap, random loss, queue |
 | `bench_console.{hpp,cpp}` | UDP console (`:5090`) |
 | `channel_controller.{hpp,cpp}` | facade over emulator + console |
-| `camera_noise_mux.{hpp,cpp}` | UVC with noise fallback on `-ENODEV` |
-| `cpu_map.{hpp,cpp}` | `VSTREAMER_CPU_MAP` parsing |
+| `apps/common/tx/source_selector.*` | UVC with noise fallback on `-ENODEV` |
+| `apps/common/cpu_map.*` | `VSTREAMER_CPU_MAP` parsing |
+| `bench_stream_metrics.*` | `stream_sdl.*` / `channel.*` metric keys |
 | `self_test.{hpp,cpp}` | `--self-test` |
 
 Common runs:
 
 ```bash
-out/full/src/test_app/stream_sdl/stream_sdl --diag                                  # noise source, SDL window
-out/full/src/test_app/stream_sdl/stream_sdl --display kmsdrm --source /dev/video0  # UVC on DRM/KMS
+out/full/src/apps/stream_sdl_test/stream_sdl_test --diag                                  # noise source, SDL window
+out/full/src/apps/stream_sdl_test/stream_sdl_test --display kmsdrm --source /dev/video0  # UVC on DRM/KMS
 ```
 
 `--help` lists every flag. Main environment variables: `VSTREAMER_FEC` (`none` disables FEC),
@@ -402,7 +404,7 @@ defines the same `ENABLE_*` macros for `#ifdef` in app code, and
 | `ENABLE_RTP_H264_PAY` | ON | `rtp_h264_pay` |
 | `ENABLE_RTP_H264_DEPAY` | ON | `rtp_h264_depay` |
 | `VSTREAMER_BUILD_TESTS` | OFF | GoogleTest suite + `ctest` registration |
-| `ENABLE_TEST_STREAM_SDL` | OFF | `stream_sdl`; needs noise or V4L2, JPEG decoder, sender/receiver, RTP pay/depay, MPP decoder, SDL sink and one encoder (configure fails otherwise) |
+| `ENABLE_TEST_STREAM_SDL` | OFF | `stream_sdl_test`; needs noise or V4L2, JPEG decoder, sender/receiver, RTP pay/depay, MPP decoder, SDL sink and one encoder (configure fails otherwise) |
 | `ENABLE_TEST_NOISE_STREAM_SDL`, `ENABLE_TEST_UVC_JPEGDEC_KMSDRM`, `ENABLE_TEST_UVC_JPEGDEC_DMKS` | OFF | deprecated aliases that turn on `ENABLE_TEST_STREAM_SDL` |
 
 ASan builds (`-fsanitize=address` in `CMAKE_CXX_FLAGS`) link LeakSanitizer suppressions for
@@ -436,7 +438,7 @@ component layer exists today; the rest is still design.
 | Component layer (`component_*`, `data_packet`, factory) | **done** | this page |
 | `stream_sender` / `stream_receiver` + RS block-erasure FEC | **done** | |
 | `rtp_h264_pay` / `rtp_h264_depay` | **done** | |
-| Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl` |
+| Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl_test` |
 | External CBR controller (FEC-gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
 | Separate `stream_sender` / `stream_receiver` apps | **planned** | wire telemetry done; see `aidocs/split-streamer.md` |
 | Reverse telemetry datagram (receiver → sender) | **done** | `core/stream_telemetry.hpp`; `peer_*` from reports when telemetry on |

@@ -7,9 +7,9 @@
 #include "apps/common/tx/source_selector_query_source.hpp"
 #include "apps/common/tx/tx_console.hpp"
 #include "components/components.hpp"
-#include "test_app/stream_sdl/metrics_sync.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
-#include "test_app/stream_sdl/stages.hpp"
+#include "apps/stream_sdl_test/metrics_sync.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
+#include "apps/stream_sdl_test/stages.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -44,9 +44,13 @@ void usage(const char *prog)
                  "  --max-datagram N    default 1476\n"
                  "  --local [HOST:]PORT stream_sender bind (winject static)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
+                 "  --mtu N             RTP MTU (default 1400)\n"
+                 "  --noise-bandwidth N 0..100 (default 100)\n"
+                 "  --noise-block-size N legacy no-op (default 0)\n"
                  "  --noise-pregenerate N default 30 (0=live FFT)\n"
                  "  --no-telemetry      disable reverse telemetry\n"
-                 "  --diag\n",
+                 "  --diag\n"
+                 "  --help\n",
                  prog);
 }
 
@@ -70,6 +74,9 @@ int main(int argc, char **argv)
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
     int         pregenerate = 30;
+    int         mtu = 1400;
+    int         noise_bandwidth = 100;
+    int         noise_block_size = 0;
     bool        no_telemetry = false;
     bool        diag = false;
 
@@ -139,6 +146,28 @@ int main(int argc, char **argv)
             }
             continue;
         }
+        if (0 == std::strcmp(argv[i], "--mtu") && i + 1 < argc)
+        {
+            mtu = std::atoi(argv[++i]);
+            continue;
+        }
+        if ((0 == std::strcmp(argv[i], "--noise-bandwidth") ||
+             0 == std::strcmp(argv[i], "--noise-randomness")) &&
+            i + 1 < argc)
+        {
+            noise_bandwidth = std::atoi(argv[++i]);
+            if (noise_bandwidth < 0 || noise_bandwidth > 100)
+            {
+                std::fprintf(stderr, "--noise-bandwidth must be 0..100\n");
+                return 1;
+            }
+            continue;
+        }
+        if (0 == std::strcmp(argv[i], "--noise-block-size") && i + 1 < argc)
+        {
+            noise_block_size = std::atoi(argv[++i]);
+            continue;
+        }
         if (0 == std::strcmp(argv[i], "--noise-pregenerate") && i + 1 < argc)
         {
             pregenerate = std::atoi(argv[++i]);
@@ -178,12 +207,12 @@ int main(int argc, char **argv)
     char stream_buf[128];
     std::snprintf(size_buf, sizeof(size_buf), "%dx%d", width, height);
     std::snprintf(fps_buf, sizeof(fps_buf), "%d", fps);
-    std::snprintf(bw_buf, sizeof(bw_buf), "%d", 100);
-    std::snprintf(blk_buf, sizeof(blk_buf), "%d", 0);
+    std::snprintf(bw_buf, sizeof(bw_buf), "%d", noise_bandwidth);
+    std::snprintf(blk_buf, sizeof(blk_buf), "%d", noise_block_size);
     std::snprintf(pre_buf, sizeof(pre_buf), "%d", pregenerate);
     const int gop_eff = gop > 0 ? gop : fps;
     std::snprintf(gop_buf, sizeof(gop_buf), "%d", gop_eff);
-    std::snprintf(mtu_buf, sizeof(mtu_buf), "%d", 1400);
+    std::snprintf(mtu_buf, sizeof(mtu_buf), "%d", mtu);
     std::snprintf(stream_buf, sizeof(stream_buf), "%s", peer);
 
     char noise_size[32];
@@ -215,6 +244,8 @@ int main(int argc, char **argv)
     cfg(enc, "fps", fps_buf);
     cfg(enc, "gop", gop_buf);
     cfg(pay, "fps", fps_buf);
+    cfg(pay, "mtu", mtu_buf);
+    cfg(sender, "mtu", mtu_buf);
     cfg(sender, "stream", stream_buf);
     if (nullptr != local_bind)
     {
@@ -285,8 +316,11 @@ int main(int argc, char **argv)
             (void)enqueue_source_frame(std::move(p), &mjpeg_q, &nv12_q, &g_bench_diag);
         });
 
-    pipeline_rate_state rate;
-    apps::app_console console;
+    pipeline_rate_state       rate;
+    apps::pipeline_controller ctrl;
+    ctrl.bind_legacy_run(&g_run);
+    ctrl.set_diag_enabled(diag);
+    apps::app_console &console = ctrl.console();
     console.set_bind_host(console_host.c_str());
     console.set_pipeline_metrics(&g_pipeline_metrics);
     console.set_pipeline_metrics_sync_live([&]() {
@@ -325,37 +359,28 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    std::signal(SIGINT, [](int) { g_run = false; });
-    std::signal(SIGTERM, [](int) { g_run = false; });
-    g_run = true;
-
-    std::thread source_thr(source_stage_selector_main, selector.get(), &mjpeg_q, &nv12_q,
-                           &g_bench_diag);
-    std::thread jpeg_thr(jpeg_stage_main, &jdec, &mjpeg_q, &nv12_q, &g_bench_diag,
-                         static_cast<int>(g_cpu_map.jpeg_workers.size()));
-    std::thread encode_thr(encode_stage_main, &enc, &pay, &sender, &nv12_q, &g_bench_diag);
-    std::thread metrics_thr([&]() {
-        while (g_run.load())
-        {
-            update_pipeline_metrics(g_bench_diag, &enc, &sender, nullptr, nullptr, false, rate,
-                                    nullptr, &jdec, true, nullptr);
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+    const int jpeg_workers = static_cast<int>(g_cpu_map.jpeg_workers.size());
+    ctrl.add_stage("source", "source",
+                   [&, sel = selector.get()](std::atomic<bool> & /*run*/) {
+                       source_stage_selector_main(sel, &mjpeg_q, &nv12_q, &g_bench_diag);
+                   });
+    ctrl.add_stage("jpeg", "jpeg", [&, jw = jpeg_workers](std::atomic<bool> & /*run*/) {
+        jpeg_stage_main(&jdec, &mjpeg_q, &nv12_q, &g_bench_diag, jw);
+    });
+    ctrl.add_stage("encode", "encode", [&](std::atomic<bool> & /*run*/) {
+        encode_stage_main(&enc, &pay, &sender, &nv12_q, &g_bench_diag);
+    });
+    ctrl.add_metrics_sync([&]() {
+        update_pipeline_metrics(g_bench_diag, &enc, &sender, nullptr, nullptr, false, rate,
+                                nullptr, &jdec, true, nullptr);
     });
 
     std::fprintf(stderr, "uvc_stream_sender: peer %s device %s %s @ %d console %s:%d\n", peer,
                  device, size_buf, fps, console_host.c_str(), console_port);
-    while (g_run.load())
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+    ctrl.run();
 
     mjpeg_q.wake_shutdown();
     nv12_q.wake_shutdown();
-    source_thr.join();
-    jpeg_thr.join();
-    encode_thr.join();
-    metrics_thr.join();
     console.stop();
     selector->close();
     sender.close();

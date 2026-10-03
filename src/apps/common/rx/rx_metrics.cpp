@@ -1,7 +1,8 @@
 #include "apps/common/rx/rx_metrics.hpp"
 
+#include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/tx_metrics.hpp"
-#include "test_app/stream_sdl/pipeline_state.hpp"
+#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <chrono>
 #include <mutex>
@@ -152,6 +153,27 @@ void telemetry_thread_main(stream_receiver *rcv)
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+}
+
+void publish_latency_metrics(double glass_ms)
+{
+    metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
+                 apps::g_latency_source_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
+                 apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"),
+                 apps::g_latency_enc_in_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"),
+                 apps::g_latency_enc_out_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
+                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
+                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
+                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
+                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
 }
 
 }  // namespace vstreamer::apps::rx

@@ -32,6 +32,9 @@ public:
     void         request_stop();
     void         run();
 
+    /** Keeps legacy stage globals (e.g. test_app::g_run) in sync with the controller run flag. */
+    void bind_legacy_run(std::atomic<bool> *legacy_run);
+
     [[nodiscard]] bool diag_enabled() const
     {
         return diag_enabled_.load(std::memory_order_relaxed);
@@ -55,7 +58,8 @@ private:
     std::atomic<bool>                  run_ {true};
     std::atomic<bool>                  diag_enabled_ {false};
     std::atomic<bool>                  stop_requested_ {false};
-    std::thread metrics_thread_;
+    std::thread                      metrics_thread_;
+    std::atomic<bool>               *legacy_run_ {nullptr};
 };
 
 }  // namespace vstreamer::apps

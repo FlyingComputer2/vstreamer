@@ -1,8 +1,8 @@
 #ifndef VSTREAMER_TEST_APP_SELF_TEST_HPP
 #define VSTREAMER_TEST_APP_SELF_TEST_HPP
 
-#include "test_app/stream_sdl/channel_controller.hpp"
-#include "test_app/stream_sdl/encoder_types.hpp"
+#include "apps/stream_sdl_test/channel_controller.hpp"
+#include "apps/stream_sdl_test/encoder_types.hpp"
 
 #include "components/components.hpp"
 
