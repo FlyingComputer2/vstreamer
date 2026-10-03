@@ -159,6 +159,10 @@ class GapLoss:
         self.filtered_gap_rate = 0.0
         self.filtered_recv_rate = 0.0
 
+    def reset(self) -> None:
+        self._recv_delta = CounterDelta()
+        self._gap_delta = CounterDelta()
+
     def _combine(self, fg: float, fr: float, prev: float) -> float:
         total = fg + fr
         if total >= self._min_total_rate:
@@ -273,7 +277,9 @@ class LossRateControl:
         self.is_holding = False
         self._hold_until = -math.inf
 
-    def step(self, fec_gap_delta: float, dt: float, now: float) -> float:
+    def step(
+        self, fec_gap_delta: float, dt: float, now: float, allow_increase: bool = True
+    ) -> float:
         gap = max(0.0, fec_gap_delta)
         self.loss_event = False
         self.is_holding = now < self._hold_until
@@ -283,7 +289,7 @@ class LossRateControl:
             self._hold_until = now + self._hold_s
             self.loss_event = True
             self.is_holding = True
-        elif not self.is_holding:
+        elif not self.is_holding and allow_increase:
             near = self.cbr_loss is not None and self.cbr > self.cbr_loss * (1.0 - self._margin)
             self.cbr += (self._ramp_slow if near else self._ramp) * max(0.0, dt)
             if self.cbr_loss is not None and self.cbr > self.cbr_loss * (1.0 + self._margin):
