@@ -1,0 +1,37 @@
+---
+description: Debugging discipline — verify before assuming
+alwaysApply: true
+---
+
+# Debugging discipline
+
+## Before changing code
+- State the observable failure in one sentence and how you will tell it is fixed.
+- Decide whether the bug is in the **data path** or in the **measurement**. Do not
+  change a metric/counter until you have shown the underlying data is correct.
+- List 2–3 candidate causes. For each, name the evidence that would confirm or
+  rule it out, then go get that evidence. Do not fix the first plausible cause
+  without checking the others.
+
+## Trace beyond the file you were pointed at
+- Find every caller of the code you touch (`rg` the function / config key),
+  including scripts, controllers, and console commands.
+- For each piece of state: which **threads** touch it, and under which lock?
+- Check the lifecycle: `init` / reconfigure / `close` / restart of **either**
+  peer, mid-stream join, and loss of a whole unit (packet, block).
+- Check what changes **at runtime** (config set while running), not just startup.
+
+## Verification must be able to fail
+- Before fixing, write or run a test that reproduces the bug and fails.
+- Unit tests of one class are not enough for pipeline bugs: exercise the real
+  producer → transport → consumer path, including runtime reconfiguration.
+- For multi-threaded code, run the check under ThreadSanitizer
+  (`-fsanitize=thread`) when practical.
+
+## When the user says "still broken"
+- Stop patching. Assume your model of the system is wrong. Re-read the call
+  graph and list which earlier assumptions were never verified.
+
+## Reporting
+- Separate **verified** (ran it, saw it) from **assumed** (reasoned, not tested).
+- Never call a fix done based only on a test that also passed before the fix.

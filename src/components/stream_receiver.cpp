@@ -1,10 +1,8 @@
 #include "components/stream_receiver.hpp"
 
-#include "core/fec_stream_header.hpp"
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
 #include "core/sequence_gap.hpp"
-#include "core/stream_air_limits.hpp"
 #include "core/stream_header.hpp"
 
 #include <cerrno>
@@ -20,6 +18,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 namespace
@@ -28,7 +27,7 @@ namespace
 double now_sec()
 {
     struct timespec ts {};
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
@@ -65,6 +64,30 @@ void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t
 namespace vstreamer
 {
 
+namespace
+{
+
+size_t max_fec_shard_bytes(int max_datagram)
+{
+    if (max_datagram <= static_cast<int>(k_stream_header_len))
+    {
+        return 0;
+    }
+    return static_cast<size_t>(max_datagram) - k_stream_header_len;
+}
+
+size_t max_decoded_app_bytes(int max_datagram)
+{
+    const size_t shard = max_fec_shard_bytes(max_datagram);
+    if (shard <= rs_block_erasure::k_header_len + rs_block_erasure::k_len_prefix)
+    {
+        return 0;
+    }
+    return shard - rs_block_erasure::k_header_len - rs_block_erasure::k_len_prefix;
+}
+
+}  // namespace
+
 stream_receiver::stream_receiver() : pool(static_cast<size_t>(1500), k_queue_depth) {}
 
 stream_receiver::~stream_receiver()
@@ -91,31 +114,27 @@ packet_kind_e stream_receiver::output_packet_kind(uint8_t port) const
     return packet_kind_e::SOCK;
 }
 
-void stream_receiver::enqueue_payload_copy(const uint8_t *data, size_t len)
+void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload)
 {
-    if (nullptr == data || 0 == len || len + k_fec_stream_header_len > k_stream_payload_max)
+    int dg = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        dg = max_datagram;
+    }
+    const size_t app_max = max_decoded_app_bytes(dg);
+    if (payload.empty() || 0 == app_max || payload.size() > app_max)
     {
         std::lock_guard<std::mutex> lock(mu);
         recv_dropped++;
         return;
     }
 
-    data_packet pkt;
-    const size_t wire_len = k_fec_stream_header_len + len;
-    uint8_t     *copy = pool.acquire(wire_len);
-    if (nullptr == copy)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        recv_dropped++;
-        return;
-    }
-
-    const uint16_t seq = fec_payload_sequence++;
-    fec_stream_header_store_be16(copy, seq);
-    std::memcpy(copy + k_fec_stream_header_len, data, len);
-    auto sd = std::make_unique<sock_data>();
+    const size_t payload_len = payload.size();
+    data_packet  pkt;
+    auto         sd = std::make_unique<sock_data>();
     sd->pts = 0;
-    sd->buf.reset(copy, wire_len, &packet_pool::release);
+    sd->seq = fec_payload_sequence++;
+    sd->buf = std::move(payload);
     pkt.reset(std::move(sd));
 
     bool evicted = false;
@@ -131,7 +150,7 @@ void stream_receiver::enqueue_payload_copy(const uint8_t *data, size_t len)
     {
         std::lock_guard<std::mutex> lock(mu);
         fec_packet_received.fetch_add(1, std::memory_order_relaxed);
-        recv_bytes.fetch_add(len, std::memory_order_relaxed);
+        recv_bytes.fetch_add(payload_len, std::memory_order_relaxed);
         if (evicted)
         {
             recv_dropped++;
@@ -140,26 +159,34 @@ void stream_receiver::enqueue_payload_copy(const uint8_t *data, size_t len)
     q_cv.notify_all();
 }
 
-void stream_receiver::enqueue_payloads(std::vector<std::vector<uint8_t>> *payloads)
+void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads)
 {
     if (nullptr == payloads)
     {
         return;
     }
-    for (const auto &payload : *payloads)
+    for (auto &payload : *payloads)
     {
-        enqueue_payload_copy(payload.data(), payload.size());
+        enqueue_payload_buffer(std::move(payload));
     }
     payloads->clear();
 }
 
 void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
 {
-    std::vector<std::vector<uint8_t>> payloads;
+    fec_rx_payload_list payloads;
     {
         std::lock_guard<std::mutex> lock(mu);
+        if (len > static_cast<size_t>(max_datagram))
+        {
+            rx_oversize.fetch_add(1, std::memory_order_relaxed);
+            recv_dropped++;
+            return;
+        }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
+
+        const size_t shard_max = max_fec_shard_bytes(max_datagram);
 
         /* stream_header_s always prefixes the FEC shard (UDP gap telemetry). */
         const uint8_t *fec_buf = data;
@@ -179,7 +206,19 @@ void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             }
         }
 
-        fec.push_air(fec_buf, fec_len, &payloads);
+        if (fec_len < rs_block_erasure::k_header_len || 0 == shard_max || fec_len > shard_max)
+        {
+            recv_dropped++;
+            return;
+        }
+        shared_sized_buffer shard = pool.acquire(fec_len);
+        if (0 == shard.capacity() || shard.size() != fec_len)
+        {
+            recv_dropped++;
+            return;
+        }
+        std::memcpy(shard.u8(), fec_buf, fec_len);
+        fec.push_air(std::move(shard), &payloads);
         note_fec_output_gaps(fec, fec_gap_count);
         fec_rec = fec.recovered();
         fec_lost = fec.decode_fail();
@@ -199,12 +238,18 @@ void stream_receiver::stop_recv_thread()
         if (recv_fd >= 0)
         {
             ::shutdown(recv_fd, SHUT_RDWR);
-            ::close(recv_fd);
-            recv_fd = -1;
         }
     }
     q_cv.notify_all();
     recv_thread.join();
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (recv_fd >= 0)
+        {
+            ::close(recv_fd);
+            recv_fd = -1;
+        }
+    }
     recv_stop = false;
 }
 
@@ -213,7 +258,7 @@ void stream_receiver::recv_thread_main()
     /* Bounded wait so block expiry and the in-order emit queue advance even
      * when the wire goes quiet (e.g. tail of a burst loss). */
     constexpr int k_poll_ms = 10;
-    uint8_t       buf[2048];
+    uint8_t       buf[65536];
     while (!recv_stop)
     {
         int fd = -1;
@@ -250,16 +295,26 @@ void stream_receiver::recv_thread_main()
             /* Drain everything that is ready before ticking. */
             for (;;)
             {
-                const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+                msghdr msg {};
+                iovec  iov {};
+                iov.iov_base = buf;
+                iov.iov_len = sizeof(buf);
+                msg.msg_iov = &iov;
+                msg.msg_iovlen = 1;
+                const ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
                 if (n <= 0)
                 {
                     break;
+                }
+                if ((msg.msg_flags & MSG_TRUNC) != 0)
+                {
+                    rx_truncated.fetch_add(1, std::memory_order_relaxed);
                 }
                 ingest_datagram(buf, static_cast<size_t>(n));
             }
         }
 
-        std::vector<std::vector<uint8_t>> payloads;
+        fec_rx_payload_list payloads;
         {
             std::lock_guard<std::mutex> lock(mu);
             fec.poll_rx(&payloads);
@@ -282,25 +337,28 @@ stream_receiver_counters stream_receiver::link_counters_snapshot() const
 
 int stream_receiver::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
+    std::string spec_copy;
     {
-        return 0;
-    }
-
-    if (listen_spec.empty())
-    {
-        return -EINVAL;
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return 0;
+        }
+        if (listen_spec.empty())
+        {
+            return -EINVAL;
+        }
+        spec_copy = listen_spec;
     }
 
     char host[128];
     int  port = 0;
-    if (parse_host_port(listen_spec, host, sizeof(host), &port) < 0)
+    if (parse_host_port(spec_copy, host, sizeof(host), &port) < 0)
     {
-        if (listen_spec.size() > 0 && listen_spec[0] == ':')
+        if (spec_copy.size() > 0 && spec_copy[0] == ':')
         {
             std::string p = "0";
-            p += listen_spec;
+            p += spec_copy;
             if (parse_host_port(p, host, sizeof(host), &port) < 0)
             {
                 return -EINVAL;
@@ -312,8 +370,8 @@ int stream_receiver::open()
         }
     }
 
-    recv_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (recv_fd < 0)
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0)
     {
         return -errno;
     }
@@ -321,41 +379,49 @@ int stream_receiver::open()
     sockaddr_in addr {};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (0 == std::strcmp(host, "0") || 0 == std::strcmp(host, "0.0.0.0") ||
-        0 == std::strcmp(host, ""))
+    if (resolve_ipv4_bind_addr(host, true, &addr.sin_addr) < 0)
     {
-        addr.sin_addr.s_addr = INADDR_ANY;
-    }
-    else if (inet_pton(AF_INET, host, &addr.sin_addr) != 1)
-    {
-        ::close(recv_fd);
-        recv_fd = -1;
+        ::close(fd);
         return -EINVAL;
     }
 
-    if (bind(recv_fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
     {
         const int err = errno;
         std::fprintf(stderr, "stream_receiver: bind %s:%d failed: %s\n", host, port,
                      std::strerror(err));
-        ::close(recv_fd);
-        recv_fd = -1;
+        ::close(fd);
         return -err;
     }
 
     constexpr int k_sock_buf = 16 * 1024 * 1024;
-    (void)setsockopt(recv_fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
 
-    udp_packet_received.store(0, std::memory_order_relaxed);
-    fec_packet_received.store(0, std::memory_order_relaxed);
-    udp_gap_count.store(0, std::memory_order_relaxed);
-    fec_gap_count.store(0, std::memory_order_relaxed);
-    last_udp_seq = 0;
-    have_udp_seq = false;
-    fec_payload_sequence = 0;
-    opened = true;
-    recv_stop = false;
-    recv_thread = std::thread(&stream_receiver::recv_thread_main, this);
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            ::close(fd);
+            return 0;
+        }
+        recv_fd = fd;
+        udp_packet_received.store(0, std::memory_order_relaxed);
+        fec_packet_received.store(0, std::memory_order_relaxed);
+        udp_gap_count.store(0, std::memory_order_relaxed);
+        fec_gap_count.store(0, std::memory_order_relaxed);
+        last_udp_seq = 0;
+        have_udp_seq = false;
+        fec_payload_sequence = 0;
+        rx_oversize.store(0, std::memory_order_relaxed);
+        opened = true;
+        recv_stop = false;
+        recv_thread = std::thread(&stream_receiver::recv_thread_main, this);
+    }
+
+    {
+        std::lock_guard<std::mutex> qlock(q_mu);
+        stopping = false;
+    }
 
     std::fprintf(stderr, "stream_receiver: listen %s:%d\n", host, port);
     return 0;
@@ -363,10 +429,21 @@ int stream_receiver::open()
 
 void stream_receiver::close()
 {
+    {
+        std::lock_guard<std::mutex> qlock(q_mu);
+        stopping = true;
+    }
+    q_cv.notify_all();
+
     stop_recv_thread();
 
     std::lock_guard<std::mutex> lock(mu);
     opened = false;
+    if (recv_fd >= 0)
+    {
+        ::close(recv_fd);
+        recv_fd = -1;
+    }
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);
@@ -390,22 +467,26 @@ int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
     {
         if (timeout_ms < 0)
         {
-            q_cv.wait(lock, [this] { return !payload_queue.empty(); });
+            q_cv.wait(lock, [this] { return stopping || !payload_queue.empty(); });
         }
         else
         {
             q_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                          [this] { return !payload_queue.empty(); });
+                          [this] { return stopping || !payload_queue.empty(); });
         }
     }
 
     if (payload_queue.empty())
     {
+        if (stopping)
+        {
+            return -EBADF;
+        }
         return -EAGAIN;
     }
 
     const size_t egress_bytes =
-        data_packet::cast<sock_data>(payload_queue.front()).buf.size;
+        data_packet::cast<sock_data>(payload_queue.front()).buf.size();
     out = std::move(payload_queue.front());
     payload_queue.pop_front();
     lock.unlock();
@@ -416,44 +497,38 @@ int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
     return 0;
 }
 
-int stream_receiver::configure(uint64_t /*key*/, int64_t /*value*/)
+int stream_receiver::configure(std::string_view key, std::string_view value)
 {
-    return -ENOTSUP;
-}
-
-int stream_receiver::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -ENOTSUP;
-}
-
-int stream_receiver::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if ("listen" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        listen_spec.assign(value->data(), value->size());
+        listen_spec.assign(value.data(), value.size());
+        return 0;
+    }
+    if ("max_datagram" == key)
+    {
+        int64_t v = 0;
+        if (key_parse_i64(value, &v) < 0 || v < 64 || v > 65507 || value.size() > 31)
+        {
+            return -EINVAL;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        max_datagram = static_cast<int>(v);
         return 0;
     }
     return -ENOTSUP;
 }
 
-int stream_receiver::query(std::string_view key, std::string_view *value) const
+int stream_receiver::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if ("listen" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        query_buf = listen_spec;
-        *value = query_buf;
+        *value = listen_spec;
         return 0;
     }
     if ("out_rate" == key)
@@ -461,8 +536,7 @@ int stream_receiver::query(std::string_view key, std::string_view *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(egress_kbps));
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if ("udp_packet_received" == key || "fec_packet_received" == key || "udp_gap_count" == key ||
@@ -487,18 +561,50 @@ int stream_receiver::query(std::string_view key, std::string_view *value) const
         }
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
-    if ("fec_recovered" == key || "fec_failures" == key)
+    if ("fec_recovered" == key || "fec_failures" == key || "fec_hdr_errors" == key ||
+        "fec_kn_mismatch" == key || "fec_evicted_blocks" == key || "fec_rs_failures" == key ||
+        "fec_missing_shards" == key || "fec_late_blocks" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        char buf[32];
-        const uint64_t n = ("fec_recovered" == key) ? fec_rec : fec_lost;
+        char           buf[32];
+        uint64_t       n = 0;
+        if ("fec_recovered" == key)
+        {
+            n = fec_rec;
+        }
+        else if ("fec_failures" == key)
+        {
+            n = fec_lost;
+        }
+        else if ("fec_hdr_errors" == key)
+        {
+            n = fec.hdr_errors();
+        }
+        else if ("fec_kn_mismatch" == key)
+        {
+            n = fec.kn_mismatch();
+        }
+        else if ("fec_evicted_blocks" == key)
+        {
+            n = fec.evicted_blocks();
+        }
+        else if ("fec_rs_failures" == key)
+        {
+            n = fec.rs_failures();
+        }
+        else if ("fec_missing_shards" == key)
+        {
+            n = fec.missing_shards();
+        }
+        else
+        {
+            n = fec.late_blocks();
+        }
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if ("stats" == key)
@@ -518,8 +624,37 @@ int stream_receiver::query(std::string_view key, std::string_view *value) const
                       recv_wire_bytes.load(std::memory_order_relaxed), recv_dropped,
                       static_cast<double>(egress_kbps), fec_rec,
                       fec_lost);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
+        return 0;
+    }
+    if ("rx_truncated" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      rx_truncated.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("max_datagram" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", max_datagram);
+        *value = buf;
+        return 0;
+    }
+    if ("rx_oversize" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, rx_oversize.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("pool_misses" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, pool.misses());
+        *value = buf;
         return 0;
     }
     return -ENOTSUP;

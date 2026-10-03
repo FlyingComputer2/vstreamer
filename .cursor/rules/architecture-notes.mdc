@@ -1,0 +1,31 @@
+---
+description: vstreamer system facts that are easy to miss from a single file
+alwaysApply: true
+---
+
+# vstreamer architecture notes
+
+- Link: `stream_sender` → UDP (loopback bench or winject radio) → `stream_receiver`.
+  FEC is `rs_block_erasure` (RS block erasure) on both ends; the receiver
+  reads k/n from each shard header.
+- `stream_sender` is multi-threaded: `input()` (encoder thread), the send thread
+  (`on_tick`, pacing) and `configure()` (channel_controller console thread) run
+  concurrently. FEC state is guarded by `fec_mu`; lock order is `mu` → `fec_mu`.
+- `scripts/cbr_controller.py` changes encode rate **and** `fec_n` at runtime via the
+  UDP console (`set_fec_k` / `set_fec_n`) → `stream_sender::configure()` → FEC
+  reinit mid-stream. `block_id` must keep counting across reinit.
+- The forward path always prepends `stream_header_s` (`stream_sequence`) before each
+  FEC shard on egress; `stream_receiver` always strips it for gap / `loss_udp_pct`.
+  Radio winject must preserve the same layout if it sits in the path.
+- Loss metrics (`stream_sender.peer_loss_udp_pct`, `peer_loss_fec_pct`, and the four
+  `peer_*_packet_received` / `peer_*_gap_count` counters) are published by the app
+  (`stream_sdl` `sync_peer_link_metrics_live` reading `stream_receiver` atomics) — not
+  from a reverse UDP telemetry channel and not via `stream_sender::query()`. They are not
+  ground truth; check the data path before changing how they are computed.
+- FEC checks: `build/rs_fec_test` (unit), plus a loopback
+  `stream_sender` → `stream_receiver` run with runtime `fec_n` changes and
+  peer restarts for anything touching the pipeline.
+- **Node independence:** every component validates only its own limits and never includes or
+  assumes another component (not even in comments). Link-specific values (e.g. winject 1476-byte
+  cap) and neighbor sizing belong to the pipeline creator (`stream_sdl`), which reads limits via
+  `query()` (e.g. `stream_sender` `max_input`) and configures the neighbors.

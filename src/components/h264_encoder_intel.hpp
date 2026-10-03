@@ -39,11 +39,8 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     [[nodiscard]] int nv12_size_locked() const;
@@ -76,10 +73,9 @@ private:
     int   live_fps = 0;
     int   live_qp = 0;
     int   live_gop = 0;
+    bool  pending_idr = false;
 
     std::deque<frame> out_q;
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

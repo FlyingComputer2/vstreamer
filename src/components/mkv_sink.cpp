@@ -101,21 +101,59 @@ void mkv_sink::stop_locked()
 
     fmt = nullptr;
     stream = nullptr;
-    pts = 0;
+    output_path.clear();
+    last_mux_pts = -1;
     t0 = 0.0;
     live_w = 0;
     live_h = 0;
     recording = false;
 }
 
+void mkv_sink::split_output_template_locked()
+{
+    output_stem.clear();
+    output_ext = ".mkv";
+    if (output_template.empty())
+    {
+        return;
+    }
+    const auto slash = output_template.find_last_of('/');
+    const auto dot = output_template.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+    {
+        output_stem = output_template;
+        return;
+    }
+    output_stem = output_template.substr(0, dot);
+    output_ext = output_template.substr(dot);
+}
+
+std::string mkv_sink::segment_path_locked() const
+{
+    if (output_stem.empty())
+    {
+        return {};
+    }
+    char buf[4096];
+    std::snprintf(buf, sizeof(buf), "%s-%03d%s", output_stem.c_str(), segment_index, output_ext.c_str());
+    return buf;
+}
+
 int mkv_sink::start_locked(int w, int h)
 {
-    if (output_path.empty())
+    if (output_template.empty())
     {
         return -EINVAL;
     }
 
     stop_locked();
+
+    ++segment_index;
+    output_path = segment_path_locked();
+    if (output_path.empty())
+    {
+        return -EINVAL;
+    }
 
     AVFormatContext *oc = nullptr;
     if (avformat_alloc_output_context2(&oc, nullptr, "matroska", output_path.c_str()) < 0 || nullptr == oc)
@@ -165,7 +203,8 @@ int mkv_sink::start_locked(int w, int h)
     stream = st;
     live_w = w;
     live_h = h;
-    pts = 0;
+    last_mux_pts = -1;
+    segment_pts_base = -1;
     t0 = now_sec();
     recording = true;
     return 0;
@@ -173,7 +212,7 @@ int mkv_sink::start_locked(int w, int h)
 
 int mkv_sink::ensure_session_locked(int w, int h)
 {
-    if (output_path.empty())
+    if (output_template.empty())
     {
         return 0;
     }
@@ -214,28 +253,46 @@ int mkv_sink::write_frame_locked(const data_packet &in)
 
     const frame_data &f = data_packet::cast<frame_data>(in);
 
-    uint8_t *buf = static_cast<uint8_t *>(av_malloc(f.buf.size));
+    uint8_t *buf = static_cast<uint8_t *>(av_malloc(f.buf.size()));
     if (nullptr == buf)
     {
         av_packet_free(&pkt);
         return -ENOMEM;
     }
-    std::memcpy(buf, f.buf.data, f.buf.size);
+    std::memcpy(buf, f.buf.u8(), f.buf.size());
 
     pkt->data = buf;
-    pkt->size = static_cast<int>(f.buf.size);
-    pkt->pts = pts;
-    pkt->dts = pts;
+    pkt->size = static_cast<int>(f.buf.size());
+
+    const int use_fps = fps > 0 ? fps : 30;
+    if (segment_pts_base < 0)
+    {
+        segment_pts_base = f.pts;
+    }
+    int64_t mux_pts = f.pts - segment_pts_base;
+    if (mux_pts < 0)
+    {
+        mux_pts = 0;
+    }
+    if (last_mux_pts >= 0 && mux_pts <= last_mux_pts)
+    {
+        mux_pts = last_mux_pts + 1;
+    }
+    last_mux_pts = mux_pts;
+    pkt->pts = mux_pts;
+    pkt->dts = mux_pts;
     pkt->duration = 1;
     pkt->stream_index = st->index;
     pkt->flags |= AV_PKT_FLAG_KEY;
-    pkt->buf = av_buffer_create(buf, f.buf.size, av_buffer_default_free, nullptr, 0);
+    pkt->buf = av_buffer_create(buf, f.buf.size(), av_buffer_default_free, nullptr, 0);
     if (nullptr == pkt->buf)
     {
         av_free(buf);
         av_packet_free(&pkt);
         return -ENOMEM;
     }
+
+    av_packet_rescale_ts(pkt, AVRational{1, use_fps}, st->time_base);
 
     int ret = av_interleaved_write_frame(oc, pkt);
     av_packet_free(&pkt);
@@ -244,7 +301,6 @@ int mkv_sink::write_frame_locked(const data_packet &in)
         return -EIO;
     }
 
-    ++pts;
     ++frames_out;
     return 0;
 }
@@ -292,23 +348,9 @@ int mkv_sink::input(uint8_t /*port*/, const data_packet &in)
     return write_frame_locked(in);
 }
 
-int mkv_sink::configure(uint64_t /*key*/, int64_t /*value*/)
+int mkv_sink::configure(std::string_view key, std::string_view value)
 {
-    return -EINVAL;
-}
-
-int mkv_sink::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -EINVAL;
-}
-
-int mkv_sink::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
 
     std::lock_guard<std::mutex> lock(mu);
 
@@ -317,17 +359,23 @@ int mkv_sink::configure(std::string_view key, std::string_view *value)
         if (v.empty())
         {
             stop_locked();
-            output_path.clear();
+            output_template.clear();
+            output_stem.clear();
+            output_ext.clear();
+            segment_index = 0;
             return 0;
         }
         if (v.size() >= 4096)
         {
             return -EINVAL;
         }
-        if (output_path != v)
+        const std::string next(v);
+        if (output_template != next)
         {
             stop_locked();
-            output_path.assign(v.data(), v.size());
+            output_template = next;
+            segment_index = 0;
+            split_output_template_locked();
         }
         return 0;
     }
@@ -369,19 +417,19 @@ int mkv_sink::configure(std::string_view key, std::string_view *value)
     return -EINVAL;
 }
 
-int mkv_sink::query(std::string_view key, std::string_view *value) const
+int mkv_sink::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "output")
     {
-        query_buf = output_path;
-        *value = query_buf;
+        *value = output_template;
+        return 0;
+    }
+
+    if (key == "segment")
+    {
+        *value = output_path;
         return 0;
     }
 
@@ -394,22 +442,21 @@ int mkv_sink::query(std::string_view key, std::string_view *value) const
             {
                 elapsed = 0.0;
             }
-            int mins = static_cast<int>(elapsed) / 60;
-            int secs = static_cast<int>(elapsed) % 60;
-            query_buf.resize(64);
-            std::snprintf(query_buf.data(), query_buf.size(), "recording %d:%02d frames=%" PRIu64, mins, secs,
+            const int mins = static_cast<int>(elapsed) / 60;
+            const int secs = static_cast<int>(elapsed) % 60;
+            char      buf[64];
+            std::snprintf(buf, sizeof(buf), "recording %d:%02d frames=%" PRIu64, mins, secs,
                           frames_out);
-            query_buf.resize(std::strlen(query_buf.c_str()));
+            *value = buf;
         }
         else
         {
-            query_buf = "idle";
+            *value = "idle";
         }
-        *value = query_buf;
         return 0;
     }
 
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

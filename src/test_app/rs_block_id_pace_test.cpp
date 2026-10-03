@@ -85,11 +85,12 @@ int main(int argc, char **argv)
     std::uniform_int_distribution<int>      body_len(180, 900);
 
     std::deque<scheduled_shard> sendq;
-    std::vector<std::vector<uint8_t>> decoded;
+    vstreamer::fec_rx_payload_list decoded;
 
     const auto t0 = steady_clk::now();
     const auto deadline = t0 + std::chrono::duration_cast<steady_clk::duration>(
                                     std::chrono::duration<double>(run_sec));
+    double     fec_decode_wall_sec = 0.0;
 
     uint64_t app_seq = 0;
     uint64_t bytes_scheduled = 0;
@@ -121,8 +122,10 @@ int main(int argc, char **argv)
 
     double schedule_cursor_sec = 0.0;
 
-    auto pump_decoder = [&](std::vector<std::vector<uint8_t>> *batch) {
+    auto pump_decoder = [&](vstreamer::fec_rx_payload_list *batch) {
+        const auto pump_t0 = steady_clk::now();
         dec.poll_rx(batch);
+        fec_decode_wall_sec += secs_between(pump_t0, steady_clk::now());
         if (batch != nullptr)
         {
             for (auto &p : *batch)
@@ -156,8 +159,10 @@ int main(int argc, char **argv)
         const auto now = steady_clk::now();
         while (!sendq.empty() && sendq.front().due <= now)
         {
-            std::vector<std::vector<uint8_t>> batch;
+            vstreamer::fec_rx_payload_list batch;
+            const auto push_t0 = steady_clk::now();
             dec.push_air(sendq.front().bytes.data(), sendq.front().bytes.size(), &batch);
+            fec_decode_wall_sec += secs_between(push_t0, steady_clk::now());
             for (auto &p : batch)
             {
                 decoded.push_back(std::move(p));
@@ -191,8 +196,10 @@ int main(int argc, char **argv)
         {
             std::this_thread::sleep_until(sendq.front().due);
         }
-        std::vector<std::vector<uint8_t>> batch;
+        vstreamer::fec_rx_payload_list batch;
+        const auto push_t0 = steady_clk::now();
         dec.push_air(sendq.front().bytes.data(), sendq.front().bytes.size(), &batch);
+        fec_decode_wall_sec += secs_between(push_t0, steady_clk::now());
         for (auto &p : batch)
         {
             decoded.push_back(std::move(p));
@@ -207,7 +214,7 @@ int main(int argc, char **argv)
     const auto tail_end = steady_clk::now() + std::chrono::milliseconds(tail_ms);
     while (steady_clk::now() < tail_end)
     {
-        std::vector<std::vector<uint8_t>> batch;
+        vstreamer::fec_rx_payload_list batch;
         pump_decoder(&batch);
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
@@ -226,7 +233,7 @@ int main(int argc, char **argv)
             seq_errors++;
             continue;
         }
-        const uint64_t s = load_u64_le(p.data());
+        const uint64_t s = load_u64_le(p.u8());
         if (s != expect)
         {
             seq_errors++;
@@ -240,9 +247,10 @@ int main(int argc, char **argv)
     std::printf(
         "rs_block_id_pace_test: %.1fs target=%.0f Mbps achieved=%.1f Mbps\n"
         "  apps=%" PRIu64 " blocks=%" PRIu64 " shards=%" PRIu64 " wire_wraps=%" PRIu64 "\n"
-        "  decoded=%zu decode_fail=%" PRIu64 " seq_errors=%" PRIu64 " missing_apps=%" PRIu64 "\n",
+        "  decoded=%zu decode_fail=%" PRIu64 " seq_errors=%" PRIu64 " missing_apps=%" PRIu64 "\n"
+        "  fec_decode_wall_sec=%.3f (push_air+poll_rx, shared kn matrix cache)\n",
         run_sec, target_mbps, achieved_mbps, app_seq, blocks, shards_scheduled, wire_wrap_marks,
-        decoded.size(), dec.decode_fail(), seq_errors, missing);
+        decoded.size(), dec.decode_fail(), seq_errors, missing, fec_decode_wall_sec);
 
     if (blocks < 256)
     {

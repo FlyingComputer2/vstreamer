@@ -141,12 +141,16 @@ int h264_encoder_intel::drain_packets_locked()
             av_packet_unref(pkt);
             return -ENOMEM;
         }
-        std::memcpy(buf, pkt->data, static_cast<size_t>(pkt->size));
+        const size_t sz = static_cast<size_t>(pkt->size);
+        std::memcpy(buf, pkt->data, sz);
 
+        shared_sized_buffer payload = shared_sized_buffer::adopt(
+            reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
+                std::free(reinterpret_cast<uint8_t *>(p));
+            });
         frame au;
-        au.reset(media_kind_e::H264, live_w, live_h, pkt->pts,
-                 !!(pkt->flags & AV_PKT_FLAG_KEY), buf, static_cast<size_t>(pkt->size),
-                 [](uint8_t *p) { std::free(p); });
+        au.reset(media_kind_e::H264, live_w, live_h, pkt->pts, !!(pkt->flags & AV_PKT_FLAG_KEY),
+                 std::move(payload));
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
         cv.notify_one();
@@ -392,7 +396,7 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
         return -EINVAL;
     }
     int want = nv12_size_locked();
-    if (want < 0 || static_cast<size_t>(want) != f.buf.size || nullptr == f.buf.data)
+    if (want < 0 || static_cast<size_t>(want) != f.buf.size() || nullptr == f.buf.u8())
     {
         return -EINVAL;
     }
@@ -402,7 +406,7 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     auto *hw = static_cast<AVFrame *>(this->hwframe);
 
     av_frame_unref(sw);
-    int sz = av_image_fill_arrays(sw->data, sw->linesize, f.buf.data, AV_PIX_FMT_NV12, live_w,
+    int sz = av_image_fill_arrays(sw->data, sw->linesize, f.buf.u8(), AV_PIX_FMT_NV12, live_w,
                                   live_h, 1);
     if (sz < 0)
     {
@@ -412,8 +416,16 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     sw->height = live_h;
     sw->format = AV_PIX_FMT_NV12;
     sw->pts = f.pts;
+    if (pending_idr)
+    {
+        sw->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
+        sw->flags |= AV_FRAME_FLAG_KEY;
+#endif
+        pending_idr = false;
+    }
     sw->buf[0] =
-        av_buffer_create(f.buf.data, static_cast<size_t>(sz), nv12_keep, nullptr, 0);
+        av_buffer_create(f.buf.u8(), static_cast<size_t>(sz), nv12_keep, nullptr, 0);
     if (nullptr == sw->buf[0])
     {
         av_frame_unref(sw);
@@ -483,23 +495,9 @@ int h264_encoder_intel::output(uint8_t /*port*/, data_packet &out, int timeout_m
     return 0;
 }
 
-int h264_encoder_intel::configure(uint64_t /*key*/, int64_t /*value*/)
+int h264_encoder_intel::configure(std::string_view key, std::string_view value)
 {
-    return -EINVAL;
-}
-
-int h264_encoder_intel::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -EINVAL;
-}
-
-int h264_encoder_intel::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
     std::string tmp(v);
 
     std::lock_guard<std::mutex> lock(mu);
@@ -591,28 +589,26 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view *value)
         }
         return 0;
     }
+    if (key == "idr")
+    {
+        pending_idr = true;
+        return 0;
+    }
     return -EINVAL;
 }
 
-int h264_encoder_intel::query(std::string_view key, std::string_view *value) const
+int h264_encoder_intel::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "status")
     {
-        query_buf = opened ? "open" : "closed";
-        *value = query_buf;
+        *value = opened ? "open" : "closed";
         return 0;
     }
     if (key == "device")
     {
-        query_buf = device;
-        *value = query_buf;
+        *value = device;
         return 0;
     }
     if (key == "size")
@@ -624,8 +620,7 @@ int h264_encoder_intel::query(std::string_view key, std::string_view *value) con
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "fps" || key == "qp" || key == "gop")
@@ -648,14 +643,12 @@ int h264_encoder_intel::query(std::string_view key, std::string_view *value) con
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "backend" || key == "codec")
     {
-        query_buf = "h264_vaapi";
-        *value = query_buf;
+        *value = "h264_vaapi";
         return 0;
     }
     return -EINVAL;

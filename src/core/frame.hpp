@@ -3,7 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
+
+#include "core/shared_sized_buffer.hpp"
 
 namespace vstreamer
 {
@@ -11,15 +12,10 @@ namespace vstreamer
 enum class media_kind_e : uint8_t
 {
     UNKNOWN = 0,
-    MJPEG   = 1,  // JPEG access unit
-    NV12    = 2,  // packed, linesize == width
-    H264    = 3,  // Annex-B access unit
+    MJPEG   = 1,
+    NV12    = 2,
+    H264    = 3,
 };
-
-inline void default_data_deleter(uint8_t *data)
-{
-    free(data);
-}
 
 class data_packet;
 
@@ -37,7 +33,8 @@ public:
 
     void release();
 
-    void reset(media_kind_e kind, int width, int height, int64_t pts, bool key, uint8_t *data, size_t size, std::function<void(uint8_t *)> data_deleter = default_data_deleter, int64_t capture_mono_ns = 0);
+    void reset(media_kind_e kind, int width, int height, int64_t pts, bool key,
+               shared_sized_buffer payload_in, int64_t capture_mono_ns = 0);
 
     [[nodiscard]] media_kind_e kind() const { return fields.kind; }
     [[nodiscard]] int          width() const { return fields.width; }
@@ -45,25 +42,22 @@ public:
     [[nodiscard]] int64_t      pts() const { return fields.pts; }
     [[nodiscard]] int64_t      capture_mono_ns() const { return fields.capture_mono_ns; }
     [[nodiscard]] bool         key() const { return fields.key; }
-    [[nodiscard]] uint8_t     *data() const { return fields.data; }
-    [[nodiscard]] size_t       size() const { return fields.size; }
+    [[nodiscard]] uint8_t     *data() const { return fields.payload.u8(); }
+    [[nodiscard]] size_t       size() const { return fields.payload.size(); }
+    [[nodiscard]] const shared_sized_buffer &payload_buffer() const { return fields.payload; }
 
     friend class data_packet;
 
 private:
-    void reset_owned() noexcept;
-
-    struct
+    struct fields_t
     {
-        media_kind_e kind;
-        int          width;
-        int          height;
-        int64_t      pts;
-        int64_t      capture_mono_ns;
-        bool         key;
-        uint8_t     *data;
-        size_t       size;
-        std::function<void(uint8_t *)> data_deleter;
+        media_kind_e         kind = media_kind_e::UNKNOWN;
+        int                  width = 0;
+        int                  height = 0;
+        int64_t              pts = 0;
+        int64_t              capture_mono_ns = 0;
+        bool                 key = false;
+        shared_sized_buffer  payload;
     } fields;
 };
 

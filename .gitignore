@@ -1,6 +1,9 @@
 # CMake / build trees
 build/
 build-*/
+out/
+logs/
+*.log
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

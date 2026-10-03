@@ -455,11 +455,13 @@ void channel_controller::set_encode_target(vstreamer::component_coder *encoder)
 
 void channel_controller::set_encode_command_handlers(std::function<bool(int kbps)> set_cbr_kbps,
                                                      std::function<bool(int qp)> set_qp,
-                                                     std::function<bool(int gop)> set_gop)
+                                                     std::function<bool(int gop)> set_gop,
+                                                     std::function<bool()> force_idr)
 {
     encode_set_cbr_kbps = std::move(set_cbr_kbps);
     encode_set_qp = std::move(set_qp);
     encode_set_gop = std::move(set_gop);
+    encode_force_idr = std::move(force_idr);
 }
 
 void channel_controller::send_pipeline_metrics(int reply_fd, const sockaddr_in &reply)
@@ -514,6 +516,7 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
             "set_encode_cbr <kbps>\n"
             "set_encode_qp <qp>\n"
             "set_gop <gop>\n"
+            "force_idr\n"
             "get_metric <metric_name>\n"
             "ping\n"
             "stats\n"
@@ -601,7 +604,7 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
         }
         static const char none_mode[] = "none";
         std::string_view val = none_mode;
-        if (stream_tx->configure("fec", &val) < 0)
+        if (stream_tx->configure("fec", val) < 0)
         {
             const char *msg = "err set_fec none\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
@@ -626,9 +629,9 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
         const char *arg = work + 10;
         char       *end = nullptr;
         const long  k = std::strtol(arg, &end, 10);
-        if (end == arg || k < 1 || k > 254)
+        if (end == arg || k < 1 || k > 15)
         {
-            const char *msg = "err bad k (1..254)\n";
+            const char *msg = "err bad k (1..15)\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                    sizeof(reply));
             return;
@@ -636,9 +639,9 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%ld", k);
         std::string_view val = buf;
-        if (stream_tx->configure("fec_k", &val) < 0)
+        if (stream_tx->configure("fec_k", val) < 0)
         {
-            const char *msg = "err set_fec_k (need k <= n)\n";
+            const char *msg = "err bad k (1..15)\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                    sizeof(reply));
             return;
@@ -661,9 +664,9 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
         const char *arg = work + 10;
         char       *end = nullptr;
         const long  n = std::strtol(arg, &end, 10);
-        if (end == arg || n < 1 || n > 255)
+        if (end == arg || n < 1 || n > 15)
         {
-            const char *msg = "err bad n (1..255)\n";
+            const char *msg = "err bad n (k..15)\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                    sizeof(reply));
             return;
@@ -671,9 +674,9 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%ld", n);
         std::string_view val = buf;
-        if (stream_tx->configure("fec_n", &val) < 0)
+        if (stream_tx->configure("fec_n", val) < 0)
         {
-            const char *msg = "err set_fec_n (need k <= n)\n";
+            const char *msg = "err bad n (k..15)\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                    sizeof(reply));
             return;
@@ -706,7 +709,7 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
             char bps_buf[32];
             std::snprintf(bps_buf, sizeof(bps_buf), "%ld", kbps * 1000L);
             std::string_view val = bps_buf;
-            ok = encode_target->configure("cbr", &val) == 0;
+            ok = encode_target->configure("cbr", val) == 0;
         }
         if (!ok)
         {
@@ -745,12 +748,38 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
             char gop_buf[16];
             std::snprintf(gop_buf, sizeof(gop_buf), "%ld", gop);
             std::string_view val = gop_buf;
-            ok = encode_target->configure("gop", &val) == 0;
+            ok = encode_target->configure("gop", val) == 0;
         }
         if (!ok)
         {
             const char *msg = encode_set_gop || nullptr != encode_target ? "err set gop failed\n"
                                                                          : "err encoder not configured\n";
+            sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
+                   sizeof(reply));
+            return;
+        }
+        const char *msg = "ok\n";
+        sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
+               sizeof(reply));
+        return;
+    }
+
+    if (0 == std::strcmp(work, "force_idr"))
+    {
+        bool ok = false;
+        if (encode_force_idr)
+        {
+            ok = encode_force_idr();
+        }
+        else if (nullptr != encode_target)
+        {
+            ok = encode_target->configure("idr", "") == 0;
+        }
+        if (!ok)
+        {
+            const char *msg = encode_force_idr || nullptr != encode_target
+                                  ? "err force_idr failed\n"
+                                  : "err encoder not configured\n";
             sendto(reply_fd, msg, std::strlen(msg), 0, reinterpret_cast<const sockaddr *>(&reply),
                    sizeof(reply));
             return;
@@ -783,7 +812,7 @@ void channel_controller::handle_console_line(const char *line, int reply_fd,
             char qp_buf[16];
             std::snprintf(qp_buf, sizeof(qp_buf), "%ld", qp);
             std::string_view val = qp_buf;
-            ok = encode_target->configure("qp", &val) == 0;
+            ok = encode_target->configure("qp", val) == 0;
         }
         if (!ok)
         {
@@ -912,6 +941,37 @@ void channel_controller::console_thread_main()
     }
 }
 
+int bind_ipv4_host(sockaddr_in *in, const std::string &host, int port)
+{
+    if (nullptr == in)
+    {
+        return -EINVAL;
+    }
+    std::memset(in, 0, sizeof(*in));
+    in->sin_family = AF_INET;
+    in->sin_port = htons(static_cast<uint16_t>(port));
+    if (host == "0.0.0.0" || host == "*")
+    {
+        in->sin_addr.s_addr = htonl(INADDR_ANY);
+        return 0;
+    }
+    if (inet_pton(AF_INET, host.c_str(), &in->sin_addr) != 1)
+    {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+void channel_controller::set_bind_host(const char *host)
+{
+    if (nullptr == host || host[0] == '\0')
+    {
+        bind_host = k_loopback_host;
+        return;
+    }
+    bind_host = host;
+}
+
 int channel_controller::setup_direction(direction_state &dir, int ingress_port,
                                       const char *egress_host, int egress_port)
 {
@@ -922,9 +982,13 @@ int channel_controller::setup_direction(direction_state &dir, int ingress_port,
     }
 
     sockaddr_in in {};
-    in.sin_family = AF_INET;
-    in.sin_addr.s_addr = htonl(INADDR_ANY);
-    in.sin_port = htons(static_cast<uint16_t>(ingress_port));
+    const int   bind_r = bind_ipv4_host(&in, bind_host, ingress_port);
+    if (bind_r < 0)
+    {
+        ::close(dir.ingress_fd);
+        dir.ingress_fd = -1;
+        return bind_r;
+    }
     if (bind(dir.ingress_fd, reinterpret_cast<sockaddr *>(&in), sizeof(in)) < 0)
     {
         const int err = -errno;
@@ -1030,9 +1094,13 @@ int channel_controller::start_console(int console_port)
     }
 
     sockaddr_in in {};
-    in.sin_family = AF_INET;
-    in.sin_addr.s_addr = htonl(INADDR_ANY);
-    in.sin_port = htons(static_cast<uint16_t>(console_port));
+    const int   bind_r = bind_ipv4_host(&in, bind_host, console_port);
+    if (bind_r < 0)
+    {
+        ::close(console_fd);
+        console_fd = -1;
+        return bind_r;
+    }
     if (bind(console_fd, reinterpret_cast<sockaddr *>(&in), sizeof(in)) < 0)
     {
         const int err = -errno;
@@ -1050,17 +1118,26 @@ int channel_controller::start_console(int console_port)
 void channel_controller::stop_relay()
 {
     relay_stop = true;
+    if (fwd.ingress_fd >= 0)
+    {
+        ::shutdown(fwd.ingress_fd, SHUT_RDWR);
+    }
+    if (rev_enabled && rev.ingress_fd >= 0)
+    {
+        ::shutdown(rev.ingress_fd, SHUT_RDWR);
+    }
+
+    if (relay_thread.joinable())
+    {
+        relay_thread.join();
+    }
+
     teardown_direction(fwd);
     if (rev_enabled)
     {
         teardown_direction(rev);
     }
     rev_enabled = false;
-
-    if (relay_thread.joinable())
-    {
-        relay_thread.join();
-    }
     relay_stop = false;
 }
 
@@ -1070,12 +1147,15 @@ void channel_controller::stop_console()
     if (console_fd >= 0)
     {
         ::shutdown(console_fd, SHUT_RDWR);
-        ::close(console_fd);
-        console_fd = -1;
     }
     if (console_thread.joinable())
     {
         console_thread.join();
+    }
+    if (console_fd >= 0)
+    {
+        ::close(console_fd);
+        console_fd = -1;
     }
     console_stop = false;
 }

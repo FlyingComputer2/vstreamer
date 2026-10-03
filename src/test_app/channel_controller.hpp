@@ -6,6 +6,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -42,6 +43,8 @@ public:
      * Pass reverse_ingress_port <= 0 to disable reverse.
      * Defaults: see channel_ports.hpp (5000→5001 fwd, 5002→5003 rev).
      */
+    void set_bind_host(const char *host);
+
     int start(int ingress_port = k_chan_fwd_ingress, const char *egress_host = k_loopback_host,
               int egress_port = k_stream_rx_listen,
               int reverse_ingress_port = k_chan_rev_ingress,
@@ -59,7 +62,8 @@ public:
     /* Non-blocking: handlers queue work for the encode thread (preferred). */
     void set_encode_command_handlers(std::function<bool(int kbps)> set_cbr_kbps,
                                      std::function<bool(int qp)> set_qp,
-                                     std::function<bool(int gop)> set_gop = {});
+                                     std::function<bool(int gop)> set_gop = {},
+                                     std::function<bool()> force_idr = {});
     void set_stream_sender(vstreamer::stream_sender *sender);
 
     void set_max_kbps(double kbps);
@@ -155,6 +159,8 @@ private:
     int console_fd = -1;
     std::thread console_thread;
 
+    std::string bind_host = k_loopback_host;
+
     mutable std::mutex cfg_mu;
     double max_kbps_limit = 0.;
     int    rate_drop_dt_ms = k_chan_default_drop_dt_ms;
@@ -169,6 +175,7 @@ private:
     std::function<bool(int kbps)> encode_set_cbr_kbps;
     std::function<bool(int qp)>   encode_set_qp;
     std::function<bool(int gop)>  encode_set_gop;
+    std::function<bool()>         encode_force_idr;
     vstreamer::stream_sender     *stream_tx = nullptr;
 };
 

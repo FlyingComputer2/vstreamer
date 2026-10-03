@@ -84,45 +84,24 @@ int sdl_sink::input(uint8_t port, const data_packet &in)
     return r;
 }
 
-int sdl_sink::configure(uint64_t /*key*/, int64_t /*value*/)
+int sdl_sink::configure(std::string_view key, std::string_view value)
 {
-    return -ENOTSUP;
-}
-
-int sdl_sink::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -ENOTSUP;
-}
-
-int sdl_sink::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if ("title" == key)
     {
-        present.set_title(*value);
+        present.set_title(value);
         return 0;
     }
     return -ENOTSUP;
 }
 
-int sdl_sink::query(std::string_view key, std::string_view *value) const
+int sdl_sink::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if ("stats" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         char buf[64];
         present.stats_string(buf, sizeof(buf), frames_in);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     return -ENOTSUP;

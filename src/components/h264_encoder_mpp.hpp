@@ -45,11 +45,8 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     int  encoder_open_locked();
@@ -58,17 +55,17 @@ private:
     int  apply_h264_cfg_locked();
     int  apply_rc_cfg_locked();
     int  drain_packets_locked(int timeout_ms);
-    int  drain_packets_unlocked(int timeout_ms);
     int  put_nv12_frame_unlocked(const frame_data &f);
-    bool push_mpp_packet_to_out(void *packet);
-    bool push_mpp_packet_to_out_locked(void *packet);
     void clear_out_locked();
     void release_enc_slot_after_eoi();
-    void drain_enc_packets_nonblock(void *mpp_ctx, void *mpp_mpi);
     bool append_enc_packet_bytes(const uint8_t *data, size_t len);
-    void flush_enc_au_to_out_locked();
-    void ingest_enc_packet(void *mpp_packet_opaque);
+    bool finalize_enc_au_frame(frame *out);
+    void enqueue_completed_aus_locked(std::vector<frame> &&aus);
+    /* mpp_api_mu must already be held; never takes mu. */
+    void ingest_enc_packet(void *mpp_packet_opaque, std::vector<frame> *completed_aus);
+    void drain_enc_packets_nonblock(void *mpp_ctx, void *mpp_mpi, std::vector<frame> *completed_aus);
 
+    /* Lock order: mu → mpp_api_mu only; never take mu while holding mpp_api_mu. */
     mutable std::mutex      mu;
     std::mutex              mpp_api_mu;
     std::condition_variable cv;
@@ -85,6 +82,9 @@ private:
     /* Target wire bitrate (bit/s); metrics h264_encoder.cbr_kbps. Honored by MPP when rc_mpp_cbr. */
     int  bps_target = 20'000'000;
     bool rc_mpp_cbr = false;
+    double super_i_ratio = 6.0;
+    double super_p_ratio = 1.5;
+    bool   pending_idr = false;
 
     int live_w = 0;
     int live_h = 0;
@@ -123,8 +123,6 @@ private:
 
     /* Capture-to-encoded-AU (ms); updated when output carries capture_mono_ns. */
     double last_latency_ms = 0.0;
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

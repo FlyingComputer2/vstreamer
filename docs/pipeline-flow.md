@@ -18,10 +18,17 @@ flowchart LR
 |------|------|
 | … → `stream_sender.0` | `SOCK` (RTP datagrams) |
 
-Reverse-path RX/gap metrics are not on the media graph. Bench apps poll
-`stream_receiver`, push counters to `stream_sender::set_receiver_counters()`, and read
-`peer_*` via `stream_sender::query()`; encoder rate is set via
-`configure("cbr")` or the channel UDP console (`set_encode_cbr`).
+Reverse-path RX/gap metrics are not on the media graph.
+
+### Telemetry
+
+Receiver link counters (`udp_packet_received`, gaps, FEC stats) reach
+`stream_sender` **only in-process**: bench apps such as `stream_sdl` poll
+`stream_receiver`, call `stream_sender::set_receiver_counters()`, and read
+`peer_*` / `peer_loss_*` via `stream_sender::query()`. A cross-host telemetry
+datagram on the reverse UDP path is not implemented in this tree (planned
+follow-up). Encoder rate is set via `configure("cbr")` or the channel UDP
+console (`set_encode_cbr`).
 
 Factory names: `v4l2_source`, `jpeg_decoder_multicore`, `h264_encoder_cedar`,
 `rtp_h264_pay`, `stream_sender`.

@@ -15,7 +15,7 @@
 
 #include "core/component_coder.hpp"
 #include "core/data_packet.hpp"
-#include "core/packet_pool.hpp"
+#include "core/buffer_pool.hpp"
 #include "core/rtp_h264.hpp"
 
 namespace vstreamer
@@ -43,13 +43,13 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
+    void rebuild_packer();
+    void recreate_pool_locked();
+
     mutable std::mutex mu;
     bool               opened = false;
 
@@ -57,14 +57,20 @@ private:
     int         fps = 30;
     uint8_t     pt = 96;
     uint32_t    ssrc = 0xC0DE0001u;
+    int64_t     capture_epoch_ns = 0;
     rtp_h264_packer packer {rtp_h264_config {}};
 
-    std::deque<std::vector<uint8_t>> pending;
-    int64_t                          pending_pts = 0;
+    struct pending_datagram
+    {
+        std::vector<uint8_t> bytes;
+        int64_t              pts = 0;
+    };
 
-    packet_pool pool;
+    std::deque<pending_datagram> pending;
+    static constexpr size_t      k_pending_cap = 512;
+    uint64_t                     datagrams_dropped = 0;
 
-    mutable std::string query_buf;
+    buffer_pool pool;
 };
 
 }  // namespace vstreamer

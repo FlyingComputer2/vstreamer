@@ -18,14 +18,23 @@
 
 #include "core/component_source.hpp"
 #include "core/data_packet.hpp"
-#include "core/packet_pool.hpp"
+#include "core/buffer_pool.hpp"
 #include "core/rs_block_erasure.hpp"
-#include "core/stream_telemetry.hpp"
-
 namespace vstreamer
 {
 
-/* Pad 0 (source): SOCK out → rtp_h264_depay. */
+/* Receiver-local link counters (UDP + post-FEC gaps). */
+struct stream_receiver_counters
+{
+    uint64_t udp_packet_received = 0;
+    uint64_t fec_packet_received = 0;
+    uint64_t udp_gap_count = 0;
+    uint64_t fec_gap_count = 0;
+    double   loss_udp_pct = 0.;
+    double   loss_fec_pct = 0.;
+};
+
+/* Pad 0 (source): SOCK out. */
 class stream_receiver : public component_source
 {
 public:
@@ -45,11 +54,8 @@ public:
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
     [[nodiscard]] stream_receiver_counters link_counters_snapshot() const;
 
@@ -78,19 +84,21 @@ private:
     void recv_thread_main();
     void stop_recv_thread();
     void ingest_datagram(const uint8_t *data, size_t len);
-    void enqueue_payloads(std::vector<std::vector<uint8_t>> *payloads);
-    void enqueue_payload_copy(const uint8_t *data, size_t len);
+    void enqueue_payloads(fec_rx_payload_list *payloads);
+    void enqueue_payload_buffer(shared_sized_buffer &&payload);
 
     mutable std::mutex mu;
     bool               opened = false;
 
     std::string listen_spec;
+    int         max_datagram = 1472;
     int         recv_fd = -1;
 
-    packet_pool pool;
+    buffer_pool pool;
 
     std::mutex              q_mu;
     std::condition_variable q_cv;
+    bool                    stopping = false;
     std::deque<data_packet> payload_queue;
     static constexpr size_t k_queue_depth = 4096;
 
@@ -103,6 +111,8 @@ private:
 
     std::atomic<uint64_t> recv_bytes {0};
     std::atomic<uint64_t> recv_wire_bytes {0};
+    std::atomic<uint64_t> rx_truncated {0};
+    std::atomic<uint64_t> rx_oversize {0};
 
     double   egress_rate_t0 = 0.;
     uint64_t egress_rate_bytes = 0;
@@ -116,8 +126,6 @@ private:
 
     std::thread       recv_thread;
     std::atomic<bool> recv_stop {false};
-
-    mutable std::string query_buf;
 
     rs_block_erasure fec;
     uint64_t           fec_rec = 0;

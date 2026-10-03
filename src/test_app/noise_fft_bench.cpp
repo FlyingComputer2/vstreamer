@@ -31,8 +31,7 @@ double bench_ms(int reps, auto fn)
 int set_str(vstreamer::noise_source &src, const char *key, std::string *storage, const char *val)
 {
     *storage = val;
-    std::string_view sv = *storage;
-    return src.configure(key, &sv);
+    return src.configure(key, *storage);
 }
 
 }  // namespace

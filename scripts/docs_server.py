@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
+import os
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -22,6 +25,7 @@ NO_CACHE_HEADERS = {
 
 INDEX_RELOAD_SCRIPT = """
 (function () {
+  const DOCS_TOKEN = {{ docs_token | tojson }};
   let version = {{ version }};
   const status = document.getElementById("reload-status");
   const listEl = document.getElementById("doc-list");
@@ -88,7 +92,10 @@ INDEX_RELOAD_SCRIPT = """
       try {
         const resp = await fetch("/api/doc/" + encodeURIComponent(name).replace(/%2F/g, "/"), {
           method: "PUT",
-          headers: { "Content-Type": "text/markdown; charset=utf-8" },
+          headers: {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "X-Docs-Token": DOCS_TOKEN,
+          },
           body: "# " + name.replace(/\\.md$/, "").replace(/[_-]/g, " ") + "\\n",
         });
         const data = await resp.json().catch(() => ({}));
@@ -406,6 +413,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
 
     const DOC_PATH = {{ doc_path | tojson }};
+    const DOCS_TOKEN = {{ docs_token | tojson }};
     const INITIAL_VERSION = {{ version }};
     const WRAP_KEY = "docs-editor-linewrap";
     const AUTOSAVE_MS = 700;
@@ -659,7 +667,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
       try {
         const resp = await fetch("/api/doc/" + DOC_PATH, {
           method: "PUT",
-          headers: { "Content-Type": "text/markdown; charset=utf-8" },
+          headers: {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "X-Docs-Token": DOCS_TOKEN,
+          },
           body,
         });
         if (!resp.ok) {
@@ -924,7 +935,7 @@ def file_fingerprint(path: Path) -> str:
     return digest.hexdigest()
 
 
-def create_app(docs_dir: Path) -> Flask:
+def create_app(docs_dir: Path, docs_token: str) -> Flask:
     app = Flask(__name__)
     docs_dir = docs_dir.resolve()
     version_condition = threading.Condition()
@@ -1019,7 +1030,9 @@ def create_app(docs_dir: Path) -> Flask:
         return response
 
     def reload_script() -> str:
-        return render_template_string(INDEX_RELOAD_SCRIPT, version=current_list_version())
+        return render_template_string(
+            INDEX_RELOAD_SCRIPT, version=current_list_version(), docs_token=docs_token
+        )
 
     def normalize_markdown_path(doc_path: str) -> str:
         if doc_path.endswith("/"):
@@ -1110,6 +1123,9 @@ def create_app(docs_dir: Path) -> Flask:
     @app.put("/api/doc/<path:doc_path>")
     def put_doc(doc_path: str):
         nonlocal previous_doc_list
+        supplied = request.headers.get("X-Docs-Token", "")
+        if not hmac.compare_digest(supplied, docs_token):
+            return jsonify(error="forbidden"), 403
         doc_path = normalize_markdown_path(doc_path)
         doc_file = resolve_doc_path(docs_dir, doc_path, must_exist=False)
         if doc_file is None:
@@ -1159,6 +1175,7 @@ def create_app(docs_dir: Path) -> Flask:
             version=current_path_version(doc_path),
             breadcrumb=f"/{doc_path}",
             breadcrumb_name=doc_path,
+            docs_token=docs_token,
         )
 
     return app
@@ -1168,6 +1185,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port (default: {DEFAULT_PORT})")
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="PUT /api/doc token (default: env VSTREAMER_DOCS_TOKEN or random at startup)",
+    )
     parser.add_argument(
         "--docs-dir",
         type=Path,
@@ -1180,7 +1202,11 @@ def main() -> None:
     if not docs_dir.is_dir():
         raise SystemExit(f"Docs directory not found: {docs_dir}")
 
-    app = create_app(docs_dir)
+    docs_token = args.token or os.environ.get("VSTREAMER_DOCS_TOKEN")
+    if not docs_token:
+        docs_token = secrets.token_urlsafe(24)
+        print(f"docs_server: generated docs PUT token (set VSTREAMER_DOCS_TOKEN to reuse): {docs_token}")
+    app = create_app(docs_dir, docs_token)
     print(f"Serving {docs_dir} at http://{args.host}:{args.port}/")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=True)
 

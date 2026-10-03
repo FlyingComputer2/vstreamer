@@ -63,16 +63,6 @@ int parse_size(std::string_view s, int *w, int *h)
     return 0;
 }
 
-void log_unsupported_pix_fmt_once(int fmt)
-{
-    static std::atomic<bool> logged {false};
-    if (!logged.exchange(true))
-    {
-        std::fprintf(stderr, "jpeg_decoder_multicore: unsupported decoded pix_fmt %s (%d)\n",
-                     av_get_pix_fmt_name(static_cast<AVPixelFormat>(fmt)), fmt);
-    }
-}
-
 }  // namespace
 
 jpeg_decoder_multicore::jpeg_decoder_multicore() = default;
@@ -140,61 +130,141 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
     }
 
     size_t nv12_sz = static_cast<size_t>(dw) * static_cast<size_t>(dh) * 3ULL / 2ULL;
-    auto  *buf = static_cast<uint8_t *>(std::malloc(nv12_sz));
-    if (nullptr == buf)
+    shared_sized_buffer buf;
+    {
+        std::lock_guard<std::mutex> pl(nv12_pool_mu);
+        if (!nv12_pool || nv12_pool_bytes != nv12_sz)
+        {
+            nv12_pool = std::make_unique<buffer_pool>(nv12_sz, 8);
+            nv12_pool_bytes = nv12_sz;
+        }
+        buf = nv12_pool->acquire(nv12_sz);
+    }
+    if (buf.empty())
     {
         return -ENOMEM;
     }
-    std::memset(buf, 0, nv12_sz);
-
     int r = -ENOTSUP;
     switch (avf->format)
     {
         case AV_PIX_FMT_YUVJ422P:
         case AV_PIX_FMT_YUV422P:
             r = pack_yuv422p_to_nv12(avf->data[0], avf->linesize[0], avf->data[1], avf->linesize[1],
-                                     avf->data[2], avf->linesize[2], avf->width, avf->height, buf,
-                                     dw, dh);
+                                     avf->data[2], avf->linesize[2], avf->width, avf->height,
+                                     buf.u8(), dw, dh);
             break;
         case AV_PIX_FMT_YUVJ420P:
         case AV_PIX_FMT_YUV420P:
             r = pack_yuv420p_to_nv12(avf->data[0], avf->linesize[0], avf->data[1], avf->linesize[1],
-                                     avf->data[2], avf->linesize[2], avf->width, avf->height, buf,
-                                     dw, dh);
+                                     avf->data[2], avf->linesize[2], avf->width, avf->height,
+                                     buf.u8(), dw, dh);
             break;
         case AV_PIX_FMT_NV12:
             r = copy_nv12_planes_to_packed(avf->data[0], avf->linesize[0], avf->data[1],
-                                           avf->linesize[1], avf->width, avf->height, false, buf,
-                                           dw, dh);
+                                           avf->linesize[1], avf->width, avf->height, false,
+                                           buf.u8(), dw, dh);
             break;
         case AV_PIX_FMT_NV21:
             r = copy_nv12_planes_to_packed(avf->data[0], avf->linesize[0], avf->data[1],
-                                           avf->linesize[1], avf->width, avf->height, true, buf,
-                                           dw, dh);
+                                           avf->linesize[1], avf->width, avf->height, true,
+                                           buf.u8(), dw, dh);
             break;
         default:
-            log_unsupported_pix_fmt_once(avf->format);
-            std::free(buf);
+            if (!unsupported_pix_fmt_log_done)
+            {
+                unsupported_pix_fmt_log_done = true;
+                std::fprintf(stderr,
+                             "jpeg_decoder_multicore: unsupported decoded pix_fmt %s (%d)\n",
+                             av_get_pix_fmt_name(static_cast<AVPixelFormat>(avf->format)),
+                             avf->format);
+            }
             return -ENOTSUP;
     }
     if (r < 0)
     {
-        std::free(buf);
         return r;
     }
 
-    out->reset(media_kind_e::NV12, dw, dh, j.pts, true, buf, nv12_sz,
-               [](uint8_t *p) { std::free(p); }, j.capture_mono_ns);
+    out->reset(media_kind_e::NV12, dw, dh, j.pts, true, std::move(buf), j.capture_mono_ns);
     return 0;
 }
 
-void jpeg_decoder_multicore::worker_main()
+namespace
+{
+
+bool parse_worker_cpulist(std::string_view spec, std::vector<int> *out)
+{
+    if (nullptr == out || spec.empty())
+    {
+        return false;
+    }
+    out->clear();
+    size_t i = 0;
+    while (i < spec.size())
+    {
+        while (i < spec.size() && (spec[i] == ',' || spec[i] == ' '))
+        {
+            i++;
+        }
+        if (i >= spec.size())
+        {
+            break;
+        }
+        size_t j = i;
+        while (j < spec.size() && spec[j] != ',')
+        {
+            j++;
+        }
+        const std::string_view token = spec.substr(i, j - i);
+        const size_t           dash = token.find('-');
+        if (dash != std::string_view::npos && dash > 0 && dash + 1 < token.size())
+        {
+            int64_t a = 0;
+            int64_t b = 0;
+            std::string left(token.substr(0, dash));
+            std::string right(token.substr(dash + 1));
+            if (key_parse_i64(left.c_str(), &a) < 0 || key_parse_i64(right.c_str(), &b) < 0 || a > b)
+            {
+                return false;
+            }
+            for (int64_t c = a; c <= b; c++)
+            {
+                out->push_back(static_cast<int>(c));
+            }
+        }
+        else
+        {
+            int64_t v = 0;
+            std::string tmp(token);
+            if (key_parse_i64(tmp.c_str(), &v) < 0)
+            {
+                return false;
+            }
+            out->push_back(static_cast<int>(v));
+        }
+        i = j + 1;
+    }
+    return !out->empty();
+}
+
+}  // namespace
+
+void jpeg_decoder_multicore::worker_main(int worker_index)
 {
     {
         int cpu = -1;
         {
             std::lock_guard<std::mutex> lock(cfg_mu);
-            cpu = worker_cpu;
+            if (!worker_cpus.empty())
+            {
+                const size_t idx =
+                    static_cast<size_t>(worker_index) % static_cast<size_t>(worker_cpus.size());
+                cpu = worker_cpus[idx];
+            }
+            else
+            {
+                cpu = worker_cpu;
+            }
         }
         pin_current_thread_to_cpu(cpu);
     }
@@ -305,7 +375,7 @@ int jpeg_decoder_multicore::start_workers()
     {
         for (int i = 0; i < n; i++)
         {
-            threads.emplace_back([this] { worker_main(); });
+            threads.emplace_back([this, i] { worker_main(i); });
         }
     }
     catch (...)
@@ -385,7 +455,7 @@ void jpeg_decoder_multicore::close()
 int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
 {
     const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::MJPEG || f.buf.size > k_max_jpeg)
+    if (f.kind != media_kind_e::MJPEG || f.buf.size() > k_max_jpeg)
     {
         return -EINVAL;
     }
@@ -396,12 +466,12 @@ int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
         return -EBADF;
     }
 
-    auto *copy = static_cast<uint8_t *>(std::malloc(f.buf.size));
+    auto *copy = static_cast<uint8_t *>(std::malloc(f.buf.size()));
     if (nullptr == copy)
     {
         return -ENOMEM;
     }
-    std::memcpy(copy, f.buf.data, f.buf.size);
+    std::memcpy(copy, f.buf.u8(), f.buf.size());
 
     std::unique_lock<std::mutex> lock(job_mu);
     if (job_count == k_queue_depth)
@@ -413,7 +483,7 @@ int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
 
     jobs[job_tail].seq = next_in_seq++;
     jobs[job_tail].data = copy;
-    jobs[job_tail].size = f.buf.size;
+    jobs[job_tail].size = f.buf.size();
     jobs[job_tail].pts = f.pts;
     jobs[job_tail].capture_mono_ns = f.capture_mono_ns;
     job_tail = (job_tail + 1) % k_queue_depth;
@@ -482,23 +552,9 @@ int jpeg_decoder_multicore::output(uint8_t /*port*/, data_packet &out, int timeo
     return status == 0 ? 0 : status;
 }
 
-int jpeg_decoder_multicore::configure(uint64_t /*key*/, int64_t /*value*/)
+int jpeg_decoder_multicore::configure(std::string_view key, std::string_view value)
 {
-    return -EINVAL;
-}
-
-int jpeg_decoder_multicore::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -EINVAL;
-}
-
-int jpeg_decoder_multicore::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
 
     if (key == "workers")
     {
@@ -534,6 +590,24 @@ int jpeg_decoder_multicore::configure(std::string_view key, std::string_view *va
         }
         std::lock_guard<std::mutex> lock(cfg_mu);
         worker_cpu = static_cast<int>(n);
+        worker_cpus.clear();
+        return 0;
+    }
+    if (key == "worker_cpus")
+    {
+        std::vector<int> list;
+        if (!parse_worker_cpulist(v, &list))
+        {
+            return -EINVAL;
+        }
+        std::lock_guard<std::mutex> life(life_mu);
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        worker_cpus = std::move(list);
+        worker_cpu = -1;
         return 0;
     }
 
@@ -588,13 +662,8 @@ int jpeg_decoder_multicore::configure(std::string_view key, std::string_view *va
     return -EINVAL;
 }
 
-int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value) const
+int jpeg_decoder_multicore::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if (key == "status")
     {
         bool is_open = false;
@@ -603,8 +672,7 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value)
             is_open = opened;
         }
         std::lock_guard<std::mutex> lock(cfg_mu);
-        query_buf = is_open ? "open" : "closed";
-        *value = query_buf;
+        *value = is_open ? "open" : "closed";
         return 0;
     }
 
@@ -616,8 +684,7 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value)
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "fps")
@@ -627,8 +694,7 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value)
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "workers")
@@ -638,8 +704,7 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value)
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "format" || key == "output_format")
@@ -649,20 +714,17 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string_view *value)
         {
             return -EINVAL;
         }
-        query_buf = name;
-        *value = query_buf;
+        *value = name;
         return 0;
     }
     if (key == "output_mode")
     {
-        query_buf = output_mode_name(output_mode);
-        *value = query_buf;
+        *value = output_mode_name(output_mode);
         return 0;
     }
     if (key == "decoded_pix_fmt")
     {
-        query_buf = decoded_pix_fmt;
-        *value = query_buf;
+        *value = decoded_pix_fmt;
         return 0;
     }
     return -EINVAL;

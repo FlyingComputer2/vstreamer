@@ -1,0 +1,16 @@
+---
+description: Implementing code-review fixes (task IDs like C1, H5, M22, L4, D1, or "P3-T2")
+alwaysApply: false
+---
+
+# Review fix work
+
+- The spec is `aidocs/implementation-plan.md`; findings and rationale are in `aidocs/review.md`.
+  If they disagree, the implementation plan wins.
+- Work phase by phase, task by task, in the order given. Do not start a phase before the
+  previous phase gate (§1.2 of the plan) passes.
+- One commit per task ID on branch `review-fixes`; subject starts with the IDs.
+- Write the test first and confirm it fails on the old code when the task has a "Test" line.
+- Never guess a design decision that is not in the plan: add it to "Open questions" at the
+  bottom of the plan and move on.
+- Do not rename existing metrics or console verbs (list in plan §0 rule 4).

@@ -16,8 +16,40 @@ namespace vstreamer
 namespace
 {
 
-void pad_nv12_tail(uint8_t *dy, uint8_t *duv, int dst_w, int dst_h, int h)
+void pad_nv12_right_columns(uint8_t *dy, uint8_t *duv, int w, int dst_w, int dst_h, int h)
 {
+    if (dst_w <= w || w < 2)
+    {
+        return;
+    }
+    for (int y = 0; y < h; y++)
+    {
+        const uint8_t last = dy[static_cast<size_t>(y) * static_cast<size_t>(dst_w) +
+                                static_cast<size_t>(w - 1)];
+        for (int x = w; x < dst_w; x++)
+        {
+            dy[static_cast<size_t>(y) * static_cast<size_t>(dst_w) + static_cast<size_t>(x)] = last;
+        }
+    }
+    const int ch = h / 2;
+    for (int y = 0; y < ch; y++)
+    {
+        const uint8_t u = duv[static_cast<size_t>(y) * static_cast<size_t>(dst_w) +
+                              static_cast<size_t>(w - 2)];
+        const uint8_t v = duv[static_cast<size_t>(y) * static_cast<size_t>(dst_w) +
+                              static_cast<size_t>(w - 1)];
+        for (int x = w; x < dst_w; x += 2)
+        {
+            duv[static_cast<size_t>(y) * static_cast<size_t>(dst_w) + static_cast<size_t>(x)] = u;
+            duv[static_cast<size_t>(y) * static_cast<size_t>(dst_w) + static_cast<size_t>(x + 1)] =
+                v;
+        }
+    }
+}
+
+void pad_nv12_tail(uint8_t *dy, uint8_t *duv, int dst_w, int dst_h, int h, int w)
+{
+    pad_nv12_right_columns(dy, duv, w, dst_w, dst_h, h);
     for (int y = h; y < dst_h; y++)
     {
         std::memcpy(dy + static_cast<size_t>(y) * static_cast<size_t>(dst_w),
@@ -34,6 +66,20 @@ void pad_nv12_tail(uint8_t *dy, uint8_t *duv, int dst_w, int dst_h, int h)
                         duv + static_cast<size_t>(ch - 1) * static_cast<size_t>(dst_w),
                         static_cast<size_t>(dst_w));
         }
+    }
+}
+
+void copy_chroma_row(uint8_t *dst, const uint8_t *src, int w, bool swap_chroma)
+{
+    if (!swap_chroma)
+    {
+        std::memcpy(dst, src, static_cast<size_t>(w));
+        return;
+    }
+    for (int x = 0; x < w; x += 2)
+    {
+        dst[x] = src[x + 1];
+        dst[x + 1] = src[x];
     }
 }
 
@@ -68,7 +114,7 @@ void merge_uv_row(uint8_t *uv, const uint8_t *cb, const uint8_t *cr, int cw)
 }  // namespace
 
 int pack_yuv420sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_stride,
-                          int ver_stride, uint8_t *dst, int dst_w, int dst_h)
+                          int ver_stride, uint8_t *dst, int dst_w, int dst_h, bool swap_chroma)
 {
     int w = src_w < dst_w ? src_w : dst_w;
     int h = src_h < dst_h ? src_h : dst_h;
@@ -92,17 +138,17 @@ int pack_yuv420sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_str
     }
     for (int y = 0; y < h / 2; y++)
     {
-        std::memcpy(duv + static_cast<size_t>(y) * static_cast<size_t>(dst_w),
-                    src_c + static_cast<size_t>(y) * static_cast<size_t>(hor_stride),
-                    static_cast<size_t>(w));
+        copy_chroma_row(duv + static_cast<size_t>(y) * static_cast<size_t>(dst_w),
+                        src_c + static_cast<size_t>(y) * static_cast<size_t>(hor_stride), w,
+                        swap_chroma);
     }
 
-    pad_nv12_tail(dy, duv, dst_w, dst_h, h);
+    pad_nv12_tail(dy, duv, dst_w, dst_h, h, w);
     return 0;
 }
 
 int pack_yuv422sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_stride,
-                          int ver_stride, uint8_t *dst, int dst_w, int dst_h)
+                          int ver_stride, uint8_t *dst, int dst_w, int dst_h, bool swap_chroma)
 {
     int w = src_w < dst_w ? src_w : dst_w;
     int h = src_h < dst_h ? src_h : dst_h;
@@ -126,12 +172,12 @@ int pack_yuv422sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_str
     }
     for (int y = 0; y < h / 2; y++)
     {
-        std::memcpy(duv + static_cast<size_t>(y) * static_cast<size_t>(dst_w),
-                    src_c + static_cast<size_t>(y * 2) * static_cast<size_t>(hor_stride),
-                    static_cast<size_t>(w));
+        copy_chroma_row(duv + static_cast<size_t>(y) * static_cast<size_t>(dst_w),
+                        src_c + static_cast<size_t>(y * 2) * static_cast<size_t>(hor_stride), w,
+                        swap_chroma);
     }
 
-    pad_nv12_tail(dy, duv, dst_w, dst_h, h);
+    pad_nv12_tail(dy, duv, dst_w, dst_h, h, w);
     return 0;
 }
 
@@ -167,7 +213,7 @@ int pack_yuv420p_to_nv12(const uint8_t *y, int y_stride, const uint8_t *u, int u
         merge_uv_row(uv, cb, cr, w / 2);
     }
 
-    pad_nv12_tail(dy, duv, dst_w, dst_h, h);
+    pad_nv12_tail(dy, duv, dst_w, dst_h, h, w);
     return 0;
 }
 
@@ -203,7 +249,7 @@ int pack_yuv422p_to_nv12(const uint8_t *y, int y_stride, const uint8_t *u, int u
         merge_uv_row(uv, cb, cr, w / 2);
     }
 
-    pad_nv12_tail(dy, duv, dst_w, dst_h, h);
+    pad_nv12_tail(dy, duv, dst_w, dst_h, h, w);
     return 0;
 }
 
@@ -246,7 +292,7 @@ int copy_nv12_planes_to_packed(const uint8_t *y_plane, int y_stride, const uint8
         }
     }
 
-    pad_nv12_tail(dy, duv, dst_w, dst_h, h);
+    pad_nv12_tail(dy, duv, dst_w, dst_h, h, w);
     return 0;
 }
 

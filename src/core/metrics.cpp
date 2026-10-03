@@ -44,24 +44,20 @@ metrics::metrics() = default;
 
 metrics::~metrics() = default;
 
-std::shared_ptr<metric> metrics::get_metric(const std::string &name, metric &seed)
+std::shared_ptr<metric> metrics::get_metric(const std::string &name)
 {
     std::lock_guard<std::mutex> lock(mu);
-    for (const auto &entry : entries)
+    const auto it = index.find(name);
+    if (it != index.end())
     {
-        if (entry.first == name)
-        {
-            return entry.second;
-        }
+        return entries[it->second].second;
     }
 
     auto ptr = std::make_shared<metric>();
-    {
-        std::lock_guard<std::mutex> slock(seed.mutex);
-        ptr->value = seed.value;
-    }
-    order.push_back(name);
+    ptr->value = uint64_t{0};
+    const size_t pos = entries.size();
     entries.emplace_back(name, ptr);
+    index.emplace(name, pos);
     return ptr;
 }
 
@@ -190,17 +186,7 @@ std::string metrics::to_string() const
     std::vector<std::pair<std::string, std::shared_ptr<metric>>> snapshot;
     {
         std::lock_guard<std::mutex> lock(mu);
-        for (const std::string &name : order)
-        {
-            for (const auto &entry : entries)
-            {
-                if (entry.first == name)
-                {
-                    snapshot.emplace_back(name, entry.second);
-                    break;
-                }
-            }
-        }
+        snapshot = entries;
     }
 
     std::string out;

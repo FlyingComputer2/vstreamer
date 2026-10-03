@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/shared_sized_buffer.hpp"
+
 // Packet-block Reed-Solomon erasure FEC (systematic Cauchy MDS via ISA-L).
 // k app datagrams become n on-air shards. Wire header is 4 bytes (see pack_header).
 // n == k: no parity (non-FEC redundancy); same block framing and header on each shard.
@@ -22,6 +24,8 @@
 // zero on RX (7 bits reserved today; the parity bit is the 8th logical spare).
 namespace vstreamer
 {
+
+using fec_rx_payload_list = std::vector<shared_sized_buffer>;
 
 class rs_block_erasure
 {
@@ -61,21 +65,21 @@ public:
 
     // init() / disable() keep the TX block_id counter running so a runtime
     // k/n change does not replay ids the receiver already saw.
-    bool init(int k, int n, int timeout_ms);
+    bool init(int k, int n, int timeout_ms, size_t max_shard_bytes = 1470);
     // Stop TX encode; flush pending first via flush()/announce_down. RX decode
     // still works from shard headers.
     void disable();
     bool enabled() const
     {
-        return enabled_;
+        return active;
     }
     int k() const
     {
-        return k_;
+        return cfg_k;
     }
     int n() const
     {
-        return n_;
+        return cfg_n;
     }
     const char* impl_name() const;
 
@@ -85,37 +89,68 @@ public:
     void flush(std::vector<std::vector<uint8_t>>* out);
     // TX tick: timeout-flush a partial block. Also expires RX state.
     void on_tick(std::vector<std::vector<uint8_t>>* out);
+    /* Next partial-block flush time; false if no pending TX deadline. */
+    [[nodiscard]] bool next_deadline(std::chrono::steady_clock::time_point* out) const;
     // RX tick: expire stale blocks and release payloads held in the
     // in-order emit queue whose head-of-line wait has elapsed. Call
     // periodically even when no datagram arrives.
-    void poll_rx(std::vector<std::vector<uint8_t>>* out);
+    void poll_rx(fec_rx_payload_list* out);
 
-    // Air datagram -> original payloads when a block can be decoded. Every
-    // datagram must carry the 4-byte FEC shard header.
-    void push_air(const uint8_t* data, size_t len,
-                  std::vector<std::vector<uint8_t>>* out);
+    // Air datagram (full 4-byte FEC shard header + body). Zero-copy RX stores the
+    // buffer in the block; systematic emits are subviews of the shard body.
+    void push_air(shared_sized_buffer shard, fec_rx_payload_list* out);
+    void push_air(const uint8_t* data, size_t len, fec_rx_payload_list* out);
 
     uint64_t recovered() const
     {
-        return recovered_;
+        return recovered_count;
     }
     uint64_t blocks() const
     {
-        return blocks_;
+        return blocks_count;
     }
     uint64_t decode_fail() const
     {
-        return decode_fail_;
+        return evicted_blocks_count + rs_failures_count;
+    }
+    uint64_t hdr_errors() const
+    {
+        return hdr_errors_count;
+    }
+    uint64_t kn_mismatch() const
+    {
+        return kn_mismatch_count;
+    }
+    uint64_t evicted_blocks() const
+    {
+        return evicted_blocks_count;
+    }
+    uint64_t rs_failures() const
+    {
+        return rs_failures_count;
+    }
+    uint64_t missing_shards() const
+    {
+        return missing_shards_count;
+    }
+    uint64_t late_blocks() const
+    {
+        return late_blocks_count;
     }
     uint64_t oversized() const
     {
-        return oversized_;
+        return oversized_count;
     }
-    // Interval since last take. recovered() / decode_fail() stay lifetime.
+    // Interval since last take. Lifetime totals stay in recovered() / decode_fail() / …
     uint64_t take_recovered();
     uint64_t take_decode_fail();
-    /* Shards still missing when an RX block is evicted / expires (interval take). */
+    uint64_t take_hdr_errors();
+    uint64_t take_kn_mismatch();
+    uint64_t take_evicted_blocks();
+    uint64_t take_rs_failures();
+    /* Shards still missing when an RX block is evicted / give-up (interval take). */
     uint64_t take_fail_missing_shards();
+    uint64_t take_late_blocks();
     uint64_t take_fail_lost_app_pkts();
 
     // Encode one block. packets.size() may be < k (tail slots are virtual pads).
@@ -127,15 +162,13 @@ public:
                       std::vector<std::vector<uint8_t>>* out) const;
     // Decode from shard index -> body. k/n come from the wire header (or
     // from init() via the overload). Returns false if unrecoverable.
-    bool decode_block(int k, int n,
-                      const std::unordered_map<int, std::vector<uint8_t>>& frags,
-                      std::vector<std::vector<uint8_t>>* payloads,
-                      int* recovered) const;
-    bool decode_block(
-        const std::unordered_map<int, std::vector<uint8_t>>& frags,
-        std::vector<std::vector<uint8_t>>* payloads, int* recovered) const;
+    bool decode_block(int k, int n, int sdu_n,
+                      const std::unordered_map<int, shared_sized_buffer>& frags,
+                      fec_rx_payload_list* payloads, int* recovered) const;
+    bool decode_block(const std::unordered_map<int, shared_sized_buffer>& frags,
+                      fec_rx_payload_list* payloads, int* recovered) const;
 
-    static size_t max_original();
+    [[nodiscard]] size_t max_original() const;
 
     static bool pack_header(uint8_t* out, uint16_t block_id, int index, int k, int n,
                             uint8_t flags, int sdu_n);
@@ -143,45 +176,63 @@ public:
                               int* index, int* k, int* n, uint8_t* flags, int* sdu_n);
 
 private:
+    static constexpr int k_ring_evict_dist = 64;
+
     struct rx_block_s
     {
-        int k = 0;
-        int n = 0;
-        int sdu_n = 0;
-        std::unordered_map<int, std::vector<uint8_t>> frags;
-        std::chrono::steady_clock::time_point first_seen{};
-        std::chrono::steady_clock::time_point last_seen{};
+        int                                              k = 0;
+        int                                              n = 0;
+        int                                              sdu_n = 0;
+        int                                              released = 0;
+        std::unordered_map<int, shared_sized_buffer>     frags;
+        std::chrono::steady_clock::time_point            first_seen{};
+        std::chrono::steady_clock::time_point            last_seen{};
     };
 
-    void note_rx_block_loss(const rx_block_s& block);
+    struct ready_block_s
+    {
+        fec_rx_payload_list payloads;
+        int                               released = 0;
+        int                               sdu_n = 0;
+    };
+
+    void account_missing_shards(const rx_block_s& block);
     void note_rx_block_output_shortfall(int expected, int available);
     static int expected_sdus(const rx_block_s& block);
-    /* Emit systematic app payloads present without RS decode; gap += (N - available). */
-    void finish_block_with_available(const rx_block_s& block, uint16_t block_id,
-                                     std::vector<std::vector<uint8_t>>* out);
-    void expire_rx(std::vector<std::vector<uint8_t>>* out);
+
+    static int ring_dist(uint8_t a, uint8_t b);
+    int        dist_from_emit(uint16_t block_id) const;
+
+    void record_payload_emit();
+    void emit_payload(fec_rx_payload_list* out, shared_sized_buffer&& app);
+    static bool frag_to_app(const shared_sized_buffer& shard, shared_sized_buffer* app);
+
+    void abandon_partial_block(const rx_block_s& block, uint16_t block_id, fec_rx_payload_list* out);
+    void expire_rx(fec_rx_payload_list* out);
     void expire_done();
     void mark_done(uint16_t block_id);
     void note_emit_base(uint16_t block_id);
-    // Signed wrap-aware distance of block_id from emit_next.
-    int emit_distance(uint16_t block_id) const;
-    void prune_emit_behind();
-    void advance_emit_past_hole();
-    void skip_emit_block(uint16_t block_id);
-    void queue_decoded_block(uint16_t block_id,
-                             std::vector<std::vector<uint8_t>> payloads,
-                             std::vector<std::vector<uint8_t>>* out);
-    void drain_emit_queue(std::vector<std::vector<uint8_t>>* out);
+    void touch_newest(uint16_t block_id);
+    void ring_evict_stale(fec_rx_payload_list* out);
+    void maybe_resync_on_late_shard(uint16_t block_id);
+    void clear_state_behind(uint16_t base_id);
+    void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
+    void on_block_decoded(uint16_t block_id, int released_before, fec_rx_payload_list payloads,
+                          int sdu_n, fec_rx_payload_list* out);
+    void maybe_give_up_head(fec_rx_payload_list* out);
+    void run_emit_engine(fec_rx_payload_list* out);
+    bool try_decode_block(uint16_t block_id, rx_block_s* block, fec_rx_payload_list* out);
+
     std::chrono::steady_clock::time_point now() const;
     static int gen_decode_matrix(int k, int n, const uint8_t* encode_matrix,
                                  const uint8_t* err_list, int nerrs,
                                  uint8_t* decode_matrix, uint8_t* decode_index);
 
-    bool enabled_ = false;
-    int k_ = 0;
-    int n_ = 0;
-    int p = 0;
-    int timeout_ms = k_default_timeout_ms;
+    bool active = false;
+    int  cfg_k = 0;
+    int  cfg_n = 0;
+    int  p = 0;
+    int  timeout_ms = k_default_timeout_ms;
     std::vector<uint8_t> encode_matrix;
     std::vector<uint8_t> g_tbls;
 
@@ -194,23 +245,37 @@ private:
     std::deque<uint16_t> done_order;
     std::unordered_map<uint16_t, std::chrono::steady_clock::time_point> done;
 
-    std::unordered_map<uint16_t, std::vector<std::vector<uint8_t>>> emit_pending;
-    std::unordered_set<uint16_t>                                    emit_skipped;
-    bool     emit_base_set = false;
-    uint16_t emit_next = 0;
-    bool     emit_waiting = false;
-    std::chrono::steady_clock::time_point emit_wait_since{};
+    std::unordered_map<uint16_t, ready_block_s> ready_blocks;
+    bool                                      emit_base_set = false;
+    uint16_t                                  emit_next = 0;
+    uint8_t                                   newest = 0;
+    bool                                      newest_set = false;
+    std::chrono::steady_clock::time_point     last_payload_emit{};
+    bool                                      have_payload_emit = false;
+    std::chrono::steady_clock::time_point     later_block_since{};
+    bool                                      later_block_waiting = false;
 
-    uint64_t recovered_ = 0;
-    uint64_t recovered_seen_ = 0;
-    uint64_t blocks_ = 0;
-    uint64_t decode_fail_ = 0;
-    uint64_t decode_fail_seen_ = 0;
-    uint64_t fail_missing_shards_ = 0;
-    uint64_t fail_missing_shards_seen_ = 0;
-    uint64_t fail_lost_app_pkts_ = 0;
-    uint64_t fail_lost_app_pkts_seen_ = 0;
-    uint64_t oversized_ = 0;
+    uint64_t recovered_count = 0;
+    uint64_t recovered_seen = 0;
+    uint64_t blocks_count = 0;
+    uint64_t decode_fail_seen = 0;
+    uint64_t hdr_errors_count = 0;
+    uint64_t hdr_errors_seen = 0;
+    uint64_t kn_mismatch_count = 0;
+    uint64_t kn_mismatch_seen = 0;
+    uint64_t evicted_blocks_count = 0;
+    uint64_t evicted_blocks_seen = 0;
+    uint64_t rs_failures_count = 0;
+    uint64_t rs_failures_seen = 0;
+    uint64_t missing_shards_count = 0;
+    uint64_t missing_shards_seen = 0;
+    uint64_t fail_lost_app_pkts_count = 0;
+    uint64_t fail_lost_app_pkts_seen = 0;
+    uint64_t late_blocks_count = 0;
+    uint64_t late_blocks_seen = 0;
+    uint64_t oversized_count = 0;
+
+    size_t max_shard_bytes = 1470;
 };
 
 }  // namespace vstreamer
