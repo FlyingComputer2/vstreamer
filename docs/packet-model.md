@@ -41,8 +41,8 @@ shard on the wire. Systematic shards add a 2 B big-endian payload length before 
 Peer loss metrics on `stream_sender` (`peer_loss_*`, `peer_*_gap_count`) are fed from
 **reverse UDP link reports** (`core/stream_telemetry.hpp`): `stream_receiver` sends cumulative
 counters to the source address of the last valid media datagram; `stream_sender` receives them
-on its bound media socket. Loss % is derived in the app (`stream_sdl` / split apps). While
-`stream_sdl` remains, telemetry is disabled there and peer counters are still copied in-process.
+on its bound media socket. Loss % is derived in the app from report deltas (`stream_sdl`
+re-baselines on a new `session_id` or a counter decrease).
 
 ### Reverse path: link report (v1, 48 bytes, big-endian)
 

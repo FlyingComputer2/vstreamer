@@ -9,8 +9,6 @@ inline constexpr const char k_loopback_host[] = "127.0.0.1";
 
 inline constexpr int k_chan_fwd_ingress = 5000;   /* stream_sender → channel */
 inline constexpr int k_stream_rx_listen = 5001;   /* channel fwd → stream_receiver */
-inline constexpr int k_chan_rev_ingress = 5002;   /* return path into channel */
-inline constexpr int k_chan_rev_egress = 5003;  /* channel rev → return listener */
 inline constexpr int k_chan_console = 5090; /* UDP console: impairment + pipeline metrics */
 
 /* Default forward-path cap (stream_sender → stream_receiver). 0 = unlimited. */

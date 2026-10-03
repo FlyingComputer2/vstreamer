@@ -17,8 +17,10 @@ namespace vstreamer::test_app
 {
 
 /*
- * Bidirectional UDP relay between two endpoints (e.g. stream_sender ↔ stream_receiver).
- * Applies max throughput (drop) then constant random loss on each direction independently.
+ * UDP relay between two endpoints (e.g. stream_sender → stream_receiver). The reverse direction
+ * is the NAT-style return path of the forward flow: replies to the forward egress socket go back
+ * from the forward ingress socket to the last forward source. Max throughput (drop) then constant
+ * random loss apply to each direction independently.
  */
 class link_emulator
 {
@@ -32,10 +34,7 @@ public:
     void set_bind_host(const char *host);
 
     int start(int ingress_port = k_chan_fwd_ingress, const char *egress_host = k_loopback_host,
-              int egress_port = k_stream_rx_listen,
-              int reverse_ingress_port = k_chan_rev_ingress,
-              const char *reverse_egress_host = k_loopback_host,
-              int reverse_egress_port = k_chan_rev_egress);
+              int egress_port = k_stream_rx_listen);
     void stop();
 
     void set_max_kbps(double kbps);
@@ -58,6 +57,7 @@ public:
         uint64_t dropped_rate = 0;
         uint64_t dropped_loss = 0;
         uint64_t dropped_queue = 0;
+        uint64_t dropped_no_route = 0;
     };
 
     [[nodiscard]] forward_stats forward_stats_snapshot() const;
@@ -88,6 +88,7 @@ private:
         std::atomic<uint64_t> dropped_rate {0};
         std::atomic<uint64_t> dropped_loss {0};
         std::atomic<uint64_t> dropped_queue {0};
+        std::atomic<uint64_t> dropped_no_route {0};
 
         std::deque<std::vector<uint8_t>> ingress_queue;
         std::atomic<size_t>              ingress_queue_len {0};
@@ -117,8 +118,9 @@ private:
     std::atomic<bool> relay_stop {false};
 
     direction_state fwd;
+    /* Return path: no sockets of its own; egress_fd aliases fwd.ingress_fd and egress_addr is the
+     * last forward source (relay-thread-only state). */
     direction_state rev;
-    bool            rev_enabled = false;
 
     std::thread relay_thread;
 

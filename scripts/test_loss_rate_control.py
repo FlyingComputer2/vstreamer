@@ -18,7 +18,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from utils import Clamp, LossRateControl  # noqa: E402
+from utils import Clamp, LossRateControl, telemetry_stale  # noqa: E402
 
 LOOP_RATE = 100.0
 DT = 1.0 / LOOP_RATE
@@ -106,16 +106,14 @@ def check_recovery(ramp: float, fall: float, label: str) -> list[str]:
     return [] if ok else [label]
 
 
-def _telemetry_stale(age: float | None, telemetry_ms: float = 100.0) -> bool:
-    return age is None or age < 0.0 or age > 3.0 * telemetry_ms
-
-
 def check_stale_age_flags() -> list[str]:
-    ok_neg = _telemetry_stale(-1.0)
-    ok_old = _telemetry_stale(1000.0)
-    ok_fresh = not _telemetry_stale(50.0)
-    ok = ok_neg and ok_old and ok_fresh
-    print(f"[{'ok' if ok else 'FAIL'}] stale age flags (-1, 1000, 50 ms)")
+    ok_neg = telemetry_stale(-1.0, 100.0)
+    ok_old = telemetry_stale(1000.0, 100.0)
+    ok_missing = telemetry_stale(None, 100.0)
+    ok_fresh = not telemetry_stale(50.0, 100.0)
+    ok_edge = not telemetry_stale(300.0, 100.0) and telemetry_stale(301.0, 100.0)
+    ok = ok_neg and ok_old and ok_missing and ok_fresh and ok_edge
+    print(f"[{'ok' if ok else 'FAIL'}] stale age flags (-1, 1000, missing, 50, 300/301 ms)")
     return [] if ok else ["stale-age-flags"]
 
 

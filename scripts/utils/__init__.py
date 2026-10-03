@@ -11,6 +11,7 @@ from utils.control import (
     GapLoss,
     Integrator,
     LossRateControl,
+    telemetry_stale,
     LPF,
 )
 from utils.metrics import Metrics, fetch_pipeline_metrics, parse_metrics_report
@@ -27,6 +28,7 @@ __all__ = [
     "GapLoss",
     "Integrator",
     "LossRateControl",
+    "telemetry_stale",
     "LPF",
     "Metrics",
     "TuneConsole",

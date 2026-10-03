@@ -101,7 +101,7 @@ inline void stream_link_report_encode(const stream_link_report &r, uint8_t out[4
 
 inline int stream_link_report_decode(const uint8_t *data, size_t len, stream_link_report *out)
 {
-    if (nullptr == out)
+    if (nullptr == data || nullptr == out)
     {
         return -EINVAL;
     }

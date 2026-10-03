@@ -99,3 +99,9 @@ TEST(StreamTelemetryTest, NonZeroReservedAccepted)
     EXPECT_EQ(0, vstreamer::stream_link_report_decode(wire, sizeof(wire), &out));
     EXPECT_EQ(sample_report().session_id, out.session_id);
 }
+
+TEST(StreamTelemetryTest, RejectNullData)
+{
+    vstreamer::stream_link_report rep {};
+    EXPECT_EQ(-EINVAL, vstreamer::stream_link_report_decode(nullptr, 48, &rep));
+}

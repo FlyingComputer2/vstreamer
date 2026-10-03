@@ -19,7 +19,7 @@ class stream_sender;
 namespace vstreamer::test_app
 {
 
-/* Facade: UDP link emulator + bench console (same API as pre-P11-T5). */
+/* Facade: UDP link emulator + bench console behind one API. */
 class channel_controller
 {
 public:
@@ -32,10 +32,7 @@ public:
     void set_bind_host(const char *host);
 
     int start(int ingress_port = k_chan_fwd_ingress, const char *egress_host = k_loopback_host,
-              int egress_port = k_stream_rx_listen,
-              int reverse_ingress_port = k_chan_rev_ingress,
-              const char *reverse_egress_host = k_loopback_host,
-              int reverse_egress_port = k_chan_rev_egress);
+              int egress_port = k_stream_rx_listen);
     int start_console(int console_port = k_chan_console);
     void stop();
 

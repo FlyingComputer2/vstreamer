@@ -244,6 +244,11 @@ class Integrator:
         return self._state
 
 
+def telemetry_stale(age_ms: float | None, telemetry_ms: float) -> bool:
+    """Stale: no report yet (-1), a missing metric, or older than 3 report intervals."""
+    return age_ms is None or age_ms < 0.0 or age_ms > 3.0 * telemetry_ms
+
+
 class LossRateControl:
     """AIMD rate control on residual (post-FEC) gaps.
 

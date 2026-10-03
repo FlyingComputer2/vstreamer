@@ -1,4 +1,4 @@
-/* self_test.cpp — split from stream_sdl (P11-T4). */
+/* self_test.cpp — stream_sdl_test --self-test. */
 
 #include "apps/stream_sdl_test/self_test.hpp"
 

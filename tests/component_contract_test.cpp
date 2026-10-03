@@ -24,7 +24,7 @@ void expect_unknown_key_enotsup(vstreamer::component &c, const std::string &labe
 
 }  // namespace
 
-/* H9: unknown keys return -ENOTSUP (bad values return -EINVAL) on every component. */
+/* Unknown keys return -ENOTSUP (bad values return -EINVAL) on every component. */
 TEST(ComponentContractTest, UnknownKeyIsEnotsup)
 {
     int checked = 0;

@@ -2,8 +2,10 @@
 
 #include "apps/stream_sdl_test/pipeline_state.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 #include <string>
 
 #include "core/metrics.hpp"
@@ -14,6 +16,7 @@ namespace vstreamer::apps::tx
 
 using namespace vstreamer;
 using test_app::g_pipeline_metrics;
+using test_app::g_run;
 using test_app::g_tx;
 
 namespace
@@ -24,6 +27,7 @@ constexpr int k_receiver_loss_avg_samples = 5;
 struct receiver_loss_tracker
 {
     stream_link_counters prev {};
+    uint32_t             session = 0;
     bool                 have_prev = false;
     double               udp_loss[k_receiver_loss_avg_samples] {};
     double               fec_loss[k_receiver_loss_avg_samples] {};
@@ -80,8 +84,19 @@ void push_loss_sample(double sample, double *buf, int &n, double &avg_out)
     avg_out = sum / static_cast<double>(n);
 }
 
-void update_receiver_loss_deltas(const stream_link_counters &cur, receiver_loss_tracker &tr)
+void update_receiver_loss_deltas(const stream_link_counters &cur, uint32_t session,
+                                 receiver_loss_tracker &tr)
 {
+    /* Receiver reopened (new session) or counters went backwards: start a fresh window. */
+    if (tr.have_prev &&
+        (session != tr.session || cur.udp_packet_received < tr.prev.udp_packet_received ||
+         cur.udp_gap_count < tr.prev.udp_gap_count ||
+         cur.fec_packet_received < tr.prev.fec_packet_received ||
+         cur.fec_gap_count < tr.prev.fec_gap_count))
+    {
+        tr = receiver_loss_tracker {};
+    }
+    tr.session = session;
     if (tr.have_prev)
     {
         const double wire_inst =
@@ -188,20 +203,19 @@ void store_sender_peer_link_metrics(uint64_t udp_recv, uint64_t fec_recv, uint64
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_fec_pct"), loss_fec_pct);
 }
 
+/* stream_sender.peer_* come only from the link reports the sender received, never from a
+ * receiver object. Published before the first report too (counters 0, age -1, session 0). */
 void sync_sender_peer_link_metrics_live(stream_sender &sender)
 {
     const stream_peer_link snap = sender.peer_link_snapshot();
-    if (!snap.have)
-    {
-        return;
-    }
-    const stream_link_counters cur = snap.report.counters;
+    const stream_link_counters cur = snap.have ? snap.report.counters : stream_link_counters {};
 
     double loss_udp = 0.;
     double loss_fec = 0.;
+    if (snap.have)
     {
         std::lock_guard<std::mutex> lock(g_sender_peer_loss_mu);
-        update_receiver_loss_deltas(cur, g_sender_peer_loss);
+        update_receiver_loss_deltas(cur, snap.report.session_id, g_sender_peer_loss);
         loss_udp = g_sender_peer_loss.loss_udp_pct;
         loss_fec = g_sender_peer_loss.loss_fec_pct;
     }
@@ -209,13 +223,27 @@ void sync_sender_peer_link_metrics_live(stream_sender &sender)
     store_sender_peer_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
                                    cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_age_ms"),
-                 static_cast<double>(snap.age_ms));
+                 static_cast<int64_t>(snap.age_ms));
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_received"),
                  snap.reports_received);
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_lost"),
                  snap.reports_lost);
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_rejected"),
                  snap.reports_rejected);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_session"),
+                 static_cast<uint64_t>(snap.have ? snap.report.session_id : 0U));
+}
+
+void telemetry_thread_main(stream_sender *sender)
+{
+    while (g_run.load())
+    {
+        if (nullptr != sender)
+        {
+            sync_sender_peer_link_metrics_live(*sender);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 }
 
 void sync_tx_cumulative_counters(const test_app::bench_diag &d, stream_sender *sender)

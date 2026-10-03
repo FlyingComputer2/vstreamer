@@ -18,10 +18,15 @@ alwaysApply: true
   FEC shard on egress; `stream_receiver` always strips it for gap / `loss_udp_pct`.
   Radio winject must preserve the same layout if it sits in the path.
 - Loss metrics (`stream_sender.peer_loss_udp_pct`, `peer_loss_fec_pct`, and the four
-  `peer_*_packet_received` / `peer_*_gap_count` counters) are published by the app
-  (`stream_sdl` `sync_peer_link_metrics_live` reading `stream_receiver` atomics) — not
-  from a reverse UDP telemetry channel and not via `stream_sender::query()`. They are not
-  ground truth; check the data path before changing how they are computed.
+  `peer_*_packet_received` / `peer_*_gap_count` counters) come from **reverse UDP link reports**
+  (`core/stream_telemetry.hpp`): `stream_receiver` sends cumulative counters to the source of the
+  last valid media datagram; `stream_sender` reads them on its media socket
+  (`peer_link_snapshot()`). The app (`stream_sdl` `sync_peer_link_metrics_live`) derives loss %
+  from report deltas and must never read the receiver object for `stream_sender.peer_*`. In the
+  bench the reports cross `link_emulator`'s reverse direction (return path of the forward flow).
+  `peer_report_age_ms` / `peer_reports_*` show return-path health; `cbr_controller.py` holds
+  increases while telemetry is stale.
+  They are not ground truth; check the data path before changing how they are computed.
 - FEC checks: `build/rs_fec_test` (unit), plus a loopback
   `stream_sender` → `stream_receiver` run with runtime `fec_n` changes and
   peer restarts for anything touching the pipeline.

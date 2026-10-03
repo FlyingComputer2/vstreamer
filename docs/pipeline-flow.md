@@ -30,8 +30,9 @@ Receiver link counters flow **receiver → reverse UDP → sender**: periodic 48
 (`stream_telemetry.hpp`) to the media source address; `stream_sender::peer_link_snapshot()` and
 `peer_*` query keys hold the last report. The app derives `peer_loss_*` from counter deltas.
 `scripts/cbr_controller.py` holds AIMD increases when `peer_report_age_ms` is stale (> 3×
-`telemetry_ms`). Legacy `stream_sdl` disables wire telemetry and still copies counters in-process
-until removed. Encoder rate: `configure("cbr")` or bench `set_encode_cbr`.
+`telemetry_ms`, or no report yet). In the `stream_sdl` bench the reports cross `link_emulator`'s
+reverse direction, the NAT-style return path of the forward flow, so reverse-path loss is
+emulated too. Encoder rate: `configure("cbr")` or bench `set_encode_cbr`.
 
 Factory names: `v4l2_source`, `jpeg_decoder_multicore`, `h264_encoder_cedar`,
 `rtp_h264_pay`, `stream_sender`.

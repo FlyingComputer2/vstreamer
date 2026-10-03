@@ -1,4 +1,4 @@
-/* tx_stages.cpp — SA-T4 split from stream_sdl stages. */
+/* tx_stages.cpp — transmit-half pipeline stages. */
 
 #include "apps/common/tx/tx_stages.hpp"
 

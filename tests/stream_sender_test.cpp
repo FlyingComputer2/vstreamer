@@ -496,3 +496,59 @@ TEST(StreamSenderTest, CloseJoinsTelemetryQuickly)
                         .count();
     EXPECT_LT(ms, 200);
 }
+
+/* Known keys answer before the first report / before open(); -ENOTSUP is only for
+ * unknown keys. */
+TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
+{
+    vstreamer::stream_sender sender;
+    std::string               val;
+    ASSERT_EQ(0, sender.query("local", &val));
+    EXPECT_EQ("0.0.0.0:0", val);
+    ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, sender.open());
+    for (const char *key : {"peer_udp_packet_received", "peer_fec_packet_received",
+                            "peer_udp_gap_count", "peer_fec_gap_count", "peer_session",
+                            "peer_reports_received", "peer_reports_lost", "peer_reports_rejected"})
+    {
+        EXPECT_EQ(0, sender.query(key, &val)) << key;
+        EXPECT_EQ("0", val) << key;
+    }
+    ASSERT_EQ(0, sender.query("peer_report_age_ms", &val));
+    EXPECT_EQ("-1", val);
+    sender.close();
+}
+
+/* local = [host:]port, validated at configure(); port 0 = ephemeral. */
+TEST(StreamSenderTest, LocalSpecForms)
+{
+    {
+        vstreamer::stream_sender sender;
+        EXPECT_EQ(-EINVAL, sender.configure("local", "junk"));
+        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:70000"));
+        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:"));
+    }
+    {
+        const int port = ephemeral_udp_port();
+        ASSERT_GT(port, 0);
+        vstreamer::stream_sender sender;
+        ASSERT_EQ(0, sender.configure("local", std::to_string(port)));
+        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+        ASSERT_EQ(0, sender.open());
+        std::string val;
+        ASSERT_EQ(0, sender.query("local", &val));
+        EXPECT_EQ("0.0.0.0:" + std::to_string(port), val);
+        sender.close();
+    }
+    {
+        vstreamer::stream_sender sender;
+        ASSERT_EQ(0, sender.configure("local", "127.0.0.1:0"));
+        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+        ASSERT_EQ(0, sender.open());
+        std::string val;
+        ASSERT_EQ(0, sender.query("local", &val));
+        EXPECT_EQ(0U, val.rfind("127.0.0.1:", 0)) << val;
+        EXPECT_NE("127.0.0.1:0", val);
+        sender.close();
+    }
+}

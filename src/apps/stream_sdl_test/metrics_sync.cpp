@@ -1,4 +1,4 @@
-/* metrics_sync.cpp — split from stream_sdl (P11-T4). */
+/* metrics_sync.cpp — bench pipeline metrics. */
 
 #include "apps/stream_sdl_test/metrics_sync.hpp"
 
@@ -453,13 +453,14 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
         }
     }
     sync_cumulative_pipeline_counters(d, sender, channel, rcv);
-    if (nullptr != rcv)
-    {
-        apps::rx::sync_peer_link_metrics_live(*rcv);
-    }
-    else if (nullptr != sender)
+    /* stream_sender.peer_* only from the sender's received link reports. */
+    if (nullptr != sender)
     {
         apps::tx::sync_sender_peer_link_metrics_live(*sender);
+    }
+    if (nullptr != rcv)
+    {
+        apps::rx::sync_rx_link_metrics_live(*rcv);
     }
 }
 

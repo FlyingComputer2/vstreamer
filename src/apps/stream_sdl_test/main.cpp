@@ -8,9 +8,10 @@
  *   CPU3: stream_receiver → rtp_h264_depay → h264_decoder_mpp → display sink
  * Rate: encoder CBR/QP at open; adjust via UDP set_encode_cbr / set_encode_qp.
  * Link: stream_sender → channel_controller (fwd) → stream_receiver
- *       return traffic → channel_controller (rev) → configured egress port
+ *       stream_receiver link reports → channel_controller (rev = return path of the fwd flow,
+ *       NAT-style) → stream_sender; peer_* metrics come from the sender's received reports.
  *
- * Default UDP ports (channel_ports.hpp): fwd 5000→5001, rev 5002→5003, console 5090.
+ * Default UDP ports (channel_ports.hpp): fwd 5000→5001, console 5090.
  *
  * channel_controller console (UDP, newline-terminated):
  *   help | h | ?
@@ -115,8 +116,6 @@ void print_usage(const char *prog)
     using test_app::k_chan_console;
     using test_app::k_chan_fwd_ingress;
     using test_app::k_loopback_host;
-    using test_app::k_chan_rev_egress;
-    using test_app::k_chan_rev_ingress;
     using test_app::k_stream_rx_listen;
 
     std::fprintf(stderr,
@@ -130,10 +129,8 @@ void print_usage(const char *prog)
                  "  (env VSTREAMER_PREGENERATE_FRAMES same as --pregenerate-frame)\n"
                  "  --chan-bind A  channel console + relay bind address (default %s)\n"
                  "  --chan-in P    channel forward ingress (default %d)\n"
-                 "  --chan-rev P   channel reverse ingress (default %d)\n"
                  "  --channel-drop-dt-ms MS  max_kbps window (default %d)\n"
                  "  --channel-queue N  per-direction ingress queue (0=off; default %d)\n"
-                 "  --rev-egress P reverse egress port (default %d)\n"
                  "  --rx-port P    stream_receiver listen (default %d)\n"
                  "  --console P    channel UDP console + metrics (default %d)\n"
                  "  --display MODE sdl (default) or kmsdrm (SDL kmsdrm / DRM)\n"
@@ -143,10 +140,12 @@ void print_usage(const char *prog)
                  "                 (or VSTREAMER_LOG_STAGE_LATENCY=1; EVERY=N th frame)\n"
                  "  --cbr KBPS     encoder CBR target kb/s (default %d)\n"
                  "  --gop N        encoder GOP 1..255 (default: same as --fps; or VSTREAMER_ENC_GOP)\n"
-                 "  --source ARG   noise (default) or V4L2 device e.g. /dev/video0\n",
-                 prog, k_loopback_host, k_chan_fwd_ingress, k_chan_rev_ingress,
+                 "  --source ARG   noise (default) or V4L2 device e.g. /dev/video0\n"
+                 "  --no-telemetry stream_receiver/stream_sender link reports off\n"
+                 "                 (peer_* metrics stay 0, peer_report_age_ms -1)\n",
+                 prog, k_loopback_host, k_chan_fwd_ingress,
                  test_app::k_chan_default_drop_dt_ms,
-                 test_app::k_chan_default_queue_depth, k_chan_rev_egress, k_stream_rx_listen,
+                 test_app::k_chan_default_queue_depth, k_stream_rx_listen,
                  k_chan_console,
                  test_app::k_encoder_default_cbr_kbps);
 }
@@ -177,8 +176,6 @@ int main(int argc, char **argv)
     using namespace vstreamer::test_app;
     using test_app::k_chan_console;
     using test_app::k_chan_fwd_ingress;
-    using test_app::k_chan_rev_egress;
-    using test_app::k_chan_rev_ingress;
     using test_app::k_loopback_host;
     using test_app::k_stream_rx_listen;
 
@@ -230,10 +227,8 @@ int main(int argc, char **argv)
         }
     }
     int chan_in = k_chan_fwd_ingress;
-    int chan_rev = k_chan_rev_ingress;
     int channel_drop_dt_ms = test_app::k_chan_default_drop_dt_ms;
     int channel_queue = test_app::k_chan_default_queue_depth;
-    int rev_egress = k_chan_rev_egress;
     int rx_port = k_stream_rx_listen;
     int console_port = k_chan_console;
     const char *chan_bind_host = k_loopback_host;
@@ -246,6 +241,7 @@ int main(int argc, char **argv)
     const char *app_label = "stream_sdl";
     bool self_test = false;
     bool diag_log = false;
+    bool telemetry = true;
     int  encoder_cbr_kbps = test_app::k_encoder_default_cbr_kbps;
     int  encoder_gop = 0;
 
@@ -302,10 +298,6 @@ int main(int argc, char **argv)
         {
             chan_in = std::atoi(argv[++i]);
         }
-        else if (0 == std::strcmp(argv[i], "--chan-rev") && i + 1 < argc)
-        {
-            chan_rev = std::atoi(argv[++i]);
-        }
         else if (0 == std::strcmp(argv[i], "--channel-drop-dt-ms") && i + 1 < argc)
         {
             channel_drop_dt_ms = std::atoi(argv[++i]);
@@ -325,10 +317,6 @@ int main(int argc, char **argv)
                 std::fprintf(stderr, "--channel-queue must be 0..65535\n");
                 return 1;
             }
-        }
-        else if (0 == std::strcmp(argv[i], "--rev-egress") && i + 1 < argc)
-        {
-            rev_egress = std::atoi(argv[++i]);
         }
         else if (0 == std::strcmp(argv[i], "--rx-port") && i + 1 < argc)
         {
@@ -353,6 +341,10 @@ int main(int argc, char **argv)
         {
             self_test = true;
             diag_log = true;
+        }
+        else if (0 == std::strcmp(argv[i], "--no-telemetry"))
+        {
+            telemetry = false;
         }
         else if (0 == std::strcmp(argv[i], "--diag"))
         {
@@ -590,8 +582,11 @@ int main(int argc, char **argv)
                      pace);
     }
     cfg_str(rcv, "listen", listen_buf);
-    cfg_str(rcv, "telemetry", "off");
-    cfg_str(sender, "telemetry", "off");
+    if (!telemetry)
+    {
+        cfg_str(rcv, "telemetry", "off");
+        cfg_str(sender, "telemetry", "off");
+    }
     {
         const char *fec = std::getenv("VSTREAMER_FEC");
         const bool  fec_off =
@@ -770,7 +765,7 @@ int main(int argc, char **argv)
     channel.set_bind_host(chan_bind_host);
 
     const int ch_start =
-        channel.start(chan_in, k_loopback_host, rx_port, chan_rev, k_loopback_host, rev_egress);
+        channel.start(chan_in, k_loopback_host, rx_port);
     if (ch_start < 0)
     {
         std::fprintf(stderr, "channel_controller start failed (%d", ch_start);
@@ -824,9 +819,10 @@ int main(int argc, char **argv)
 
     std::fprintf(stderr,
                  "%s: %s @ %d fps | source %s | display %s | channel fwd :%d->:%d "
-                 "rev :%d->:%d | console :%d\n",
+                 "(rev = return path) | telemetry %s | console :%d\n",
                  app_label, size_buf, fps, use_v4l2 ? source_arg : "noise",
-                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port, chan_rev, rev_egress, console_port);
+                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port, telemetry ? "on" : "off",
+                 console_port);
 #if defined(ENABLE_NOISE_SOURCE)
     if (!use_v4l2)
     {
@@ -917,7 +913,7 @@ int main(int argc, char **argv)
         encode_stage_main(&enc, &pay, &sender, &nv12_q, &g_bench_diag);
     });
     ctrl.add_stage("telemetry", "",
-                   [&](std::atomic<bool> & /*run*/) { telemetry_thread_main(&rcv); });
+                   [&](std::atomic<bool> & /*run*/) { apps::tx::telemetry_thread_main(&sender); });
     ctrl.add_metrics_sync([&]() {
         static int bench_log_ticks = 0;
         refresh_pipeline_metrics();

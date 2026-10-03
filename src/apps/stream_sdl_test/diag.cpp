@@ -1,4 +1,4 @@
-/* diag.cpp — split from stream_sdl (P11-T4). */
+/* diag.cpp — bench pipeline counters and diagnostics. */
 
 #include "apps/stream_sdl_test/diag.hpp"
 

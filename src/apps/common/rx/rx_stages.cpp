@@ -1,4 +1,4 @@
-/* rx_stages.cpp — SA-T4 split from stream_sdl stages. */
+/* rx_stages.cpp — receive-half pipeline stages. */
 
 #include "apps/common/rx/rx_stages.hpp"
 

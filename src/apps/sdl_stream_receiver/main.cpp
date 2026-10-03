@@ -195,7 +195,7 @@ int main(int argc, char **argv)
                    });
     ctrl.add_stage("telemetry", "",
                    [&](std::atomic<bool> & /*run*/) {
-                       telemetry_thread_main(&rcv);
+                       apps::rx::telemetry_thread_main(&rcv);
                    });
     ctrl.add_metrics_sync([&]() {
         update_pipeline_metrics(g_bench_diag, nullptr, nullptr, &rcv, preview, kmsdrm, rate,

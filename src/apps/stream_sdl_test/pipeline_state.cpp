@@ -1,4 +1,4 @@
-/* pipeline_state.cpp — split from stream_sdl (P11-T4). */
+/* pipeline_state.cpp — shared bench pipeline state. */
 
 #include "apps/stream_sdl_test/pipeline_state.hpp"
 

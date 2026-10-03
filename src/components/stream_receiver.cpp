@@ -223,11 +223,14 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             return false;
         }
         std::memcpy(shard.u8(), fec_buf, fec_len);
+        const uint64_t hdr_errors_before = fec.hdr_errors();
         fec.push_air(std::move(shard), &payloads);
         note_fec_output_gaps(fec, fec_gap_count);
         fec_rec = fec.recovered();
         fec_lost = fec.decode_fail();
-        valid_media = stream_datagram_len_ok(len);
+        /* Only a datagram whose stream header and FEC shard header both parsed moves the
+         * telemetry destination. */
+        valid_media = stream_datagram_len_ok(len) && fec.hdr_errors() == hdr_errors_before;
     }
     enqueue_payloads(&payloads);
     return valid_media;
@@ -328,26 +331,26 @@ void stream_receiver::recv_thread_main()
                 {
                     const bool peer_changed =
                         have_peer && (0 != std::memcmp(&src, &peer_addr, sizeof(peer_addr)));
-                    peer_addr = src;
-                    peer_len = sizeof(peer_addr);
-                    if (!have_peer)
+                    if (!have_peer || peer_changed)
                     {
+                        if (peer_changed)
+                        {
+                            telemetry_peer_changes.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        peer_addr = src;
+                        peer_len = sizeof(peer_addr);
                         have_peer = true;
-                    }
-                    else if (peer_changed)
-                    {
-                        telemetry_peer_changes.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    char host[INET_ADDRSTRLEN];
-                    const char *hip =
-                        inet_ntop(AF_INET, &peer_addr.sin_addr, host, sizeof(host));
-                    if (nullptr != hip)
-                    {
-                        char buf[64];
-                        std::snprintf(buf, sizeof(buf), "%s:%u", hip,
-                                      static_cast<unsigned>(ntohs(peer_addr.sin_port)));
-                        std::lock_guard<std::mutex> plock(peer_display_mu);
-                        telemetry_peer_str = buf;
+                        char       host[INET_ADDRSTRLEN];
+                        const char *hip =
+                            inet_ntop(AF_INET, &peer_addr.sin_addr, host, sizeof(host));
+                        if (nullptr != hip)
+                        {
+                            char peer_str[64];
+                            std::snprintf(peer_str, sizeof(peer_str), "%s:%u", hip,
+                                          static_cast<unsigned>(ntohs(peer_addr.sin_port)));
+                            std::lock_guard<std::mutex> plock(peer_display_mu);
+                            telemetry_peer_str = peer_str;
+                        }
                     }
                 }
             }
@@ -375,8 +378,9 @@ void stream_receiver::recv_thread_main()
             {
                 telemetry_send_errors.fetch_add(1, std::memory_order_relaxed);
             }
-            next_report = now + std::chrono::milliseconds(interval);
-            if (now >= next_report)
+            /* Advance by one interval; never burst-send to catch up. */
+            next_report += std::chrono::milliseconds(interval);
+            if (now - next_report > std::chrono::milliseconds(interval))
             {
                 next_report = now + std::chrono::milliseconds(interval);
             }
@@ -488,6 +492,9 @@ int stream_receiver::open()
         recv_fd = fd;
         session_id.store(new_session, std::memory_order_relaxed);
         report_seq.store(0, std::memory_order_relaxed);
+        telemetry_sent.store(0, std::memory_order_relaxed);
+        telemetry_send_errors.store(0, std::memory_order_relaxed);
+        telemetry_peer_changes.store(0, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> plock(peer_display_mu);
             telemetry_peer_str.clear();

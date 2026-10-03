@@ -310,7 +310,7 @@ void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
     later_block_waiting = false;
 }
 
-/* C3 resync, either direction: after rx_hold_ms with no shard at all, the next shard starts a
+/* Resync, either direction: after rx_hold_ms with no shard at all, the next shard starts a
  * new session (peer restart or link back up). Its block id is random relative to emit_next, so
  * holding it behind never-coming gap ids (forward jump) would stall delivery and, once the ids
  * cross the half ring, let the backward rebase discard it. Everything held is from the old
@@ -1336,6 +1336,12 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
 
     const int d = dist_from_emit(block_id);
     if (d < 0 && done.find(block_id) != done.end())
+    {
+        return;
+    }
+    /* Already decoded and waiting for the head: a late (parity) shard is redundant. Creating a
+     * new rx block here would later be abandoned and count the whole block as lost again. */
+    if (ready_blocks.find(block_id) != ready_blocks.end())
     {
         return;
     }

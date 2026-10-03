@@ -199,7 +199,7 @@ FU-A, capture-time header extension).
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
-| `local` | C Q | bind `host:port` before `open()` (default ephemeral `0.0.0.0:0`); `query("local")` after `open()` |
+| `local` | C Q | bind `[host:]port` before `open()`, port 0 = ephemeral (default `0.0.0.0:0`); `query("local")` returns the bound address once open |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
 | `mtu` | C | 200..1500, default 1400 |
 | `max_datagram` | C Q | 64..65507, default 1472 (UDP payload incl. headers), live |
@@ -278,8 +278,9 @@ Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_O
 
 One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
 `max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
-reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). See
-[latency_system_time.md](../aidocs/latency_system_time.md) for clock sync on multi-host links.
+reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). Capture-to-display latency
+across two hosts needs clock sync, which is not implemented; `latency.glass_ms` is only meaningful
+in `stream_sdl_test`.
 
 Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
 `tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
@@ -302,7 +303,7 @@ source → [jpeg] → encoder → rtp_h264_pay → stream_sender ─▶ link_emu
 | `apps/common/tx/tx_stages.*`, `rx/rx_stages.*` | per-stage thread loops |
 | `apps/common/queues.*` | bounded drop-oldest queues between stages |
 | `metrics_sync.{hpp,cpp}`, `diag.{hpp,cpp}` | pipeline metrics and `--diag` lines |
-| `link_emulator.{hpp,cpp}` | UDP relay with rate cap, random loss, queue |
+| `link_emulator.{hpp,cpp}` | UDP relay with rate cap, random loss, queue; reverse = return path of the forward flow |
 | `bench_console.{hpp,cpp}` | UDP console (`:5090`) |
 | `channel_controller.{hpp,cpp}` | facade over emulator + console |
 | `apps/common/tx/source_selector.*` | UVC with noise fallback on `-ENODEV` |
@@ -347,9 +348,11 @@ Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
 `h264_encoder.out_bytes`, `stream_sender.peer_fec_gap_count`,
 `stream_sender.peer_fec_packet_received`, `stream_sender.peer_udp_gap_count`,
 `stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`.
-`stream_sender.peer_*` packet/gap counters come from reverse UDP link reports when telemetry is
-enabled (default). `stream_sdl` sets `telemetry=off` and still fills peer metrics in-process.
-`peer_report_age_ms` (`-1` if never) and `peer_reports_*` diagnose the return path.
+`stream_sender.peer_*` packet/gap counters come from the link reports the sender received, never
+from the receiver object. The reports travel the emulator's reverse direction, so
+`set_constant_loss` affects them too. `peer_report_age_ms` (`-1` if never), `peer_reports_*` and
+`peer_session` diagnose the return path. `--no-telemetry` turns reports off on both ends (peer
+counters stay 0, age `-1`). Counters read 0 until the first report arrives.
 
 `scripts/cbr_controller.py` reads peer counters and `peer_report_age_ms`, holds bitrate increases
 when telemetry is stale, and adjusts `set_encode_cbr` (AIMD).
@@ -369,8 +372,12 @@ that same socket (NAT-style return path).
 | Ground | static | yes | `listen=<winject tx>` |
 | Ground | server (`rx` only) | no | — |
 
-Sender `configure("local", "[ip:]port")` fixes the source port for winject **static** on the
-rover. Details: `aidocs/stream_trx_telemetry.md` §6.
+Sender `configure("local", "[host:]port")` fixes the source port for winject **static** on the
+rover. The upstream's `txbus`/`rxbus` must pair in both directions on both managers, or the
+reports are not carried back. In **server** mode winject replies to the last app that sent to its
+`rx` port, so another app sending there takes over the return path until `stream_sender` sends
+again (within one frame while media flows). winject's upstream FEC passes the 48-byte reports
+through unchanged. The return path costs about 3.8 kbit/s at the default 100 ms interval.
 
 ### Other test programs
 
@@ -440,7 +447,7 @@ component layer exists today; the rest is still design.
 | `rtp_h264_pay` / `rtp_h264_depay` | **done** | |
 | Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl_test` |
 | External CBR controller (FEC-gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
-| Separate `stream_sender` / `stream_receiver` apps | **planned** | wire telemetry done; see `aidocs/split-streamer.md` |
+| Separate `stream_sender` / `stream_receiver` apps | **planned** | wire telemetry done |
 | Reverse telemetry datagram (receiver → sender) | **done** | `core/stream_telemetry.hpp`; `peer_*` from reports when telemetry on |
 | Channel feedback plugin (`feedback_winject`, `feedback_none`) | **not started** | maps radio CI (`flow`, RSSI/SNR, `fec_lost`, `stream_request`) to QP/GOP/fps and the send gate |
 | Config file loader (`key = value`, `source`/`sink`/`encoder`/`decoder`/`feedback`) | **not started** | |

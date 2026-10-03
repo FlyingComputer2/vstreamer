@@ -16,12 +16,9 @@ void channel_controller::set_bind_host(const char *host)
     console_.set_bind_host(host);
 }
 
-int channel_controller::start(int ingress_port, const char *egress_host, int egress_port,
-                              int reverse_ingress_port, const char *reverse_egress_host,
-                              int reverse_egress_port)
+int channel_controller::start(int ingress_port, const char *egress_host, int egress_port)
 {
-    return link_.start(ingress_port, egress_host, egress_port, reverse_ingress_port,
-                       reverse_egress_host, reverse_egress_port);
+    return link_.start(ingress_port, egress_host, egress_port);
 }
 
 int channel_controller::start_console(int console_port)

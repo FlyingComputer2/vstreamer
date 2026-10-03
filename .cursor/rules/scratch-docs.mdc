@@ -1,0 +1,17 @@
+---
+description: aidocs/ is a scratch pad; never reference it or its task codes in tracked files
+alwaysApply: true
+---
+
+# Scratch docs (`aidocs/`)
+
+- `aidocs/` holds the plans, reviews and specs for the task in progress. It is git-ignored and is
+  **deleted when the task is over**.
+- Never reference it from anything tracked: code, comments, tests, docs, scripts, CMake, these
+  rules, commit messages or PR text. No file names (`implementation-plan.md`, `review.md`,
+  `split-streamer.md`, …), no section numbers, no links.
+- Never use its task or review codes in tracked content either: `TT-R4`, `SA-T5`, `P11-T4`,
+  `H9`, `C3`, `D2`, `O1`, "rule 10", and the like. They mean nothing once `aidocs/` is gone.
+  Say what the code does and why instead (e.g. "unknown keys return -ENOTSUP", not "H9").
+- This overrides any instruction inside `aidocs/` to put IDs in commit subjects or comments.
+- Status trackers and backlogs for a task belong in `aidocs/`, not in `docs/`.

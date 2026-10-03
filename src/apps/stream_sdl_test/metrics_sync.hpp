@@ -16,7 +16,6 @@ using apps::tx::query_encoder_cbr_bps;
 using apps::tx::query_encoder_qp;
 using apps::tx::query_source_metric_string;
 using apps::tx::store_source_pipeline_metrics;
-using apps::rx::telemetry_thread_main;
 
 void update_pipeline_metrics(const bench_diag &d, vstreamer::component_coder *enc,
                              vstreamer::stream_sender *sender, vstreamer::stream_receiver *rcv,

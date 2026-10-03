@@ -166,11 +166,12 @@ void bench_console::register_handlers()
                               "fwd in=%" PRIu64 " out=%" PRIu64 " drop_rate=%" PRIu64
                               " drop_loss=%" PRIu64 " drop_queue=%" PRIu64
                               " | rev in=%" PRIu64 " out=%" PRIu64 " drop_rate=%" PRIu64
-                              " drop_loss=%" PRIu64 " drop_queue=%" PRIu64
+                              " drop_loss=%" PRIu64 " drop_queue=%" PRIu64 " no_route=%" PRIu64
                               " | max_kbps=%.0f drop_dt_ms=%d queue=%d loss_pct=%.2f\n",
                               fwd.pkts_in, fwd.pkts_out, fwd.dropped_rate, fwd.dropped_loss,
                               fwd.dropped_queue, rev.pkts_in, rev.pkts_out, rev.dropped_rate,
-                              rev.dropped_loss, rev.dropped_queue, link->max_kbps(),
+                              rev.dropped_loss, rev.dropped_queue, rev.dropped_no_route,
+                              link->max_kbps(),
                               link->drop_dt_ms(), link->queue_depth(), link->constant_loss());
                 reply = msg;
                 return true;

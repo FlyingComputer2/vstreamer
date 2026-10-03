@@ -1,11 +1,11 @@
 #include "apps/common/rx/rx_metrics.hpp"
 
 #include "apps/common/stage_latency.hpp"
-#include "apps/common/tx/tx_metrics.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <chrono>
-#include <mutex>
+#include <cstdlib>
+#include <string>
 #include <thread>
 
 #include "core/metrics.hpp"
@@ -18,105 +18,28 @@ using namespace vstreamer;
 using test_app::g_pipeline_metrics;
 using test_app::g_run;
 
-namespace
-{
-
-constexpr int k_receiver_loss_avg_samples = 5;
-
-struct receiver_loss_tracker
-{
-    stream_link_counters prev {};
-    bool                 have_prev = false;
-    double               udp_loss[k_receiver_loss_avg_samples] {};
-    double               fec_loss[k_receiver_loss_avg_samples] {};
-    int                  udp_n = 0;
-    int                  fec_n = 0;
-    double               loss_udp_pct = 0.;
-    double               loss_fec_pct = 0.;
-};
-
-receiver_loss_tracker g_rcv_loss;
-std::mutex            g_rcv_loss_mu;
-
-double interval_loss_pct(uint64_t pkts_now, uint64_t gap_now, uint64_t pkts_prev,
-                         uint64_t gap_prev)
-{
-    if (pkts_now < pkts_prev || gap_now < gap_prev)
-    {
-        return -1.;
-    }
-    const uint64_t dp = pkts_now - pkts_prev;
-    const uint64_t dg = gap_now - gap_prev;
-    const uint64_t denom = dp + dg;
-    if (denom < 8)
-    {
-        return -1.;
-    }
-    return static_cast<double>(dg) / static_cast<double>(denom) * 100.0;
-}
-
-void push_loss_sample(double sample, double *buf, int &n, double &avg_out)
-{
-    if (sample < 0.)
-    {
-        return;
-    }
-    if (n < k_receiver_loss_avg_samples)
-    {
-        buf[n] = sample;
-        ++n;
-    }
-    else
-    {
-        for (int i = 1; i < k_receiver_loss_avg_samples; ++i)
-        {
-            buf[i - 1] = buf[i];
-        }
-        buf[k_receiver_loss_avg_samples - 1] = sample;
-    }
-    double sum = 0.;
-    for (int i = 0; i < n; ++i)
-    {
-        sum += buf[i];
-    }
-    avg_out = sum / static_cast<double>(n);
-}
-
-void update_receiver_loss_deltas(const stream_link_counters &cur, receiver_loss_tracker &tr)
-{
-    if (tr.have_prev)
-    {
-        const double wire_inst =
-            interval_loss_pct(cur.udp_packet_received, cur.udp_gap_count,
-                              tr.prev.udp_packet_received, tr.prev.udp_gap_count);
-        push_loss_sample(wire_inst, tr.udp_loss, tr.udp_n, tr.loss_udp_pct);
-
-        const double fec_inst =
-            interval_loss_pct(cur.fec_packet_received, cur.fec_gap_count, tr.prev.fec_packet_received,
-                              tr.prev.fec_gap_count);
-        push_loss_sample(fec_inst, tr.fec_loss, tr.fec_n, tr.loss_fec_pct);
-    }
-    tr.prev = cur;
-    tr.have_prev = true;
-}
-
-}  // namespace
-
-void sync_peer_link_metrics_live(stream_receiver &rcv)
+/* Receiver-side view of the link; the receiver publishes stream_receiver.* only. The sender's
+ * stream_sender.peer_* come from the link reports it receives (tx::sync_sender_peer_link_metrics_live). */
+void sync_rx_link_metrics_live(stream_receiver &rcv)
 {
     const stream_link_counters cur = rcv.link_counters_snapshot();
-
-    double loss_udp = 0.;
-    double loss_fec = 0.;
+    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.udp_packet_received"),
+                 cur.udp_packet_received);
+    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.udp_gap_count"),
+                 cur.udp_gap_count);
+    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_packet_received"),
+                 cur.fec_packet_received);
+    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_gap_count"),
+                 cur.fec_gap_count);
+    for (const char *key : {"telemetry_sent", "telemetry_send_errors"})
     {
-        std::lock_guard<std::mutex> lock(g_rcv_loss_mu);
-        update_receiver_loss_deltas(cur, g_rcv_loss);
-        loss_udp = g_rcv_loss.loss_udp_pct;
-        loss_fec = g_rcv_loss.loss_fec_pct;
+        std::string val;
+        if (0 == rcv.query(key, &val))
+        {
+            metric_store(*g_pipeline_metrics.get_metric(std::string("stream_receiver.") + key),
+                         static_cast<uint64_t>(std::strtoull(val.c_str(), nullptr, 10)));
+        }
     }
-
-    tx::store_sender_peer_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
-                                       cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
 }
 
 void sync_rx_cumulative_counters(const test_app::bench_diag &d, stream_receiver *rcv)
@@ -149,7 +72,7 @@ void telemetry_thread_main(stream_receiver *rcv)
     {
         if (nullptr != rcv)
         {
-            sync_peer_link_metrics_live(*rcv);
+            sync_rx_link_metrics_live(*rcv);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
