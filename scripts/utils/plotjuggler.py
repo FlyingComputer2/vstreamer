@@ -52,7 +52,14 @@ def push_tick(timestamp: float, values: dict[str, float | None]) -> None:
     if len(body) <= 1:
         return
     payload = json.dumps(body, separators=(",", ":"))
-    loop.call_soon_threadsafe(queue.put_nowait, payload)
+    loop.call_soon_threadsafe(_put_drop_oldest, queue, payload)
+
+
+def _put_drop_oldest(queue: asyncio.Queue[str], payload: str) -> None:
+    """Runs on the client loop; while disconnected keep only the newest ticks."""
+    while queue.full():
+        queue.get_nowait()
+    queue.put_nowait(payload)
 
 
 def _run_thread() -> None:
@@ -62,7 +69,7 @@ def _run_thread() -> None:
 async def _async_main() -> None:
     global _loop, _out_queue
     _loop = asyncio.get_running_loop()
-    _out_queue = asyncio.Queue(maxsize=10_000)
+    _out_queue = asyncio.Queue(maxsize=1_000)
     _started.set()
 
     while not _stop.is_set():
@@ -82,7 +89,7 @@ async def _async_main() -> None:
                     try:
                         await ws.send(payload)
                     except ConnectionClosed:
-                        _out_queue.put_nowait(payload)
+                        _put_drop_oldest(_out_queue, payload)
                         break
         except Exception:
             logger.debug("plotjuggler connect/send failed", exc_info=True)

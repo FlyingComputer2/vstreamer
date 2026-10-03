@@ -2,7 +2,17 @@
 
 from utils.args import Args
 from utils.console import Console
-from utils.control import Clamp, CounterDelta, Delay, FecMap, FirBoxcar, Integrator, LPF
+from utils.control import (
+    Clamp,
+    CounterDelta,
+    Delay,
+    FecMap,
+    FirBoxcar,
+    GapLoss,
+    Integrator,
+    LossRateControl,
+    LPF,
+)
 from utils.metrics import Metrics, fetch_pipeline_metrics, parse_metrics_report
 from utils.tune_console import TuneConsole
 
@@ -14,7 +24,9 @@ __all__ = [
     "Delay",
     "FecMap",
     "FirBoxcar",
+    "GapLoss",
     "Integrator",
+    "LossRateControl",
     "LPF",
     "Metrics",
     "TuneConsole",
