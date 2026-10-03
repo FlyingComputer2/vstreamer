@@ -22,12 +22,13 @@ Reverse-path RX/gap metrics are not on the media graph.
 
 ### Telemetry
 
-Receiver link counters (`udp_packet_received`, gaps, FEC stats) reach the
-`stream_sender.peer_*` / `peer_loss_*` **metrics only in-process**: `stream_sdl` reads
-`stream_receiver::link_counters_snapshot()` and publishes them under the sender's metric names
-(`metrics_sync.cpp`). They are not `stream_sender` keys. A cross-host telemetry datagram on the
-reverse UDP path is not implemented yet (planned with the sender/receiver app split). Encoder
-rate is set via `configure("cbr")` or the bench console (`set_encode_cbr`).
+Receiver link counters flow **receiver → reverse UDP → sender**: periodic 48-byte reports
+(`stream_telemetry.hpp`) to the media source address; `stream_sender::peer_link_snapshot()` and
+`peer_*` query keys hold the last report. The app derives `peer_loss_*` from counter deltas.
+`scripts/cbr_controller.py` holds AIMD increases when `peer_report_age_ms` is stale (> 3×
+`telemetry_ms`, or no report yet). In the `stream_sdl` bench the reports cross `link_emulator`'s
+reverse direction, the NAT-style return path of the forward flow, so reverse-path loss is
+emulated too. Encoder rate: `configure("cbr")` or bench `set_encode_cbr`.
 
 Factory names: `v4l2_source`, `jpeg_decoder_multicore`, `h264_encoder_cedar`,
 `rtp_h264_pay`, `stream_sender`.
