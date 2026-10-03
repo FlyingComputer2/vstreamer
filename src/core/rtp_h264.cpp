@@ -252,21 +252,30 @@ int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
 
     const int64_t capture_rel = capture_mono_ns > 0 ? capture_mono_ns : 0;
 
-    const bool inject_params = au_has_idr && !au_has_sps && !au_has_pps && sps_len > 0 && pps_len > 0;
-    if (inject_params)
-    {
-        if (send_nal(sps, sps_len, 0, ts, capture_rel) < 0)
-        {
-            return -EINVAL;
-        }
-        if (send_nal(pps, pps_len, 0, ts, capture_rel) < 0)
-        {
-            return -EINVAL;
-        }
-    }
-
+    bool injected_cached_sps = false;
+    bool injected_cached_pps = false;
     for (size_t n = 0; n < emit.size(); ++n)
     {
+        const int type = nal_type(emit[n].first, static_cast<size_t>(emit[n].second));
+        if (au_has_idr && type >= 1 && type <= 5)
+        {
+            if (!au_has_sps && !injected_cached_sps && sps_len > 0)
+            {
+                if (send_nal(sps, sps_len, 0, ts, capture_rel) < 0)
+                {
+                    return -EINVAL;
+                }
+                injected_cached_sps = true;
+            }
+            if (!au_has_pps && !injected_cached_pps && pps_len > 0)
+            {
+                if (send_nal(pps, pps_len, 0, ts, capture_rel) < 0)
+                {
+                    return -EINVAL;
+                }
+                injected_cached_pps = true;
+            }
+        }
         const int marker = (n + 1 == emit.size()) ? 1 : 0;
         if (send_nal(emit[n].first, emit[n].second, marker, ts, capture_rel) < 0)
         {

@@ -1,0 +1,53 @@
+#ifndef VSTREAMER_TEST_APP_PIPELINE_STATE_HPP
+#define VSTREAMER_TEST_APP_PIPELINE_STATE_HPP
+
+#include "test_app/stream_sdl/cpu_map.hpp"
+#include "test_app/stream_sdl/diag.hpp"
+
+#include <atomic>
+#include <mutex>
+
+#include "core/component_source.hpp"
+#include "core/metrics.hpp"
+
+namespace vstreamer::test_app
+{
+
+class pipeline_queue;
+
+extern std::atomic<bool> g_run;
+extern std::atomic<bool> g_diag;
+extern std::atomic<bool> g_bench_metrics_log;
+extern std::atomic<bool> g_skip_decode;
+extern std::atomic<bool> g_dec_opened;
+
+extern cpu_stage_map g_cpu_map;
+
+extern std::atomic<int64_t> g_latest_source_pts;
+extern std::atomic<int> g_stream_fps;
+extern std::atomic<int> g_pending_console_cbr_kbps;
+extern std::atomic<int> g_pending_console_qp;
+extern std::atomic<int> g_pending_console_gop;
+extern std::atomic<bool> g_pending_console_idr;
+extern std::atomic<double> g_glass_latency_ms;
+extern std::atomic<double> g_latency_source_ms;
+extern std::atomic<double> g_latency_jpeg_ms;
+extern std::atomic<double> g_latency_enc_in_ms;
+extern std::atomic<double> g_latency_enc_out_ms;
+extern std::atomic<double> g_latency_depay_ms;
+extern std::atomic<double> g_latency_dec_in_ms;
+extern std::atomic<double> g_latency_dec_out_ms;
+extern std::atomic<double> g_latency_present_ms;
+
+extern bench_diag g_bench_diag;
+extern vstreamer::metrics g_pipeline_metrics;
+extern vstreamer::component_source *g_metrics_source;
+extern pipeline_queue *g_metrics_nv12_q;
+
+extern std::mutex g_pipeline_metrics_update_mu;
+
+int ensure_decoder_open(vstreamer::h264_decoder_mpp *dec);
+
+}  // namespace vstreamer::test_app
+
+#endif

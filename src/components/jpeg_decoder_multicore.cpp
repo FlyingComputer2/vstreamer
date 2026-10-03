@@ -659,7 +659,7 @@ int jpeg_decoder_multicore::configure(std::string_view key, std::string_view val
         output_format = kind;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int jpeg_decoder_multicore::query(std::string_view key, std::string *value) const
@@ -727,7 +727,7 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string *value) cons
         *value = decoded_pix_fmt;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

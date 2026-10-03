@@ -594,7 +594,7 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view value)
         pending_idr = true;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int h264_encoder_intel::query(std::string_view key, std::string *value) const
@@ -651,7 +651,7 @@ int h264_encoder_intel::query(std::string_view key, std::string *value) const
         *value = "h264_vaapi";
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

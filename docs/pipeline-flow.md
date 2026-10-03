@@ -22,13 +22,12 @@ Reverse-path RX/gap metrics are not on the media graph.
 
 ### Telemetry
 
-Receiver link counters (`udp_packet_received`, gaps, FEC stats) reach
-`stream_sender` **only in-process**: bench apps such as `stream_sdl` poll
-`stream_receiver`, call `stream_sender::set_receiver_counters()`, and read
-`peer_*` / `peer_loss_*` via `stream_sender::query()`. A cross-host telemetry
-datagram on the reverse UDP path is not implemented in this tree (planned
-follow-up). Encoder rate is set via `configure("cbr")` or the channel UDP
-console (`set_encode_cbr`).
+Receiver link counters (`udp_packet_received`, gaps, FEC stats) reach the
+`stream_sender.peer_*` / `peer_loss_*` **metrics only in-process**: `stream_sdl` reads
+`stream_receiver::link_counters_snapshot()` and publishes them under the sender's metric names
+(`metrics_sync.cpp`). They are not `stream_sender` keys. A cross-host telemetry datagram on the
+reverse UDP path is not implemented yet (planned with the sender/receiver app split). Encoder
+rate is set via `configure("cbr")` or the bench console (`set_encode_cbr`).
 
 Factory names: `v4l2_source`, `jpeg_decoder_multicore`, `h264_encoder_cedar`,
 `rtp_h264_pay`, `stream_sender`.
@@ -50,8 +49,8 @@ flowchart LR
 | decoder → `sdl_sink` | `FRAME` / NV12 |
 
 Factory names: `stream_receiver`, `rtp_h264_depay`, `h264_decoder_mpp`, `sdl_sink`
-(`display`), `sdl_kmsdrm_sink` (SDL `kmsdrm` on DRM/KMS). Build with
-`-DENABLE_SDL_SINK=ON` (requires SDL2).
+(`display`; configure `video_driver=kmsdrm` or factory aliases `sdl_kmsdrm` for DRM/KMS).
+Build with `-DENABLE_SDL_SINK=ON` (requires SDL2).
 
 ## Legacy aliases
 

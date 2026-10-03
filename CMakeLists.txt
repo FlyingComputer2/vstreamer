@@ -96,7 +96,6 @@ if(ENABLE_SDL_SINK)
     list(APPEND VSTREAMER_SOURCES
         src/components/sdl_nv12_presenter.cpp
         src/components/sdl_sink.cpp
-        src/components/sdl_kmsdrm_sink.cpp
     )
 endif()
 if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
@@ -174,12 +173,18 @@ if(ENABLE_NOISE_SOURCE)
 endif()
 
 function(vstreamer_add_app name)
-    add_executable(${name} ${ARGN})
+    set(options LSAN)
+    cmake_parse_arguments(VSA "${options}" "" "" ${ARGN})
+    set(_app_sources ${VSA_UNPARSED_ARGUMENTS})
+    add_executable(${name} ${_app_sources})
     target_include_directories(${name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR}/generated
     )
     target_link_libraries(${name} PRIVATE vstreamer_source)
+    if(VSA_LSAN)
+        target_link_libraries(${name} PRIVATE ${VSTREAMER_LSAN_HOOKS})
+    endif()
     target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
 endfunction()
 
@@ -199,14 +204,24 @@ message(STATUS "  ENABLE_RTP_H264_PAY=${ENABLE_RTP_H264_PAY}")
 message(STATUS "  ENABLE_RTP_H264_DEPAY=${ENABLE_RTP_H264_DEPAY}")
 message(STATUS "  VSTREAMER_BUILD_TESTS=${VSTREAMER_BUILD_TESTS}")
 
-if(ENABLE_NOISE_SOURCE)
-    vstreamer_add_app(noise_fft_bench src/test_app/noise_fft_bench.cpp)
+option(ENABLE_TEST_STREAM_SDL "Build stream_sdl loopback test" OFF)
+option(ENABLE_TEST_NOISE_STREAM_SDL "Deprecated alias for ENABLE_TEST_STREAM_SDL" OFF)
+if(ENABLE_TEST_NOISE_STREAM_SDL)
+    set(ENABLE_TEST_STREAM_SDL ON)
 endif()
 
-if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
-    vstreamer_add_app(rs_fec_test src/test_app/rs_fec_test.cpp)
-    vstreamer_add_app(rs_block_id_pace_test src/test_app/rs_block_id_pace_test.cpp)
+option(ENABLE_TEST_UVC_JPEGDEC_KMSDRM "Deprecated; use stream_sdl --display kmsdrm --source /dev/video0" OFF)
+option(ENABLE_TEST_UVC_JPEGDEC_DMKS "Deprecated alias for ENABLE_TEST_UVC_JPEGDEC_KMSDRM" OFF)
+if(ENABLE_TEST_UVC_JPEGDEC_DMKS)
+    message(WARNING "ENABLE_TEST_UVC_JPEGDEC_DMKS is deprecated; use stream_sdl --display kmsdrm --source /dev/video0")
+    set(ENABLE_TEST_UVC_JPEGDEC_KMSDRM ON)
 endif()
+if(ENABLE_TEST_UVC_JPEGDEC_KMSDRM)
+    message(WARNING "ENABLE_TEST_UVC_JPEGDEC_KMSDRM is deprecated; use stream_sdl --display kmsdrm --source /dev/video0")
+    set(ENABLE_TEST_STREAM_SDL ON CACHE BOOL "" FORCE)
+endif()
+
+add_subdirectory(src/test_app)
 
 if(VSTREAMER_BUILD_TESTS)
     enable_testing()
@@ -221,74 +236,4 @@ if(VSTREAMER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_subdirectory(tests)
-
-    if(TARGET rs_fec_test)
-        add_test(NAME rs_fec_test COMMAND rs_fec_test)
-    endif()
-    if(TARGET rs_block_id_pace_test)
-        add_test(NAME rs_block_id_pace_test COMMAND rs_block_id_pace_test)
-    endif()
-endif()
-
-option(ENABLE_TEST_STREAM_SDL "Build stream_sdl loopback test" OFF)
-option(ENABLE_TEST_NOISE_STREAM_SDL "Deprecated alias for ENABLE_TEST_STREAM_SDL" OFF)
-if(ENABLE_TEST_NOISE_STREAM_SDL)
-    set(ENABLE_TEST_STREAM_SDL ON)
-endif()
-
-if(ENABLE_TEST_STREAM_SDL)
-    if(NOT ENABLE_NOISE_SOURCE OR NOT ENABLE_JPEG_DECODER_MULTICORE OR NOT ENABLE_SDL_SINK OR
-       NOT ENABLE_STREAM_SENDER OR NOT ENABLE_STREAM_RECEIVER OR NOT ENABLE_RTP_H264_PAY OR
-       NOT ENABLE_RTP_H264_DEPAY OR NOT ENABLE_H264_DECODER_MPP)
-        message(FATAL_ERROR "ENABLE_TEST_STREAM_SDL requires noise, jpeg_decoder, stream_*, rtp, mpp decode, sdl")
-    endif()
-    if(NOT ENABLE_H264_ENCODER_MPP AND NOT ENABLE_H264_ENCODER_CEDAR AND NOT ENABLE_H264_ENCODER_INTEL)
-        message(FATAL_ERROR "ENABLE_TEST_STREAM_SDL requires ENABLE_H264_ENCODER_MPP, CEDAR, or INTEL")
-    endif()
-    set(_stream_sdl_sources src/test_app/stream_sdl.cpp)
-    if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
-        list(APPEND _stream_sdl_sources src/test_app/camera_noise_mux.cpp)
-    endif()
-    add_executable(stream_sdl
-        ${_stream_sdl_sources}
-        src/test_app/channel_controller.cpp
-        src/test_app/cpu_map.cpp
-    )
-    target_include_directories(stream_sdl PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
-    )
-    target_link_libraries(stream_sdl PRIVATE vstreamer_source ${VSTREAMER_LSAN_HOOKS})
-    target_compile_options(stream_sdl PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-option(ENABLE_TEST_UVC_JPEGDEC_KMSDRM "Build uvc_jpegdec_kmsdrm (V4L2 + kmsdrm)" OFF)
-option(ENABLE_TEST_UVC_JPEGDEC_DMKS "Deprecated typo alias for ENABLE_TEST_UVC_JPEGDEC_KMSDRM" OFF)
-if(ENABLE_TEST_UVC_JPEGDEC_DMKS)
-    message(WARNING "ENABLE_TEST_UVC_JPEGDEC_DMKS is deprecated; use ENABLE_TEST_UVC_JPEGDEC_KMSDRM")
-endif()
-if(ENABLE_TEST_UVC_JPEGDEC_KMSDRM OR ENABLE_TEST_UVC_JPEGDEC_DMKS)
-    if(NOT ENABLE_V4L2_SOURCE OR NOT ENABLE_JPEG_DECODER_MULTICORE OR NOT ENABLE_SDL_SINK OR
-       NOT ENABLE_STREAM_SENDER OR NOT ENABLE_STREAM_RECEIVER OR NOT ENABLE_RTP_H264_PAY OR
-       NOT ENABLE_RTP_H264_DEPAY OR NOT ENABLE_H264_DECODER_MPP)
-        message(FATAL_ERROR "ENABLE_TEST_UVC_JPEGDEC_KMSDRM requires v4l2, jpeg_decoder, stream_*, rtp, mpp decode, sdl")
-    endif()
-    if(NOT ENABLE_H264_ENCODER_MPP AND NOT ENABLE_H264_ENCODER_CEDAR AND NOT ENABLE_H264_ENCODER_INTEL)
-        message(FATAL_ERROR "ENABLE_TEST_UVC_JPEGDEC_KMSDRM requires ENABLE_H264_ENCODER_MPP, CEDAR, or INTEL")
-    endif()
-    set(_uvc_jpegdec_sources
-        src/test_app/uvc_jpegdec_kmsdrm.cpp
-        src/test_app/channel_controller.cpp
-    )
-    if(ENABLE_NOISE_SOURCE)
-        list(APPEND _uvc_jpegdec_sources src/test_app/camera_noise_mux.cpp)
-    endif()
-    list(APPEND _uvc_jpegdec_sources src/test_app/cpu_map.cpp)
-    add_executable(uvc_jpegdec_kmsdrm ${_uvc_jpegdec_sources})
-    target_include_directories(uvc_jpegdec_kmsdrm PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
-    )
-    target_link_libraries(uvc_jpegdec_kmsdrm PRIVATE vstreamer_source ${VSTREAMER_LSAN_HOOKS})
-    target_compile_options(uvc_jpegdec_kmsdrm PRIVATE -Wall -Wextra -Wpedantic)
 endif()

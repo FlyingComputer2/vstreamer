@@ -1,3 +1,9 @@
+# Vendored copies (use FetchContent)
+third_party/
+
+# Local planning notes (not versioned)
+aidocs/
+
 # CMake / build trees
 build/
 build-*/

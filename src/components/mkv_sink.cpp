@@ -414,7 +414,7 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         return 0;
     }
 
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int mkv_sink::query(std::string_view key, std::string *value) const
