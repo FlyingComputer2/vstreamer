@@ -2,10 +2,10 @@
 
 #include "apps/common/tx/tx_stages.hpp"
 
+#include "apps/common/pipeline_state.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/source_selector.hpp"
-#include "apps/stream_sdl_test/encoder_types.hpp"
-#include "apps/stream_sdl_test/pipeline_state.hpp"
+#include "apps/common/tx/tx_state.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -19,10 +19,13 @@ namespace vstreamer::test_app
 {
 
 using namespace vstreamer;
+using apps::g_cpu_map;
+using apps::g_run;
 using apps::log_stage_latency;
 using apps::note_source_pts;
 using apps::packet_frame_bytes;
 using apps::packet_media_kind;
+using apps::tx::g_tx;
 
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
 
@@ -58,7 +61,7 @@ void forward_aus_and_note_emitted(rtp_h264_pay &pay, stream_sender &sender, benc
     }
 }
 
-void pull_encoded_aus(h264_encoder_t &enc, std::vector<data_packet> &out)
+void pull_encoded_aus(apps::tx::encoder_t &enc, std::vector<data_packet> &out)
 {
     data_packet pkt;
     while (g_run.load() && enc.output(0, pkt, 0) == 0)
@@ -67,14 +70,14 @@ void pull_encoded_aus(h264_encoder_t &enc, std::vector<data_packet> &out)
     }
 }
 
-void drain_encoder(h264_encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag)
+void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag)
 {
     std::vector<data_packet> aus;
     pull_encoded_aus(enc, aus);
     forward_aus_and_note_emitted(pay, sender, diag, aus);
 }
 
-bool submit_nv12_to_encoder(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
+bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
                             bench_diag *diag, data_packet &nv12, bool *accepted)
 {
     if (nullptr != accepted)
@@ -303,7 +306,7 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, apps::pipeline_queue *mjpeg_q
     }
 }
 
-void apply_pending_console_encoder_cfg(h264_encoder_t &enc)
+void apply_pending_console_encoder_cfg(apps::tx::encoder_t &enc)
 {
     const int kbps = g_tx.pending_console_cbr_kbps.exchange(-1, std::memory_order_acq_rel);
     if (kbps >= 100)
@@ -335,7 +338,7 @@ void apply_pending_console_encoder_cfg(h264_encoder_t &enc)
     }
 }
 
-void encode_stage_main(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
+void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
                        apps::pipeline_queue *nv12_q, bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.encode);

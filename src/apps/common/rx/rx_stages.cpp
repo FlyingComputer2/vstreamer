@@ -2,8 +2,9 @@
 
 #include "apps/common/rx/rx_stages.hpp"
 
+#include "apps/common/pipeline_state.hpp"
+#include "apps/common/rx/rx_state.hpp"
 #include "apps/common/stage_latency.hpp"
-#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <cerrno>
 #include <cstdio>
@@ -17,8 +18,12 @@ namespace vstreamer::test_app
 {
 
 using namespace vstreamer;
+using apps::g_cpu_map;
+using apps::g_run;
 using apps::log_stage_latency;
 using apps::packet_frame_bytes;
+using apps::rx::ensure_decoder_open;
+using apps::rx::g_rx;
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY)
 
@@ -137,7 +142,7 @@ void present_thread_main(component_sink *display, apps::present_frame_queue *pre
                 {
                     const int64_t latest =
                         apps::g_latest_source_pts.load(std::memory_order_relaxed);
-                    const int   fps = g_tx.stream_fps.load(std::memory_order_relaxed);
+                    const int   fps = g_rx.stream_fps.load(std::memory_order_relaxed);
                     if (fps > 0 && latest >= f.pts)
                     {
                         const double lag_ms = static_cast<double>(latest - f.pts) * 1000.0 /

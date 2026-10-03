@@ -383,7 +383,7 @@ through unchanged. The return path costs about 3.8 kbit/s at the default 100 ms 
 
 | Target | Built when | Purpose |
 |--------|-----------|---------|
-| `noise_fft_bench` | `ENABLE_NOISE_SOURCE` | noise IFFT throughput |
+| `noise_fft_bench_test` | `ENABLE_NOISE_SOURCE` | noise IFFT throughput |
 | `rs_fec_test` | sender or receiver | RS FEC unit checks (also a ctest) |
 | `rs_block_id_pace_test` | sender or receiver | block-id / pacing checks (also a ctest) |
 | `vstreamer_tests` | `VSTREAMER_BUILD_TESTS` | GoogleTest suite (`ctest`) |

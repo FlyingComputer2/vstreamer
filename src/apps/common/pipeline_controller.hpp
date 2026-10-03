@@ -32,7 +32,7 @@ public:
     void         request_stop();
     void         run();
 
-    /** Keeps legacy stage globals (e.g. test_app::g_run) in sync with the controller run flag. */
+    /** Keeps legacy stage globals (e.g. apps::g_run) in sync with the controller run flag. */
     void bind_legacy_run(std::atomic<bool> *legacy_run);
 
     [[nodiscard]] bool diag_enabled() const

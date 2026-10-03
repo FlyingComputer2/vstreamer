@@ -8,7 +8,7 @@
 
 #if defined(ENABLE_H264_ENCODER_MPP) || defined(ENABLE_H264_ENCODER_CEDAR) || \
     defined(ENABLE_H264_ENCODER_INTEL)
-#include "apps/stream_sdl_test/encoder_types.hpp"
+#include "apps/common/tx/encoder_types.hpp"
 #endif
 
 namespace vstreamer::apps::tx
@@ -32,7 +32,7 @@ void jpeg_stage_main(vstreamer::jpeg_decoder_multicore *jdec, apps::pipeline_que
                      apps::pipeline_queue *nv12_q, bench_diag *diag, int max_inflight);
 #if defined(ENABLE_H264_ENCODER_MPP) || defined(ENABLE_H264_ENCODER_CEDAR) || \
     defined(ENABLE_H264_ENCODER_INTEL)
-void encode_stage_main(h264_encoder_t *enc, vstreamer::rtp_h264_pay *pay,
+void encode_stage_main(apps::tx::encoder_t *enc, vstreamer::rtp_h264_pay *pay,
                        vstreamer::stream_sender *sender, apps::pipeline_queue *nv12_q,
                        bench_diag *diag);
 #endif

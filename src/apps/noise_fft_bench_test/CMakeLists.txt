@@ -1,0 +1,1 @@
+vstreamer_add_app(noise_fft_bench_test noise_fft_bench_test.cpp)

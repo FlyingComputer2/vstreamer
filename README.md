@@ -12,8 +12,7 @@ vstreamer/
 └── src/
     ├── components/   # plugins (V4L2, stream_*, rtp pay/depay, MKV, …)
     ├── core/         # packets, frames, factory, component interfaces
-    ├── apps/           # uvc_stream_sender, sdl_stream_receiver, stream_sdl_test, apps_common
-    └── test_app/       # rs_fec_test/, noise_fft_bench/, …
+    └── apps/         # uvc_stream_sender, sdl_stream_receiver, apps_common, *_test programs
 ```
 
 ## Build

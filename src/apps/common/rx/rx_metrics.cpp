@@ -1,7 +1,7 @@
 #include "apps/common/rx/rx_metrics.hpp"
 
+#include "apps/common/pipeline_state.hpp"
 #include "apps/common/stage_latency.hpp"
-#include "apps/stream_sdl_test/pipeline_state.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -15,8 +15,6 @@ namespace vstreamer::apps::rx
 {
 
 using namespace vstreamer;
-using test_app::g_pipeline_metrics;
-using test_app::g_run;
 
 /* Receiver-side view of the link; the receiver publishes stream_receiver.* only. The sender's
  * stream_sender.peer_* come from the link reports it receives (tx::sync_sender_peer_link_metrics_live). */

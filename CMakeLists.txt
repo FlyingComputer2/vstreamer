@@ -224,11 +224,13 @@ if(ENABLE_TEST_UVC_JPEGDEC_KMSDRM)
     set(ENABLE_TEST_STREAM_SDL ON CACHE BOOL "" FORCE)
 endif()
 
-add_subdirectory(src/apps)
-add_subdirectory(src/test_app)
-
 if(VSTREAMER_BUILD_TESTS)
     enable_testing()
+endif()
+
+add_subdirectory(src/apps)
+
+if(VSTREAMER_BUILD_TESTS)
 
     set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
     include(FetchContent)

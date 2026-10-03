@@ -298,9 +298,7 @@ int main(int argc, char **argv)
     }
     sender.set_enabled(true, 0);
 
-    g_diag = diag;
     apps::stage_latency_set_diag_enabled(diag);
-    g_tx.stream_fps.store(fps);
 
     const size_t pipe_q = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                      apps::k_default_pipe_queue_depth, 64);

@@ -147,9 +147,8 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    g_diag = diag;
     apps::stage_latency_set_diag_enabled(diag);
-    g_tx.stream_fps.store(fps);
+    g_rx.stream_fps.store(fps);
     if (nullptr != std::getenv("VSTREAMER_SKIP_DECODE"))
     {
         g_rx.skip_decode = true;

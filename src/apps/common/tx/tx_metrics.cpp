@@ -1,6 +1,7 @@
 #include "apps/common/tx/tx_metrics.hpp"
 
-#include "apps/stream_sdl_test/pipeline_state.hpp"
+#include "apps/common/pipeline_state.hpp"
+#include "apps/common/tx/tx_state.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -15,9 +16,6 @@ namespace vstreamer::apps::tx
 {
 
 using namespace vstreamer;
-using test_app::g_pipeline_metrics;
-using test_app::g_run;
-using test_app::g_tx;
 
 namespace
 {

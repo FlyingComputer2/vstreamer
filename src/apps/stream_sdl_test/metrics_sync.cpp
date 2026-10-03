@@ -186,7 +186,11 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     }
     const double enc_q_pop_fps =
         apps::rate_per_sec(now.tx_enc_nv12_popped, prev.tx_enc_nv12_popped, dt);
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     const size_t enc_q_depth = (nullptr != g_tx.metrics_nv12_q) ? g_tx.metrics_nv12_q->size() : 0;
+#else
+    const size_t enc_q_depth = 0;
+#endif
     double       enc_q_latency_ms = 0.0;
     if (jpeg_out_fps > 0.5)
     {

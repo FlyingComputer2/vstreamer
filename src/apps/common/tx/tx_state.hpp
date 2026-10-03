@@ -12,7 +12,6 @@ namespace vstreamer::apps::tx
 
 struct tx_state
 {
-    std::atomic<int>  stream_fps {30};
     std::atomic<int>  pending_console_cbr_kbps {-1};
     std::atomic<int>  pending_console_qp {-1};
     std::atomic<int>  pending_console_gop {-1};
@@ -21,6 +20,8 @@ struct tx_state
     vstreamer::component_source *metrics_source = nullptr;
     pipeline_queue              *metrics_nv12_q = nullptr;
 };
+
+extern tx_state g_tx;
 
 }  // namespace vstreamer::apps::tx
 

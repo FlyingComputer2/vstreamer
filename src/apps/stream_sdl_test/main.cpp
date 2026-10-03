@@ -842,14 +842,13 @@ int main(int argc, char **argv)
         }
     }
 #endif
-    g_diag = diag_log;
     apps::stage_latency_set_diag_enabled(diag_log);
     if (diag_log)
     {
         std::fprintf(stderr,
                      "stream_sdl: diagnostic logging enabled (--diag); stage_latency lines on\n");
     }
-    g_tx.stream_fps.store(fps, std::memory_order_relaxed);
+    g_rx.stream_fps.store(fps, std::memory_order_relaxed);
     const size_t pipe_q_depth = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                            apps::k_default_pipe_queue_depth, 64);
     const size_t present_q_depth =
