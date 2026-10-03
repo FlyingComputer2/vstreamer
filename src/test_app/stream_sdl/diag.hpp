@@ -1,8 +1,6 @@
 #ifndef VSTREAMER_TEST_APP_DIAG_HPP
 #define VSTREAMER_TEST_APP_DIAG_HPP
 
-#include "test_app/stream_sdl/encoder_types.hpp"
-
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -86,10 +84,10 @@ struct pipeline_rate_state
 };
 
 void log_bench_diag(const bench_diag &d, vstreamer::stream_receiver &rcv,
-                    vstreamer::stream_sender &sender, h264_encoder_t &enc,
+                    vstreamer::stream_sender &sender, vstreamer::component_coder &enc,
                     const channel_controller *channel);
 
-void log_bench_rate_line(const pipeline_rate_state &rate, h264_encoder_t &enc,
+void log_bench_rate_line(const pipeline_rate_state &rate, vstreamer::component_coder &enc,
                          const bench_diag &diag);
 
 double query_component_latency_ms(vstreamer::component &c);

@@ -3,7 +3,10 @@
 #include "test_app/stream_sdl/stages.hpp"
 
 #include "apps/common/stage_latency.hpp"
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
 #include "apps/common/tx/source_selector.hpp"
+#include "test_app/stream_sdl/encoder_types.hpp"
+#endif
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
 #include <cerrno>
@@ -41,6 +44,8 @@ int open_stage(const char *name, int rc)
     }
     return rc;
 }
+
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
 
 bool forward_encoded_au(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag,
                         data_packet &pkt)
@@ -388,6 +393,10 @@ void encode_stage_main(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sender *se
     }
 }
 
+#endif  // !VSTREAMER_BENCH_RX_ONLY
+
+#if !defined(VSTREAMER_BENCH_TX_ONLY)
+
 int drain_decoder_one_frame(h264_decoder_mpp *dec, data_packet &frame_pkt, bench_diag &diag,
                             int timeout_ms)
 {
@@ -690,5 +699,7 @@ void decode_thread_main(h264_decoder_mpp *dec, apps::present_frame_queue *presen
 
     drain_decoder_to_present(dec, present_q, *diag);
 }
+
+#endif  // !VSTREAMER_BENCH_TX_ONLY
 
 }  // namespace vstreamer::test_app

@@ -35,7 +35,9 @@ extern apps::pipeline_queue *g_metrics_nv12_q;
 
 extern std::mutex g_pipeline_metrics_update_mu;
 
+#if defined(ENABLE_H264_DECODER_MPP)
 int ensure_decoder_open(vstreamer::h264_decoder_mpp *dec);
+#endif
 
 }  // namespace vstreamer::test_app
 

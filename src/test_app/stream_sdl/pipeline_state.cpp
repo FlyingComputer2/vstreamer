@@ -2,8 +2,6 @@
 
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
-#include "test_app/stream_sdl/encoder_types.hpp"
-
 #include "components/components.hpp"
 
 namespace vstreamer::test_app
@@ -17,6 +15,7 @@ std::atomic<bool> g_bench_metrics_log {false};
 std::atomic<bool> g_skip_decode {false};
 std::atomic<bool> g_dec_opened {false};
 
+#if defined(ENABLE_H264_DECODER_MPP)
 int ensure_decoder_open(h264_decoder_mpp *dec)
 {
     if (g_skip_decode.load() || nullptr == dec)
@@ -35,6 +34,8 @@ int ensure_decoder_open(h264_decoder_mpp *dec)
     g_dec_opened = true;
     return 0;
 }
+#endif
+
 apps::cpu_stage_map g_cpu_map;
 
 std::atomic<int>  g_stream_fps {30};

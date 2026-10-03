@@ -19,8 +19,11 @@ namespace vstreamer::test_app
 using namespace vstreamer;
 
 void log_bench_diag(const bench_diag &d, stream_receiver &rcv, stream_sender &sender,
-                    h264_encoder_t &enc, const test_app::channel_controller *channel)
+                    component_coder &enc, const test_app::channel_controller *channel)
 {
+#if defined(VSTREAMER_BENCH_TX_ONLY) || defined(VSTREAMER_BENCH_RX_ONLY)
+    (void)channel;
+#endif
     std::string rcv_stats;
     std::string snd_stats;
     std::string enc_qp;
@@ -28,8 +31,12 @@ void log_bench_diag(const bench_diag &d, stream_receiver &rcv, stream_sender &se
     (void)sender.query("stats", &snd_stats);
     (void)enc.query("qp", &enc_qp);
 
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     const auto ch = (nullptr != channel) ? channel->forward_stats_snapshot()
                                          : test_app::channel_controller::forward_stats {};
+#else
+    const test_app::channel_controller::forward_stats ch {};
+#endif
     std::fprintf(stderr,
                  "diag: tx noise=%" PRIu64 " jpeg_nv12=%" PRIu64 " nv12=%" PRIu64
                  " enc_err=%" PRIu64 " rtp=%" PRIu64
@@ -100,7 +107,7 @@ template <typename Comp>
     return std::strtoull(v.c_str(), &end, 10);
 }
 
-void log_bench_rate_line(const pipeline_rate_state &rate, h264_encoder_t &enc,
+void log_bench_rate_line(const pipeline_rate_state &rate, component_coder &enc,
                          const bench_diag &diag)
 {
     if (!rate.have_snap)

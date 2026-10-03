@@ -179,14 +179,13 @@ void bench_console::register_handlers()
         },
         link_help);
 
-    apps::tx::tx_console_targets tx_targets;
-    tx_targets.sender = stream_tx;
-    tx_targets.encoder = encode_target;
-    tx_targets.set_cbr_kbps = encode_set_cbr_kbps;
-    tx_targets.set_qp = encode_set_qp;
-    tx_targets.set_gop = encode_set_gop;
-    tx_targets.force_idr = encode_force_idr;
-    apps::tx::register_tx_console_handlers(inner_, tx_targets);
+    tx_targets_.sender = stream_tx;
+    tx_targets_.encoder = encode_target;
+    tx_targets_.set_cbr_kbps = encode_set_cbr_kbps;
+    tx_targets_.set_qp = encode_set_qp;
+    tx_targets_.set_gop = encode_set_gop;
+    tx_targets_.force_idr = encode_force_idr;
+    apps::tx::register_tx_console_handlers(inner_, tx_targets_);
 }
 
 int bench_console::start(link_emulator &link_em, int console_port)

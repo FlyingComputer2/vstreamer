@@ -73,7 +73,7 @@ bool query_source_metric_string(component_source *src, const char *key, std::str
 }
 
 void store_source_pipeline_metrics(double source_out_fps, double source_out_kbps, const char *ts,
-                                   jpeg_decoder_multicore *jdec)
+                                   component *jdec)
 {
     std::string device = "noise";
     std::string media_type = "mjpeg";
@@ -135,12 +135,12 @@ void store_source_pipeline_metrics(double source_out_fps, double source_out_kbps
     }
     metric_store(*g_pipeline_metrics.get_metric("source.state"), src_state);
 }
-void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_sender *sender,
+void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_sender *sender,
                              stream_receiver *rcv, component_sink *preview, bool kmsdrm,
                              pipeline_rate_state &rate,
                              const test_app::channel_controller *channel,
-                             jpeg_decoder_multicore *jdec, bool jpeg_active,
-                             h264_decoder_mpp *dec)
+                             component *jdec, bool jpeg_active,
+                             component *dec)
 {
     std::lock_guard<std::mutex> update_lock(g_pipeline_metrics_update_mu);
     const auto t_now = std::chrono::steady_clock::now();
@@ -184,8 +184,12 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_se
     const uint64_t snd_pkts_now = apps::parse_stats_field(snd_stats, "pkts");
     const uint64_t snd_bytes_now = apps::parse_stats_field(snd_stats, "bytes");
 
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     const auto ch = (nullptr != channel) ? channel->forward_stats_snapshot()
                                          : test_app::channel_controller::forward_stats {};
+#else
+    const test_app::channel_controller::forward_stats ch {};
+#endif
     const double noise_fps = apps::rate_per_sec(now.tx_noise, prev.tx_noise, dt);
     const double jpeg_out_fps = apps::rate_per_sec(now.tx_jpeg_nv12, prev.tx_jpeg_nv12, dt);
     const double enc_in_fps = apps::rate_per_sec(now.tx_nv12, prev.tx_nv12, dt);
@@ -263,13 +267,17 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_se
     {
         enc_q_latency_ms = static_cast<double>(enc_q_depth) * 1000.0 / jpeg_out_fps;
     }
-    const double ch_fwd_kbps =
+    double       ch_fwd_kbps = 0.0;
+    uint64_t     ch_fwd_drops = 0;
+    double       ch_drop_pps = 0.0;
+    double       ch_drop_kbps = 0.0;
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
+    ch_fwd_kbps =
         ch.bytes_out > prev_ch_bytes_out
             ? static_cast<double>(ch.bytes_out - prev_ch_bytes_out) * 8.0 / dt / 1000.0
             : 0.0;
-    const uint64_t ch_fwd_drops = ch.dropped_rate + ch.dropped_loss + ch.dropped_queue;
-    const double   ch_drop_pps = apps::rate_per_sec(ch_fwd_drops, prev_ch_fwd_drops, dt);
-    double         ch_drop_kbps = 0.0;
+    ch_fwd_drops = ch.dropped_rate + ch.dropped_loss + ch.dropped_queue;
+    ch_drop_pps = apps::rate_per_sec(ch_fwd_drops, prev_ch_fwd_drops, dt);
     if (rate.have_snap && dt > 0.0 && ch.bytes_in >= prev_ch_bytes_in &&
         ch.bytes_out >= prev_ch_bytes_out)
     {
@@ -280,6 +288,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_se
             ch_drop_kbps = static_cast<double>(din - dout) * 8.0 / dt / 1000.0;
         }
     }
+#endif
 
     uint64_t sink_frames = now.rx_present_ok;
     std::string sink_stats;
@@ -414,6 +423,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_se
                      query_u64(*sender, "fec_oversized"));
     }
 
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != channel)
     {
         metric_store(*g_pipeline_metrics.get_metric("channel.forward_kbps"), ch_fwd_kbps);
@@ -428,6 +438,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t *enc, stream_se
         metric_store(*g_pipeline_metrics.get_metric("channel.queue"),
                      static_cast<double>(ch_queue));
     }
+#endif
 
     if (nullptr != rcv)
     {
@@ -599,6 +610,9 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
                                        const test_app::channel_controller *channel,
                                        stream_receiver *rcv)
 {
+#if defined(VSTREAMER_BENCH_TX_ONLY) || defined(VSTREAMER_BENCH_RX_ONLY)
+    (void)channel;
+#endif
     if (nullptr != sender)
     {
         metric_store(*g_pipeline_metrics.get_metric("source.out_bytes"),
@@ -620,6 +634,7 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_bytes"),
                      sender->wire_bytes_sent_counter());
     }
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != channel)
     {
         metric_store(*g_pipeline_metrics.get_metric("channel.forward_bytes"),
@@ -627,6 +642,7 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
         metric_store(*g_pipeline_metrics.get_metric("channel.queue"),
                      static_cast<double>(channel->forward_queue_size()));
     }
+#endif
     if (nullptr != rcv)
     {
         const uint64_t fec_pkts =
@@ -715,7 +731,7 @@ struct metrics_serve_rate_state
 
 metrics_serve_rate_state g_metrics_serve_rate;
 
-void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, h264_encoder_t *enc,
+void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, component_coder *enc,
                                 stream_receiver *rcv,
                                 const test_app::channel_controller *channel)
 {
@@ -780,7 +796,7 @@ void telemetry_thread_main(stream_receiver *rcv)
     }
 }
 
-int query_encoder_qp(h264_encoder_t &enc)
+int query_encoder_qp(component_coder &enc)
 {
     std::string val;
     if (enc.query("qp", &val) < 0 || val.empty())
@@ -790,7 +806,7 @@ int query_encoder_qp(h264_encoder_t &enc)
     return std::atoi(val.c_str());
 }
 
-int query_encoder_cbr_bps(h264_encoder_t &enc)
+int query_encoder_cbr_bps(component_coder &enc)
 {
     std::string val;
     if (enc.query("cbr", &val) < 0 || val.empty())

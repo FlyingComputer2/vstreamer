@@ -4,6 +4,7 @@
 #include <functional>
 
 #include "apps/common/app_console.hpp"
+#include "apps/common/tx/tx_console.hpp"
 #include "test_app/stream_sdl/channel_ports.hpp"
 
 namespace vstreamer
@@ -55,6 +56,7 @@ private:
     std::function<bool(int gop)>  encode_set_gop;
     std::function<bool()>         encode_force_idr;
     vstreamer::stream_sender     *stream_tx = nullptr;
+    apps::tx::tx_console_targets tx_targets_;
     bool                         handlers_registered = false;
 };
 

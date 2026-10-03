@@ -1,7 +1,9 @@
 include(${CMAKE_CURRENT_SOURCE_DIR}/common/app_capabilities.cmake)
 
 add_subdirectory(common)
-include(${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/pipeline_lib.cmake)
+if(VSTREAMER_APP_TX_OK OR VSTREAMER_APP_RX_OK)
+    include(${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/pipeline_lib.cmake)
+endif()
 
 option(ENABLE_APP_UVC_STREAM_SENDER "Build uvc_stream_sender" ON)
 option(ENABLE_APP_SDL_STREAM_RECEIVER "Build sdl_stream_receiver" ON)
