@@ -223,11 +223,14 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             return false;
         }
         std::memcpy(shard.u8(), fec_buf, fec_len);
+        const uint64_t hdr_errors_before = fec.hdr_errors();
         fec.push_air(std::move(shard), &payloads);
         note_fec_output_gaps(fec, fec_gap_count);
         fec_rec = fec.recovered();
         fec_lost = fec.decode_fail();
-        valid_media = stream_datagram_len_ok(len);
+        /* D2: only a datagram whose stream header and FEC shard header both parsed moves the
+         * telemetry destination. */
+        valid_media = stream_datagram_len_ok(len) && fec.hdr_errors() == hdr_errors_before;
     }
     enqueue_payloads(&payloads);
     return valid_media;
