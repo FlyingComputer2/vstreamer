@@ -1,0 +1,136 @@
+#ifndef VSTREAMER_CORE_STREAM_TELEMETRY_HPP
+#define VSTREAMER_CORE_STREAM_TELEMETRY_HPP
+
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+
+namespace vstreamer
+{
+
+/* Receiver-local link counters (UDP + post-FEC gaps). Loss % is derived in the app. */
+struct stream_link_counters
+{
+    uint64_t udp_packet_received = 0;
+    uint64_t fec_packet_received = 0;
+    uint64_t udp_gap_count = 0;
+    uint64_t fec_gap_count = 0;
+};
+
+struct stream_link_report
+{
+    uint32_t             session_id = 0;
+    uint32_t             report_seq = 0;
+    uint16_t             interval_ms = 0;
+    stream_link_counters counters {};
+};
+
+struct stream_peer_link
+{
+    bool                 have = false;
+    stream_link_report   report {};
+    int64_t              age_ms = -1;
+    uint64_t             reports_received = 0;
+    uint64_t             reports_lost = 0;
+    uint64_t             reports_rejected = 0;
+};
+
+inline constexpr uint16_t k_stream_link_report_magic = 0x5654;
+inline constexpr uint8_t  k_stream_link_report_version = 1;
+inline constexpr uint8_t  k_stream_link_report_type_receiver = 1;
+inline constexpr size_t   k_stream_link_report_len = 48;
+
+namespace detail
+{
+
+inline void put_be16(uint8_t *out, uint16_t v)
+{
+    out[0] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    out[1] = static_cast<uint8_t>(v & 0xFF);
+}
+
+inline void put_be32(uint8_t *out, uint32_t v)
+{
+    out[0] = static_cast<uint8_t>((v >> 24) & 0xFF);
+    out[1] = static_cast<uint8_t>((v >> 16) & 0xFF);
+    out[2] = static_cast<uint8_t>((v >> 8) & 0xFF);
+    out[3] = static_cast<uint8_t>(v & 0xFF);
+}
+
+inline void put_be64(uint8_t *out, uint64_t v)
+{
+    put_be32(out, static_cast<uint32_t>(v >> 32));
+    put_be32(out + 4, static_cast<uint32_t>(v & 0xFFFFFFFFULL));
+}
+
+inline uint16_t get_be16(const uint8_t *in)
+{
+    return static_cast<uint16_t>((static_cast<uint16_t>(in[0]) << 8) |
+                                 static_cast<uint16_t>(in[1]));
+}
+
+inline uint32_t get_be32(const uint8_t *in)
+{
+    return (static_cast<uint32_t>(in[0]) << 24) |
+           (static_cast<uint32_t>(in[1]) << 16) |
+           (static_cast<uint32_t>(in[2]) << 8) | static_cast<uint32_t>(in[3]);
+}
+
+inline uint64_t get_be64(const uint8_t *in)
+{
+    return (static_cast<uint64_t>(get_be32(in)) << 32) |
+           static_cast<uint64_t>(get_be32(in + 4));
+}
+
+}  // namespace detail
+
+inline void stream_link_report_encode(const stream_link_report &r, uint8_t out[48])
+{
+    detail::put_be16(out + 0, k_stream_link_report_magic);
+    out[2] = k_stream_link_report_version;
+    out[3] = k_stream_link_report_type_receiver;
+    detail::put_be32(out + 4, r.session_id);
+    detail::put_be32(out + 8, r.report_seq);
+    detail::put_be16(out + 12, r.interval_ms);
+    detail::put_be16(out + 14, 0);
+    detail::put_be64(out + 16, r.counters.udp_packet_received);
+    detail::put_be64(out + 24, r.counters.udp_gap_count);
+    detail::put_be64(out + 32, r.counters.fec_packet_received);
+    detail::put_be64(out + 40, r.counters.fec_gap_count);
+}
+
+inline int stream_link_report_decode(const uint8_t *data, size_t len, stream_link_report *out)
+{
+    if (nullptr == out)
+    {
+        return -EINVAL;
+    }
+    if (len != k_stream_link_report_len)
+    {
+        return -EMSGSIZE;
+    }
+    if (detail::get_be16(data + 0) != k_stream_link_report_magic ||
+        data[2] != k_stream_link_report_version ||
+        data[3] != k_stream_link_report_type_receiver)
+    {
+        return -EPROTO;
+    }
+    stream_link_report r {};
+    r.session_id = detail::get_be32(data + 4);
+    if (0 == r.session_id)
+    {
+        return -EPROTO;
+    }
+    r.report_seq = detail::get_be32(data + 8);
+    r.interval_ms = detail::get_be16(data + 12);
+    r.counters.udp_packet_received = detail::get_be64(data + 16);
+    r.counters.udp_gap_count = detail::get_be64(data + 24);
+    r.counters.fec_packet_received = detail::get_be64(data + 32);
+    r.counters.fec_gap_count = detail::get_be64(data + 40);
+    *out = r;
+    return 0;
+}
+
+}  // namespace vstreamer
+
+#endif  // VSTREAMER_CORE_STREAM_TELEMETRY_HPP

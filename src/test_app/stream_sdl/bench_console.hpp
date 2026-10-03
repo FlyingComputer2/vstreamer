@@ -1,13 +1,9 @@
 #ifndef VSTREAMER_TEST_APP_BENCH_CONSOLE_HPP
 #define VSTREAMER_TEST_APP_BENCH_CONSOLE_HPP
 
-#include <atomic>
 #include <functional>
-#include <string>
-#include <thread>
 
-#include <netinet/in.h>
-
+#include "apps/common/app_console.hpp"
 #include "test_app/stream_sdl/channel_ports.hpp"
 
 namespace vstreamer
@@ -49,28 +45,17 @@ public:
     void set_stream_sender(vstreamer::stream_sender *sender);
 
 private:
-    void console_thread_main();
-    void stop_console();
-    void handle_console_line(const char *line, int reply_fd, const sockaddr_in &reply);
-    void send_pipeline_metrics(int reply_fd, const sockaddr_in &reply);
+    void register_handlers();
 
-    link_emulator *link = nullptr;
-
-    std::atomic<bool> console_stop {false};
-    int               console_fd = -1;
-    std::thread       console_thread;
-    std::string       bind_host = k_loopback_host;
-
-    const vstreamer::metrics *pipeline_metrics = nullptr;
-    std::function<void()>     pipeline_metrics_refresh;
-    std::function<void()>     pipeline_metrics_sync_live;
-    std::function<void()>     source_state_metrics_refresh;
-    vstreamer::component_coder *encode_target = nullptr;
+    apps::app_console            inner_;
+    link_emulator               *link = nullptr;
+    vstreamer::component_coder  *encode_target = nullptr;
     std::function<bool(int kbps)> encode_set_cbr_kbps;
     std::function<bool(int qp)>   encode_set_qp;
     std::function<bool(int gop)>  encode_set_gop;
     std::function<bool()>         encode_force_idr;
     vstreamer::stream_sender     *stream_tx = nullptr;
+    bool                         handlers_registered = false;
 };
 
 }  // namespace vstreamer::test_app

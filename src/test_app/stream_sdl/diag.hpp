@@ -92,7 +92,6 @@ void log_bench_diag(const bench_diag &d, vstreamer::stream_receiver &rcv,
 void log_bench_rate_line(const pipeline_rate_state &rate, h264_encoder_t &enc,
                          const bench_diag &diag);
 
-void format_stats_timestamp(char *buf, size_t buflen);
 double query_component_latency_ms(vstreamer::component &c);
 
 }  // namespace vstreamer::test_app

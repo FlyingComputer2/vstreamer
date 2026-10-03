@@ -1,5 +1,8 @@
 set(_apps_common_sources
+    app_console.cpp
+    app_metrics.cpp
     cpu_map.cpp
+    pipeline_controller.cpp
     queues.cpp
     stage_latency.cpp
 )

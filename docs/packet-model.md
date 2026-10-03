@@ -3,8 +3,8 @@
 Pipeline wires carry `data_packet` (`core/data_packet.hpp`): owned
 `packet_body` subclasses (`frame_data`, `audio_data`, `sock_data`).
 
-Receiver RX/gap counters are not carried in `data_packet`; the bench app publishes them as
-`stream_sender.peer_*` metrics in-process. See [pipeline-flow.md](pipeline-flow.md).
+Receiver RX/gap counters are not carried in `data_packet`; they are sent on the reverse UDP
+link-report path and surfaced as `stream_sender.peer_*` metrics (see [pipeline-flow.md](pipeline-flow.md)).
 
 ### RTP capture timestamp extension
 
@@ -38,8 +38,27 @@ shard on the wire. Systematic shards add a 2 B big-endian payload length before 
 `stream_receiver` strips FEC and length, then passes **`sock_data`** to `rtp_h264_depay` with
 `sock_data.seq` set to the post-FEC app sequence (in-process gap metric input; not on wire).
 
-Peer loss metrics on `stream_sender` (`peer_loss_*`, `peer_*_gap_count`) are updated from the
-in-process receiver counters in `stream_sdl` — not from reverse UDP telemetry.
+Peer loss metrics on `stream_sender` (`peer_loss_*`, `peer_*_gap_count`) are fed from
+**reverse UDP link reports** (`core/stream_telemetry.hpp`): `stream_receiver` sends cumulative
+counters to the source address of the last valid media datagram; `stream_sender` receives them
+on its bound media socket. Loss % is derived in the app (`stream_sdl` / split apps). While
+`stream_sdl` remains, telemetry is disabled there and peer counters are still copied in-process.
+
+### Reverse path: link report (v1, 48 bytes, big-endian)
+
+| Off | Size | Field |
+|----:|-----:|-------|
+| 0 | 2 | `magic` `0x5654` |
+| 2 | 1 | `version` `1` |
+| 3 | 1 | `type` `1` receiver link report |
+| 4 | 4 | `session_id` (new each receiver `open()`) |
+| 8 | 4 | `report_seq` |
+| 12 | 2 | `interval_ms` (`telemetry_ms`) |
+| 14 | 2 | `reserved` |
+| 16 | 8 | `udp_recv` |
+| 24 | 8 | `udp_gap` |
+| 32 | 8 | `fec_recv` |
+| 40 | 8 | `fec_gap` |
 
 ## Stream path
 

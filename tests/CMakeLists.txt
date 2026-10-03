@@ -1,4 +1,5 @@
 set(VSTREAMER_TEST_SOURCES
+    app_console_test.cpp
     buffer_pool_test.cpp
     component_contract_test.cpp
     camera_noise_mux_test.cpp
@@ -8,6 +9,7 @@ set(VSTREAMER_TEST_SOURCES
     h264_level_test.cpp
     key_util_test.cpp
     peer_link_metrics_test.cpp
+    pipeline_controller_test.cpp
     stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp

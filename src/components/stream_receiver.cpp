@@ -4,6 +4,7 @@
 #include "core/key_util.hpp"
 #include "core/sequence_gap.hpp"
 #include "core/stream_header.hpp"
+#include "core/stream_telemetry.hpp"
 
 #include <cerrno>
 #include <cinttypes>
@@ -11,6 +12,7 @@
 #include <cstring>
 
 #include <chrono>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -172,16 +174,17 @@ void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads)
     payloads->clear();
 }
 
-void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
+bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
 {
     fec_rx_payload_list payloads;
+    bool                valid_media = false;
     {
         std::lock_guard<std::mutex> lock(mu);
         if (len > static_cast<size_t>(max_datagram))
         {
             rx_oversize.fetch_add(1, std::memory_order_relaxed);
             recv_dropped++;
-            return;
+            return false;
         }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
@@ -200,30 +203,34 @@ void stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
                 udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
             }
             const uint8_t *fec_ptr = stream_fec_shard(data, len, &fec_len);
-            if (fec_ptr != nullptr)
+            if (fec_ptr == nullptr)
             {
-                fec_buf = fec_ptr;
+                recv_dropped++;
+                return false;
             }
+            fec_buf = fec_ptr;
         }
 
         if (fec_len < rs_block_erasure::k_header_len || 0 == shard_max || fec_len > shard_max)
         {
             recv_dropped++;
-            return;
+            return false;
         }
         shared_sized_buffer shard = pool.acquire(fec_len);
         if (0 == shard.capacity() || shard.size() != fec_len)
         {
             recv_dropped++;
-            return;
+            return false;
         }
         std::memcpy(shard.u8(), fec_buf, fec_len);
         fec.push_air(std::move(shard), &payloads);
         note_fec_output_gaps(fec, fec_gap_count);
         fec_rec = fec.recovered();
         fec_lost = fec.decode_fail();
+        valid_media = stream_datagram_len_ok(len);
     }
     enqueue_payloads(&payloads);
+    return valid_media;
 }
 
 void stream_receiver::stop_recv_thread()
@@ -259,6 +266,10 @@ void stream_receiver::recv_thread_main()
      * when the wire goes quiet (e.g. tail of a burst loss). */
     constexpr int k_poll_ms = 10;
     uint8_t       buf[65536];
+    sockaddr_in   peer_addr {};
+    socklen_t     peer_len = 0;
+    bool          have_peer = false;
+    auto          next_report = std::chrono::steady_clock::now();
     while (!recv_stop)
     {
         int fd = -1;
@@ -295,10 +306,13 @@ void stream_receiver::recv_thread_main()
             /* Drain everything that is ready before ticking. */
             for (;;)
             {
-                msghdr msg {};
-                iovec  iov {};
+                sockaddr_in src {};
+                msghdr      msg {};
+                iovec       iov {};
                 iov.iov_base = buf;
                 iov.iov_len = sizeof(buf);
+                msg.msg_name = &src;
+                msg.msg_namelen = sizeof(src);
                 msg.msg_iov = &iov;
                 msg.msg_iovlen = 1;
                 const ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
@@ -310,7 +324,61 @@ void stream_receiver::recv_thread_main()
                 {
                     rx_truncated.fetch_add(1, std::memory_order_relaxed);
                 }
-                ingest_datagram(buf, static_cast<size_t>(n));
+                if (ingest_datagram(buf, static_cast<size_t>(n)))
+                {
+                    const bool peer_changed =
+                        have_peer && (0 != std::memcmp(&src, &peer_addr, sizeof(peer_addr)));
+                    peer_addr = src;
+                    peer_len = sizeof(peer_addr);
+                    if (!have_peer)
+                    {
+                        have_peer = true;
+                    }
+                    else if (peer_changed)
+                    {
+                        telemetry_peer_changes.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    char host[INET_ADDRSTRLEN];
+                    const char *hip =
+                        inet_ntop(AF_INET, &peer_addr.sin_addr, host, sizeof(host));
+                    if (nullptr != hip)
+                    {
+                        char buf[64];
+                        std::snprintf(buf, sizeof(buf), "%s:%u", hip,
+                                      static_cast<unsigned>(ntohs(peer_addr.sin_port)));
+                        std::lock_guard<std::mutex> plock(peer_display_mu);
+                        telemetry_peer_str = buf;
+                    }
+                }
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (have_peer && telemetry_on.load(std::memory_order_relaxed) && now >= next_report)
+        {
+            const int interval = telemetry_ms.load(std::memory_order_relaxed);
+            stream_link_report rep {};
+            rep.session_id = session_id.load(std::memory_order_relaxed);
+            rep.report_seq = report_seq.fetch_add(1, std::memory_order_relaxed);
+            rep.interval_ms = static_cast<uint16_t>(interval);
+            rep.counters = link_counters_snapshot();
+            uint8_t wire[vstreamer::k_stream_link_report_len];
+            stream_link_report_encode(rep, wire);
+            const ssize_t sent =
+                sendto(fd, wire, sizeof(wire), MSG_DONTWAIT,
+                       reinterpret_cast<sockaddr *>(&peer_addr), peer_len);
+            if (sent == static_cast<ssize_t>(sizeof(wire)))
+            {
+                telemetry_sent.fetch_add(1, std::memory_order_relaxed);
+            }
+            else
+            {
+                telemetry_send_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            next_report = now + std::chrono::milliseconds(interval);
+            if (now >= next_report)
+            {
+                next_report = now + std::chrono::milliseconds(interval);
             }
         }
 
@@ -325,9 +393,9 @@ void stream_receiver::recv_thread_main()
     }
 }
 
-stream_receiver_counters stream_receiver::link_counters_snapshot() const
+stream_link_counters stream_receiver::link_counters_snapshot() const
 {
-    stream_receiver_counters c;
+    stream_link_counters c;
     c.udp_packet_received = udp_packet_received.load(std::memory_order_relaxed);
     c.fec_packet_received = fec_packet_received.load(std::memory_order_relaxed);
     c.udp_gap_count = udp_gap_count.load(std::memory_order_relaxed);
@@ -397,6 +465,19 @@ int stream_receiver::open()
     constexpr int k_sock_buf = 16 * 1024 * 1024;
     (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
 
+    uint32_t new_session = 0;
+    {
+        std::random_device rd;
+        for (int attempt = 0; attempt < 16 && 0 == new_session; ++attempt)
+        {
+            new_session = static_cast<uint32_t>(rd());
+        }
+        if (0 == new_session)
+        {
+            new_session = 1;
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(mu);
         if (opened)
@@ -405,6 +486,12 @@ int stream_receiver::open()
             return 0;
         }
         recv_fd = fd;
+        session_id.store(new_session, std::memory_order_relaxed);
+        report_seq.store(0, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> plock(peer_display_mu);
+            telemetry_peer_str.clear();
+        }
         udp_packet_received.store(0, std::memory_order_relaxed);
         fec_packet_received.store(0, std::memory_order_relaxed);
         udp_gap_count.store(0, std::memory_order_relaxed);
@@ -497,8 +584,52 @@ int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
     return 0;
 }
 
+namespace
+{
+
+bool parse_on_off(std::string_view value, bool *out)
+{
+    if (nullptr == out)
+    {
+        return false;
+    }
+    if ("on" == value || "ON" == value)
+    {
+        *out = true;
+        return true;
+    }
+    if ("off" == value || "OFF" == value)
+    {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
 int stream_receiver::configure(std::string_view key, std::string_view value)
 {
+    if ("telemetry" == key)
+    {
+        bool on = false;
+        if (!parse_on_off(value, &on))
+        {
+            return -EINVAL;
+        }
+        telemetry_on.store(on, std::memory_order_relaxed);
+        return 0;
+    }
+    if ("telemetry_ms" == key)
+    {
+        int64_t v = 0;
+        if (key_parse_i64(value, &v) < 0 || v < 20 || v > 5000 || value.size() > 31)
+        {
+            return -EINVAL;
+        }
+        telemetry_ms.store(static_cast<int>(v), std::memory_order_relaxed);
+        return 0;
+    }
     if ("listen" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -607,19 +738,71 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("telemetry" == key)
+    {
+        *value = telemetry_on.load(std::memory_order_relaxed) ? "on" : "off";
+        return 0;
+    }
+    if ("telemetry_ms" == key)
+    {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", telemetry_ms.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("telemetry_sent" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      telemetry_sent.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("telemetry_send_errors" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      telemetry_send_errors.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("telemetry_peer_changes" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      telemetry_peer_changes.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("session_id" == key)
+    {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%" PRIu32, session_id.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("telemetry_peer" == key)
+    {
+        std::lock_guard<std::mutex> plock(peer_display_mu);
+        *value = telemetry_peer_str;
+        return 0;
+    }
     if ("stats" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        char buf[320];
+        char buf[420];
         std::snprintf(buf, sizeof(buf),
                       "udp_packet_received=%" PRIu64 " fec_packet_received=%" PRIu64
                       " udp_gap_count=%" PRIu64 " fec_gap_count=%" PRIu64
+                      " telemetry_sent=%" PRIu64 " telemetry_send_errors=%" PRIu64
                       " bytes=%" PRIu64 " wire_bytes=%" PRIu64 " dropped=%" PRIu64
                       " out_rate=%.1f fec_recovered=%" PRIu64 " fec_failures=%" PRIu64,
                       udp_packet_received.load(std::memory_order_relaxed),
                       fec_packet_received.load(std::memory_order_relaxed),
                       udp_gap_count.load(std::memory_order_relaxed),
                       fec_gap_count.load(std::memory_order_relaxed),
+                      telemetry_sent.load(std::memory_order_relaxed),
+                      telemetry_send_errors.load(std::memory_order_relaxed),
                       recv_bytes.load(std::memory_order_relaxed),
                       recv_wire_bytes.load(std::memory_order_relaxed), recv_dropped,
                       static_cast<double>(egress_kbps), fec_rec,

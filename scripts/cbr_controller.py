@@ -99,6 +99,7 @@ def main() -> int:
     a.default("hold-s", 1.0)
     a.default("near-loss-margin-pct", 10.0)
     a.default("fec-gap-min", 1)
+    a.default("telemetry-ms", 100)
 
     _stop_other_controllers()
 
@@ -123,6 +124,10 @@ def main() -> int:
     metric.refresh()
     s_cbr0 = metric("h264_encoder.cbr_kbps")
     cbr0 = float(s_cbr0) if s_cbr0 is not None else float(a("cbr-min"))
+    telemetry_ms = float(a("telemetry-ms"))
+    stale_hold = False
+    peer_session_prev: float | None = None
+
     rate_ctl = LossRateControl(
         cbr0,
         cbr_clamp,
@@ -160,8 +165,29 @@ def main() -> int:
             s_fec_recv = metric("stream_sender.peer_fec_packet_received")
             s_udp_gap  = metric("stream_sender.peer_udp_gap_count")
             s_fec_gap  = metric("stream_sender.peer_fec_gap_count")
+            s_report_age = metric("stream_sender.peer_report_age_ms")
+            s_peer_session = metric("stream_sender.peer_session")
             s_encoded  = metric("h264_encoder.out_bytes")
             s_cbr      = metric("h264_encoder.cbr_kbps")
+
+            if s_peer_session is not None and peer_session_prev is not None:
+                if s_peer_session != peer_session_prev:
+                    udp_loss.reset()
+                    fec_loss.reset()
+            if s_peer_session is not None:
+                peer_session_prev = s_peer_session
+
+            stale = (
+                s_report_age is None
+                or s_report_age < 0.0
+                or s_report_age > 3.0 * telemetry_ms
+            )
+            if stale and not stale_hold:
+                print(f"stale telemetry (age={s_report_age} ms), holding", flush=True)
+                stale_hold = True
+            if not stale and stale_hold:
+                print("telemetry recovered", flush=True)
+                stale_hold = False
 
             encoded_delta_ = s_encoded - d_encode(s_encoded) if s_encoded is not None else 0.0
             encoded_rate_raw_ = encoded_delta_ / metrics_dt * 8.0 / 1000.0 if metrics_dt > 0.0 else 0.0
@@ -202,7 +228,12 @@ def main() -> int:
             console.line(f"set_fec_n {int(round(fec_n_))}")
 
             # calculate CBR (receiver counter reset on peer restart gives a negative delta)
-            cbr_kbps = rate_ctl.step(max(0.0, fec_gap_delta_), metrics_dt, time.monotonic())
+            cbr_kbps = rate_ctl.step(
+                max(0.0, fec_gap_delta_),
+                metrics_dt,
+                time.monotonic(),
+                allow_increase=not stale,
+            )
             plot("loss_event", float(rate_ctl.loss_event))
             plot("is_holding", float(rate_ctl.is_holding))
             plot("cbr_loss", rate_ctl.cbr_loss if rate_ctl.cbr_loss is not None else 0.0)

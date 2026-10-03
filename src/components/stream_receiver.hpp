@@ -20,19 +20,12 @@
 #include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
 #include "core/rs_block_erasure.hpp"
+#include "core/stream_telemetry.hpp"
+
+#include <netinet/in.h>
+
 namespace vstreamer
 {
-
-/* Receiver-local link counters (UDP + post-FEC gaps). */
-struct stream_receiver_counters
-{
-    uint64_t udp_packet_received = 0;
-    uint64_t fec_packet_received = 0;
-    uint64_t udp_gap_count = 0;
-    uint64_t fec_gap_count = 0;
-    double   loss_udp_pct = 0.;
-    double   loss_fec_pct = 0.;
-};
 
 /* Pad 0 (source): SOCK out. */
 class stream_receiver : public component_source
@@ -57,7 +50,7 @@ public:
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
-    [[nodiscard]] stream_receiver_counters link_counters_snapshot() const;
+    [[nodiscard]] stream_link_counters link_counters_snapshot() const;
 
     [[nodiscard]] const std::atomic<uint64_t> &peer_udp_packet_received_counter() const
     {
@@ -83,7 +76,8 @@ public:
 private:
     void recv_thread_main();
     void stop_recv_thread();
-    void ingest_datagram(const uint8_t *data, size_t len);
+    /* Returns true when the datagram is valid stream media (telemetry peer update). */
+    bool ingest_datagram(const uint8_t *data, size_t len);
     void enqueue_payloads(fec_rx_payload_list *payloads);
     void enqueue_payload_buffer(shared_sized_buffer &&payload);
 
@@ -126,6 +120,16 @@ private:
 
     std::thread       recv_thread;
     std::atomic<bool> recv_stop {false};
+
+    std::atomic<bool> telemetry_on {true};
+    std::atomic<int>  telemetry_ms {100};
+    std::atomic<uint32_t> session_id {0};
+    std::atomic<uint32_t> report_seq {0};
+    std::atomic<uint64_t> telemetry_sent {0};
+    std::atomic<uint64_t> telemetry_send_errors {0};
+    std::atomic<uint64_t> telemetry_peer_changes {0};
+    mutable std::mutex    peer_display_mu;
+    std::string           telemetry_peer_str;
 
     rs_block_erasure fec;
     uint64_t           fec_rec = 0;

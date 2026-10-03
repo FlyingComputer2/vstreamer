@@ -4,11 +4,14 @@
 #include "core/data_packet.hpp"
 #include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
+#include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -80,6 +83,128 @@ vstreamer::data_packet make_sock_packet(uint32_t counter, size_t payload_bytes)
     pkt.reset(std::move(sd));
     return pkt;
 }
+
+/* Test-only NAT relay: forward media (drop every Nth), return link reports to the sender. */
+class UdpNatRelay
+{
+public:
+    ~UdpNatRelay()
+    {
+        stop();
+    }
+
+    int start(int relay_port, int receiver_port, int drop_every_n)
+    {
+        drop_every_n_ = drop_every_n;
+        fd_ = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0)
+        {
+            return -errno;
+        }
+        sockaddr_in bind_addr {};
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        bind_addr.sin_port = htons(static_cast<uint16_t>(relay_port));
+        if (bind(fd_, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
+        {
+            const int err = errno;
+            close(fd_);
+            fd_ = -1;
+            return -err;
+        }
+        forward_.sin_family = AF_INET;
+        forward_.sin_port = htons(static_cast<uint16_t>(receiver_port));
+        forward_.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        stop_ = false;
+        thread_ = std::thread(&UdpNatRelay::loop, this);
+        return 0;
+    }
+
+    void stop()
+    {
+        if (!thread_.joinable())
+        {
+            return;
+        }
+        stop_ = true;
+        if (fd_ >= 0)
+        {
+            ::shutdown(fd_, SHUT_RDWR);
+        }
+        thread_.join();
+        if (fd_ >= 0)
+        {
+            close(fd_);
+            fd_ = -1;
+        }
+        stop_ = false;
+    }
+
+private:
+    static bool is_link_report(const uint8_t *data, size_t len)
+    {
+        return len == vstreamer::k_stream_link_report_len &&
+               data[0] == 0x56 && data[1] == 0x54;
+    }
+
+    void loop()
+    {
+        uint8_t     buf[65536];
+        sockaddr_in sender_addr {};
+        socklen_t   sender_len = 0;
+        bool        have_sender = false;
+        uint64_t    media_seen = 0;
+
+        while (!stop_.load(std::memory_order_relaxed))
+        {
+            pollfd pfd {fd_, POLLIN, 0};
+            (void)poll(&pfd, 1, 50);
+            if (stop_.load(std::memory_order_relaxed))
+            {
+                break;
+            }
+            for (;;)
+            {
+                sockaddr_in from {};
+                socklen_t   from_len = sizeof(from);
+                const ssize_t n = recvfrom(fd_, buf, sizeof(buf), MSG_DONTWAIT,
+                                           reinterpret_cast<sockaddr *>(&from), &from_len);
+                if (n <= 0)
+                {
+                    break;
+                }
+                if (is_link_report(buf, static_cast<size_t>(n)))
+                {
+                    if (have_sender)
+                    {
+                        (void)sendto(fd_, buf, static_cast<size_t>(n), 0,
+                                     reinterpret_cast<sockaddr *>(&sender_addr), sender_len);
+                    }
+                    continue;
+                }
+                if (!have_sender)
+                {
+                    sender_addr = from;
+                    sender_len = from_len;
+                    have_sender = true;
+                }
+                ++media_seen;
+                if (drop_every_n_ > 0 && (media_seen % static_cast<uint64_t>(drop_every_n_)) == 0)
+                {
+                    continue;
+                }
+                (void)sendto(fd_, buf, static_cast<size_t>(n), 0,
+                             reinterpret_cast<sockaddr *>(&forward_), sizeof(forward_));
+            }
+        }
+    }
+
+    int                fd_ = -1;
+    int                drop_every_n_ = 0;
+    sockaddr_in        forward_ {};
+    std::atomic<bool>  stop_ {false};
+    std::thread        thread_;
+};
 
 uint32_t read_counter_be32(const uint8_t *data, size_t len)
 {
@@ -414,4 +539,57 @@ TEST(LoopbackTest, SenderRestartMidStream)
     ASSERT_TRUE(saw_resume);
     ASSERT_EQ(expect_next, 10400u);
     receiver.close();
+}
+
+TEST(LoopbackTest, ReverseTelemetryCountersMatch)
+{
+    const int rcv_port = ephemeral_udp_port();
+    const int relay_port = ephemeral_udp_port();
+    ASSERT_GT(rcv_port, 0);
+    ASSERT_GT(relay_port, 0);
+
+    UdpNatRelay relay;
+    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 10));
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+
+    const std::string relay_host = "127.0.0.1:" + std::to_string(relay_port);
+    const std::string rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
+    ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "20"));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    constexpr size_t k_payload = 64;
+    constexpr int    k_packets = 200;
+    for (int i = 0; i < k_packets; ++i)
+    {
+        const vstreamer::data_packet in = make_sock_packet(static_cast<uint32_t>(i), k_payload);
+        ASSERT_EQ(0, sender.input(0, in));
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+    const auto rcv_cnt = receiver.link_counters_snapshot();
+    const auto peer = sender.peer_link_snapshot();
+    ASSERT_TRUE(peer.have);
+    EXPECT_EQ(rcv_cnt.udp_packet_received, peer.report.counters.udp_packet_received);
+    EXPECT_EQ(rcv_cnt.fec_packet_received, peer.report.counters.fec_packet_received);
+    EXPECT_EQ(rcv_cnt.udp_gap_count, peer.report.counters.udp_gap_count);
+    EXPECT_EQ(rcv_cnt.fec_gap_count, peer.report.counters.fec_gap_count);
+    EXPECT_GT(rcv_cnt.udp_gap_count, 0U);
+    EXPECT_EQ(0U, peer.reports_lost);
+
+    sender.close();
+    receiver.close();
+    relay.stop();
 }

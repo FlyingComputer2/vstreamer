@@ -106,6 +106,34 @@ def check_recovery(ramp: float, fall: float, label: str) -> list[str]:
     return [] if ok else [label]
 
 
+def _telemetry_stale(age: float | None, telemetry_ms: float = 100.0) -> bool:
+    return age is None or age < 0.0 or age > 3.0 * telemetry_ms
+
+
+def check_stale_age_flags() -> list[str]:
+    ok_neg = _telemetry_stale(-1.0)
+    ok_old = _telemetry_stale(1000.0)
+    ok_fresh = not _telemetry_stale(50.0)
+    ok = ok_neg and ok_old and ok_fresh
+    print(f"[{'ok' if ok else 'FAIL'}] stale age flags (-1, 1000, 50 ms)")
+    return [] if ok else ["stale-age-flags"]
+
+
+def check_stale_telemetry_holds_increase() -> list[str]:
+    ctl = _make_ctl(50.0, 5.0)
+    before = ctl.cbr
+    ctl.step(0.0, 1.0, 0.0, allow_increase=False)
+    held = abs(ctl.cbr - before) < 1e-6
+    ctl.step(0.0, 1.0, 1.0, allow_increase=True)
+    increased = ctl.cbr > before
+    ok = held and increased
+    print(
+        f"[{'ok' if ok else 'FAIL'}] stale telemetry blocks increase "
+        f"(held={held} increased={increased})"
+    )
+    return [] if ok else ["stale-hold"]
+
+
 def check_restart_reset() -> list[str]:
     ctl = _make_ctl(50.0, 5.0, cbr0=5000.0)
     ctl.step(-12345.0, DT, 0.0)
@@ -126,6 +154,8 @@ def main() -> int:
             failures += check_steady_state(ctl.step, cbr0, cap, f"steady {tag} cap={cap:g}", warmup_s)
         failures += check_recovery(ramp, fall, f"recovery {tag}")
     failures += check_restart_reset()
+    failures += check_stale_age_flags()
+    failures += check_stale_telemetry_holds_increase()
 
     # The previous controller never reacted to loss: a pure ramp must fail the steady-state check.
     def loss_blind(_gaps: float, dt: float, _now: float, s={"cbr": 1000.0}) -> float:

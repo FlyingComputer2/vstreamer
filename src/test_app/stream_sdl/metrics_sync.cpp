@@ -2,6 +2,7 @@
 
 #include "test_app/stream_sdl/metrics_sync.hpp"
 
+#include "apps/common/app_metrics.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
@@ -39,35 +40,6 @@ namespace
     c.rx_nv12_out_bytes = d.rx_nv12_out_bytes.load();
     c.rx_present_ok = d.rx_present_ok.load();
     return c;
-}
-
-[[nodiscard]] double elapsed_sec(std::chrono::steady_clock::time_point t0,
-                                 std::chrono::steady_clock::time_point t1)
-{
-    const auto dt = std::chrono::duration_cast<std::chrono::duration<double>>(t1 - t0);
-    return dt.count() > 0.0 ? dt.count() : 1.0;
-}
-
-[[nodiscard]] double rate_per_sec(uint64_t now, uint64_t prev, double dt_sec)
-{
-    if (now <= prev)
-    {
-        return 0.0;
-    }
-    return static_cast<double>(now - prev) / dt_sec;
-}
-
-[[nodiscard]] uint64_t parse_stats_field(std::string_view stats, const char *key)
-{
-    const std::string prefix = std::string(key) + "=";
-    const auto              pos = stats.find(prefix);
-    if (pos == std::string_view::npos)
-    {
-        return 0;
-    }
-    const char *start = stats.data() + pos + prefix.size();
-    char       *end = nullptr;
-    return std::strtoull(start, &end, 10);
 }
 
 template <typename Comp>
@@ -192,7 +164,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
         prev_ch_bytes_in = rate.ch_bytes_in;
         prev_ch_bytes_out = rate.ch_bytes_out;
         prev_ch_fwd_drops = rate.ch_fwd_drops;
-        dt = elapsed_sec(rate.t0, t_now);
+        dt = apps::elapsed_sec(rate.t0, t_now);
     }
     const pipeline_counters now = snapshot_counters(d);
 
@@ -201,24 +173,24 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     (void)rcv.query("stats", &rcv_stats);
     (void)sender.query("stats", &snd_stats);
 
-    const uint64_t rcv_bytes_now = parse_stats_field(rcv_stats, "bytes");
-    const uint64_t snd_pkts_now = parse_stats_field(snd_stats, "pkts");
-    const uint64_t snd_bytes_now = parse_stats_field(snd_stats, "bytes");
+    const uint64_t rcv_bytes_now = apps::parse_stats_field(rcv_stats, "bytes");
+    const uint64_t snd_pkts_now = apps::parse_stats_field(snd_stats, "pkts");
+    const uint64_t snd_bytes_now = apps::parse_stats_field(snd_stats, "bytes");
 
     const auto ch = (nullptr != channel) ? channel->forward_stats_snapshot()
                                          : test_app::channel_controller::forward_stats {};
-    const double noise_fps = rate_per_sec(now.tx_noise, prev.tx_noise, dt);
-    const double jpeg_out_fps = rate_per_sec(now.tx_jpeg_nv12, prev.tx_jpeg_nv12, dt);
-    const double enc_in_fps = rate_per_sec(now.tx_nv12, prev.tx_nv12, dt);
-    const double enc_pkt_ps = rate_per_sec(now.tx_rtp_sock, prev.tx_rtp_sock, dt);
-    const double snd_pkt_ps = rate_per_sec(snd_pkts_now, prev_snd_pkts, dt);
-    const double rx_pkt_ps = rate_per_sec(now.rx_udp, prev.rx_udp, dt);
-    const double dec_in_au_pps = rate_per_sec(now.rx_dec_in_ok, prev.rx_dec_in_ok, dt);
-    const double depay_au_pps = rate_per_sec(now.rx_depay_au, prev.rx_depay_au, dt);
-    const double dec_out_fps = rate_per_sec(now.rx_nv12_out, prev.rx_nv12_out, dt);
-    const double present_fps = rate_per_sec(now.rx_present_ok, prev.rx_present_ok, dt);
+    const double noise_fps = apps::rate_per_sec(now.tx_noise, prev.tx_noise, dt);
+    const double jpeg_out_fps = apps::rate_per_sec(now.tx_jpeg_nv12, prev.tx_jpeg_nv12, dt);
+    const double enc_in_fps = apps::rate_per_sec(now.tx_nv12, prev.tx_nv12, dt);
+    const double enc_pkt_ps = apps::rate_per_sec(now.tx_rtp_sock, prev.tx_rtp_sock, dt);
+    const double snd_pkt_ps = apps::rate_per_sec(snd_pkts_now, prev_snd_pkts, dt);
+    const double rx_pkt_ps = apps::rate_per_sec(now.rx_udp, prev.rx_udp, dt);
+    const double dec_in_au_pps = apps::rate_per_sec(now.rx_dec_in_ok, prev.rx_dec_in_ok, dt);
+    const double depay_au_pps = apps::rate_per_sec(now.rx_depay_au, prev.rx_depay_au, dt);
+    const double dec_out_fps = apps::rate_per_sec(now.rx_nv12_out, prev.rx_nv12_out, dt);
+    const double present_fps = apps::rate_per_sec(now.rx_present_ok, prev.rx_present_ok, dt);
     const uint64_t sink_dropped_now = d.rx_present_q_drop.load();
-    const double   sink_drop_fps = rate_per_sec(sink_dropped_now, prev_sink_dropped, dt);
+    const double   sink_drop_fps = apps::rate_per_sec(sink_dropped_now, prev_sink_dropped, dt);
     const double nv12_gap_fps =
         jpeg_out_fps > enc_in_fps ? jpeg_out_fps - enc_in_fps : 0.0;
 
@@ -231,7 +203,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
         nv12_q_drop + enc_input_miss + d.tx_enc_in_err.load();
     const uint64_t dec_dropped_now =
         d.rx_dec_in_err.load() + d.rx_depay_err.load() + d.rx_au_q_drop.load();
-    const double   dec_drop_pps = rate_per_sec(dec_dropped_now, prev_dec_dropped, dt);
+    const double   dec_drop_pps = apps::rate_per_sec(dec_dropped_now, prev_dec_dropped, dt);
 
     /* Encoder output bitrate (H.264 AU bytes); same unit as h264_encoder.cbr_kbps. */
     const uint64_t enc_out_bytes_now =
@@ -277,7 +249,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
             static_cast<double>(now.rx_nv12_out_bytes - prev.rx_nv12_out_bytes) * 8.0 / dt / 1000.0;
     }
     const double enc_q_pop_fps =
-        rate_per_sec(now.tx_enc_nv12_popped, prev.tx_enc_nv12_popped, dt);
+        apps::rate_per_sec(now.tx_enc_nv12_popped, prev.tx_enc_nv12_popped, dt);
     const size_t enc_q_depth = (nullptr != g_metrics_nv12_q) ? g_metrics_nv12_q->size() : 0;
     double       enc_q_latency_ms = 0.0;
     if (jpeg_out_fps > 0.5)
@@ -289,7 +261,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
             ? static_cast<double>(ch.bytes_out - prev_ch_bytes_out) * 8.0 / dt / 1000.0
             : 0.0;
     const uint64_t ch_fwd_drops = ch.dropped_rate + ch.dropped_loss + ch.dropped_queue;
-    const double   ch_drop_pps = rate_per_sec(ch_fwd_drops, prev_ch_fwd_drops, dt);
+    const double   ch_drop_pps = apps::rate_per_sec(ch_fwd_drops, prev_ch_fwd_drops, dt);
     double         ch_drop_kbps = 0.0;
     if (rate.have_snap && dt > 0.0 && ch.bytes_in >= prev_ch_bytes_in &&
         ch.bytes_out >= prev_ch_bytes_out)
@@ -306,11 +278,11 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     std::string sink_stats;
     if (nullptr != preview && preview->query("stats", &sink_stats) == 0)
     {
-        sink_frames = parse_stats_field(sink_stats, "frames");
+        sink_frames = apps::parse_stats_field(sink_stats, "frames");
     }
 
     char ts[40];
-    format_stats_timestamp(ts, sizeof(ts));
+    apps::format_stats_timestamp(ts, sizeof(ts));
 
     const bool pipeline_flowing =
         (now.tx_rtp_sock > 0 && now.rx_udp > 0) || (enc_pkt_ps > 0.5 && rx_pkt_ps > 0.5);
@@ -364,7 +336,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
                      jpeg_nv12_out_kbps);
         const uint64_t mjpeg_q_drop = d.tx_mjpeg_q_drop.load();
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.dropped_fps"),
-                     rate_per_sec(mjpeg_q_drop, prev.tx_mjpeg_q_drop, dt));
+                     apps::rate_per_sec(mjpeg_q_drop, prev.tx_mjpeg_q_drop, dt));
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"),
                      apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
         if (nullptr != jdec)
@@ -685,7 +657,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender &sender, h264
         std::lock_guard<std::mutex> lock(g_metrics_serve_rate.mu);
         if (g_metrics_serve_rate.have)
         {
-            const double sec = elapsed_sec(g_metrics_serve_rate.prev_t, t_now);
+            const double sec = apps::elapsed_sec(g_metrics_serve_rate.prev_t, t_now);
             if (sec > 0.0 && enc_out_bytes >= g_metrics_serve_rate.prev_enc_out_bytes &&
                 enc_out_bytes > g_metrics_serve_rate.prev_enc_out_bytes)
             {
