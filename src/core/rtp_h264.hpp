@@ -27,7 +27,7 @@ public:
     void reset();
 
     /* Clears pending and enqueues new datagrams. */
-    int pack_annexb(const uint8_t *data, size_t size, int64_t pts, int64_t capture_mono_ns = 0);
+    int pack_annexb(const uint8_t *data, size_t size, int64_t pts, int64_t capture_rt_ns = 0);
 
     bool pending() const { return !queue.empty(); }
 
@@ -36,9 +36,9 @@ public:
 
 private:
     int append_datagram(const uint8_t *payload, int plen, int marker, uint32_t ts,
-                        int64_t capture_rel_ns = 0);
+                        int64_t capture_rt_ns = 0);
     int send_nal(const uint8_t *nal, int len, int marker, uint32_t ts,
-                 int64_t capture_rel_ns = 0);
+                 int64_t capture_rt_ns = 0);
     void cache_param(const uint8_t *nal, int len);
 
     rtp_h264_config cfg;
@@ -58,8 +58,6 @@ public:
 
     void reset();
 
-    void set_capture_epoch_ns(int64_t epoch_ns) { capture_epoch_ns = epoch_ns; }
-
     /* Returns 0 when no AU ready; 1 when au_out filled; negative on error. */
     int feed(const uint8_t *datagram, size_t len, std::vector<uint8_t> *au_out);
 
@@ -69,7 +67,7 @@ public:
 
     [[nodiscard]] int64_t au_pts() const { return last_au_frame_pts; }
 
-    [[nodiscard]] int64_t au_capture_mono_ns() const { return last_au_capture_mono_ns; }
+    [[nodiscard]] int64_t au_capture_rt_ns() const { return last_au_capture_rt_ns; }
 
     [[nodiscard]] uint64_t need_idr() const { return need_idr_count; }
 
@@ -85,7 +83,7 @@ private:
         bool     marker = false;
         const uint8_t *payload = nullptr;
         size_t           plen = 0;
-        int64_t          capture_rel_ns = 0;
+        int64_t          capture_rt_ns = 0;
     };
 
     bool parse_rtp(const uint8_t *datagram, size_t len, parsed_rtp *out) const;
@@ -94,23 +92,22 @@ private:
     void append_annexb_nal(const uint8_t *nal, size_t len);
     void abort_fu();
     int  process_payload(const parsed_rtp &rtp);
-    void note_au_timestamps(uint32_t ts, int64_t capture_mono_ns);
-    void finish_building_au(uint32_t ts, int64_t capture_mono_ns);
+    void note_au_timestamps(uint32_t ts, int64_t capture_rt_ns);
+    void finish_building_au(uint32_t ts, int64_t capture_rt_ns);
     int  pop_completed_au(std::vector<uint8_t> *au_out);
 
     struct completed_au_s
     {
         std::vector<uint8_t> bytes;
         uint32_t             ts = 0;
-        int64_t              capture_mono_ns = 0;
+        int64_t              capture_rt_ns = 0;
         bool                 key = false;
         bool                 damaged = false;
     };
 
     int                 fps = 30;
-    int64_t             capture_epoch_ns = 0;
     int64_t             last_au_frame_pts = 0;
-    int64_t             last_au_capture_mono_ns = 0;
+    int64_t             last_au_capture_rt_ns = 0;
     bool                last_au_key = false;
 
     std::vector<uint8_t> building_au;
@@ -132,7 +129,7 @@ private:
     uint64_t nal_dropped_count = 0;
     uint64_t rtp_reordered_count = 0;
 
-    int64_t building_capture_mono_ns = 0;
+    int64_t building_capture_rt_ns = 0;
     std::deque<completed_au_s> completed_aus;
 };
 

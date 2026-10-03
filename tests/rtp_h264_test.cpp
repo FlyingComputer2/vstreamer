@@ -5,8 +5,10 @@
 #include <gtest/gtest.h>
 
 #include "core/shared_sized_buffer.hpp"
+#include "core/time_util.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -25,13 +27,13 @@ void append_nal(std::vector<uint8_t> *au, const uint8_t *nal, size_t len)
 }
 
 std::vector<std::vector<uint8_t>> pack_au(const std::vector<uint8_t> &annexb, int mtu,
-                                          int64_t capture_rel = 0)
+                                          int64_t capture_rt = 0)
 {
     rtp_h264_config cfg;
     cfg.mtu = mtu;
     cfg.fps = 30;
     rtp_h264_packer packer(cfg);
-    EXPECT_EQ(0, packer.pack_annexb(annexb.data(), annexb.size(), 7, capture_rel));
+    EXPECT_EQ(0, packer.pack_annexb(annexb.data(), annexb.size(), 7, capture_rt));
     std::vector<std::vector<uint8_t>> out;
     uint8_t buf[2048];
     while (packer.pending())
@@ -44,10 +46,8 @@ std::vector<std::vector<uint8_t>> pack_au(const std::vector<uint8_t> &annexb, in
 }
 
 std::vector<uint8_t> depack_datagrams(rtp_h264_depacketizer &dep,
-                                      const std::vector<std::vector<uint8_t>> &dgrams,
-                                      int64_t epoch_ns = 0)
+                                      const std::vector<std::vector<uint8_t>> &dgrams)
 {
-    dep.set_capture_epoch_ns(epoch_ns);
     std::vector<uint8_t> au;
     for (const auto &dg : dgrams)
     {
@@ -398,33 +398,56 @@ TEST(RtpH264Test, PayMtuRtpLimitsOnly)
     pay.close();
 }
 
-TEST(RtpH264Test, CaptureEpochRoundTrip)
+TEST(RtpH264Test, CaptureExtensionGoldenHeader)
 {
-    constexpr int64_t k_epoch = 1'000'000'000'000LL;
-    constexpr int64_t k_cap = k_epoch + 42'000'000LL;
-    const int64_t     rel = k_cap - k_epoch;
-
-    const uint8_t idr[] = {0x65, 0x01};
+    constexpr int64_t k_rt = 1'704'067'200'000'000'000LL;
+    const uint8_t     idr[] = {0x65, 0x01};
     std::vector<uint8_t> au;
     append_nal(&au, idr, sizeof(idr));
-    const auto dgrams = pack_au(au, 1400, rel);
-
-    rtp_h264_depacketizer dep(30);
-    const std::vector<uint8_t> out = depack_datagrams(dep, dgrams, k_epoch);
-    EXPECT_FALSE(out.empty());
-    EXPECT_EQ(k_cap, dep.au_capture_mono_ns());
+    const auto dgrams = pack_au(au, 1400, k_rt);
+    ASSERT_FALSE(dgrams.empty());
+    const auto &dg = dgrams.front();
+    EXPECT_GE(dg.size(), 28U);
+    EXPECT_EQ(0xbe, dg[12]);
+    EXPECT_EQ(0xde, dg[13]);
+    EXPECT_EQ(0x00, dg[14]);
+    EXPECT_EQ(0x03, dg[15]);
+    EXPECT_EQ(0x27, dg[16]);
+    uint64_t be = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        be = (be << 8) | dg[17 + i];
+    }
+    EXPECT_EQ(k_rt, static_cast<int64_t>(be));
 }
 
-TEST(RtpH264Test, CaptureZeroWithoutEpoch)
+TEST(RtpH264Test, CaptureRealtimeRoundTrip)
+{
+    constexpr int64_t k_rt = 1'704'067'200'042'000'000LL;
+
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+    const auto dgrams = pack_au(au, 1400, k_rt);
+
+    rtp_h264_depacketizer dep(30);
+    const std::vector<uint8_t> out = depack_datagrams(dep, dgrams);
+    EXPECT_FALSE(out.empty());
+    EXPECT_EQ(k_rt, dep.au_capture_rt_ns());
+}
+
+TEST(RtpH264Test, OldCaptureExtensionIdIgnored)
 {
     const uint8_t idr[] = {0x65, 0x01};
     std::vector<uint8_t> au;
     append_nal(&au, idr, sizeof(idr));
-    const auto dgrams = pack_au(au, 1400, 12345);
+    auto dgrams = pack_au(au, 1400, vstreamer::realtime_ns());
+    ASSERT_FALSE(dgrams.empty());
+    dgrams.front()[16] = 0x17;
 
     rtp_h264_depacketizer dep(30);
-    (void)depack_datagrams(dep, dgrams, 0);
-    EXPECT_EQ(0, dep.au_capture_mono_ns());
+    (void)depack_datagrams(dep, dgrams);
+    EXPECT_EQ(0, dep.au_capture_rt_ns());
 }
 
 TEST(RtpH264Test, DepayComponentQueuesMultipleAus)
@@ -572,4 +595,123 @@ TEST(RtpH264Test, NoInjectOnNonIdrSlice)
     append_nal(&au, slice, sizeof(slice));
     const std::vector<uint8_t> out = depack_packer_au(packer, au);
     EXPECT_EQ(std::vector<int>({1}), annexb_nal_types(out));
+}
+
+void feed_depay_sock(vstreamer::rtp_h264_depay &depay, const std::vector<uint8_t> &dg)
+{
+    auto sd = std::make_unique<vstreamer::sock_data>();
+    sd->buf = vstreamer::shared_sized_buffer::copy_from(dg.data(), dg.size());
+    vstreamer::data_packet in;
+    in.reset(std::move(sd));
+    EXPECT_EQ(0, depay.input(0, in));
+}
+
+int64_t depay_output_capture_mono(vstreamer::rtp_h264_depay &depay)
+{
+    vstreamer::data_packet out;
+    EXPECT_EQ(0, depay.output(0, out, 0));
+    return vstreamer::data_packet::cast<vstreamer::frame_data>(out).capture_mono_ns;
+}
+
+uint64_t depay_query_u64(vstreamer::rtp_h264_depay &depay, const char *key)
+{
+    std::string v;
+    EXPECT_EQ(0, depay.query(key, &v));
+    return static_cast<uint64_t>(std::strtoull(v.c_str(), nullptr, 10));
+}
+
+TEST(RtpH264Test, PayDepayCaptureMonoRoundTrip)
+{
+    vstreamer::rtp_h264_pay pay;
+    vstreamer::rtp_h264_depay depay;
+    ASSERT_EQ(0, pay.open());
+    ASSERT_EQ(0, depay.open());
+
+    const int64_t cap_mono = vstreamer::steady_mono_ns() - 30'000'000LL;
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+
+    auto fd = std::make_unique<vstreamer::frame_data>();
+    fd->kind = vstreamer::media_kind_e::H264;
+    fd->pts = 1;
+    fd->capture_mono_ns = cap_mono;
+    fd->buf = vstreamer::shared_sized_buffer::copy_from(au.data(), au.size());
+    vstreamer::data_packet pkt;
+    pkt.reset(std::move(fd));
+    ASSERT_EQ(0, pay.input(0, pkt));
+
+    vstreamer::data_packet sock_pkt;
+    ASSERT_EQ(0, pay.output(0, sock_pkt, 0));
+    const auto &sock = vstreamer::data_packet::cast<vstreamer::sock_data>(sock_pkt);
+    const std::vector<uint8_t> dg(sock.buf.u8(), sock.buf.u8() + sock.buf.size());
+    feed_depay_sock(depay, dg);
+
+    const int64_t out_cap = depay_output_capture_mono(depay);
+    EXPECT_GT(out_cap, 0);
+    const int64_t delta = out_cap - cap_mono;
+    EXPECT_GE(delta, -5'000'000LL);
+    EXPECT_LE(delta, 5'000'000LL);
+    pay.close();
+    depay.close();
+}
+
+TEST(RtpH264Test, DepayRejectsCaptureTooFarAhead)
+{
+    vstreamer::rtp_h264_depay depay;
+    ASSERT_EQ(0, depay.open());
+
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+    const int64_t future_rt = vstreamer::realtime_ns() + 200'000'000LL;
+    const auto    dgrams = pack_au(au, 1400, future_rt);
+    for (const auto &dg : dgrams)
+    {
+        feed_depay_sock(depay, dg);
+    }
+    EXPECT_EQ(0, depay_output_capture_mono(depay));
+    EXPECT_EQ(1U, depay_query_u64(depay, "capture_ts_rejected"));
+    depay.close();
+}
+
+TEST(RtpH264Test, DepayRejectsCaptureTooOld)
+{
+    vstreamer::rtp_h264_depay depay;
+    ASSERT_EQ(0, depay.open());
+
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+    const int64_t stale_rt = vstreamer::realtime_ns() - 120'000'000'000LL;
+    const auto    dgrams = pack_au(au, 1400, stale_rt);
+    for (const auto &dg : dgrams)
+    {
+        feed_depay_sock(depay, dg);
+    }
+    EXPECT_EQ(0, depay_output_capture_mono(depay));
+    EXPECT_EQ(1U, depay_query_u64(depay, "capture_ts_rejected"));
+    depay.close();
+}
+
+TEST(RtpH264Test, DepayAcceptsSmallClockAheadSkew)
+{
+    vstreamer::rtp_h264_depay depay;
+    ASSERT_EQ(0, depay.open());
+
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+    const int64_t ahead_rt = vstreamer::realtime_ns() + 20'000'000LL;
+    const auto    dgrams = pack_au(au, 1400, ahead_rt);
+    for (const auto &dg : dgrams)
+    {
+        feed_depay_sock(depay, dg);
+    }
+    const int64_t cap_mono = depay_output_capture_mono(depay);
+    EXPECT_GT(cap_mono, 0);
+    const int64_t lag_ns = vstreamer::steady_mono_ns() - cap_mono;
+    EXPECT_LT(lag_ns, 0);
+    EXPECT_GT(lag_ns, -35'000'000LL);
+    depay.close();
 }

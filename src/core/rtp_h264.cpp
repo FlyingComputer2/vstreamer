@@ -15,7 +15,8 @@ constexpr int k_max_rtp = 1500;
 constexpr int k_max_param = 256;
 constexpr int k_capture_ext_words = 3;
 constexpr int k_capture_ext_total = 4 + k_capture_ext_words * 4;
-constexpr uint8_t k_capture_ext_id = 1;
+/* RFC 5285 one-byte header extension id 2: capture instant, CLOCK_REALTIME ns (BE u64). */
+constexpr uint8_t k_capture_ext_id = 2;
 constexpr uint8_t k_capture_ext_len_bytes = 8;
 
 uint32_t pts_to_rtp_ts(int64_t pts, int fps)
@@ -94,9 +95,9 @@ void rtp_h264_packer::reset()
 }
 
 int rtp_h264_packer::append_datagram(const uint8_t *payload, int plen, int marker, uint32_t ts,
-                                     int64_t capture_rel_ns)
+                                     int64_t capture_rt_ns)
 {
-    const bool have_capture = capture_rel_ns > 0;
+    const bool have_capture = capture_rt_ns > 0;
     const int  hdr_extra = have_capture ? k_capture_ext_total : 0;
     const int  total = k_rtp_hdr + hdr_extra + plen;
     if (plen < 0 || total > cfg.mtu || total > k_max_rtp)
@@ -124,10 +125,10 @@ int rtp_h264_packer::append_datagram(const uint8_t *payload, int plen, int marke
         pkt[14] = 0;
         pkt[15] = static_cast<uint8_t>(k_capture_ext_words);
         pkt[16] = static_cast<uint8_t>((k_capture_ext_id << 4) | (k_capture_ext_len_bytes - 1));
-        uint64_t rel_be = static_cast<uint64_t>(capture_rel_ns);
+        uint64_t rt_be = static_cast<uint64_t>(capture_rt_ns);
         for (int i = 0; i < 8; ++i)
         {
-            pkt[17 + i] = static_cast<uint8_t>((rel_be >> (56 - 8 * i)) & 0xff);
+            pkt[17 + i] = static_cast<uint8_t>((rt_be >> (56 - 8 * i)) & 0xff);
         }
         pkt[25] = 0;
         pkt[26] = 0;
@@ -140,9 +141,9 @@ int rtp_h264_packer::append_datagram(const uint8_t *payload, int plen, int marke
 }
 
 int rtp_h264_packer::send_nal(const uint8_t *nal, int len, int marker, uint32_t ts,
-                              int64_t capture_rel_ns)
+                              int64_t capture_rt_ns)
 {
-    const bool have_capture = capture_rel_ns > 0;
+    const bool have_capture = capture_rt_ns > 0;
     const int  hdr_extra = have_capture ? k_capture_ext_total : 0;
     const int  max_single = cfg.mtu - k_rtp_hdr - hdr_extra;
     if (len <= 0)
@@ -151,7 +152,7 @@ int rtp_h264_packer::send_nal(const uint8_t *nal, int len, int marker, uint32_t 
     }
     if (len <= max_single)
     {
-        return append_datagram(nal, len, marker, ts, capture_rel_ns);
+        return append_datagram(nal, len, marker, ts, capture_rt_ns);
     }
 
     const int max_fu = cfg.mtu - k_rtp_hdr - hdr_extra - 2;
@@ -173,7 +174,7 @@ int rtp_h264_packer::send_nal(const uint8_t *nal, int len, int marker, uint32_t 
         fu[0] = static_cast<uint8_t>(nri | 28);
         fu[1] = static_cast<uint8_t>(type | (first ? 0x80 : 0) | (last ? 0x40 : 0));
         std::memcpy(fu + 2, p, static_cast<size_t>(chunk));
-        if (append_datagram(fu, chunk + 2, marker && last, ts, capture_rel_ns) < 0)
+        if (append_datagram(fu, chunk + 2, marker && last, ts, capture_rt_ns) < 0)
         {
             return -EINVAL;
         }
@@ -204,7 +205,7 @@ void rtp_h264_packer::cache_param(const uint8_t *nal, int len)
 }
 
 int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
-                                 int64_t capture_mono_ns)
+                                 int64_t capture_rt_ns)
 {
     queue.clear();
     const uint32_t ts = pts_to_rtp_ts(pts, cfg.fps);
@@ -250,7 +251,7 @@ int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
         emit.push_back(nal);
     }
 
-    const int64_t capture_rel = capture_mono_ns > 0 ? capture_mono_ns : 0;
+    const int64_t capture_rt = capture_rt_ns > 0 ? capture_rt_ns : 0;
 
     bool injected_cached_sps = false;
     bool injected_cached_pps = false;
@@ -261,7 +262,7 @@ int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
         {
             if (!au_has_sps && !injected_cached_sps && sps_len > 0)
             {
-                if (send_nal(sps, sps_len, 0, ts, capture_rel) < 0)
+                if (send_nal(sps, sps_len, 0, ts, capture_rt) < 0)
                 {
                     return -EINVAL;
                 }
@@ -269,7 +270,7 @@ int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
             }
             if (!au_has_pps && !injected_cached_pps && pps_len > 0)
             {
-                if (send_nal(pps, pps_len, 0, ts, capture_rel) < 0)
+                if (send_nal(pps, pps_len, 0, ts, capture_rt) < 0)
                 {
                     return -EINVAL;
                 }
@@ -277,7 +278,7 @@ int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
             }
         }
         const int marker = (n + 1 == emit.size()) ? 1 : 0;
-        if (send_nal(emit[n].first, emit[n].second, marker, ts, capture_rel) < 0)
+        if (send_nal(emit[n].first, emit[n].second, marker, ts, capture_rt) < 0)
         {
             return -EINVAL;
         }
@@ -316,12 +317,12 @@ void rtp_h264_depacketizer::reset()
     received_packets = 0;
     loss = 0.f;
     last_au_frame_pts = 0;
-    last_au_capture_mono_ns = 0;
+    last_au_capture_rt_ns = 0;
     last_au_key = false;
     need_idr_count = 0;
     nal_dropped_count = 0;
     rtp_reordered_count = 0;
-    building_capture_mono_ns = 0;
+    building_capture_rt_ns = 0;
     completed_aus.clear();
 }
 
@@ -359,7 +360,7 @@ bool rtp_h264_depacketizer::parse_rtp(const uint8_t *datagram, size_t len,
         return false;
     }
 
-    int64_t capture_rel = 0;
+    int64_t capture_rt = 0;
     if ((datagram[0] & 0x10) != 0)
     {
         if (pkt_len < off + 4)
@@ -385,12 +386,12 @@ bool rtp_h264_depacketizer::parse_rtp(const uint8_t *datagram, size_t len,
                 if (ext_id == k_capture_ext_id && ext_len == k_capture_ext_len_bytes &&
                     pkt_len >= off + 4 + ext_len)
                 {
-                    uint64_t rel_be = 0;
+                    uint64_t rt_be = 0;
                     for (int i = 0; i < 8; ++i)
                     {
-                        rel_be = (rel_be << 8) | datagram[off + 5 + i];
+                        rt_be = (rt_be << 8) | datagram[off + 5 + i];
                     }
-                    capture_rel = static_cast<int64_t>(rel_be);
+                    capture_rt = static_cast<int64_t>(rt_be);
                 }
             }
             off += ext_total;
@@ -409,7 +410,7 @@ bool rtp_h264_depacketizer::parse_rtp(const uint8_t *datagram, size_t len,
     out->marker = (datagram[1] & 0x80) != 0;
     out->payload = datagram + off;
     out->plen = pkt_len - off;
-    out->capture_rel_ns = capture_rel;
+    out->capture_rt_ns = capture_rt;
     return true;
 }
 
@@ -476,27 +477,27 @@ void rtp_h264_depacketizer::abort_fu()
     building_damaged = true;
 }
 
-void rtp_h264_depacketizer::note_au_timestamps(uint32_t ts, int64_t capture_mono_ns)
+void rtp_h264_depacketizer::note_au_timestamps(uint32_t ts, int64_t capture_rt_ns)
 {
     last_au_frame_pts = (static_cast<int64_t>(ts) * fps) / 90000;
-    last_au_capture_mono_ns = capture_mono_ns;
+    last_au_capture_rt_ns = capture_rt_ns;
 }
 
-void rtp_h264_depacketizer::finish_building_au(uint32_t ts, int64_t capture_mono_ns)
+void rtp_h264_depacketizer::finish_building_au(uint32_t ts, int64_t capture_rt_ns)
 {
     if (building_au.empty())
     {
         have_building_ts = false;
         building_key = false;
         building_damaged = false;
-        building_capture_mono_ns = 0;
+        building_capture_rt_ns = 0;
         return;
     }
 
     completed_au_s item;
     item.bytes = building_au;
     item.ts = ts;
-    item.capture_mono_ns = capture_mono_ns;
+    item.capture_rt_ns = capture_rt_ns;
     item.key = building_key;
     item.damaged = building_damaged;
     completed_aus.push_back(std::move(item));
@@ -505,7 +506,7 @@ void rtp_h264_depacketizer::finish_building_au(uint32_t ts, int64_t capture_mono
     have_building_ts = false;
     building_key = false;
     building_damaged = false;
-    building_capture_mono_ns = 0;
+    building_capture_rt_ns = 0;
 }
 
 int rtp_h264_depacketizer::pop_completed_au(std::vector<uint8_t> *au_out)
@@ -522,7 +523,7 @@ int rtp_h264_depacketizer::pop_completed_au(std::vector<uint8_t> *au_out)
     {
         need_idr_count++;
     }
-    note_au_timestamps(item.ts, item.capture_mono_ns);
+    note_au_timestamps(item.ts, item.capture_rt_ns);
     return 1;
 }
 
@@ -626,19 +627,17 @@ int rtp_h264_depacketizer::feed(const uint8_t *datagram, size_t len, std::vector
 
     if (have_building_ts && rtp.ts != building_ts)
     {
-        finish_building_au(building_ts, building_capture_mono_ns);
+        finish_building_au(building_ts, building_capture_rt_ns);
     }
 
     note_sequence(rtp.seq);
 
     begin_au_if_needed(rtp.ts);
 
-    int64_t cap = 0;
-    if (capture_epoch_ns > 0 && rtp.capture_rel_ns > 0)
+    if (rtp.capture_rt_ns > 0)
     {
-        cap = capture_epoch_ns + rtp.capture_rel_ns;
+        building_capture_rt_ns = rtp.capture_rt_ns;
     }
-    building_capture_mono_ns = cap;
 
     const int pr = process_payload(rtp);
     if (pr < 0)
@@ -648,7 +647,7 @@ int rtp_h264_depacketizer::feed(const uint8_t *datagram, size_t len, std::vector
 
     if (rtp.marker)
     {
-        finish_building_au(rtp.ts, building_capture_mono_ns);
+        finish_building_au(rtp.ts, building_capture_rt_ns);
     }
 
     return pop_completed_au(au_out);
