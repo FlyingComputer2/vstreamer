@@ -147,10 +147,10 @@ int main(int argc, char **argv)
 
     g_diag = diag;
     apps::stage_latency_set_diag_enabled(diag);
-    g_stream_fps.store(fps);
+    g_tx.stream_fps.store(fps);
     if (nullptr != std::getenv("VSTREAMER_SKIP_DECODE"))
     {
-        g_skip_decode = true;
+        g_rx.skip_decode = true;
         std::fprintf(stderr, "sdl_stream_receiver: decode disabled (VSTREAMER_SKIP_DECODE)\n");
     }
 

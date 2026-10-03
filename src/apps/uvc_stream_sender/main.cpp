@@ -258,7 +258,7 @@ int main(int argc, char **argv)
         camera, noise, k_noise_fallback_w, k_noise_fallback_h, k_noise_fallback_fps, on_switch,
         source_selector::push_packet_fn {}, source_selector::push_packet_fn {});
     metrics_src = std::make_unique<source_selector_query_source>(*selector);
-    g_metrics_source = metrics_src.get();
+    g_tx.metrics_source = metrics_src.get();
 
     if (selector->open() < 0 || jdec.open() < 0 || enc.open() < 0 || sender.open() < 0 ||
         pay.open() < 0)
@@ -269,13 +269,13 @@ int main(int argc, char **argv)
 
     g_diag = diag;
     apps::stage_latency_set_diag_enabled(diag);
-    g_stream_fps.store(fps);
+    g_tx.stream_fps.store(fps);
 
     const size_t pipe_q = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                      apps::k_default_pipe_queue_depth, 64);
     apps::pipeline_queue mjpeg_q(pipe_q, g_run);
     apps::pipeline_queue nv12_q(pipe_q, g_run);
-    g_metrics_nv12_q = &nv12_q;
+    g_tx.metrics_nv12_q = &nv12_q;
 
     selector->set_push_handlers(
         [&](data_packet &&p) {
@@ -294,9 +294,9 @@ int main(int argc, char **argv)
     });
     console.set_source_state_metrics_refresh([&]() {
         std::string st = "running";
-        if (nullptr != g_metrics_source)
+        if (nullptr != g_tx.metrics_source)
         {
-            (void)query_source_metric_string(g_metrics_source, "state", st);
+            (void)query_source_metric_string(g_tx.metrics_source, "state", st);
         }
         metric_store(*g_pipeline_metrics.get_metric("source.state"), st);
     });
@@ -304,19 +304,19 @@ int main(int argc, char **argv)
     tx_targets.sender = &sender;
     tx_targets.encoder = &enc;
     tx_targets.set_cbr_kbps = [&](int kbps) {
-        g_pending_console_cbr_kbps.store(kbps, std::memory_order_release);
+        g_tx.pending_console_cbr_kbps.store(kbps, std::memory_order_release);
         return true;
     };
     tx_targets.set_qp = [&](int qp) {
-        g_pending_console_qp.store(qp, std::memory_order_release);
+        g_tx.pending_console_qp.store(qp, std::memory_order_release);
         return true;
     };
     tx_targets.set_gop = [&](int g) {
-        g_pending_console_gop.store(g, std::memory_order_release);
+        g_tx.pending_console_gop.store(g, std::memory_order_release);
         return true;
     };
     tx_targets.force_idr = [&]() {
-        g_pending_console_idr.store(true, std::memory_order_release);
+        g_tx.pending_console_idr.store(true, std::memory_order_release);
         return true;
     };
     apps::tx::register_tx_console_handlers(console, tx_targets);

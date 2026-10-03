@@ -7,7 +7,6 @@ set(_bench_core
     ${_bench_pipeline_dir}/pipeline_state.cpp
     ${_bench_pipeline_dir}/diag.cpp
     ${_bench_pipeline_dir}/metrics_sync.cpp
-    ${_bench_pipeline_dir}/stages.cpp
 )
 
 if(VSTREAMER_APP_TX_OK AND VSTREAMER_APP_RX_OK)

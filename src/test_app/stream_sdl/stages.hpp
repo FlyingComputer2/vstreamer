@@ -1,58 +1,15 @@
 #ifndef VSTREAMER_TEST_APP_STAGES_HPP
 #define VSTREAMER_TEST_APP_STAGES_HPP
 
-#include "apps/common/queues.hpp"
-#include "test_app/stream_sdl/diag.hpp"
-
-#include "components/components.hpp"
-
-#if !defined(VSTREAMER_BENCH_RX_ONLY) && (defined(ENABLE_H264_ENCODER_MPP) || \
-                                          defined(ENABLE_H264_ENCODER_CEDAR) || \
-                                          defined(ENABLE_H264_ENCODER_INTEL))
-#include "test_app/stream_sdl/encoder_types.hpp"
-#endif
-
-namespace vstreamer::apps::tx
-{
-class source_selector;
-}
+#include "apps/common/pipeline_stage_util.hpp"
+#include "apps/common/rx/rx_stages.hpp"
+#include "apps/common/tx/tx_stages.hpp"
 
 namespace vstreamer::test_app
 {
 
-int cfg_str(vstreamer::component &c, const char *key, const char *val);
-int open_stage(const char *name, int rc);
-int prepare_preview_sink(vstreamer::component_sink *preview, bool kmsdrm, int w, int h);
-
-bool enqueue_source_frame(vstreamer::data_packet &&raw, apps::pipeline_queue *mjpeg_q,
-                          apps::pipeline_queue *nv12_q, bench_diag *diag);
-
-#if !defined(VSTREAMER_BENCH_RX_ONLY)
-void source_stage_main(vstreamer::component_source *source, apps::pipeline_queue *mjpeg_q,
-                       apps::pipeline_queue *nv12_q, bench_diag *diag);
-void source_stage_selector_main(apps::tx::source_selector *selector, apps::pipeline_queue *mjpeg_q,
-                                apps::pipeline_queue *nv12_q, bench_diag *diag);
-void jpeg_stage_main(vstreamer::jpeg_decoder_multicore *jdec, apps::pipeline_queue *mjpeg_q,
-                     apps::pipeline_queue *nv12_q, bench_diag *diag, int max_inflight);
-#if defined(ENABLE_H264_ENCODER_MPP) || defined(ENABLE_H264_ENCODER_CEDAR) || \
-    defined(ENABLE_H264_ENCODER_INTEL)
-void encode_stage_main(h264_encoder_t *enc, vstreamer::rtp_h264_pay *pay,
-                       vstreamer::stream_sender *sender, apps::pipeline_queue *nv12_q,
-                       bench_diag *diag);
-#endif
-#endif  // !VSTREAMER_BENCH_RX_ONLY
-
-#if !defined(VSTREAMER_BENCH_TX_ONLY)
-void present_thread_main(vstreamer::component_sink *display, apps::present_frame_queue *present_q,
-                         int width, int height, bool kmsdrm, bool sdl_open_on_thread,
-                         bench_diag *diag);
-void rx_net_thread_main(vstreamer::stream_receiver *rcv, vstreamer::rtp_h264_depay *depay,
-                        apps::rx_au_queue *au_q, bench_diag *diag);
-#if defined(ENABLE_H264_DECODER_MPP)
-void decode_thread_main(vstreamer::h264_decoder_mpp *dec, apps::present_frame_queue *present_q,
-                        apps::rx_au_queue *au_q, bench_diag *diag);
-#endif
-#endif  // !VSTREAMER_BENCH_TX_ONLY
+using vstreamer::apps::cfg_str;
+using vstreamer::apps::open_stage;
 
 }  // namespace vstreamer::test_app
 

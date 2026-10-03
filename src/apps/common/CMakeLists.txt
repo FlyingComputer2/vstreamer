@@ -5,12 +5,23 @@ set(_apps_common_sources
     app_metrics.cpp
     cpu_map.cpp
     pipeline_controller.cpp
+    pipeline_stage_util.cpp
     queues.cpp
     stage_latency.cpp
 )
 
 if(VSTREAMER_APP_TX_OK)
-    list(APPEND _apps_common_sources tx/tx_console.cpp)
+    list(APPEND _apps_common_sources
+        tx/tx_console.cpp
+        tx/tx_metrics.cpp
+        tx/tx_stages.cpp
+    )
+endif()
+if(VSTREAMER_APP_RX_OK)
+    list(APPEND _apps_common_sources
+        rx/rx_metrics.cpp
+        rx/rx_stages.cpp
+    )
 endif()
 if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
     list(APPEND _apps_common_sources tx/source_selector.cpp)

@@ -624,7 +624,7 @@ int main(int argc, char **argv)
 
     if (nullptr != std::getenv("VSTREAMER_SKIP_DECODE"))
     {
-        g_skip_decode = true;
+        g_rx.skip_decode = true;
         std::fprintf(stderr, "%s: decode disabled (VSTREAMER_SKIP_DECODE)\n", app_label);
     }
     if (const char *bench = std::getenv("VSTREAMER_BENCH_METRICS");
@@ -727,19 +727,19 @@ int main(int argc, char **argv)
     }
     channel.set_encode_command_handlers(
         [](int kbps) -> bool {
-            g_pending_console_cbr_kbps.store(kbps, std::memory_order_release);
+            g_tx.pending_console_cbr_kbps.store(kbps, std::memory_order_release);
             return true;
         },
         [](int qp) -> bool {
-            g_pending_console_qp.store(qp, std::memory_order_release);
+            g_tx.pending_console_qp.store(qp, std::memory_order_release);
             return true;
         },
         [](int gop) -> bool {
-            g_pending_console_gop.store(gop, std::memory_order_release);
+            g_tx.pending_console_gop.store(gop, std::memory_order_release);
             return true;
         },
         []() -> bool {
-            g_pending_console_idr.store(true, std::memory_order_release);
+            g_tx.pending_console_idr.store(true, std::memory_order_release);
             return true;
         });
     channel.set_stream_sender(&sender);
@@ -747,10 +747,10 @@ int main(int argc, char **argv)
     sender.set_enabled(true, 0);
 
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
-    g_metrics_source =
+    g_tx.metrics_source =
         use_uvc_selector ? static_cast<component_source *>(uvc_metrics_source.get()) : source;
 #else
-    g_metrics_source = source;
+    g_tx.metrics_source = source;
 #endif
     if (!defer_sdl_to_present && prepare_preview_sink(preview, kmsdrm, width, height) < 0)
     {
@@ -807,9 +807,9 @@ int main(int argc, char **argv)
     });
     channel.set_source_state_metrics_refresh([]() {
         std::string src_state = "running";
-        if (nullptr != g_metrics_source)
+        if (nullptr != g_tx.metrics_source)
         {
-            (void)query_source_metric_string(g_metrics_source, "state", src_state);
+            (void)query_source_metric_string(g_tx.metrics_source, "state", src_state);
         }
         metric_store(*g_pipeline_metrics.get_metric("source.state"), src_state);
     });
@@ -852,7 +852,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr,
                      "stream_sdl: diagnostic logging enabled (--diag); stage_latency lines on\n");
     }
-    g_stream_fps.store(fps, std::memory_order_relaxed);
+    g_tx.stream_fps.store(fps, std::memory_order_relaxed);
     const size_t pipe_q_depth = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                            apps::k_default_pipe_queue_depth, 64);
     const size_t present_q_depth =
@@ -874,7 +874,7 @@ int main(int argc, char **argv)
     }
     apps::pipeline_queue      mjpeg_q(pipe_q_depth, g_run);
     apps::pipeline_queue      nv12_q(pipe_q_depth, g_run);
-    g_metrics_nv12_q = &nv12_q;
+    g_tx.metrics_nv12_q = &nv12_q;
     apps::present_frame_queue present_q(present_q_depth, g_run);
     apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
 

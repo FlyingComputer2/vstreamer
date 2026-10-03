@@ -1,6 +1,8 @@
 #ifndef VSTREAMER_TEST_APP_METRICS_SYNC_HPP
 #define VSTREAMER_TEST_APP_METRICS_SYNC_HPP
 
+#include "apps/common/rx/rx_metrics.hpp"
+#include "apps/common/tx/tx_metrics.hpp"
 #include "test_app/stream_sdl/channel_controller.hpp"
 #include "test_app/stream_sdl/diag.hpp"
 #include "apps/common/queues.hpp"
@@ -10,10 +12,11 @@
 namespace vstreamer::test_app
 {
 
-bool query_source_metric_string(vstreamer::component_source *src, const char *key,
-                                std::string &out);
-void store_source_pipeline_metrics(double source_out_fps, double source_out_kbps, const char *ts,
-                                   vstreamer::component *jdec);
+using apps::tx::query_encoder_cbr_bps;
+using apps::tx::query_encoder_qp;
+using apps::tx::query_source_metric_string;
+using apps::tx::store_source_pipeline_metrics;
+using apps::rx::telemetry_thread_main;
 
 void update_pipeline_metrics(const bench_diag &d, vstreamer::component_coder *enc,
                              vstreamer::stream_sender *sender, vstreamer::stream_receiver *rcv,
@@ -25,11 +28,6 @@ void update_pipeline_metrics(const bench_diag &d, vstreamer::component_coder *en
 void sync_pipeline_metrics_live(const bench_diag &d, vstreamer::stream_sender *sender,
                                 vstreamer::component_coder *enc, vstreamer::stream_receiver *rcv,
                                 const channel_controller *channel);
-
-void telemetry_thread_main(vstreamer::stream_receiver *rcv);
-
-int query_encoder_qp(vstreamer::component_coder &enc);
-int query_encoder_cbr_bps(vstreamer::component_coder &enc);
 
 }  // namespace vstreamer::test_app
 
