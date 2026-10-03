@@ -64,6 +64,10 @@ private:
     std::deque<au_item>   au_queue;
     static constexpr size_t k_au_queue_depth = 8;
     uint64_t              au_dropped = 0;
+    uint64_t              capture_ts_rejected = 0;
+    double                capture_skew_ms = 0.0;
+
+    [[nodiscard]] int64_t accept_capture_rt_ns(int64_t capture_rt_ns);
 };
 
 }  // namespace vstreamer

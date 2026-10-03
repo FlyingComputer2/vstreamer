@@ -75,7 +75,6 @@ int rtp_h264_pay::open()
     {
         return 0;
     }
-    capture_epoch_ns = steady_mono_ns();
     recreate_pool_locked();
     rebuild_packer();
     opened = true;
@@ -88,7 +87,6 @@ void rtp_h264_pay::close()
     pending.clear();
     packer.reset();
     opened = false;
-    capture_epoch_ns = 0;
 }
 
 int rtp_h264_pay::input(uint8_t port, const data_packet &in)
@@ -104,16 +102,8 @@ int rtp_h264_pay::input(uint8_t port, const data_packet &in)
     }
 
     std::lock_guard<std::mutex> lock(mu);
-    int64_t capture_rel = 0;
-    if (f.capture_mono_ns > 0 && capture_epoch_ns > 0)
-    {
-        capture_rel = f.capture_mono_ns - capture_epoch_ns;
-        if (capture_rel < 0)
-        {
-            capture_rel = 0;
-        }
-    }
-    if (packer.pack_annexb(f.buf.u8(), f.buf.size(), f.pts, capture_rel) < 0)
+    const int64_t capture_rt = mono_to_realtime_ns(f.capture_mono_ns);
+    if (packer.pack_annexb(f.buf.u8(), f.buf.size(), f.pts, capture_rt) < 0)
     {
         return -EINVAL;
     }
@@ -211,14 +201,6 @@ int rtp_h264_pay::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
-    }
-    if ("capture_epoch_ns" == key)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%" PRId64, capture_epoch_ns);
-        *value = buf;
-        return 0;
     }
     if ("datagrams_dropped" == key)
     {

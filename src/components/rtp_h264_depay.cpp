@@ -1,6 +1,7 @@
 #include "components/rtp_h264_depay.hpp"
 
 #include "core/key_util.hpp"
+#include "core/time_util.hpp"
 
 #include <cerrno>
 #include <cinttypes>
@@ -9,6 +10,13 @@
 
 namespace vstreamer
 {
+namespace
+{
+
+constexpr int64_t k_capture_skew_min_ns = -50'000'000LL;
+constexpr int64_t k_capture_skew_max_ns = 60'000'000'000LL;
+
+}  // namespace
 
 rtp_h264_depay::rtp_h264_depay() = default;
 
@@ -48,6 +56,8 @@ int rtp_h264_depay::open()
     depay = rtp_h264_depacketizer(fps);
     au_queue.clear();
     au_dropped = 0;
+    capture_ts_rejected = 0;
+    capture_skew_ms = 0.0;
     opened = true;
     return 0;
 }
@@ -58,6 +68,24 @@ void rtp_h264_depay::close()
     depay.reset();
     au_queue.clear();
     opened = false;
+}
+
+int64_t rtp_h264_depay::accept_capture_rt_ns(int64_t capture_rt_ns)
+{
+    if (capture_rt_ns <= 0)
+    {
+        return 0;
+    }
+    const int64_t now_mono = steady_mono_ns();
+    const int64_t now_rt = realtime_ns();
+    const int64_t skew_ns = now_rt - capture_rt_ns;
+    if (skew_ns < k_capture_skew_min_ns || skew_ns > k_capture_skew_max_ns)
+    {
+        capture_ts_rejected++;
+        return 0;
+    }
+    capture_skew_ms = static_cast<double>(skew_ns) / 1e6;
+    return now_mono - skew_ns;
 }
 
 void rtp_h264_depay::push_au(au_item &&item)
@@ -94,7 +122,7 @@ int rtp_h264_depay::input(uint8_t port, const data_packet &in)
         au_item item;
         item.buf = std::move(au);
         item.pts = depay.au_pts();
-        item.capture_mono_ns = depay.au_capture_mono_ns();
+        item.capture_mono_ns = accept_capture_rt_ns(depay.au_capture_rt_ns());
         item.key = depay.au_key();
         push_au(std::move(item));
     }
@@ -150,17 +178,6 @@ int rtp_h264_depay::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
-    if ("capture_epoch_ns" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        std::lock_guard<std::mutex> lock(mu);
-        depay.set_capture_epoch_ns(v);
-        return 0;
-    }
     return -ENOTSUP;
 }
 
@@ -208,6 +225,22 @@ int rtp_h264_depay::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, au_dropped);
+        *value = buf;
+        return 0;
+    }
+    if ("capture_ts_rejected" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, capture_ts_rejected);
+        *value = buf;
+        return 0;
+    }
+    if ("capture_skew_ms" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "%.3f", capture_skew_ms);
         *value = buf;
         return 0;
     }

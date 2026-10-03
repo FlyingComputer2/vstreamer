@@ -57,7 +57,6 @@ private:
     int         fps = 30;
     uint8_t     pt = 96;
     uint32_t    ssrc = 0xC0DE0001u;
-    int64_t     capture_epoch_ns = 0;
     rtp_h264_packer packer {rtp_h264_config {}};
 
     struct pending_datagram
