@@ -24,8 +24,8 @@ Read first: `.cursor/rules/architecture-notes.mdc`, `.cursor/rules/debugging-dis
    `stream_sender.peer_udp_packet_received`, and the console verbs listed in
    `src/test_app/stream_sdl.cpp` header. Adding new metrics/commands is fine.
 5. **Wire format** may only change where a task says so (C6 framing, M17 RTP extension).
-6. **No new compiler warnings.** Baseline warning counts (fresh build, 2026-10-03):
-   full = 10, rover = 2, intel = 2, gs = 0. A phase may reduce them, never increase.
+6. **No new compiler warnings.** Baseline warning counts (fresh build, 2026-10-04):
+   full = 2, rover = 2, intel = 2, gs = 0. A phase may reduce them, never increase.
 7. **Tests must be able to fail.** For every bug-fix task with a "Test" line, write the test
    first, run it against the unfixed code, confirm it fails (or hangs → use a timeout), then fix.
    Note in the commit message: `test fails before fix: yes`.
@@ -56,7 +56,7 @@ cd ~/development/vstreamer
 cmake -S . -B out/full  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
       -DCMAKE_CXX_FLAGS="-fsanitize=address -g" \
       -DENABLE_H264_ENCODER_MPP=ON -DENABLE_SDL_SINK=ON \
-      -DENABLE_TEST_STREAM_SDL=ON -DENABLE_TEST_UVC_JPEGDEC_KMSDRM=ON \
+      -DENABLE_TEST_STREAM_SDL=ON \
       -DVSTREAMER_BUILD_TESTS=ON          # option added in P0-T2
 cmake -S . -B out/rover -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_CEDAR=ON
 cmake -S . -B out/intel -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_INTEL=ON
@@ -89,7 +89,7 @@ Hardware MPP tests (label `hw`, used from P7; suppressions in `tests/tsan_mpp.su
 
 ```bash
 cmake -S . -B out/tsan-hw -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-fsanitize=thread -g" \
-      -DENABLE_H264_ENCODER_MPP=ON -DENABLE_H264_DECODER_MPP=OFF -DVSTREAMER_BUILD_TESTS=ON
+      -DENABLE_H264_ENCODER_MPP=ON -DENABLE_H264_DECODER_MPP=ON -DVSTREAMER_BUILD_TESTS=ON
 cmake --build out/tsan-hw -j8 && ctest --test-dir out/tsan-hw -L hw --output-on-failure --timeout 300
 ```
 
@@ -119,10 +119,14 @@ printf 'set_constant_loss 10\n' | nc -u -w1 127.0.0.1 5090   # picture keeps upd
 | P7 Codecs | C5, H7, M18–M22, M24, L9 | |
 | P8 App & tooling | H4, H6, M25–M28, L5 | |
 | P9 Docs | D1–D4 | Last, so docs describe the final code |
+| P10 Close-out | P10-T1…T3 blockers, T4…T8 follow-ups | Final recheck findings; do before finishing P9-T1/T2 |
+| P11 test_app restructure | P11-T1…T6 | Directory per target; kmsdrm as `--display`/`video_driver` flag; split `stream_sdl.cpp` and `channel_controller` |
 
-**Execution status (2026-10-04):** P0–P6, **P6.5**, **P7**, and P8 landed on `review-fixes`
-(`aef51a9`). **P9** partial (D3, D4 done; D1 banner + roadmap table; D2 README only).
-**Remaining:** finish P9 (D1, D2, P9-T5 commit hashes in `review.md`).
+**Execution status (2026-10-04):** P0–P8, **P6.5**, and **P7** on `main` as squash `71abb9b`.
+**P10** close-out on `review-closeout` (T1–T8). **P11** test_app restructure (T1–T6) landed on
+`review-closeout`: per-target dirs, unified `sdl_sink` + `video_driver`, `uvc_jpegdec_kmsdrm`
+removed, `stream_sdl` split, `link_emulator` + `bench_console`. **P9** partial (D3, D4; D1/D2
+open). **Remaining:** P9-T1/T2.
 
 **P7 gate (2026-10-04, bench RK3588):** §1.2 builds + `ctest` full (63/63) + §1.3 TSan (62/62) +
 `out/tsan-hw -L hw` passed. Warning budget (rule 6): **rover/intel/gs** exceeded baseline on
@@ -834,6 +838,329 @@ drain while holding `mu` (re-entrant lock on `fetch_one_mpp_frame`).
 
 ---
 
+## P10 — Close-out (final recheck 2026-10-04)
+
+Found by the final recheck of `main` @ `71abb9b` (squash of `review-fixes`, already on
+`origin/main`). All design choices below are decided; nothing here needs a new decision.
+
+**Branch:** `review-fixes` is now redundant (`main` holds the squash). Create `review-closeout`
+from `main` and work there (rule 1 otherwise unchanged: one commit per task, IDs in the subject).
+**Do not push**; the user merges.
+
+**Recheck results that already pass (do not rework):** clean builds rover/intel/gs; `ctest` full
+63/63 (ASan); §1.3 TSan 62/62 and `tsan-hw -L hw` 1/1; §1.4 smoke. Decode advances, FEC on/off and
+10 % loss behave, and Ctrl-C exited in 1.4–1.5 s in 6 of 7 runs.
+
+### Blockers (must land before the review is closed)
+
+- **P10-T1 · test discovery at build time.** `gtest_discover_tests` runs the test binary during
+  the build with a 5 s timeout. A clean `-j8` build of `out/full` failed because
+  `h264_encoder_mpp_hw_test --gtest_list_tests` timed out under load. It takes 0.09 s unloaded, and
+  the MPP library probes hardware at load time.
+  - Fix: in `tests/CMakeLists.txt`, add `DISCOVERY_MODE PRE_TEST` to **both**
+    `gtest_discover_tests` calls (`vstreamer_tests` and `h264_encoder_mpp_hw_test`, plus the new
+    decoder test from P10-T4). The build must never execute a test binary.
+  - Verify: `cmake --build out/full -j8 --clean-first` succeeds 3 times in a row. `ctest -N` still
+    lists 63 tests (64+ after P10-T4). `ctest -L hw` still selects only the hw tests.
+
+- **P10-T2 · rule 6: warnings.** A fresh build of `main` is over budget: full 17 (budget 10),
+  rover 5 (2), intel 5 (2), gs 2 (0). Fix every warning in project code. Leave only the two
+  third-party/bench ones that are part of the baseline: `pffft_priv_impl.h:341 unused 'l1'` and
+  `noise_fft_bench.cpp:17 auto parameter`.
+  - `src/core/rs_block_erasure.cpp:447/451`: unused `sn`. Remove it, or use it if it was meant to
+    feed a check.
+  - `src/core/pix_convert.cpp:19`: unused `dst_h`. Use it in a bounds `assert`, or mark it
+    `[[maybe_unused]]` if the signature must stay.
+  - `src/components/v4l2_source.cpp:715`: unused `port`. Leave the parameter unnamed
+    (`uint8_t /*port*/`, as other components do).
+  - `src/test_app/stream_sdl.cpp`:
+    - `:1762` `query_receiver_counters` is dead code left over from P6.5-T5. Delete it.
+    - `:212` `pkt`: leave unnamed.
+    - `:556` `source_out_bytes`: remove the parameter and its call sites, or use it.
+    - `:893` `prev_ch_pkts_out` and `:952` `enc_out_kbps` are set but never used. Remove them
+      unless a metric was meant to use them. If one was, wire it up and keep the metric name
+      (rule 4).
+    - `:2778` `-Wformat-truncation`: enlarge `mtu_cap` to `char[24]`.
+  - **New baseline (update rule 6 in §0 in the same commit):** full = 2, rover = 2, intel = 2,
+    gs = 0, measured with `--clean-first`.
+  - Verify: §1.2 with `--clean-first`; `grep -c 'warning:' out/*.log` matches the new baseline.
+
+- **P10-T3 · `review.md` status (absorbs P9-T5).** In `aidocs/review.md` Decisions tables:
+  - Fill the empty Status cell for M1–M17, M23, L1–L4, L6–L8 and L10–L12. Use
+    `done \`71abb9b\`` for each one; the final recheck confirmed all of them in code. L2 →
+    `obsolete (frame.hpp no longer allocates; H1)`.
+  - M22 status → `done \`71abb9b\` (incl. drain-under-mu deadlock fix)`, and add the regression
+    test commit from P10-T4.
+  - Rewrite the M16 decision text: drop "clamp `mtu` to the FEC `max_original()`" and say "`mtu`
+    validated against RTP limits only; pipeline creator sizes it from `stream_sender` `max_input`
+    (superseded by N1)".
+  - Replace `aef51a9` with `71abb9b` everywhere in `review.md` and in §2 of this file. `aef51a9`
+    is not on `main`.
+  - D1/D2 stay `partial` until P9-T1/T2 land.
+  - Verify: every row of the C/H/M/L/D/N tables has a non-empty Status cell. Check it with the
+    command below. It must print nothing; today it prints the 28 rows above, which have no Status
+    cell at all:
+    `awk -F'|' '$2 ~ /^ *[CHMLDN][0-9]+ *$/ && (NF < 5 || $(NF-1) ~ /^ *$/)' aidocs/review.md`
+
+### Follow-ups (same branch, after the blockers)
+
+- **P10-T4 · M22 regression test + decoder under TSan.** The drain-under-`mu` deadlock had no
+  test: no test ran the MPP decoder, and the `tsan-hw` config built it OFF.
+  - Add `tests/h264_decoder_mpp_test.cpp` → target `h264_decoder_mpp_hw_test`. Build it only when
+    `ENABLE_H264_ENCODER_MPP AND ENABLE_H264_DECODER_MPP`. Use the same `gtest_discover_tests`
+    properties as the encoder hw test (label `hw`, `RESOURCE_LOCK mpp_hw`, TSan suppressions,
+    `DISCOVERY_MODE PRE_TEST`).
+  - Test `EncodeDecodeRoundTrip`:
+    1. `GTEST_SKIP()` if the encoder or decoder fails `open()` (no `/dev/mpp_service`).
+    2. MPP-encode 30 NV12 frames at 416×240 (same frame setup as `h264_encoder_mpp_test.cpp`).
+    3. Feed each AU to `h264_decoder_mpp` from one thread, retrying `-EAGAIN` by draining
+       `output()`, and collect the outputs.
+    4. Assert at least 25 decoded frames within 5 s, with dimensions 416×240 and the
+       NV12 kind.
+    5. A watchdog `std::thread` + `std::future` timeout must fail the test instead of hanging
+       ctest.
+  - Rule 7 proof: temporarily restore `src/components/h264_decoder_mpp.{cpp,hpp}` from `aef51a9`
+    (`git show aef51a9:src/components/h264_decoder_mpp.cpp > …`). Confirm the test fails by
+    watchdog timeout, then restore `main`'s version. Put `test fails before fix: yes` in the
+    commit message.
+  - §1.3: change the `out/tsan-hw` configure line to `-DENABLE_H264_DECODER_MPP=ON` (edit this
+    file). Run `ctest --test-dir out/tsan-hw -L hw`. Fix any TSan report in decoder code. Only
+    MPP-internal frames may go into `tests/tsan_mpp.supp`.
+
+- **P10-T5 · `channel_controller` drops bursts with no impairment configured (bug, predates
+  the review).** In the smoke test, the receiver reported gaps and FEC failures with
+  `drop_r=0 drop_l=0`, and in every run `udp_gap_count == ch.in − ch.out`.
+  - **Cause:** in `relay_thread_main`, `drain_ingress` reads **every** pending datagram into the
+    ingress queue before `flush_ingress_queue` runs. Any burst larger than the queue depth (32)
+    that sits in the socket buffer evicts the oldest datagrams in `accept_ingress`
+    (`dropped_queue`), even with no rate limit, so the queue never blocked on anything. An IDR AU
+    at 20 Mbit/s is about 60 datagrams.
+  - Reproduced (2026-10-04, no rate limit, no loss): a 300-datagram burst into :5000 lost about
+    300 at `--channel-queue 32` and 0 at `--channel-queue 0`.
+  - **Decided behavior:** the queue holds only datagrams that egress actually refused (rate
+    limit). Fix: in `drain_ingress`, after each `accept_ingress`, call
+    `flush_ingress_queue(dir)` (or try egress directly when the queue is empty). Only enqueue a
+    datagram when the head is held by `rate_limited`/`send_failed`. Keep the rate-limit semantics
+    as they are: queue > 0 holds (shaper), queue = 0 drops (policer). Note this in the header
+    comment.
+  - Also print the counter: in `stream_sdl.cpp` `print_diag` (around line 676), append
+    ` drop_q=%" PRIu64` after `drop_l` with `ch.dropped_queue`. Append only; do not rename or
+    reorder existing fields (rule 4). No script parses the `ch` fields today.
+  - Test (write first; it must fail on current code): add a `channel_controller` unit test.
+    1. Start the channel on ephemeral loopback ports with default queue 32 and no rate limit or
+       loss.
+    2. Send 300 datagrams back-to-back to ingress, then receive on egress with a timeout.
+    3. Assert all 300 arrive and `dropped_queue == 0`.
+    4. Second case: `set_max_kbps` small, queue 32. Assert `dropped_queue > 0` and
+       `pkts_out + dropped_queue + dropped_rate == pkts_in` (accounting holds).
+    - `channel_controller` is in `test_app`, so add `src/test_app/channel_controller.cpp` to the
+      `add_executable(vstreamer_tests …)` line in `tests/CMakeLists.txt`, next to `cpu_map.cpp`.
+      The console needs no wiring; tests can leave its setters unset.
+  - Verify: run §1.4 over 5 runs with no loss configured. `udp_gap_count`, `fec_failures` and
+    `drop_q` stay 0.
+
+- **P10-T6 · M14 edge: partial parameter sets.** `rtp_h264.cpp` injects cached SPS/PPS only
+  when an IDR AU has **neither**. An IDR AU carrying SPS but no PPS (or the reverse) gets nothing
+  injected.
+  - Decided behavior: for an IDR AU, inject only the **missing** parameter set(s), cached SPS
+    before cached PPS. Insert them immediately before the first VCL NAL (types 1–5), not at the
+    front of the AU, so an in-AU SPS still precedes an injected PPS. Non-IDR AUs are unchanged.
+  - Test (rtp_h264_test, write first): an AU of `SPS, IDR` with SPS/PPS already cached emits the
+    NAL order `SPS, PPS(cached), IDR`. An AU of `IDR` only emits `SPS, PPS, IDR`. An AU of
+    `SPS, PPS, IDR` emits exactly 3 NALs. A non-IDR slice gets no injection.
+
+- **P10-T7 · repo hygiene.**
+  - Delete the untracked `third_party/` directory. It's the pre-H2 vendored pffft; the build uses
+    FetchContent (confirm `grep -rn third_party CMakeLists.txt cmake tests` is empty first).
+  - Add `third_party/` to `.gitignore` so a stray copy doesn't come back.
+
+- **P10-T8 · shutdown time check (measure only).** In one of 7 smoke runs, Ctrl-C took 2.46 s,
+  over the §1.4 target of 2 s. Run `stream_sdl --diag` 10 times, about 5 s each, with
+  `kill -INT` and timing. If **2 or more** runs exceed 2 s, find the slow join: add temporary
+  per-stage join timing, then remove it. Fix it only if the cause is inside the review's scope
+  (a teardown order from M11/C1/H3). Otherwise record the numbers under "Open questions" and stop.
+  If fewer than 2 runs exceed 2 s, record "P10-T8: n/10 over 2 s, max X s" in §2 and close.
+
+**P10 gate:**
+- §1.2 with `--clean-first`, at the new warning baseline.
+- `ctest` full.
+- §1.3 TSan, and `tsan-hw -L hw` (now including the decoder test).
+- §1.4 smoke (with `drop_q`).
+- The P10-T3 awk check prints nothing.
+- Then update §2 "Execution status" to: all phases done except P11 and P9-T1/T2.
+
+---
+
+## P11 — `test_app` restructure by target; kmsdrm becomes a flag (decided 2026-10-04)
+
+**Why:**
+- `src/test_app/` is a flat directory mixing four targets.
+- `stream_sdl.cpp` is 3042 lines.
+- `uvc_jpegdec_kmsdrm` is not a separate program. It is a 7-line file that `#include`s
+  `stream_sdl.cpp` with `VSTREAMER_APP_UVC_JPEGDEC_KMSDRM` defined, only to change three defaults
+  (`--display kmsdrm`, `--source /dev/video0`, log label). `stream_sdl` already accepts those
+  flags.
+- The full build compiles `stream_sdl.cpp` twice, which is why its warnings appear twice.
+- At the component level, `sdl_kmsdrm_sink` and `sdl_sink` are the same wrapper around
+  `sdl_nv12_presenter`. They differ only in the video-driver string (`"kmsdrm"` vs `nullptr`)
+  and the log tag.
+
+**Order:** after P10 (P11-T4 moves code that P10-T5 fixes), before P9-T1/T2 (docs describe the
+final layout). Same branch, `review-closeout`. One commit per task.
+
+**Rule for this phase:** move and split only. No behavior change except what T2/T3 state. Metric
+names, console verbs, CLI flags and env vars stay unchanged (rule 4), except the removed
+`dmks` spellings in T2.
+
+### P11-T1 · directory per target (pure move)
+Target layout. Use `git mv` so history follows.
+```
+src/test_app/
+  CMakeLists.txt                     # add_subdirectory() per target, gated by its option
+  stream_sdl/                        # target stream_sdl (ENABLE_TEST_STREAM_SDL)
+    CMakeLists.txt
+    stream_sdl.cpp                   # split in P11-T4
+    channel_controller.{hpp,cpp}     # split in P11-T5
+    channel_ports.hpp
+    cpu_map.{hpp,cpp}
+    camera_noise_mux.{hpp,cpp}, camera_noise_mux_logic.hpp
+  noise_fft_bench/   CMakeLists.txt, noise_fft_bench.cpp        # ENABLE_NOISE_SOURCE
+  rs_fec_test/       CMakeLists.txt, rs_fec_test.cpp            # ENABLE_STREAM_SENDER|RECEIVER
+  rs_block_id_pace_test/ CMakeLists.txt, rs_block_id_pace_test.cpp
+```
+- Each per-target `CMakeLists.txt` uses `vstreamer_add_app()`. Extend the helper with an optional
+  `LSAN` flag that links `${VSTREAMER_LSAN_HOOKS}`, so `stream_sdl` stops hand-rolling
+  `add_executable`.
+- Top-level `CMakeLists.txt` keeps the options and calls `add_subdirectory(src/test_app)`. The
+  `add_test(rs_fec_test …)` / `add_test(rs_block_id_pace_test …)` registrations move with their
+  targets.
+- Includes: `test_app/stream_sdl/…` (e.g. `#include "test_app/stream_sdl/cpu_map.hpp"`).
+  Update `tests/cpu_map_test.cpp`, `tests/camera_noise_mux_test.cpp` and the
+  `cpu_map.cpp` path in `tests/CMakeLists.txt`.
+- Verify:
+  - §1.2: same targets built, same binary names and paths (`out/full/stream_sdl` etc.).
+  - `ctest` count unchanged.
+  - `git diff -M --stat` shows renames only, plus include-path and CMake edits.
+
+### P11-T2 · `sdl_sink` takes the video driver as a key; delete `sdl_kmsdrm_sink`
+- `sdl_sink`: new configure key **`video_driver`**:
+  - `auto` (default, `nullptr` to the presenter, so SDL picks), `kmsdrm`, or any other SDL
+    video driver name (passed through, e.g. `x11`, `wayland`).
+  - Only valid before `open()`; after open, return `-EBUSY`.
+  - `query("video_driver")` returns the configured value.
+  - The presenter is constructed in `open()` from the key, not as a member initializer. Use
+    `std::optional<sdl_nv12_presenter>` or equivalent.
+  - Bring over `sdl_kmsdrm_sink`'s more detailed `open`/`prepare`/`present` failure logging
+    (with the throttle) so kmsdrm diagnostics are not lost. The log tag stays `sdl_sink`.
+- Delete `sdl_kmsdrm_sink.{hpp,cpp}`. Remove it from `components.hpp`, the source list in
+  `CMakeLists.txt` and `sdl_nv12_presenter.hpp`'s comment.
+- `component_factory`:
+  - `sdl_kmsdrm`, `sdl_kmsdrm_sink` and `kmsdrm_sink` return an `sdl_sink` already configured
+    with `video_driver=kmsdrm`.
+  - **Drop** the `dmks` typo aliases (`sdl_dmks`, `sdl_dmks_sink`, `dmks`, `dmks_sink`). Nothing
+    in-tree uses them, and there is no config loader yet.
+- Test (`ENABLE_SDL_SINK` only; no display needed because nothing is opened):
+  - `configure("video_driver","kmsdrm")` → `query` returns `kmsdrm`.
+  - The default `query` returns `auto`.
+  - `make("sdl_kmsdrm")` → `name()=="sdl_sink"` and `query` returns `kmsdrm`.
+- `stream_sdl`:
+  - One `sdl_sink display;`. `--display kmsdrm` sets `video_driver=kmsdrm`.
+  - The existing `kmsdrm` branches (`defer_sdl_to_present`, `prepare_preview_sink`, log labels)
+    keep their behavior, driven by the same `bool kmsdrm`.
+  - `prepare_preview_sink` casts to `sdl_sink` only.
+  - `display_use_kmsdrm` accepts `kmsdrm` and `sdl_kmsdrm`. Drop the `dmks` spellings.
+
+### P11-T3 · delete the `uvc_jpegdec_kmsdrm` target
+- Delete `src/test_app/uvc_jpegdec_kmsdrm.cpp` and every `VSTREAMER_APP_UVC_JPEGDEC_KMSDRM` block
+  in `stream_sdl.cpp`. Defaults become:
+  - display `sdl`, label `stream_sdl`;
+  - source `noise` when `ENABLE_NOISE_SOURCE`, else `/dev/video0`.
+- The replacement command is `stream_sdl --display kmsdrm --source /dev/video0`. Put it in
+  `print_usage`, README and the `stream_sdl.cpp` header comment.
+- CMake:
+  - `ENABLE_TEST_UVC_JPEGDEC_KMSDRM` and `ENABLE_TEST_UVC_JPEGDEC_DMKS` become deprecated
+    aliases. They set `ENABLE_TEST_STREAM_SDL ON` and print a `WARNING` naming the replacement
+    command. This matches the existing `ENABLE_TEST_NOISE_STREAM_SDL` alias.
+  - The `stream_sdl` requirement changes from "noise required" to **noise OR v4l2**, plus the
+    rest unchanged (jpeg decoder, stream_*, rtp, mpp decode, sdl, one encoder). Make the same
+    change in the source `#error` block.
+  - Guard `noise_source noise;` and the noise `cfg_str` calls with `#ifdef ENABLE_NOISE_SOURCE`,
+    so a v4l2-only build compiles.
+- Update §1.1 of this file: drop `-DENABLE_TEST_UVC_JPEGDEC_KMSDRM=ON` from the `out/full` line.
+- Verify:
+  - §1.2. Full build warnings must not increase; the duplicated `stream_sdl.cpp` warnings
+    disappear.
+  - A v4l2-only configure builds `stream_sdl`:
+    `-DENABLE_TEST_STREAM_SDL=ON -DENABLE_NOISE_SOURCE=OFF -DENABLE_V4L2_SOURCE=ON` plus the
+    usual MPP options.
+  - §1.4 smoke with `--display sdl`.
+  - `--display kmsdrm` smoke only if a free VT/DRM master is available. Otherwise report "not
+    possible here" (rule in §1.4).
+
+### P11-T4 · split `stream_sdl.cpp` (mechanical; no logic change)
+Split along the existing function groups into `src/test_app/stream_sdl/`. Everything stays in
+`namespace vstreamer::test_app` (the anonymous-namespace helpers become internal-linkage
+functions declared in the module headers).
+
+| File | Contents (current symbols) |
+|---|---|
+| `main.cpp` | `main`, `print_usage`, arg/env parsing, `source_arg_*`, `display_use_kmsdrm`, signal handling. This is the **pipeline creator**: it builds, configures, opens and wires every component, including the P6.5 `max_input` → `mtu` sizing. |
+| `queues.hpp` | `pipeline_queue`, `present_frame_queue`, `rx_au_queue`, `queue_depth_from_env` |
+| `stages.{hpp,cpp}` | `source_stage_main`, `jpeg_stage_main`, `encode_stage_main`, `rx_net_thread_main`, `decode_thread_main`, `present_thread_main`, and their helpers (`submit_nv12_to_encoder`, `forward_*`, `drain_*`, `feed_decoder_au`, …) |
+| `diag.{hpp,cpp}` | `bench_diag`, stage-latency helpers, `log_bench_diag`, `log_bench_rate_line`, counters/rate structs |
+| `metrics_sync.{hpp,cpp}` | `update_pipeline_metrics`, `sync_*`, `store_*`, receiver loss tracker, `telemetry_thread_main`, `query_*` helpers |
+| `self_test.{hpp,cpp}` | `run_self_test`, `send_channel_console` |
+
+- Target size: no file over ~800 lines.
+- Verify:
+  - §1.2 and `ctest`.
+  - §1.4 smoke: the `--diag` output format is byte-identical apart from counter values.
+    Compare the field names of one line before and after.
+
+### P11-T5 · split `channel_controller` into link emulator + bench console
+`channel_controller` does two unrelated jobs: the UDP link emulator (relay, rate cap, loss, queue)
+and the bench control console on :5090. The console holds pointers to the encoder,
+`stream_sender` and metrics.
+- `link_emulator.{hpp,cpp}`: relay threads, impairments and `forward_stats`. No knowledge of any
+  pipeline component. It exposes setters/getters for `max_kbps`, `drop_dt_ms`, `constant_loss`
+  and `queue_depth`.
+- `bench_console.{hpp,cpp}`: the UDP console thread and every verb.
+  - It gets a `link_emulator&` for the impairment verbs.
+  - It gets the existing callbacks/pointers for the encoder, FEC and metrics verbs, all wired
+    by `main.cpp`.
+  - Verbs, replies and the help text stay unchanged (rule 4), so `scripts/cbr_controller.py`
+    and the other scripts keep working.
+- Teardown order (M11) is preserved in both classes: shutdown → join → close.
+- The P10-T5 burst test moves with `link_emulator`. Add one `bench_console` test: start it on an
+  ephemeral port and send `set_constant_loss 5`. Assert the reply is `ok` and the emulator's
+  `constant_loss()==5`.
+- Verify:
+  - §1.2, `ctest`, §1.3 TSan.
+  - §1.4 smoke including the console commands.
+  - Console wire compatibility: before T5, save the replies of
+    `for c in help ping stats 'get_metric h264_encoder.cbr_kbps'; do printf '%s\n' "$c" | nc -u -w1 127.0.0.1 5090; done`
+    against a running `stream_sdl`. After T5, the same replies must match apart from numbers.
+  - `scripts/cbr_controller.py` has no `--help`. Run it for about 10 s against a live
+    `stream_sdl` and confirm it reads metrics and sets CBR without errors.
+
+### P11-T6 · references
+- Update every path and target reference, found with
+  `grep -rn -E 'test_app/|uvc_jpegdec|sdl_kmsdrm|dmks' README.md AGENTS.md docs .cursor aidocs CMakeLists.txt src tests scripts`.
+  This includes README's layout tree, `docs/pipeline-flow.md`, `docs/component-source.md` and
+  `.cursor/rules/architecture-notes.mdc`.
+- `aidocs/review.md` and the P0–P10 sections of this file are history. Leave them as they are,
+  except §1.1 (T3).
+
+**P11 gate:**
+- §1.2 with `--clean-first` (warnings ≤ the P10 baseline).
+- `ctest` full, and §1.3 TSan + `tsan-hw`.
+- §1.4 smoke (`--display sdl`; kmsdrm if possible).
+- The v4l2-only configure from T3 builds.
+- The T6 grep finds only intended hits.
+- Then update §2 "Execution status".
+
+---
+
 ## Follow-ups explicitly out of scope
 - Cross-host reverse telemetry datagram (M13 wire part).
 - Wiring depay `need_idr` → encoder `idr` across the link (M18 feedback part).
@@ -854,4 +1181,6 @@ Cross-cutting only. P7 ordering and scope live in the P7 section; node independe
 ## Open questions
 _(Composer: append here instead of guessing; leave the task unimplemented.)_
 
-- None. P6.5 not started; no open design questions for P6.5 or P7.
+- None. P10 decisions are written into each task (T6 injection order, T2 new baseline,
+  T8 threshold). P11 decisions likewise (`video_driver` key and values, dropped `dmks` aliases,
+  deprecated CMake aliases, file split table).

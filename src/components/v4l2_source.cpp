@@ -712,7 +712,7 @@ int v4l2_source::dequeue_capture_locked(frame &out)
     return ret;
 }
 
-int v4l2_source::output(uint8_t port, data_packet &out, int timeout_ms)
+int v4l2_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
 {
     std::unique_lock<std::mutex> lock(mu);
     if (!source_open)

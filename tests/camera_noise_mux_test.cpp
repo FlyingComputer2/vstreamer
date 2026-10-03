@@ -1,4 +1,4 @@
-#include "test_app/camera_noise_mux_logic.hpp"
+#include "test_app/stream_sdl/camera_noise_mux_logic.hpp"
 
 #include "core/component_source.hpp"
 #include "core/data_packet.hpp"

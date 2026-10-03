@@ -166,7 +166,7 @@ output or a likely race under normal use · **Medium** = edge cases, latency, ro
 - **M19** `rc:super_i_thd` = average frame bytes at ≥1080p (`:364-374`), with re-encode up to 8 times. Nearly every I-frame exceeds that, so I-frames get re-encoded repeatedly at worse QP. Check that this is intended.
 - **M20** `h264_level_for_size` returns 4.0 for everything above 720p (`:71`). 1080p60 needs 4.2 and 4K needs 5.1.
 - **M21** `drain_packets_locked(timeout > 0)` keeps polling until the deadline even after receiving packets, so `output(timeout_ms)` always takes the full timeout. That's latent today (callers pass 0).
-- **M22** `h264_decoder_mpp`: `output(timeout)` holds `mu` while polling, which blocks `input()`. `pending_capture_mono_ns` is one value that gets overwritten by the latest input, so the latency metric is attributed to the wrong frame when the decoder pipelines. Output size comes from the configured `size`, not the stream; a mismatch crops or green-pads silently. **Fixed in P7** (`aef51a9`) except: `drain_mpp_to_ready` was still invoked under `mu` in `input()`/`output()`, deadlocking the decode thread (`dec_in=0` in §1.4); drain must run with `mu` released (fixed in follow-up commit after `aef51a9`).
+- **M22** `h264_decoder_mpp`: `output(timeout)` holds `mu` while polling, which blocks `input()`. `pending_capture_mono_ns` is one value that gets overwritten by the latest input, so the latency metric is attributed to the wrong frame when the decoder pipelines. Output size comes from the configured `size`, not the stream; a mismatch crops or green-pads silently. **Fixed in P7** (`71abb9b`) except: `drain_mpp_to_ready` was still invoked under `mu` in `input()`/`output()`, deadlocking the decode thread (`dec_in=0` in §1.4); drain must run with `mu` released (fixed in follow-up commit after `71abb9b`).
 - **M23** `encoder_open_locked` overwrites `ret` across six `mpp_enc_cfg_set_s32` calls and checks only the last one (`:498-503`). `put_nv12_frame_unlocked` leaks a slot on the `-EIO` path (`:1021-1024`).
 - **M24** `jpeg_decoder_multicore`: one `worker_cpu` value pins **all** workers to the same core. `stream_sdl` also calls `input()` then `output(-1)` one frame at a time, so the "multicore" decoder never has more than one job in flight.
 
@@ -222,7 +222,7 @@ Status for every item: **Fix** = do as described; notes say what was chosen when
 Nothing was deferred or dropped.
 
 **Status column:** tracks `review-fixes` per [`implementation-plan.md`](implementation-plan.md).
-Bulk land: `aef51a9` (P0–P8, P6.5, P7). Post-land fixes list their own commit when pushed.
+Bulk land: `71abb9b` (P0–P8, P6.5, P7). Post-land fixes list their own commit when pushed.
 
 ### Critical
 
@@ -232,7 +232,7 @@ Bulk land: `aef51a9` (P0–P8, P6.5, P7). Post-land fixes list their own commit 
 | C2 | Full fix: validate k,n ≤ `k_header_k_n_max` in `stream_sender` and the channel console; make `rs_block_erasure::init()` validate before changing any state, so a failure keeps the old config running; stamp the stream header only on packets that reserved room for it. | done |
 | C3 | Use 8-bit wrap math in `emit_distance`; remove the "peer restarted" heuristic (a block more than half the ring away counts as late or stale; `emit_hold` / `done` expiry resyncs the queue after a quiet gap); add a wraparound regression test. | done |
 | C4 | Add a shared bounds-safe `key_parse_i64(std::string_view, int64_t*)` (`std::from_chars`, base 10; covers L6) in `core/key_util.hpp` and use it at all 8 sites. | done |
-| C5 | Restructure: one lock order `mu` → `mpp_api_mu`, never take `mu` while holding `mpp_api_mu`; collect AUs locally and push them to `out_q` after releasing; protect the slot deques with one lock. | done (P7) `aef51a9` |
+| C5 | Restructure: one lock order `mu` → `mpp_api_mu`, never take `mu` while holding `mpp_api_mu`; collect AUs locally and push them to `out_q` after releasing; protect the slot deques with one lock. | done (P7) `71abb9b` |
 | C6 | "none" = the `n == k` framing: always send the stream header + FEC shard header. One wire format; receiver unchanged. | done |
 
 ### High
@@ -245,7 +245,7 @@ Bulk land: `aef51a9` (P0–P8, P6.5, P7). Post-land fixes list their own commit 
 | H4 | Keep the AU locally and retry it first (same `holding` pattern as the encode thread). | done (P8) |
 | H5 | Full depayloader rework: drop the FU-A on a sequence gap; build real AUs on the marker bit with a correct key flag; output queue instead of a single slot; signed sequence difference for the loss stat; honor CSRC count and padding. | done (P6) |
 | H6 | Rescale with `av_packet_rescale_ts`; take PTS from the frame; on a resize, start a new numbered file instead of overwriting. | done (P8) |
-| H7 | Swap chroma for the `_VU` formats in the 420SP/422SP packers. | done (P7) `aef51a9` |
+| H7 | Swap chroma for the `_VU` formats in the 420SP/422SP packers. | done (P7) `71abb9b` |
 | H8 | Use the monotonic clock (`time_util` helpers) for pacing, the send-gate deadline and rate windows. | done |
 | H9 | Change the interface to `query(std::string_view key, std::string *out)`; remove `query_buf` everywhere (do together with L7). | done |
 
@@ -253,30 +253,30 @@ Bulk land: `aef51a9` (P0–P8, P6.5, P7). Post-land fixes list their own commit 
 
 | ID | Decision | Status |
 |----|----------|--------|
-| M1 | Implement the missing-shards counter on eviction and expiry. |
-| M2 | Release surviving systematic shards in order right away; drop the block once emit has passed it. |
-| M3 | Send partial-block payloads through the in-order emit queue. |
-| M4 | Separate counters: parse errors, k/n mismatches, evictions, RS failures. |
-| M5 | Evict or expire partial blocks once the id ring has moved past them, not only by time. |
-| M6 | Cache the Cauchy matrix and tables per (k,n); decode in place without copying the shard map. |
-| M7 | Delete `count_app_packets_in_frags`; make `rtp_datagram_payload_offset` static. |
-| M8 | Evict before acquiring a buffer (drop oldest); bound the queue by time or bytes (~100 ms) instead of 4096 packets. |
-| M9 | Guard `mtu` with `mu`; reset the pacer through a flag that the send thread consumes. |
-| M10 | Wait until the FEC flush deadline instead of polling every 5 ms. |
-| M11 | Teardown order shutdown → join → close in `stream_receiver` and `channel_controller`; make `console_fd` atomic. |
-| M12 | Size the receive buffer to the largest datagram and count `MSG_TRUNC` drops. |
-| M13 | This round: document that telemetry is loopback-only. The reverse-path telemetry datagram (receiver → sender) is a separate follow-up, not in this round. |
-| M14 | Insert cached SPS/PPS only before IDR AUs that don't already carry them. |
-| M15 | Replace the fixed 64-entry NAL array with a vector. |
-| M16 | Don't drop datagrams that haven't been pulled yet; apply `mtu`/`fps` live; clamp `mtu` to the FEC `max_original()`. |
-| M17 | Switch the capture extension to a relative (sender-local) timestamp in network byte order. |
-| M18 | Add `configure("idr")` and expose it on the console; wire it to receiver loss feedback later. MPP + Cedar + Intel; Cedar/Intel compile-checked only, **untested on HW** (bench is RK3588 MPP). | done (P7) `aef51a9` |
-| M19 | Make the I-frame super-frame threshold a configure key, with a default well above the average frame (~6×). CBR mode only (2026-10-04). | done (P7) `aef51a9` |
-| M20 | Choose the H.264 level from resolution × fps per Annex A. | done (P7) `aef51a9` |
-| M21 | Return as soon as at least one packet has been drained. | done (P7) `aef51a9` |
-| M22 | Poll without holding `mu`; match capture timestamps to frames via PTS; add an explicit scale/crop mode key for the output size. Remove `stream_sdl`'s `g_mpp_hw_mu` afterwards (2026-10-04). | done (P7) `aef51a9` + drain-under-`mu` deadlock fix (follow-up commit) |
-| M23 | Check every cfg set call; return the slot on `-EIO`. |
-| M24 | Per-worker CPU list (`worker_cpus`); `VSTREAMER_CPU_MAP` in `stream_sdl` with JPEG workers on the big cores 4–7 of the Orange Pi 5 by default; let the app keep several jobs in flight (2026-10-04). | done (P7) `aef51a9` |
+| M1 | Implement the missing-shards counter on eviction and expiry. | done `71abb9b` |
+| M2 | Release surviving systematic shards in order right away; drop the block once emit has passed it. | done `71abb9b` |
+| M3 | Send partial-block payloads through the in-order emit queue. | done `71abb9b` |
+| M4 | Separate counters: parse errors, k/n mismatches, evictions, RS failures. | done `71abb9b` |
+| M5 | Evict or expire partial blocks once the id ring has moved past them, not only by time. | done `71abb9b` |
+| M6 | Cache the Cauchy matrix and tables per (k,n); decode in place without copying the shard map. | done `71abb9b` |
+| M7 | Delete `count_app_packets_in_frags`; make `rtp_datagram_payload_offset` static. | done `71abb9b` |
+| M8 | Evict before acquiring a buffer (drop oldest); bound the queue by time or bytes (~100 ms) instead of 4096 packets. | done `71abb9b` |
+| M9 | Guard `mtu` with `mu`; reset the pacer through a flag that the send thread consumes. | done `71abb9b` |
+| M10 | Wait until the FEC flush deadline instead of polling every 5 ms. | done `71abb9b` |
+| M11 | Teardown order shutdown → join → close in `stream_receiver` and `channel_controller`; make `console_fd` atomic. | done `71abb9b` |
+| M12 | Size the receive buffer to the largest datagram and count `MSG_TRUNC` drops. | done `71abb9b` |
+| M13 | This round: document that telemetry is loopback-only. The reverse-path telemetry datagram (receiver → sender) is a separate follow-up, not in this round. | done `71abb9b` |
+| M14 | Insert cached SPS/PPS only before IDR AUs that don't already carry them. | done `71abb9b` |
+| M15 | Replace the fixed 64-entry NAL array with a vector. | done `71abb9b` |
+| M16 | Don't drop datagrams that haven't been pulled yet; apply `mtu`/`fps` live; `mtu` validated against RTP limits only; pipeline creator sizes it from `stream_sender` `max_input` (superseded by N1). | done `71abb9b` |
+| M17 | Switch the capture extension to a relative (sender-local) timestamp in network byte order. | done `71abb9b` |
+| M18 | Add `configure("idr")` and expose it on the console; wire it to receiver loss feedback later. MPP + Cedar + Intel; Cedar/Intel compile-checked only, **untested on HW** (bench is RK3588 MPP). | done (P7) `71abb9b` |
+| M19 | Make the I-frame super-frame threshold a configure key, with a default well above the average frame (~6×). CBR mode only (2026-10-04). | done (P7) `71abb9b` |
+| M20 | Choose the H.264 level from resolution × fps per Annex A. | done (P7) `71abb9b` |
+| M21 | Return as soon as at least one packet has been drained. | done (P7) `71abb9b` |
+| M22 | Poll without holding `mu`; match capture timestamps to frames via PTS; add an explicit scale/crop mode key for the output size. Remove `stream_sdl`'s `g_mpp_hw_mu` afterwards (2026-10-04). | done `71abb9b` (incl. drain-under-mu deadlock fix; P10-T4 regression test) |
+| M23 | Check every cfg set call; return the slot on `-EIO`. | done `71abb9b` |
+| M24 | Per-worker CPU list (`worker_cpus`); `VSTREAMER_CPU_MAP` in `stream_sdl` with JPEG workers on the big cores 4–7 of the Orange Pi 5 by default; let the app keep several jobs in flight (2026-10-04). | done (P7) `71abb9b` |
 | M25 | Back off on `-EAGAIN`; forward AUs strictly in the order they were pulled. | done (P8) |
 | M26 | Bind the console and relay to 127.0.0.1 by default, with an opt-in flag for other addresses. | done (P8) |
 | M27 | `docs_server.py`: require a token for PUT. | done (P8) |
@@ -286,18 +286,18 @@ Bulk land: `aef51a9` (P0–P8, P6.5, P7). Post-land fixes list their own commit 
 
 | ID | Decision | Status |
 |----|----------|--------|
-| L1 | Replaced by the H1 buffer/pool work (remove the duplicate pools). |
-| L2 | Add `<cstdlib>` to `frame.hpp`. |
-| L3 | Delete dead encoder/app wrappers. |
-| L4 | Rename `rs_block_erasure` members to follow the coding guidelines. |
+| L1 | Replaced by the H1 buffer/pool work (remove the duplicate pools). | done `71abb9b` |
+| L2 | Add `<cstdlib>` to `frame.hpp`. | obsolete (frame.hpp no longer allocates; H1) |
+| L3 | Delete dead encoder/app wrappers. | done `71abb9b` |
+| L4 | Rename `rs_block_erasure` members to follow the coding guidelines. | done `71abb9b` |
 | L5 | Use one container in `metrics`; replace the seed parameter with a default value. | done (P8) |
-| L6 | Parse as base 10 (part of the C4 helper). |
-| L7 | Simplify the component interface: const value input, drop the unused `int64_t` overloads (together with H9). |
-| L8 | Per-instance log throttles. |
-| L9 | Pad columns in `pix_convert`. | done (P7) `aef51a9` |
-| L10 | `vstreamer_add_app()` CMake helper / INTERFACE target for flags and includes. |
-| L11 | `enable_testing()`; register `rs_fec_test`, `rs_block_id_pace_test` and new regression tests (C1, C2, C3, H5). |
-| L12 | Add `logs/` and `*.log` to `.gitignore`; commit `.cursor/rules/`; delete `newmetrics.txt`. |
+| L6 | Parse as base 10 (part of the C4 helper). | done `71abb9b` |
+| L7 | Simplify the component interface: const value input, drop the unused `int64_t` overloads (together with H9). | done `71abb9b` |
+| L8 | Per-instance log throttles. | done `71abb9b` |
+| L9 | Pad columns in `pix_convert`. | done (P7) `71abb9b` |
+| L10 | `vstreamer_add_app()` CMake helper / INTERFACE target for flags and includes. | done `71abb9b` |
+| L11 | `enable_testing()`; register `rs_fec_test`, `rs_block_id_pace_test` and new regression tests (C1, C2, C3, H5). | done `71abb9b` |
+| L12 | Add `logs/` and `*.log` to `.gitignore`; commit `.cursor/rules/`; delete `newmetrics.txt`. | done `71abb9b` |
 | D1 | (Confirmed) Rewrite `docs/vstreamer.md` from the current `component_*` interfaces, and move what isn't built yet into a clearly marked target-design / roadmap section with a status table. | partial (P9 banner + status table) |
 | D2 | Complete the build option table. | partial (README §1.1; full table still in CMake) |
 | D3 | Fix the queue-default comment in `stream_sdl.cpp`. | done (P9) |
@@ -310,12 +310,12 @@ Implemented as phase P6.5 in the plan.
 
 | ID | Finding | Decision | Status |
 |----|---------|----------|--------|
-| N1 | `rtp_h264_pay` includes `rs_block_erasure` and clamps `mtu` to the FEC limit (introduced by plan M16). | Validate RTP limits only; the app sizes `mtu` from `stream_sender` `max_input`. | done (P6.5) `aef51a9` |
-| N2 | `rs_block_erasure` and `stream_sender`/`stream_receiver` hard-code the winject 1476-byte cap (`stream_air_limits.hpp`). | Delete the header; FEC takes `max_shard_bytes` in `init()`; sender/receiver key `max_datagram` (default 1472); `stream_sdl` sets 1476 for winject. | done (P6.5) `aef51a9` |
-| N3 | `sock_data::fec_seq` names a transport detail in a generic packet type. | Rename to `seq` (producer-defined). | done (P6.5) `aef51a9` |
-| N4 | Sender/receiver headers name their neighbor components. | Describe pads by packet kind only. | done (P6.5) `aef51a9` |
-| N5 | `stream_sender` stores receiver counters (`set_receiver_counters`, `peer_*`). | Move peer telemetry to the app; keep publishing the same metric names. | done (P6.5) `aef51a9` |
-| N6 | `v4l2_source` embeds `noise_source` as a fallback. | Fallback policy moves to the app source stage; v4l2 returns `-ENODEV` while the device is down; drop the CMake V4L2→NOISE requirement. | done (P6.5) `aef51a9` |
+| N1 | `rtp_h264_pay` includes `rs_block_erasure` and clamps `mtu` to the FEC limit (introduced by plan M16). | Validate RTP limits only; the app sizes `mtu` from `stream_sender` `max_input`. | done (P6.5) `71abb9b` |
+| N2 | `rs_block_erasure` and `stream_sender`/`stream_receiver` hard-code the winject 1476-byte cap (`stream_air_limits.hpp`). | Delete the header; FEC takes `max_shard_bytes` in `init()`; sender/receiver key `max_datagram` (default 1472); `stream_sdl` sets 1476 for winject. | done (P6.5) `71abb9b` |
+| N3 | `sock_data::fec_seq` names a transport detail in a generic packet type. | Rename to `seq` (producer-defined). | done (P6.5) `71abb9b` |
+| N4 | Sender/receiver headers name their neighbor components. | Describe pads by packet kind only. | done (P6.5) `71abb9b` |
+| N5 | `stream_sender` stores receiver counters (`set_receiver_counters`, `peer_*`). | Move peer telemetry to the app; keep publishing the same metric names. | done (P6.5) `71abb9b` |
+| N6 | `v4l2_source` embeds `noise_source` as a fallback. | Fallback policy moves to the app source stage; v4l2 returns `-ENODEV` while the device is down; drop the CMake V4L2→NOISE requirement. | done (P6.5) `71abb9b` |
 
 ### Suggested implementation batches
 
