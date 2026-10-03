@@ -21,8 +21,4 @@ set(_stream_sdl_sources
     link_emulator.cpp
     bench_console.cpp
 )
-if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
-    list(APPEND _stream_sdl_sources camera_noise_mux.cpp)
-endif()
-
 vstreamer_add_app(stream_sdl ${_stream_sdl_sources} LSAN COMMON)

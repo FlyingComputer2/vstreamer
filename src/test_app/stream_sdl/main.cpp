@@ -37,7 +37,8 @@
 #include "components/components.hpp"
 
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
-#include "test_app/stream_sdl/camera_noise_mux.hpp"
+#include "apps/common/tx/source_selector.hpp"
+#include "apps/common/tx/source_selector_query_source.hpp"
 #endif
 #include "test_app/stream_sdl/channel_controller.hpp"
 #include "test_app/stream_sdl/channel_ports.hpp"
@@ -57,6 +58,7 @@
 #include <cstring>
 
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <csignal>
 #include <string>
@@ -479,9 +481,10 @@ int main(int argc, char **argv)
 #endif
 #ifdef ENABLE_V4L2_SOURCE
     v4l2_source camera;
-#if defined(ENABLE_NOISE_SOURCE)
-    vstreamer::test_app::camera_noise_mux_source camera_mux(camera, noise);
 #endif
+#if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
+    std::unique_ptr<apps::tx::source_selector>              uvc_selector;
+    std::unique_ptr<apps::tx::source_selector_query_source> uvc_metrics_source;
 #endif
     jpeg_decoder_multicore jdec;
     h264_encoder_t enc;
@@ -503,12 +506,13 @@ int main(int argc, char **argv)
 
     component_source *source = nullptr;
     const char *source_open_label = "noise_source";
+    bool         use_uvc_selector = false;
     if (use_v4l2)
     {
 #ifdef ENABLE_V4L2_SOURCE
 #if defined(ENABLE_NOISE_SOURCE)
-        source = &camera_mux;
-        source_open_label = "camera_noise_mux";
+        use_uvc_selector = true;
+        source_open_label = "source_selector";
 #else
         source = &camera;
         source_open_label = "v4l2_source";
@@ -642,7 +646,38 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (open_stage(source_open_label, source->open()) < 0 ||
+#if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
+    if (use_uvc_selector)
+    {
+        const auto on_switch = [&](apps::tx::source_kind /*kind*/, int w, int h, int f) {
+            char sz[32];
+            char fb[16];
+            std::snprintf(sz, sizeof(sz), "%dx%d", w, h);
+            std::snprintf(fb, sizeof(fb), "%d", f);
+            (void)cfg_str(enc, "size", sz);
+            (void)cfg_str(enc, "fps", fb);
+            (void)cfg_str(pay, "fps", fb);
+            if (use_jpeg_decode)
+            {
+                (void)cfg_str(jdec, "size", sz);
+                (void)cfg_str(jdec, "fps", fb);
+            }
+            (void)enc.configure("idr", std::string_view("1"));
+        };
+        uvc_selector = std::make_unique<apps::tx::source_selector>(
+            camera, noise, width, height, fps, on_switch, apps::tx::source_selector::push_packet_fn {},
+            apps::tx::source_selector::push_packet_fn {});
+        uvc_metrics_source =
+            std::make_unique<apps::tx::source_selector_query_source>(*uvc_selector);
+    }
+#endif
+
+    const int source_open_rc =
+#if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
+        use_uvc_selector ? uvc_selector->open() :
+#endif
+                           (nullptr != source ? source->open() : -EINVAL);
+    if (open_stage(source_open_label, source_open_rc) < 0 ||
         (use_jpeg_decode && open_stage("jpeg_decoder", jdec.open()) < 0) ||
         open_stage("h264_encoder", enc.open()) < 0 || open_stage("stream_sender", sender.open()) < 0 ||
         open_stage("stream_receiver", rcv.open()) < 0)
@@ -711,7 +746,12 @@ int main(int argc, char **argv)
 
     sender.set_enabled(true, 0);
 
+#if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
+    g_metrics_source =
+        use_uvc_selector ? static_cast<component_source *>(uvc_metrics_source.get()) : source;
+#else
     g_metrics_source = source;
+#endif
     if (!defer_sdl_to_present && prepare_preview_sink(preview, kmsdrm, width, height) < 0)
     {
         std::fprintf(stderr,
@@ -838,7 +878,25 @@ int main(int argc, char **argv)
     apps::present_frame_queue present_q(present_q_depth, g_run);
     apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
 
-    std::thread source_thr(source_stage_main, source, &mjpeg_q, &nv12_q, &g_bench_diag);
+    std::thread source_thr;
+#if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
+    if (use_uvc_selector)
+    {
+        uvc_selector->set_push_handlers(
+            [&](data_packet &&pkt) {
+                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
+            },
+            [&](data_packet &&pkt) {
+                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
+            });
+        source_thr = std::thread(source_stage_selector_main, uvc_selector.get(), &mjpeg_q, &nv12_q,
+                                 &g_bench_diag);
+    }
+    else
+#endif
+    {
+        source_thr = std::thread(source_stage_main, source, &mjpeg_q, &nv12_q, &g_bench_diag);
+    }
     std::thread jpeg_thr;
     if (use_jpeg_decode)
     {

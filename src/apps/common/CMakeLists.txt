@@ -7,6 +7,10 @@ set(_apps_common_sources
     stage_latency.cpp
 )
 
+if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
+    list(APPEND _apps_common_sources tx/source_selector.cpp)
+endif()
+
 add_library(apps_common STATIC ${_apps_common_sources})
 target_include_directories(apps_common
     PUBLIC

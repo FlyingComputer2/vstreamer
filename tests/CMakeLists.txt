@@ -2,7 +2,6 @@ set(VSTREAMER_TEST_SOURCES
     app_console_test.cpp
     buffer_pool_test.cpp
     component_contract_test.cpp
-    camera_noise_mux_test.cpp
     link_emulator_test.cpp
     bench_console_test.cpp
     cpu_map_test.cpp
@@ -15,6 +14,10 @@ set(VSTREAMER_TEST_SOURCES
     rs_block_erasure_emit_test.cpp
     shared_sized_buffer_test.cpp
 )
+
+if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
+    list(APPEND VSTREAMER_TEST_SOURCES source_selector_test.cpp)
+endif()
 
 if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
     list(APPEND VSTREAMER_TEST_SOURCES

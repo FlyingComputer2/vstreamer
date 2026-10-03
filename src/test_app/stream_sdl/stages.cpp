@@ -3,6 +3,7 @@
 #include "test_app/stream_sdl/stages.hpp"
 
 #include "apps/common/stage_latency.hpp"
+#include "apps/common/tx/source_selector.hpp"
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
 #include <cerrno>
@@ -147,6 +148,46 @@ bool submit_nv12_to_encoder(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sende
     return true;
 }
 
+namespace
+{
+
+bool handle_source_poll_error(int got)
+{
+    if (-EBADF == got || -ECANCELED == got)
+    {
+        return false;
+    }
+    if (-EAGAIN == got)
+    {
+        return true;
+    }
+    std::fprintf(stderr, "stream_sdl: source output failed (%d", got);
+    if (-got > 0 && -got < 4096)
+    {
+        std::fprintf(stderr, "; %s", std::strerror(-got));
+    }
+    std::fprintf(stderr, ")\n");
+    return false;
+}
+
+}  // namespace
+
+bool enqueue_source_frame(data_packet &&raw, apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
+                          bench_diag *diag)
+{
+    diag->tx_noise++;
+    diag->tx_source_bytes += packet_frame_bytes(raw);
+    note_source_pts(raw);
+    log_stage_latency("source", raw);
+    if (packet_media_kind(raw) == media_kind_e::NV12)
+    {
+        diag->tx_jpeg_nv12++;
+        diag->tx_jpeg_nv12_bytes += packet_frame_bytes(raw);
+        return nv12_q->push(std::move(raw), &diag->tx_nv12_q_drop);
+    }
+    return mjpeg_q->push(std::move(raw), &diag->tx_mjpeg_q_drop);
+}
+
 void source_stage_main(component_source *source, apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
                        bench_diag *diag)
 {
@@ -157,36 +198,28 @@ void source_stage_main(component_source *source, apps::pipeline_queue *mjpeg_q, 
         const int got = source->output(0, raw, g_run.load() ? -1 : 0);
         if (got < 0)
         {
-            if (-EBADF == got || -ECANCELED == got)
+            if (!handle_source_poll_error(got))
             {
                 break;
             }
-            if (-EAGAIN == got)
-            {
-                continue;
-            }
-            std::fprintf(stderr, "stream_sdl: source output failed (%d", got);
-            if (-got > 0 && -got < 4096)
-            {
-                std::fprintf(stderr, "; %s", std::strerror(-got));
-            }
-            std::fprintf(stderr, ")\n");
+            continue;
+        }
+        data_packet moved = std::move(raw);
+        if (!enqueue_source_frame(std::move(moved), mjpeg_q, nv12_q, diag))
+        {
             break;
         }
-        diag->tx_noise++;
-        diag->tx_source_bytes += packet_frame_bytes(raw);
-        note_source_pts(raw);
-        log_stage_latency("source", raw);
-        if (packet_media_kind(raw) == media_kind_e::NV12)
-        {
-            diag->tx_jpeg_nv12++;
-            diag->tx_jpeg_nv12_bytes += packet_frame_bytes(raw);
-            if (!nv12_q->push(std::move(raw), &diag->tx_nv12_q_drop))
-            {
-                break;
-            }
-        }
-        else if (!mjpeg_q->push(std::move(raw), &diag->tx_mjpeg_q_drop))
+    }
+}
+
+void source_stage_selector_main(apps::tx::source_selector *selector, apps::pipeline_queue * /*mjpeg_q*/,
+                                apps::pipeline_queue * /*nv12_q*/, bench_diag * /*diag*/)
+{
+    pin_current_thread_to_cpu(g_cpu_map.source);
+    while (g_run.load() && nullptr != selector)
+    {
+        const int got = selector->poll_once(g_run.load() ? -1 : 0);
+        if (got < 0 && !handle_source_poll_error(got))
         {
             break;
         }
