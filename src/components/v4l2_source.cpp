@@ -385,12 +385,6 @@ int v4l2_source::capture_open_locked(bool log_fail)
     live_h = height;
     apply_ctrl_stash_locked();
 
-    if (noise_active)
-    {
-        std::fprintf(stderr, "v4l2_source: capture restored; leaving noise\n");
-        noise_active = false;
-        noise.close();
-    }
     if (log_fail)
     {
         std::fprintf(stderr, "v4l2_source: capture open %s %dx%d MJPEG@%d\n", device.c_str(),
@@ -569,38 +563,13 @@ int v4l2_source::open()
         return 0;
     }
 
-    /* Noise fallback matches requested capture geometry (not hard-coded rover size). */
-    {
-        char size_buf[32];
-        std::snprintf(size_buf, sizeof(size_buf), "%dx%d", width, height);
-        std::string_view size_sv = size_buf;
-        noise.configure("size", &size_sv);
-        char fps_buf[32];
-        key_format_i64(fps, fps_buf, sizeof(fps_buf));
-        std::string_view fps_sv = fps_buf;
-        noise.configure("fps", &fps_sv);
-        std::string_view fmt_sv = "nv12";
-        noise.configure("format", &fmt_sv);
-    }
-
-    int r = capture_open_locked(true);
+    const int r = capture_open_locked(true);
     if (r < 0)
     {
-        int nr = noise.open();
-        if (nr < 0)
-        {
-            return nr;
-        }
-        noise_active = true;
         cap_retry_due = now_sec() + 1.0;
         std::fprintf(stderr,
-                     "v4l2_source: capture unavailable on %s; NV12 noise fallback %dx%d@%d\n",
+                     "v4l2_source: capture unavailable on %s; waiting for device (%dx%d@%d)\n",
                      device.c_str(), width, height, fps);
-    }
-    else
-    {
-        /* Open embedded noise so pregenerate can run while UVC capture is live. */
-        (void)noise.open();
     }
     source_open = true;
     return 0;
@@ -608,19 +577,14 @@ int v4l2_source::open()
 
 void v4l2_source::interrupt_shutdown()
 {
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        capture_close_locked();
-    }
-    noise.stop_pregenerate();
+    std::lock_guard<std::mutex> lock(mu);
+    capture_close_locked();
 }
 
 void v4l2_source::close()
 {
     interrupt_shutdown();
     std::lock_guard<std::mutex> lock(mu);
-    noise.close();
-    noise_active = false;
     source_open = false;
     cap_retry_due = 0;
 }
@@ -640,16 +604,16 @@ bool v4l2_source::maybe_retry_capture_locked()
     return false;
 }
 
-int v4l2_source::fetch_live_locked(frame &out, int timeout_ms)
+int v4l2_source::wait_capture_fd(int local_fd, int timeout_ms)
 {
-    if (!capture_open || fd < 0)
+    if (local_fd < 0)
     {
         return -EBADF;
     }
 
     fd_set fds;
     FD_ZERO(&fds);
-    FD_SET(fd, &fds);
+    FD_SET(local_fd, &fds);
     struct timeval tv {};
     if (timeout_ms == 0)
     {
@@ -668,16 +632,10 @@ int v4l2_source::fetch_live_locked(frame &out, int timeout_ms)
         tv.tv_usec = (timeout_ms % 1000) * 1000;
     }
 
-    int sel = ::select(fd + 1, &fds, nullptr, nullptr, &tv);
+    int sel = ::select(local_fd + 1, &fds, nullptr, nullptr, &tv);
     if (sel < 0)
     {
-        int e = errno;
-        if (capture_lost_errno(e))
-        {
-            std::fprintf(stderr, "v4l2_source: select lost: %s\n", std::strerror(e));
-            capture_close_locked();
-            return -e;
-        }
+        const int e = errno;
         if (e == EINTR)
         {
             return -EAGAIN;
@@ -687,6 +645,15 @@ int v4l2_source::fetch_live_locked(frame &out, int timeout_ms)
     if (sel == 0)
     {
         return -EAGAIN;
+    }
+    return 0;
+}
+
+int v4l2_source::dequeue_capture_locked(frame &out)
+{
+    if (!capture_open || fd < 0)
+    {
+        return -EBADF;
     }
 
     struct v4l2_buffer buf {};
@@ -721,9 +688,18 @@ int v4l2_source::fetch_live_locked(frame &out, int timeout_ms)
         else
         {
             std::memcpy(tmp, src, size);
-            const int64_t cap_ns = steady_mono_ns();
-            out.reset(media_kind_e::MJPEG, live_w, live_h, pts++, true, tmp, size,
-                      [](uint8_t *p) { std::free(p); }, cap_ns);
+            int64_t cap_ns = steady_mono_ns();
+            if ((buf.flags & V4L2_BUF_FLAG_TIMESTAMP_MASK) == V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC)
+            {
+                cap_ns = static_cast<int64_t>(buf.timestamp.tv_sec) * 1000000000LL +
+                         static_cast<int64_t>(buf.timestamp.tv_usec) * 1000LL;
+            }
+            shared_sized_buffer payload = shared_sized_buffer::adopt(
+                reinterpret_cast<std::byte *>(tmp), size, size, [](std::byte *p) {
+                    std::free(reinterpret_cast<uint8_t *>(p));
+                });
+            out.reset(media_kind_e::MJPEG, live_w, live_h, pts++, true, std::move(payload),
+                      cap_ns);
             ret = 0;
         }
     }
@@ -751,64 +727,57 @@ int v4l2_source::output(uint8_t port, data_packet &out, int timeout_ms)
 
     if (capture_open)
     {
-        frame fr;
-        int   r = fetch_live_locked(fr, timeout_ms);
-        if (r == 0)
+        const int local_fd = fd;
+        lock.unlock();
+        const int wait_r = wait_capture_fd(local_fd, timeout_ms);
+        lock.lock();
+        if (!source_open)
         {
-            out.adopt_frame(std::move(fr));
-            return 0;
+            return -EBADF;
         }
-        if (capture_open)
+        if (!capture_open || fd != local_fd)
         {
-            return r;
+            /* Device closed during select — retry below. */
         }
-        /* Lost device — fall through to noise. */
+        else if (wait_r < 0)
+        {
+            if (wait_r != -EAGAIN && capture_lost_errno(-wait_r))
+            {
+                std::fprintf(stderr, "v4l2_source: select lost: %s\n",
+                             std::strerror(-wait_r));
+                capture_close_locked();
+            }
+            else if (capture_open)
+            {
+                return wait_r;
+            }
+        }
+        else if (wait_r == 0)
+        {
+            frame fr;
+            const int r = dequeue_capture_locked(fr);
+            if (r == 0)
+            {
+                out.adopt_frame(std::move(fr));
+                return 0;
+            }
+            if (capture_open)
+            {
+                return r;
+            }
+        }
+        else if (capture_open)
+        {
+            return wait_r;
+        }
     }
 
-    if (!noise_active)
-    {
-        int nr = noise.open();
-        if (nr < 0)
-        {
-            return nr;
-        }
-        noise_active = true;
-        std::fprintf(stderr,
-                     "v4l2_source: capture unavailable on %s; NV12 noise fallback %dx%d@%d\n",
-                     device.c_str(), width, height, fps);
-    }
-    /* Drop lock so console configure/query is not blocked by fps pacing. */
-    lock.unlock();
-    return noise.output(port, out, timeout_ms);
+    return -ENODEV;
 }
 
-int v4l2_source::configure(uint64_t key, int64_t value)
+int v4l2_source::configure(std::string_view key, std::string_view value)
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (key == 0 || key > 0xffffffffu)
-    {
-        return -EINVAL;
-    }
-    return set_ctrl_locked(static_cast<uint32_t>(key), static_cast<int32_t>(value));
-}
-
-int v4l2_source::query(uint64_t key, int64_t *value) const
-{
-    std::lock_guard<std::mutex> lock(mu);
-    if (key == 0 || key > 0xffffffffu)
-    {
-        return -EINVAL;
-    }
-    return get_ctrl_locked(static_cast<uint32_t>(key), value);
-}
-
-int v4l2_source::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
 
     std::lock_guard<std::mutex> lock(mu);
     if (key == "device")
@@ -840,111 +809,94 @@ int v4l2_source::configure(std::string_view key, std::string_view *value)
         }
         width = w;
         height = h;
-        char size_buf[32];
-        std::snprintf(size_buf, sizeof(size_buf), "%dx%d", width, height);
-        std::string_view size_sv = size_buf;
-        noise.configure("size", &size_sv);
         return 0;
     }
     if (key == "fps")
     {
         int64_t n = 0;
-        std::string tmp(v);
-        if (key_parse_i64(tmp.c_str(), &n) < 0 || n <= 0 || n > 240)
+        if (key_parse_i64(v, &n) < 0 || n <= 0 || n > 240)
         {
             return -EINVAL;
         }
         fps = static_cast<int>(n);
-        char         fps_buf[32];
-        key_format_i64(fps, fps_buf, sizeof(fps_buf));
-        std::string_view fps_sv = fps_buf;
-        noise.configure("fps", &fps_sv);
         return 0;
     }
-    if (key == "noise-bandwidth" || key == "noise-randomness" || key == "noise-block-size" ||
-        key == "pregenerate-frames" || key == "pregenerate-frame" ||
-        key == "pregenerate_frames" || key == "pregenerate_frame")
+    if (key.rfind("ctrl.", 0) == 0 || key.rfind("v4l2-ctl/", 0) == 0)
     {
-        return noise.configure(key, value);
-    }
-    if (key.rfind("v4l2-ctl/", 0) == 0)
-    {
-        std::string_view ctl = key.substr(9);
-        uint32_t         id = 0;
-        int              r = resolve_ctrl_name_locked(ctl, &id);
-        if (r < 0)
+        const std::string_view ctl =
+            key.rfind("ctrl.", 0) == 0 ? key.substr(5) : key.substr(9);
+        uint32_t id = 0;
+        if (key.rfind("ctrl.", 0) == 0)
         {
-            return r;
+            int64_t id64 = 0;
+            if (key_parse_i64_auto(ctl, &id64) < 0 || id64 < 0 ||
+                id64 > static_cast<int64_t>(0xffffffffu))
+            {
+                return -EINVAL;
+            }
+            id = static_cast<uint32_t>(id64);
+        }
+        else
+        {
+            const int r = resolve_ctrl_name_locked(ctl, &id);
+            if (r < 0)
+            {
+                return r;
+            }
         }
         int64_t n = 0;
-        std::string tmp(v);
-        if (key_parse_i64(tmp.c_str(), &n) < 0)
+        if (key_parse_i64(v, &n) < 0)
         {
             return -EINVAL;
         }
         return set_ctrl_locked(id, static_cast<int32_t>(n));
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
-int v4l2_source::query(std::string_view key, std::string_view *value) const
+int v4l2_source::query(std::string_view key, std::string *value) const
 {
     if (nullptr == value)
     {
         return -EINVAL;
     }
 
-    const bool noise_metric_key =
-        key == "state" || key == "noise-bandwidth" || key == "noise-randomness" ||
-        key == "noise-luma-block-size" || key == "noise-block-size" || key == "noise-fft-simd" ||
-        key == "noise-fft-grid" || key == "pregenerate-frames" || key == "pregenerate-frame" ||
-        key == "pregenerate_frames" || key == "pregenerate_frame";
-
     std::unique_lock<std::mutex> lock(mu);
+
     if (key == "state")
     {
-        lock.unlock();
-        return noise.query(key, value);
+        *value = capture_open ? "capturing" : "waiting_device";
+        return 0;
     }
-    if (noise_metric_key && noise_active && !capture_open)
-    {
-        lock.unlock();
-        return noise.query(key, value);
-    }
-
     if (key == "status")
     {
         if (capture_open)
         {
             char buf[64];
             std::snprintf(buf, sizeof(buf), "live %dx%d %d", live_w, live_h, fps);
-            query_buf = buf;
+            *value = buf;
         }
         else
         {
-            query_buf = "noise";
+            *value = "waiting_device";
         }
-        *value = query_buf;
         return 0;
     }
     if (key == "device")
     {
-        query_buf = device;
-        *value = query_buf;
+        *value = device;
         return 0;
     }
     if (key == "format")
     {
-        query_buf = format;
-        *value = query_buf;
+        *value = format;
         return 0;
     }
     if (key == "size")
     {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%dx%d", width, height);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "fps")
@@ -954,42 +906,12 @@ int v4l2_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
-    if (key == "media_type")
+    if (key == "media_type" || key == "pixel_type")
     {
-        if (capture_open)
-        {
-            query_buf = "mjpeg";
-        }
-        else if (noise_active)
-        {
-            return noise.query(std::string_view("media_type"), value);
-        }
-        else
-        {
-            query_buf = "mjpeg";
-        }
-        *value = query_buf;
-        return 0;
-    }
-    if (key == "pixel_type")
-    {
-        if (capture_open)
-        {
-            query_buf = "mjpeg";
-        }
-        else if (noise_active)
-        {
-            return noise.query(std::string_view("pixel_type"), value);
-        }
-        else
-        {
-            query_buf = "mjpeg";
-        }
-        *value = query_buf;
+        *value = "mjpeg";
         return 0;
     }
     if (key == "width")
@@ -997,8 +919,7 @@ int v4l2_source::query(std::string_view key, std::string_view *value) const
         const int w = capture_open && live_w > 0 ? live_w : width;
         char      buf[16];
         std::snprintf(buf, sizeof(buf), "%d", w);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "height")
@@ -1006,31 +927,38 @@ int v4l2_source::query(std::string_view key, std::string_view *value) const
         const int h = capture_open && live_h > 0 ? live_h : height;
         char      buf[16];
         std::snprintf(buf, sizeof(buf), "%d", h);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "v4l2-ctl")
     {
-        int r = list_ctrls_locked(&query_buf);
-        if (r < 0)
-        {
-            return r;
-        }
-        *value = query_buf;
-        return 0;
+        return list_ctrls_locked(value);
     }
-    if (key.rfind("v4l2-ctl/", 0) == 0)
+    if (key.rfind("ctrl.", 0) == 0 || key.rfind("v4l2-ctl/", 0) == 0)
     {
-        std::string_view ctl = key.substr(9);
-        uint32_t         id = 0;
-        int              r = resolve_ctrl_name_locked(ctl, &id);
-        if (r < 0)
+        const std::string_view ctl =
+            key.rfind("ctrl.", 0) == 0 ? key.substr(5) : key.substr(9);
+        uint32_t id = 0;
+        if (key.rfind("ctrl.", 0) == 0)
         {
-            return r;
+            int64_t id64 = 0;
+            if (key_parse_i64_auto(ctl, &id64) < 0 || id64 < 0 ||
+                id64 > static_cast<int64_t>(0xffffffffu))
+            {
+                return -EINVAL;
+            }
+            id = static_cast<uint32_t>(id64);
+        }
+        else
+        {
+            const int r = resolve_ctrl_name_locked(ctl, &id);
+            if (r < 0)
+            {
+                return r;
+            }
         }
         int64_t n = 0;
-        r = get_ctrl_locked(id, &n);
+        const int r = get_ctrl_locked(id, &n);
         if (r < 0)
         {
             return r;
@@ -1040,11 +968,10 @@ int v4l2_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

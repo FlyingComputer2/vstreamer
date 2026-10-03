@@ -17,16 +17,21 @@
 
 #include <netinet/in.h>
 
-#include "core/stream_telemetry.hpp"
 #include "core/component_sink.hpp"
 #include "core/data_packet.hpp"
-#include "core/packet_pool.hpp"
+#include "core/buffer_pool.hpp"
 #include "core/rs_block_erasure.hpp"
 
 namespace vstreamer
 {
 
-/* Pad 0 (sink): SOCK in from rtp_h264_pay → UDP egress. Link metrics via query(). */
+enum class fec_mode_e
+{
+    none,
+    block,
+};
+
+/* Pad 0 (sink): SOCK in → UDP egress. */
 class stream_sender : public component_sink
 {
 public:
@@ -51,13 +56,8 @@ public:
     int set_enabled(bool on, int timeout_ms) override;
     [[nodiscard]] bool enabled() const override;
 
-    void set_receiver_counters(stream_receiver_counters counters);
-
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
     [[nodiscard]] const std::atomic<uint64_t> &wire_pkts_sent_counter() const
     {
@@ -74,6 +74,12 @@ private:
     void pace_wire_send(size_t bytes);
     void enqueue_wire_copy(const uint8_t *data, size_t len);
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
+
+    [[nodiscard]] size_t queue_byte_limit() const;
+
+    [[nodiscard]] int effective_fec_k() const;
+    [[nodiscard]] int effective_fec_n() const;
+    [[nodiscard]] size_t fec_max_shard_bytes() const;
     /* Flush partial block, (re)init with current k/n/timeout. No locks held. */
     int  reinit_fec_if_active();
     /* Flush partial block and stop encoding. No locks held. */
@@ -84,6 +90,7 @@ private:
 
     std::string stream_spec;
     int         mtu = 1400;
+    int         max_datagram = 1472;
 
     int         send_fd = -1;
     sockaddr_in dst_addr {};
@@ -93,14 +100,13 @@ private:
     double            deadline_sec = 0;
     mutable std::mutex gate_mu;
 
-    stream_receiver_counters peer {};
+    buffer_pool pool;
 
-    packet_pool pool;
-
-    std::mutex              q_mu;
+    mutable std::mutex      q_mu;
     std::condition_variable q_cv;
     std::deque<data_packet> queue;
-    static constexpr size_t k_queue_depth = 4096;
+    size_t                  queue_bytes = 0;
+    static constexpr size_t k_queue_packet_cap = 1024;
 
     std::thread       send_thread;
     std::atomic<bool> send_stop {false};
@@ -113,17 +119,17 @@ private:
     uint64_t ingress_rate_bytes = 0;
     float    ingress_kbps = 0.f;
 
-    std::atomic<int> max_wire_kbps {0};
-    double           pace_bucket_bytes = 0.;
-    double           pace_last_sec = 0.;
-
-    mutable std::string query_buf;
+    std::atomic<int>  max_wire_kbps {0};
+    std::atomic<bool> pace_reset {false};
+    double            pace_bucket_bytes = 0.;
+    double            pace_last_sec = 0.;
+    int               queue_ms = 100;
 
     /* Guards fec (touched by input(), the send thread and configure()).
      * Lock order: mu -> fec_mu; never hold fec_mu while taking mu/q_mu. */
     mutable std::mutex fec_mu;
     rs_block_erasure   fec;
-    bool              fec_block = false;
+    fec_mode_e        fec_mode = fec_mode_e::block;
     int               fec_k = 10;
     int               fec_n = 12;
     int               fec_timeout_ms = rs_block_erasure::k_default_timeout_ms;

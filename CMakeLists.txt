@@ -18,40 +18,54 @@ option(ENABLE_STREAM_SENDER "Build stream_sender component" ON)
 option(ENABLE_STREAM_RECEIVER "Build stream_receiver component" ON)
 option(ENABLE_RTP_H264_PAY "Build rtp_h264_pay component" ON)
 option(ENABLE_RTP_H264_DEPAY "Build rtp_h264_depay component" ON)
+option(VSTREAMER_BUILD_TESTS "Build unit/integration tests" OFF)
 
-if(ENABLE_V4L2_SOURCE AND NOT ENABLE_NOISE_SOURCE)
-    message(FATAL_ERROR "ENABLE_V4L2_SOURCE requires ENABLE_NOISE_SOURCE")
+
+find_package(PkgConfig REQUIRED)
+
+if(ENABLE_H264_DECODER_MPP OR ENABLE_H264_ENCODER_MPP)
+    pkg_check_modules(MPP IMPORTED_TARGET rockchip_mpp)
+    if(ENABLE_H264_DECODER_MPP AND NOT MPP_FOUND)
+        message(WARNING "rockchip_mpp not found; disabling ENABLE_H264_DECODER_MPP")
+        set(ENABLE_H264_DECODER_MPP OFF CACHE BOOL "" FORCE)
+    endif()
+    if(ENABLE_H264_ENCODER_MPP AND NOT MPP_FOUND)
+        message(WARNING "rockchip_mpp not found; disabling ENABLE_H264_ENCODER_MPP")
+        set(ENABLE_H264_ENCODER_MPP OFF CACHE BOOL "" FORCE)
+    endif()
 endif()
 
 set(VSTREAMER_SOURCES
     src/core/frame.cpp
     src/core/metrics.cpp
     src/core/data_packet.cpp
-    src/core/packet_types.cpp
-    src/core/packet_pool.cpp
+    src/core/buffer_pool.cpp
     src/core/component_sink.cpp
     src/core/rtp_h264.cpp
     src/core/pix_convert.cpp
+    src/core/h264_level.cpp
     src/core/component_factory.cpp
 )
 
 if(ENABLE_NOISE_SOURCE)
-    add_executable(noise_fft_bench src/test_app/noise_fft_bench.cpp)
-    target_include_directories(noise_fft_bench PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
-    )
-    target_link_libraries(noise_fft_bench PRIVATE vstreamer_source)
-    target_compile_options(noise_fft_bench PRIVATE -Wall -Wextra -Wpedantic)
-
     set(PFFFT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(PFFFT_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
     set(PFFFT_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(PFFFT_USE_TYPE_DOUBLE OFF CACHE BOOL "" FORCE)
     set(PFFFT_USE_SIMD ON CACHE BOOL "" FORCE)
     set(INSTALL_PFFFT OFF CACHE BOOL "" FORCE)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/pffft
-                     ${CMAKE_CURRENT_BINARY_DIR}/pffft EXCLUDE_FROM_ALL)
+
+    include(FetchContent)
+    FetchContent_Declare(pffft
+        GIT_REPOSITORY https://github.com/marton78/pffft.git
+        GIT_TAG        e1dbebc9fbf74247d12f094accbbc470aaee8715
+    )
+    FetchContent_GetProperties(pffft)
+    if(NOT pffft_POPULATED)
+        FetchContent_Populate(pffft)
+    endif()
+    add_subdirectory(${pffft_SOURCE_DIR} ${pffft_BINARY_DIR} EXCLUDE_FROM_ALL)
+
     list(APPEND VSTREAMER_SOURCES
         src/components/noise_source.cpp
         src/core/noise_fft2.cpp
@@ -103,8 +117,6 @@ if(ENABLE_RTP_H264_DEPAY)
     list(APPEND VSTREAMER_SOURCES src/components/rtp_h264_depay.cpp)
 endif()
 
-find_package(PkgConfig REQUIRED)
-
 set(VSTREAMER_LIBS)
 if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_CEDAR OR ENABLE_H264_ENCODER_INTEL OR ENABLE_MKV_SINK)
     pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
@@ -119,8 +131,9 @@ if(ENABLE_SDL_SINK)
     list(APPEND VSTREAMER_LIBS PkgConfig::SDL2)
 endif()
 if(ENABLE_H264_DECODER_MPP OR ENABLE_H264_ENCODER_MPP)
-    pkg_check_modules(MPP REQUIRED IMPORTED_TARGET rockchip_mpp)
-    list(APPEND VSTREAMER_LIBS PkgConfig::MPP)
+    if(MPP_FOUND)
+        list(APPEND VSTREAMER_LIBS PkgConfig::MPP)
+    endif()
 endif()
 
 configure_file(
@@ -160,6 +173,16 @@ if(ENABLE_NOISE_SOURCE)
     endif()
 endif()
 
+function(vstreamer_add_app name)
+    add_executable(${name} ${ARGN})
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+    )
+    target_link_libraries(${name} PRIVATE vstreamer_source)
+    target_compile_options(${name} PRIVATE -Wall -Wextra -Wpedantic)
+endfunction()
+
 message(STATUS "vstreamer components:")
 message(STATUS "  ENABLE_NOISE_SOURCE=${ENABLE_NOISE_SOURCE}")
 message(STATUS "  ENABLE_V4L2_SOURCE=${ENABLE_V4L2_SOURCE}")
@@ -174,23 +197,37 @@ message(STATUS "  ENABLE_STREAM_SENDER=${ENABLE_STREAM_SENDER}")
 message(STATUS "  ENABLE_STREAM_RECEIVER=${ENABLE_STREAM_RECEIVER}")
 message(STATUS "  ENABLE_RTP_H264_PAY=${ENABLE_RTP_H264_PAY}")
 message(STATUS "  ENABLE_RTP_H264_DEPAY=${ENABLE_RTP_H264_DEPAY}")
+message(STATUS "  VSTREAMER_BUILD_TESTS=${VSTREAMER_BUILD_TESTS}")
+
+if(ENABLE_NOISE_SOURCE)
+    vstreamer_add_app(noise_fft_bench src/test_app/noise_fft_bench.cpp)
+endif()
 
 if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
-    add_executable(rs_fec_test src/test_app/rs_fec_test.cpp)
-    target_include_directories(rs_fec_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
-    )
-    target_link_libraries(rs_fec_test PRIVATE vstreamer_source)
-    target_compile_options(rs_fec_test PRIVATE -Wall -Wextra -Wpedantic)
+    vstreamer_add_app(rs_fec_test src/test_app/rs_fec_test.cpp)
+    vstreamer_add_app(rs_block_id_pace_test src/test_app/rs_block_id_pace_test.cpp)
+endif()
 
-    add_executable(rs_block_id_pace_test src/test_app/rs_block_id_pace_test.cpp)
-    target_include_directories(rs_block_id_pace_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_BINARY_DIR}/generated
+if(VSTREAMER_BUILD_TESTS)
+    enable_testing()
+
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    include(FetchContent)
+    FetchContent_Declare(googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+        GIT_SHALLOW    TRUE
     )
-    target_link_libraries(rs_block_id_pace_test PRIVATE vstreamer_source)
-    target_compile_options(rs_block_id_pace_test PRIVATE -Wall -Wextra -Wpedantic)
+    FetchContent_MakeAvailable(googletest)
+
+    add_subdirectory(tests)
+
+    if(TARGET rs_fec_test)
+        add_test(NAME rs_fec_test COMMAND rs_fec_test)
+    endif()
+    if(TARGET rs_block_id_pace_test)
+        add_test(NAME rs_block_id_pace_test COMMAND rs_block_id_pace_test)
+    endif()
 endif()
 
 option(ENABLE_TEST_STREAM_SDL "Build stream_sdl loopback test" OFF)
@@ -208,9 +245,14 @@ if(ENABLE_TEST_STREAM_SDL)
     if(NOT ENABLE_H264_ENCODER_MPP AND NOT ENABLE_H264_ENCODER_CEDAR AND NOT ENABLE_H264_ENCODER_INTEL)
         message(FATAL_ERROR "ENABLE_TEST_STREAM_SDL requires ENABLE_H264_ENCODER_MPP, CEDAR, or INTEL")
     endif()
+    set(_stream_sdl_sources src/test_app/stream_sdl.cpp)
+    if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
+        list(APPEND _stream_sdl_sources src/test_app/camera_noise_mux.cpp)
+    endif()
     add_executable(stream_sdl
-        src/test_app/stream_sdl.cpp
+        ${_stream_sdl_sources}
         src/test_app/channel_controller.cpp
+        src/test_app/cpu_map.cpp
     )
     target_include_directories(stream_sdl PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -234,10 +276,15 @@ if(ENABLE_TEST_UVC_JPEGDEC_KMSDRM OR ENABLE_TEST_UVC_JPEGDEC_DMKS)
     if(NOT ENABLE_H264_ENCODER_MPP AND NOT ENABLE_H264_ENCODER_CEDAR AND NOT ENABLE_H264_ENCODER_INTEL)
         message(FATAL_ERROR "ENABLE_TEST_UVC_JPEGDEC_KMSDRM requires ENABLE_H264_ENCODER_MPP, CEDAR, or INTEL")
     endif()
-    add_executable(uvc_jpegdec_kmsdrm
+    set(_uvc_jpegdec_sources
         src/test_app/uvc_jpegdec_kmsdrm.cpp
         src/test_app/channel_controller.cpp
     )
+    if(ENABLE_NOISE_SOURCE)
+        list(APPEND _uvc_jpegdec_sources src/test_app/camera_noise_mux.cpp)
+    endif()
+    list(APPEND _uvc_jpegdec_sources src/test_app/cpu_map.cpp)
+    add_executable(uvc_jpegdec_kmsdrm ${_uvc_jpegdec_sources})
     target_include_directories(uvc_jpegdec_kmsdrm PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_BINARY_DIR}/generated

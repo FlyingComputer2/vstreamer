@@ -476,7 +476,10 @@ int noise_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
         fd->pts = frame_pts;
         fd->capture_mono_ns = steady_mono_ns();
         fd->key = true;
-        fd->buf.reset(buf, nv12_sz, [](uint8_t *p) { std::free(p); });
+        fd->buf = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(buf), nv12_sz, nv12_sz,
+                                             [](std::byte *p) {
+                                                 std::free(reinterpret_cast<uint8_t *>(p));
+                                             });
         out.reset(std::move(fd));
     }
 
@@ -484,23 +487,9 @@ int noise_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
     return 0;
 }
 
-int noise_source::configure(uint64_t /*key*/, int64_t /*value*/)
+int noise_source::configure(std::string_view key, std::string_view value)
 {
-    return -EINVAL;
-}
-
-int noise_source::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -EINVAL;
-}
-
-int noise_source::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
 
     join_pregenerate_worker();
     std::lock_guard<std::mutex> lock(mu);
@@ -577,13 +566,8 @@ int noise_source::configure(std::string_view key, std::string_view *value)
     return -EINVAL;
 }
 
-int noise_source::query(std::string_view key, std::string_view *value) const
+int noise_source::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     if (key == "state")
     {
         const int n = pregen_build_n.load(std::memory_order_acquire);
@@ -607,11 +591,15 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         return 0;
     }
 
+    if (nullptr == value)
+    {
+        return -EINVAL;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
     if (key == "status")
     {
-        query_buf = "noise_nv12";
-        *value = query_buf;
+        *value = "noise_nv12";
         return 0;
     }
     if (key == "size")
@@ -621,8 +609,7 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "fps")
@@ -632,14 +619,12 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "format")
     {
-        query_buf = "nv12";
-        *value = query_buf;
+        *value = "nv12";
         return 0;
     }
     if (key_is_noise_bandwidth(key))
@@ -649,8 +634,7 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "pregenerate-frames" || key == "pregenerate-frame" ||
@@ -661,8 +645,7 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "noise-fft-grid" || key == "noise_fft_grid")
@@ -672,8 +655,7 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "noise-internal-size" || key == "noise_internal_size")
@@ -683,20 +665,17 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "noise-luma-block-size" || key == "noise_luma_block_size")
     {
-        query_buf = "1";
-        *value = query_buf;
+        *value = "1";
         return 0;
     }
     if (key == "noise-fft-simd" || key == "noise_fft_simd")
     {
-        query_buf = fft.simd_arch();
-        *value = query_buf;
+        *value = fft.simd_arch();
         return 0;
     }
     if (key_is_noise_block_size(key))
@@ -706,42 +685,36 @@ int noise_source::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "device")
     {
-        query_buf = "noise";
-        *value = query_buf;
+        *value = "noise";
         return 0;
     }
     if (key == "media_type")
     {
-        query_buf = "raw";
-        *value = query_buf;
+        *value = "raw";
         return 0;
     }
     if (key == "pixel_type")
     {
-        query_buf = "nv12";
-        *value = query_buf;
+        *value = "nv12";
         return 0;
     }
     if (key == "width")
     {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", width);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "height")
     {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", height);
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     return -EINVAL;

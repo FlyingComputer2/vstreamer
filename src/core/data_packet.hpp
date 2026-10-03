@@ -13,15 +13,20 @@
 namespace vstreamer
 {
 
+/*
+ * A packet's body and bytes are immutable once it has been passed to input() or
+ * returned from output(). Code that needs to modify bytes must own the only
+ * reference (buf.use_count() == 1 on the underlying storage) or copy.
+ */
 class data_packet
 {
 public:
     data_packet() = default;
 
-    explicit data_packet(std::unique_ptr<packet_body> body_in) : body(std::move(body_in)) {}
+    explicit data_packet(std::shared_ptr<packet_body> body_in) : body(std::move(body_in)) {}
 
-    data_packet(const data_packet &) = delete;
-    data_packet &operator=(const data_packet &) = delete;
+    data_packet(const data_packet &) = default;
+    data_packet &operator=(const data_packet &) = default;
 
     data_packet(data_packet &&other) noexcept = default;
     data_packet &operator=(data_packet &&other) noexcept = default;
@@ -79,13 +84,13 @@ public:
         return static_cast<const T &>(pkt.get());
     }
 
-    void reset(std::unique_ptr<packet_body> body_in) { body = std::move(body_in); }
+    void reset(std::shared_ptr<packet_body> body_in) { body = std::move(body_in); }
 
     void adopt_frame(frame &&fr);
     void move_to_frame(frame &out);
 
 private:
-    std::unique_ptr<packet_body> body;
+    std::shared_ptr<packet_body> body;
 };
 
 }  // namespace vstreamer

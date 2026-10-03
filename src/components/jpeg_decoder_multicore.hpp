@@ -14,8 +14,11 @@
 #include <thread>
 #include <vector>
 
+#include "core/buffer_pool.hpp"
 #include "core/component_coder.hpp"
 #include "core/output_opts.hpp"
+
+#include <memory>
 
 namespace vstreamer
 {
@@ -44,11 +47,8 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     static constexpr int k_max_workers = 8;
@@ -72,7 +72,7 @@ private:
         frame    out;
     };
 
-    void worker_main();
+    void worker_main(int worker_index);
     int  decode_one(void *dec, void *avframe, void *pkt, const job &j, frame *out) const;
     int  start_workers();
     void stop_workers();
@@ -83,6 +83,7 @@ private:
     int                fps = 30;
     int                workers = 2;
     int                worker_cpu = -1;
+    std::vector<int>   worker_cpus;
     output_mode_e      output_mode = output_mode_e::filter;
     media_kind_e       output_format = media_kind_e::NV12;
     mutable std::string decoded_pix_fmt = "unknown";
@@ -105,7 +106,11 @@ private:
     result_slot             results[k_queue_depth];
     uint64_t                next_out_seq = 0;
 
-    mutable std::string query_buf;
+    mutable bool unsupported_pix_fmt_log_done = false;
+
+    mutable std::mutex              nv12_pool_mu;
+    mutable std::unique_ptr<buffer_pool> nv12_pool;
+    mutable size_t                  nv12_pool_bytes = 0;
 };
 
 }  // namespace vstreamer

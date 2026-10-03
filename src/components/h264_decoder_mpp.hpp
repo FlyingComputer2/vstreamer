@@ -8,13 +8,17 @@
 
 #include <atomic>
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
 
+#include "core/buffer_pool.hpp"
 #include "core/component_coder.hpp"
 #include "core/output_opts.hpp"
+
+#include <memory>
 
 namespace vstreamer
 {
@@ -41,22 +45,24 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     int  ensure_decoder_locked();
     void free_decoder_locked();
     void clear_pending_locked();
     int  handle_info_change_locked(void *mpp_frame);
-    void drain_mpp_to_ready_locked(int timeout_ms);
-    int  fetch_one_mpp_frame_locked(int timeout_ms);
+    /* Poll MPP and pack frames; caller must not hold mu. */
+    void drain_mpp_to_ready(int timeout_ms);
+    int  fetch_one_mpp_frame(int timeout_ms);
     int  pack_mpp_to_ready_locked(void *mpp_frame);
+    void remember_capture_pts(int64_t pts, int64_t capture_mono_ns);
+    int64_t lookup_capture_pts(int64_t pts) const;
 
+    /* Lock order: mu → mpp_io_mu only. */
     mutable std::mutex mu;
+    std::mutex         mpp_io_mu;
     bool               opened = false;
     std::atomic<bool>  cancel_io {false};
 
@@ -73,13 +79,26 @@ private:
     void *frm_grp = nullptr;
 
     static constexpr size_t k_max_ready_frames = 8;
-    int64_t                 pending_capture_mono_ns = 0;
-    std::deque<frame>       ready_frames;
+    static constexpr size_t k_pts_ring = 64;
+    struct pts_capture_entry
+    {
+        int64_t pts = 0;
+        int64_t capture_mono_ns = 0;
+    };
+    std::array<pts_capture_entry, k_pts_ring> pts_ring {};
+    size_t                                   pts_ring_head = 0;
+    bool                                     output_size_stream = false;
+    std::deque<frame>                        ready_frames;
+
+    std::unique_ptr<buffer_pool> nv12_pool;
+    size_t                       nv12_pool_bytes = 0;
 
     /* Capture-to-decoded-frame (ms); updated when output carries capture_mono_ns. */
     double last_latency_ms = 0.0;
 
-    mutable std::string query_buf;
+    unsigned log_errinfo_throttle = 0;
+    unsigned log_fbc_throttle = 0;
+    unsigned log_pix_throttle = 0;
 };
 
 }  // namespace vstreamer

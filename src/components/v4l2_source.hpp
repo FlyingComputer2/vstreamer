@@ -5,9 +5,6 @@
 #ifndef ENABLE_V4L2_SOURCE
 #error "v4l2_source requires -DENABLE_V4L2_SOURCE=ON"
 #endif
-#ifndef ENABLE_NOISE_SOURCE
-#error "v4l2_source requires -DENABLE_NOISE_SOURCE=ON"
-#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -18,12 +15,11 @@
 #include <vector>
 
 #include "core/component_source.hpp"
-#include "components/noise_source.hpp"
 
 namespace vstreamer
 {
 
-/* UVC MJPEG mmap capture (rover camera path). Falls back to noise_source. */
+/* UVC MJPEG mmap capture. */
 class v4l2_source : public component_source
 {
    public:
@@ -41,16 +37,13 @@ class v4l2_source : public component_source
     int  open() override;
     void close() override;
 
-    /* Unblock capture select and stop embedded noise pregen (pipeline shutdown). */
+    /* Unblock capture select (pipeline shutdown). */
     void interrupt_shutdown();
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
    private:
     int  capture_open_locked(bool log_fail);
@@ -60,8 +53,9 @@ class v4l2_source : public component_source
     int  get_ctrl_locked(uint32_t id, int64_t *value) const;
     int  resolve_ctrl_name_locked(std::string_view name, uint32_t *id) const;
     int  list_ctrls_locked(std::string *out) const;
-    int  fetch_live_locked(frame &out, int timeout_ms);
-    bool maybe_retry_capture_locked();
+    static int wait_capture_fd(int fd, int timeout_ms);
+    int        dequeue_capture_locked(frame &out);
+    bool       maybe_retry_capture_locked();
 
     mutable std::mutex mu;
 
@@ -82,15 +76,10 @@ class v4l2_source : public component_source
     int     live_h = 0;
     int64_t pts = 0;
 
-    bool   noise_active = false;
     double cap_retry_due = 0;
 
     /* CID -> value; applied after STREAMON / open. */
     std::map<uint32_t, int32_t> ctrl_stash;
-
-    noise_source noise;
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

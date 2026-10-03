@@ -415,7 +415,7 @@ int sdl_nv12_presenter::ensure_video_locked(int w, int h)
 int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_open)
 {
     const int need = nv12_byte_size(f.width, f.height);
-    if (need < 0 || static_cast<size_t>(need) != f.buf.size || nullptr == f.buf.data)
+    if (need < 0 || static_cast<size_t>(need) != f.buf.size() || nullptr == f.buf.u8())
     {
         return -EINVAL;
     }
@@ -436,8 +436,8 @@ int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_o
         return r;
     }
 
-    const uint8_t *y = f.buf.data;
-    const uint8_t *uv = f.buf.data + static_cast<size_t>(f.width * f.height);
+    const uint8_t *y = f.buf.u8();
+    const uint8_t *uv = f.buf.u8() + static_cast<size_t>(f.width * f.height);
 
     auto *tex = static_cast<SDL_Texture *>(texture);
     clear_sdl_error();

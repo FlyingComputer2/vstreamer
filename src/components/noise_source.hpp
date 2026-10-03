@@ -40,11 +40,8 @@ public:
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     int  fill_nv12_locked(uint8_t *dst, size_t dst_sz);
@@ -89,8 +86,6 @@ private:
     noise_fft2_plan fft;
     noise_fft2_plan fft_chroma_u;
     noise_fft2_plan fft_chroma_v;
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

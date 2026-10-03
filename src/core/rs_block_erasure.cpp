@@ -1,9 +1,11 @@
 #include "core/rs_block_erasure.hpp"
 
-#include "core/stream_air_limits.hpp"
-
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
+#include <mutex>
+#include <optional>
+#include <utility>
 #include <cstring>
 #include <random>
 
@@ -44,23 +46,40 @@ size_t align_shard(size_t row)
     return row < k_min_shard ? k_min_shard : row;
 }
 
-void add_virtual_empty_systematic(
-    int sdu_n, int k, std::unordered_map<int, std::vector<uint8_t>>& frags)
+struct kn_encode_tables
 {
-    for (int i = sdu_n; i < k; i++)
+    std::vector<uint8_t> encode_matrix;
+    std::vector<uint8_t> g_tbls;
+};
+
+const kn_encode_tables& kn_encode_tables_for(int k, int n)
+{
+    static std::mutex                                    mu;
+    static std::array<std::array<std::optional<kn_encode_tables>, 16>, 16> cache;
+    std::lock_guard<std::mutex>                          lock(mu);
+    std::optional<kn_encode_tables>&                     slot = cache[static_cast<size_t>(k)]
+        [static_cast<size_t>(n)];
+    if (!slot.has_value())
     {
-        if (frags.find(i) != frags.end())
-        {
-            continue;
-        }
-        frags.emplace(i, std::vector<uint8_t>(vstreamer::rs_block_erasure::k_len_prefix, 0));
+        kn_encode_tables built;
+        const int        p = n - k;
+        built.encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
+        built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
+        gf_gen_cauchy1_matrix(built.encode_matrix.data(), n, k);
+        ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+        slot = std::move(built);
     }
+    return *slot;
 }
 }  // namespace
 
-size_t vstreamer::rs_block_erasure::max_original()
+size_t vstreamer::rs_block_erasure::max_original() const
 {
-    return k_stream_payload_max - k_header_len - k_len_prefix;
+    if (max_shard_bytes <= k_header_len + k_len_prefix)
+    {
+        return 0;
+    }
+    return max_shard_bytes - k_header_len - k_len_prefix;
 }
 
 const char* vstreamer::rs_block_erasure::impl_name() const
@@ -80,65 +99,127 @@ vstreamer::rs_block_erasure::rs_block_erasure()
     block_id = static_cast<uint16_t>(rd());
 }
 
-bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms)
+bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_shard_bytes_in)
 {
-    enabled_ = false;
     if (k < k_header_k_n_min || n < k || n > k_header_k_n_max ||
-        k > k_header_k_n_max || timeout_ms < 0)
+        k > k_header_k_n_max || timeout_ms < 0 ||
+        max_shard_bytes_in < k_header_len + k_len_prefix + 1)
     {
         return false;
     }
-    k_ = k;
-    n_ = n;
+    active = false;
+    cfg_k = k;
+    cfg_n = n;
     p = n - k;
     this->timeout_ms = timeout_ms;
-    encode_matrix.assign(static_cast<size_t>(n_) * static_cast<size_t>(k_), 0);
-    g_tbls.assign(static_cast<size_t>(k_) * static_cast<size_t>(p) * 32, 0);
-    gf_gen_cauchy1_matrix(encode_matrix.data(), n_, k_);
-    ec_init_tables_base(k_, p, encode_matrix.data() + k_ * k_,
-                        g_tbls.data());
+    max_shard_bytes = max_shard_bytes_in;
+    const kn_encode_tables& tables = kn_encode_tables_for(cfg_k, cfg_n);
+    encode_matrix = tables.encode_matrix;
+    g_tbls = tables.g_tbls;
     pending.clear();
     deadline_set = false;
     rx_blocks.clear();
     done_order.clear();
     done.clear();
-    emit_pending.clear();
-    emit_skipped.clear();
+    ready_blocks.clear();
     emit_base_set = false;
     emit_next = 0;
-    emit_waiting = false;
-    recovered_ = 0;
-    recovered_seen_ = 0;
-    blocks_ = 0;
-    decode_fail_ = 0;
-    decode_fail_seen_ = 0;
-    fail_missing_shards_ = 0;
-    fail_missing_shards_seen_ = 0;
-    fail_lost_app_pkts_ = 0;
-    fail_lost_app_pkts_seen_ = 0;
-    oversized_ = 0;
-    enabled_ = true;
+    newest_set = false;
+    have_payload_emit = false;
+    later_block_waiting = false;
+    recovered_count = 0;
+    recovered_seen = 0;
+    blocks_count = 0;
+    decode_fail_seen = 0;
+    hdr_errors_count = 0;
+    hdr_errors_seen = 0;
+    kn_mismatch_count = 0;
+    kn_mismatch_seen = 0;
+    evicted_blocks_count = 0;
+    evicted_blocks_seen = 0;
+    rs_failures_count = 0;
+    rs_failures_seen = 0;
+    missing_shards_count = 0;
+    missing_shards_seen = 0;
+    fail_lost_app_pkts_count = 0;
+    fail_lost_app_pkts_seen = 0;
+    late_blocks_count = 0;
+    late_blocks_seen = 0;
+    oversized_count = 0;
+    active = true;
     return true;
 }
 
 void vstreamer::rs_block_erasure::disable()
 {
-    enabled_ = false;
+    active = false;
     pending.clear();
     deadline_set = false;
-    k_ = 0;
-    n_ = 0;
+    cfg_k = 0;
+    cfg_n = 0;
     p = 0;
     encode_matrix.clear();
     g_tbls.clear();
     rx_blocks.clear();
     done_order.clear();
     done.clear();
-    emit_pending.clear();
-    emit_skipped.clear();
+    ready_blocks.clear();
     emit_base_set = false;
     emit_next = 0;
-    emit_waiting = false;
+    newest_set = false;
+    have_payload_emit = false;
+    later_block_waiting = false;
+}
+
+int vstreamer::rs_block_erasure::ring_dist(uint8_t a, uint8_t b)
+{
+    return static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(a - b)));
+}
+
+int vstreamer::rs_block_erasure::dist_from_emit(uint16_t block_id) const
+{
+    return ring_dist(static_cast<uint8_t>(wire_block_id(block_id)),
+                     static_cast<uint8_t>(emit_next));
+}
+
+void vstreamer::rs_block_erasure::record_payload_emit()
+{
+    last_payload_emit = now();
+    have_payload_emit = true;
+}
+
+void vstreamer::rs_block_erasure::emit_payload(fec_rx_payload_list* out,
+                                               shared_sized_buffer&& app)
+{
+    if (nullptr == out || app.empty())
+    {
+        return;
+    }
+    out->push_back(std::move(app));
+    record_payload_emit();
+}
+
+bool vstreamer::rs_block_erasure::frag_to_app(const shared_sized_buffer& shard,
+                                              shared_sized_buffer* app)
+{
+    if (nullptr == app || shard.size() < k_header_len + k_len_prefix)
+    {
+        return false;
+    }
+    const uint8_t* body = shard.u8() + k_header_len;
+    const size_t   body_len = shard.size() - k_header_len;
+    const uint16_t orig_len = load_be16(body);
+    if (0 == orig_len)
+    {
+        app->clear();
+        return true;
+    }
+    if (k_len_prefix + orig_len > body_len)
+    {
+        return false;
+    }
+    *app = shard.subview(k_header_len + k_len_prefix, orig_len);
+    return !app->empty();
 }
 
 void vstreamer::rs_block_erasure::note_emit_base(uint16_t block_id)
@@ -147,22 +228,58 @@ void vstreamer::rs_block_erasure::note_emit_base(uint16_t block_id)
     {
         emit_base_set = true;
         emit_next = wire_block_id(block_id);
-        emit_waiting = false;
+        newest = static_cast<uint8_t>(emit_next);
+        newest_set = true;
     }
 }
 
-int vstreamer::rs_block_erasure::emit_distance(uint16_t block_id) const
+void vstreamer::rs_block_erasure::touch_newest(uint16_t block_id)
 {
-    return static_cast<int16_t>(static_cast<uint16_t>(wire_block_id(block_id) - emit_next));
+    const uint8_t bid = static_cast<uint8_t>(wire_block_id(block_id));
+    if (!newest_set)
+    {
+        newest = bid;
+        newest_set = true;
+        return;
+    }
+    if (ring_dist(bid, newest) > 0)
+    {
+        newest = bid;
+    }
 }
 
-void vstreamer::rs_block_erasure::prune_emit_behind()
+void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base_id)
 {
-    for (auto it = emit_skipped.begin(); it != emit_skipped.end();)
+    const uint8_t base = static_cast<uint8_t>(wire_block_id(base_id));
+    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
     {
-        if (emit_distance(*it) < 0)
+        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
         {
-            it = emit_skipped.erase(it);
+            it = rx_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (auto it = ready_blocks.begin(); it != ready_blocks.end();)
+    {
+        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
+        {
+            it = ready_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (auto it = done.begin(); it != done.end();)
+    {
+        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
+        {
+            done_order.erase(std::remove(done_order.begin(), done_order.end(), it->first),
+                             done_order.end());
+            it = done.erase(it);
         }
         else
         {
@@ -171,145 +288,304 @@ void vstreamer::rs_block_erasure::prune_emit_behind()
     }
 }
 
-void vstreamer::rs_block_erasure::advance_emit_past_hole()
+void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
 {
-    // Jump emit_next to the nearest queued block ahead of it.
-    bool     found = false;
-    uint16_t best = 0;
-    int      best_d = 0;
-    for (const auto& kv : emit_pending)
+    if (dist_from_emit(block_id) >= 0)
     {
-        const int d = emit_distance(kv.first);
-        if (!found || d < best_d)
-        {
-            found = true;
-            best = kv.first;
-            best_d = d;
-        }
+        return;
     }
-    if (found)
-    {
-        emit_next = wire_block_id(best);
-        prune_emit_behind();
-    }
-}
-
-void vstreamer::rs_block_erasure::skip_emit_block(uint16_t block_id)
-{
-    note_emit_base(block_id);
-    emit_pending.erase(block_id);
-    if (emit_distance(block_id) >= 0)
-    {
-        emit_skipped.insert(block_id);
-    }
-}
-
-void vstreamer::rs_block_erasure::drain_emit_queue(
-    std::vector<std::vector<uint8_t>>* out)
-{
-    if (out == nullptr || !emit_base_set)
+    if (!have_payload_emit)
     {
         return;
     }
     const auto t = now();
-    for (;;)
+    if (t - last_payload_emit < std::chrono::milliseconds(rx_hold_ms()))
     {
-        auto it = emit_pending.find(emit_next);
-        if (it != emit_pending.end())
+        return;
+    }
+    emit_next = wire_block_id(block_id);
+    clear_state_behind(block_id);
+    later_block_waiting = false;
+}
+
+void vstreamer::rs_block_erasure::ring_evict_stale(fec_rx_payload_list* out)
+{
+    if (!newest_set)
+    {
+        return;
+    }
+    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
+    {
+        const uint8_t bid = static_cast<uint8_t>(wire_block_id(it->first));
+        if (ring_dist(bid, newest) < -k_ring_evict_dist)
         {
-            for (auto& row : it->second)
-            {
-                out->push_back(std::move(row));
-            }
-            emit_pending.erase(it);
-            emit_skipped.erase(emit_next);
-            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
-            emit_waiting = false;
-            continue;
+            evicted_blocks_count++;
+            const rx_block_s snap = it->second;
+            const uint16_t  eid = it->first;
+            it = rx_blocks.erase(it);
+            abandon_partial_block(snap, eid, out);
         }
-        if (emit_skipped.count(emit_next) != 0)
+        else
         {
-            emit_skipped.erase(emit_next);
-            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
-            emit_waiting = false;
-            continue;
+            ++it;
         }
-        if (emit_pending.empty())
+    }
+    for (auto it = done.begin(); it != done.end();)
+    {
+        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), newest) <
+            -k_ring_evict_dist)
         {
-            emit_waiting = false;
-            break;
+            done_order.erase(std::remove(done_order.begin(), done_order.end(), it->first),
+                             done_order.end());
+            it = done.erase(it);
         }
-        // Head-of-line hole: emit_next was never seen, is still assembling,
-        // or belongs to a peer that restarted. Wait a bounded reorder window,
-        // then skip past it so later blocks are not held (or leaked) forever.
-        if (!emit_waiting)
+        else
         {
-            emit_waiting = true;
-            emit_wait_since = t;
+            ++it;
         }
-        const bool timed_out =
-            t - emit_wait_since > std::chrono::milliseconds(emit_hold_ms());
-        if (!timed_out && emit_pending.size() <= k_block_max)
-        {
-            break;
-        }
-        advance_emit_past_hole();
-        emit_waiting = false;
     }
 }
 
-void vstreamer::rs_block_erasure::queue_decoded_block(
-    uint16_t block_id, std::vector<std::vector<uint8_t>> payloads,
-    std::vector<std::vector<uint8_t>>* out)
+void vstreamer::rs_block_erasure::try_stream_head_systematic(
+    rx_block_s& block, fec_rx_payload_list* out)
 {
-    note_emit_base(block_id);
-    if (payloads.empty())
+    const int sn = expected_sdus(block);
+    while (block.released < sn)
     {
-        skip_emit_block(block_id);
-        drain_emit_queue(out);
+        const auto it = block.frags.find(block.released);
+        if (it == block.frags.end())
+        {
+            break;
+        }
+        shared_sized_buffer app;
+        if (!frag_to_app(it->second, &app))
+        {
+            break;
+        }
+        emit_payload(out, std::move(app));
+        block.released++;
+    }
+}
+
+void vstreamer::rs_block_erasure::abandon_partial_block(
+    const rx_block_s& block, uint16_t block_id, fec_rx_payload_list* out)
+{
+    account_missing_shards(block);
+    const int sn = expected_sdus(block);
+    int       emitted = 0;
+    for (int i = block.released; i < sn; i++)
+    {
+        const auto it = block.frags.find(i);
+        if (it == block.frags.end())
+        {
+            continue;
+        }
+        shared_sized_buffer app;
+        if (!frag_to_app(it->second, &app))
+        {
+            continue;
+        }
+        emit_payload(out, std::move(app));
+        emitted++;
+    }
+    note_rx_block_output_shortfall(sn, block.released + emitted);
+    if (wire_block_id(block_id) == emit_next)
+    {
+        mark_done(emit_next);
+        emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+        later_block_waiting = false;
+    }
+}
+
+void vstreamer::rs_block_erasure::on_block_decoded(uint16_t block_id, int released_before,
+                                                   fec_rx_payload_list payloads, int sdu_n,
+                                                   fec_rx_payload_list* out)
+{
+    const int d = dist_from_emit(block_id);
+    if (d < 0)
+    {
+        late_blocks_count++;
+        for (int i = released_before; i < sdu_n && i < static_cast<int>(payloads.size()); i++)
+        {
+            emit_payload(out, std::move(payloads[static_cast<size_t>(i)]));
+        }
+        mark_done(block_id);
         return;
     }
-    const int d = emit_distance(block_id);
-    if (d < -static_cast<int>(k_wire_block_id_mod / 2))
+    if (wire_block_id(block_id) == emit_next)
     {
-        // Far behind emit_next: the peer restarted its id counter. Release
-        // whatever is queued from the old stream and resync on this block.
-        std::vector<std::pair<int, uint16_t>> order;
-        for (const auto& kv : emit_pending)
+        for (int i = released_before; i < sdu_n && i < static_cast<int>(payloads.size()); i++)
         {
-            order.emplace_back(emit_distance(kv.first), kv.first);
+            emit_payload(out, std::move(payloads[static_cast<size_t>(i)]));
         }
-        std::sort(order.begin(), order.end());
-        for (const auto& e : order)
-        {
-            for (auto& row : emit_pending[e.second])
-            {
-                if (out != nullptr)
-                {
-                    out->push_back(std::move(row));
-                }
-            }
-        }
-        emit_pending.clear();
-        emit_skipped.clear();
-        emit_waiting = false;
-        emit_next = wire_block_id(block_id);
+        mark_done(emit_next);
+        emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+        later_block_waiting = false;
+        run_emit_engine(out);
+        return;
     }
-    else if (d < 0)
+    ready_block_s ready;
+    ready.payloads = std::move(payloads);
+    ready.released = released_before;
+    ready.sdu_n = sdu_n;
+    ready_blocks[block_id] = std::move(ready);
+    if (d > 0 && !later_block_waiting)
     {
-        // Late block (queue already advanced past it): deliver now rather
-        // than drop k app packets.
-        if (out != nullptr)
+        later_block_waiting = true;
+        later_block_since = now();
+    }
+}
+
+void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
+{
+    if (!emit_base_set)
+    {
+        return;
+    }
+    const auto t = now();
+    bool       give_up = false;
+    auto       rxit = rx_blocks.find(emit_next);
+    if (rxit != rx_blocks.end())
+    {
+        const rx_block_s& block = rxit->second;
+        const int         sn = expected_sdus(block);
+        if (static_cast<int>(block.frags.size()) >= block.n)
         {
-            for (auto& row : payloads)
-            {
-                out->push_back(std::move(row));
-            }
+            give_up = true;
+        }
+        else if (later_block_waiting &&
+                 t - later_block_since > std::chrono::milliseconds(emit_hold_ms()))
+        {
+            give_up = true;
+        }
+        if (give_up)
+        {
+            const rx_block_s snap = block;
+            rx_blocks.erase(rxit);
+            abandon_partial_block(snap, emit_next, out);
+            run_emit_engine(out);
         }
         return;
     }
-    emit_pending[block_id] = std::move(payloads);
-    drain_emit_queue(out);
+    if (ready_blocks.find(emit_next) != ready_blocks.end())
+    {
+        return;
+    }
+    if (later_block_waiting &&
+        t - later_block_since > std::chrono::milliseconds(emit_hold_ms()))
+    {
+        bool     jump = false;
+        uint16_t target = emit_next;
+        int      best_d = 0;
+        for (const auto& kv : ready_blocks)
+        {
+            const int d = dist_from_emit(kv.first);
+            if (d > 0 && (!jump || d < best_d))
+            {
+                jump = true;
+                target = kv.first;
+                best_d = d;
+            }
+        }
+        if (jump)
+        {
+            emit_next = wire_block_id(target);
+        }
+        else
+        {
+            /* Never-seen head hole: step without mark_done so a very late shard
+             * can still be delivered (rs_fec_test hole / peer reorder). */
+            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+        }
+        later_block_waiting = false;
+        run_emit_engine(out);
+    }
+}
+
+void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
+{
+    if (!emit_base_set)
+    {
+        return;
+    }
+    for (;;)
+    {
+        bool progressed = false;
+        auto rit = ready_blocks.find(emit_next);
+        if (rit != ready_blocks.end())
+        {
+            ready_block_s& rb = rit->second;
+            for (int i = rb.released; i < rb.sdu_n && i < static_cast<int>(rb.payloads.size());
+                 i++)
+            {
+                emit_payload(out, std::move(rb.payloads[static_cast<size_t>(i)]));
+            }
+            ready_blocks.erase(rit);
+            mark_done(emit_next);
+            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+            progressed = true;
+            continue;
+        }
+        auto rxit = rx_blocks.find(emit_next);
+        if (rxit != rx_blocks.end())
+        {
+            const int before = rxit->second.released;
+            try_stream_head_systematic(rxit->second, out);
+            if (rxit->second.released != before)
+            {
+                progressed = true;
+            }
+        }
+        if (!progressed)
+        {
+            break;
+        }
+    }
+    maybe_give_up_head(out);
+}
+
+bool vstreamer::rs_block_erasure::try_decode_block(uint16_t block_id, rx_block_s* block,
+                                                   fec_rx_payload_list* out)
+{
+    if (nullptr == block)
+    {
+        return false;
+    }
+    if (static_cast<int>(block->frags.size()) < block->sdu_n)
+    {
+        return false;
+    }
+    size_t shard_slots = block->frags.size();
+    for (int i = block->sdu_n; i < block->k; i++)
+    {
+        if (block->frags.find(i) == block->frags.end())
+        {
+            shard_slots++;
+        }
+    }
+    if (shard_slots < static_cast<size_t>(block->k))
+    {
+        return false;
+    }
+    int                  rec = 0;
+    fec_rx_payload_list  decoded;
+    const rx_block_s     snap = *block;
+    const int            released_before = block->released;
+    const bool           ok =
+        decode_block(block->k, block->n, block->sdu_n, block->frags, &decoded, &rec);
+    rx_blocks.erase(block_id);
+    if (!ok)
+    {
+        rs_failures_count++;
+        abandon_partial_block(snap, block_id, out);
+        run_emit_engine(out);
+        return true;
+    }
+    recovered_count += static_cast<uint64_t>(rec);
+    blocks_count++;
+    note_rx_block_output_shortfall(expected_sdus(snap), static_cast<int>(decoded.size()));
+    on_block_decoded(block_id, released_before, std::move(decoded), snap.sdu_n, out);
+    return true;
 }
 
 bool vstreamer::rs_block_erasure::pack_header(uint8_t* out, uint16_t block_id, int index,
@@ -371,13 +647,13 @@ bool vstreamer::rs_block_erasure::encode_block(
     const std::vector<std::vector<uint8_t>>& packets, uint16_t block_id,
     std::vector<std::vector<uint8_t>>* out) const
 {
-    if (!enabled_ || out == nullptr || packets.size() > static_cast<size_t>(k_))
+    if (!active || out == nullptr || packets.size() > static_cast<size_t>(cfg_k))
     {
         return false;
     }
-    std::vector<std::vector<uint8_t>> data_shards(static_cast<size_t>(k_));
+    std::vector<std::vector<uint8_t>> data_shards(static_cast<size_t>(cfg_k));
     size_t max_row = 0;
-    for (int i = 0; i < k_; i++)
+    for (int i = 0; i < cfg_k; i++)
     {
         const std::vector<uint8_t>* pkt = i < static_cast<int>(packets.size())
                                               ? &packets[static_cast<size_t>(i)]
@@ -398,18 +674,18 @@ bool vstreamer::rs_block_erasure::encode_block(
         max_row = std::max(max_row, data_shards[static_cast<size_t>(i)].size());
     }
     const size_t shard_len = align_shard(max_row);
-    if (k_header_len + shard_len > k_stream_payload_max)
+    if (k_header_len + shard_len > max_shard_bytes)
     {
         return false;
     }
-    for (int i = 0; i < k_; i++)
+    for (int i = 0; i < cfg_k; i++)
     {
         data_shards[static_cast<size_t>(i)].resize(shard_len, 0);
     }
     std::vector<std::vector<uint8_t>> parity(static_cast<size_t>(p));
-    std::vector<unsigned char*> data_ptrs(static_cast<size_t>(k_));
+    std::vector<unsigned char*> data_ptrs(static_cast<size_t>(cfg_k));
     std::vector<unsigned char*> coding_ptrs(static_cast<size_t>(p));
-    for (int i = 0; i < k_; i++)
+    for (int i = 0; i < cfg_k; i++)
     {
         data_ptrs[static_cast<size_t>(i)] =
             data_shards[static_cast<size_t>(i)].data();
@@ -422,23 +698,23 @@ bool vstreamer::rs_block_erasure::encode_block(
     }
     if (p > 0)
     {
-        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), k_, p,
+        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), cfg_k, p,
                           const_cast<unsigned char*>(g_tbls.data()),
                           data_ptrs.data(), coding_ptrs.data());
     }
 
     out->clear();
     const int sdu_n = static_cast<int>(packets.size());
-    for (int i = 0; i < n_; i++)
+    for (int i = 0; i < cfg_n; i++)
     {
-        if (i < k_ && i >= sdu_n)
+        if (i < cfg_k && i >= sdu_n)
         {
             continue;
         }
-        const uint8_t flags = i >= k_ ? k_flag_parity : 0;
+        const uint8_t flags = i >= cfg_k ? k_flag_parity : 0;
         size_t body_len = shard_len;
         const uint8_t* body = nullptr;
-        if (i < k_)
+        if (i < cfg_k)
         {
             const size_t plen = packets[static_cast<size_t>(i)].size();
             body_len = k_len_prefix + plen;
@@ -446,10 +722,10 @@ bool vstreamer::rs_block_erasure::encode_block(
         }
         else
         {
-            body = parity[static_cast<size_t>(i - k_)].data();
+            body = parity[static_cast<size_t>(i - cfg_k)].data();
         }
         std::vector<uint8_t> pkt(k_header_len + body_len);
-        pack_header(pkt.data(), block_id, i, k_, n_, flags, sdu_n);
+        pack_header(pkt.data(), block_id, i, cfg_k, cfg_n, flags, sdu_n);
         memcpy(pkt.data() + k_header_len, body, body_len);
         out->push_back(std::move(pkt));
     }
@@ -532,76 +808,115 @@ int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
 }
 
 bool vstreamer::rs_block_erasure::decode_block(
-    const std::unordered_map<int, std::vector<uint8_t>>& frags,
-    std::vector<std::vector<uint8_t>>* payloads, int* recovered) const
+    const std::unordered_map<int, shared_sized_buffer>& frags, fec_rx_payload_list* payloads,
+    int* recovered) const
 {
-    if (!enabled_)
+    if (!active)
     {
         return false;
     }
-    return decode_block(k_, n_, frags, payloads, recovered);
+    return decode_block(cfg_k, cfg_n, cfg_k, frags, payloads, recovered);
 }
 
 bool vstreamer::rs_block_erasure::decode_block(
-    int k, int n, const std::unordered_map<int, std::vector<uint8_t>>& frags,
-    std::vector<std::vector<uint8_t>>* payloads, int* recovered) const
+    int k, int n, int sdu_n, const std::unordered_map<int, shared_sized_buffer>& frags,
+    fec_rx_payload_list* payloads, int* recovered) const
 {
     if (payloads == nullptr || k < 1 || n < k || n > static_cast<int>(k_max_n) ||
-        frags.size() < static_cast<size_t>(k))
+        sdu_n < 0 || sdu_n > k)
     {
         return false;
     }
-    const int parity = n - k;
-    std::vector<uint8_t> encode_matrix(static_cast<size_t>(n) *
-                                       static_cast<size_t>(k));
-    gf_gen_cauchy1_matrix(encode_matrix.data(), n, k);
+    size_t shard_slots = frags.size();
+    for (int i = sdu_n; i < k; i++)
+    {
+        if (frags.find(i) == frags.end())
+        {
+            shard_slots++;
+        }
+    }
+    if (shard_slots < static_cast<size_t>(k))
+    {
+        return false;
+    }
+    const int               parity = n - k;
+    const kn_encode_tables& tables = kn_encode_tables_for(k, n);
+    const uint8_t*          encode_matrix = tables.encode_matrix.data();
 
-    size_t shard_len = 0;
+    size_t shard_len = k_len_prefix;
     for (const auto& kv : frags)
     {
-        if (kv.first < 0 || kv.first >= n)
+        if (kv.first < 0 || kv.first >= n || kv.second.size() < k_header_len)
         {
             return false;
         }
-        shard_len = std::max(shard_len, kv.second.size());
+        const size_t body_len = kv.second.size() - k_header_len;
+        shard_len = std::max(shard_len, body_len);
     }
-    if (shard_len < k_len_prefix)
-    {
-        return false;
-    }
-    // Systematic rows may be native-size; pad to the longest (usually parity)
-    // so ISA-L columns match encode.
     shard_len = align_shard(shard_len);
-    std::vector<std::vector<uint8_t>> padded(static_cast<size_t>(n));
-    std::vector<uint8_t> have(static_cast<size_t>(n), 0);
+
+    std::array<uint8_t, k_max_n>              have {};
+    std::array<std::vector<uint8_t>, k_max_n> owned {};
     for (const auto& kv : frags)
     {
-        auto& row = padded[static_cast<size_t>(kv.first)];
-        row = kv.second;
-        if (row.size() < shard_len)
+        const int idx = kv.first;
+        have[static_cast<size_t>(idx)] = 1;
+        const uint8_t* body = kv.second.u8() + k_header_len;
+        const size_t   body_len = kv.second.size() - k_header_len;
+        if (body_len < shard_len)
         {
-            row.resize(shard_len, 0);
+            owned[static_cast<size_t>(idx)].assign(body, body + body_len);
+            owned[static_cast<size_t>(idx)].resize(shard_len, 0);
         }
-        have[static_cast<size_t>(kv.first)] = 1;
+    }
+    for (int i = sdu_n; i < k; i++)
+    {
+        if (frags.find(i) != frags.end())
+        {
+            continue;
+        }
+        have[static_cast<size_t>(i)] = 1;
+        owned[static_cast<size_t>(i)].assign(shard_len, 0);
     }
 
-    std::vector<std::vector<uint8_t>> data_copy(static_cast<size_t>(k));
-    bool have_all_data = true;
+    const auto row_ref = [&](int idx) -> const std::vector<uint8_t>& {
+        if (!owned[static_cast<size_t>(idx)].empty())
+        {
+            return owned[static_cast<size_t>(idx)];
+        }
+        const shared_sized_buffer& shard = frags.at(idx);
+        owned[static_cast<size_t>(idx)].assign(shard.u8() + k_header_len,
+                                                shard.u8() + shard.size());
+        if (owned[static_cast<size_t>(idx)].size() < shard_len)
+        {
+            owned[static_cast<size_t>(idx)].resize(shard_len, 0);
+        }
+        return owned[static_cast<size_t>(idx)];
+    };
+
+    bool have_all_systematic = true;
     for (int i = 0; i < k; i++)
     {
         if (!have[static_cast<size_t>(i)])
         {
-            have_all_data = false;
-            continue;
+            have_all_systematic = false;
+            break;
         }
-        data_copy[static_cast<size_t>(i)] = padded[static_cast<size_t>(i)];
     }
 
-    int rec = 0;
-    if (!have_all_data)
+    std::vector<std::vector<uint8_t>> data_copy(static_cast<size_t>(k));
+    int                               rec = 0;
+    if (!have_all_systematic)
     {
+        for (int i = 0; i < k; i++)
+        {
+            if (have[static_cast<size_t>(i)])
+            {
+                data_copy[static_cast<size_t>(i)] = row_ref(i);
+            }
+        }
         uint8_t err_list[k_max_n];
-        int nerrs = 0;
+        int     nerrs = 0;
         for (int i = 0; i < n; i++)
         {
             if (!have[static_cast<size_t>(i)])
@@ -616,16 +931,16 @@ bool vstreamer::rs_block_erasure::decode_block(
         std::vector<uint8_t> decode_matrix(static_cast<size_t>(nerrs) *
                                            static_cast<size_t>(k));
         uint8_t decode_index[k_max_n];
-        if (gen_decode_matrix(k, n, encode_matrix.data(), err_list, nerrs,
-                              decode_matrix.data(), decode_index) != 0)
+        if (gen_decode_matrix(k, n, encode_matrix, err_list, nerrs, decode_matrix.data(),
+                              decode_index) != 0)
         {
             return false;
         }
-        std::vector<uint8_t> decode_tbls(static_cast<size_t>(k) *
-                                         static_cast<size_t>(nerrs) * 32);
-        std::vector<unsigned char*> src_ptrs(static_cast<size_t>(k));
+        std::vector<uint8_t>              decode_tbls(static_cast<size_t>(k) *
+                                                      static_cast<size_t>(nerrs) * 32);
+        std::vector<unsigned char*>       src_ptrs(static_cast<size_t>(k));
         std::vector<std::vector<uint8_t>> recover(static_cast<size_t>(nerrs));
-        std::vector<unsigned char*> rec_ptrs(static_cast<size_t>(nerrs));
+        std::vector<unsigned char*>       rec_ptrs(static_cast<size_t>(nerrs));
         for (int i = 0; i < k; i++)
         {
             const int idx = decode_index[i];
@@ -634,25 +949,22 @@ bool vstreamer::rs_block_erasure::decode_block(
                 return false;
             }
             src_ptrs[static_cast<size_t>(i)] =
-                padded[static_cast<size_t>(idx)].data();
+                const_cast<unsigned char*>(row_ref(idx).data());
         }
         for (int i = 0; i < nerrs; i++)
         {
             recover[static_cast<size_t>(i)].assign(shard_len, 0);
-            rec_ptrs[static_cast<size_t>(i)] =
-                recover[static_cast<size_t>(i)].data();
+            rec_ptrs[static_cast<size_t>(i)] = recover[static_cast<size_t>(i)].data();
         }
-        ec_init_tables_base(k, nerrs, decode_matrix.data(),
-                            decode_tbls.data());
-        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), k, nerrs,
-                          decode_tbls.data(), src_ptrs.data(), rec_ptrs.data());
+        ec_init_tables_base(k, nerrs, decode_matrix.data(), decode_tbls.data());
+        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), k, nerrs, decode_tbls.data(),
+                            src_ptrs.data(), rec_ptrs.data());
         for (int i = 0; i < nerrs; i++)
         {
             const int idx = err_list[i];
             if (idx < k)
             {
-                data_copy[static_cast<size_t>(idx)] =
-                    std::move(recover[static_cast<size_t>(i)]);
+                data_copy[static_cast<size_t>(idx)] = std::move(recover[static_cast<size_t>(i)]);
                 rec++;
             }
         }
@@ -661,8 +973,42 @@ bool vstreamer::rs_block_erasure::decode_block(
     payloads->clear();
     for (int i = 0; i < k; i++)
     {
-        const auto& row = data_copy[static_cast<size_t>(i)];
-        if (row.size() < k_len_prefix)
+        if (have_all_systematic)
+        {
+            if (!have[static_cast<size_t>(i)])
+            {
+                continue;
+            }
+            if (frags.find(i) != frags.end())
+            {
+                shared_sized_buffer app;
+                if (!frag_to_app(frags.at(i), &app))
+                {
+                    return false;
+                }
+                if (app.empty())
+                {
+                    continue;
+                }
+                payloads->push_back(std::move(app));
+                continue;
+            }
+            const std::vector<uint8_t>& row = owned[static_cast<size_t>(i)];
+            if (row.size() < k_len_prefix)
+            {
+                return false;
+            }
+            const uint16_t orig_len = load_be16(row.data());
+            if (orig_len == 0)
+            {
+                continue;
+            }
+            payloads->push_back(
+                shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
+            continue;
+        }
+        const std::vector<uint8_t>& row = data_copy[static_cast<size_t>(i)];
+        if (row.empty() || row.size() < k_len_prefix)
         {
             return false;
         }
@@ -675,8 +1021,7 @@ bool vstreamer::rs_block_erasure::decode_block(
         {
             return false;
         }
-        payloads->emplace_back(row.data() + k_len_prefix,
-                               row.data() + k_len_prefix + orig_len);
+        payloads->push_back(shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
     }
     if (recovered != nullptr)
     {
@@ -692,13 +1037,13 @@ void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len,
     {
         out->clear();
     }
-    if (!enabled_ || out == nullptr || data == nullptr)
+    if (!active || out == nullptr || data == nullptr)
     {
         return;
     }
     if (len > max_original())
     {
-        oversized_++;
+        oversized_count++;
         return;
     }
     pending.emplace_back(data, data + len);
@@ -708,7 +1053,7 @@ void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len,
                     std::chrono::milliseconds(timeout_ms);
         deadline_set = true;
     }
-    if (static_cast<int>(pending.size()) >= k_)
+    if (static_cast<int>(pending.size()) >= cfg_k)
     {
         flush(out);
     }
@@ -720,13 +1065,13 @@ void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
     {
         out->clear();
     }
-    if (!enabled_ || out == nullptr || pending.empty())
+    if (!active || out == nullptr || pending.empty())
     {
         return;
     }
     if (!encode_block(pending, block_id, out))
     {
-        oversized_++;
+        oversized_count++;
         out->clear();
         pending.clear();
         deadline_set = false;
@@ -735,7 +1080,7 @@ void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
     block_id = static_cast<uint16_t>(block_id + 1);
     pending.clear();
     deadline_set = false;
-    blocks_++;
+    blocks_count++;
 }
 
 int vstreamer::rs_block_erasure::rx_hold_ms() const
@@ -743,41 +1088,26 @@ int vstreamer::rs_block_erasure::rx_hold_ms() const
     return std::max(timeout_ms * 10, 250);
 }
 
-int count_app_packets_in_frags(
-    const std::unordered_map<int, std::vector<uint8_t>>& frags, int k)
+void vstreamer::rs_block_erasure::account_missing_shards(const rx_block_s& block)
 {
-    int n = 0;
-    for (int i = 0; i < k; i++)
+    const int sn = block.sdu_n > 0 ? block.sdu_n : block.k;
+    if (sn <= 0 || block.n <= 0 || block.k <= 0)
     {
-        const auto it = frags.find(i);
-        if (it == frags.end())
-        {
-            continue;
-        }
-        const auto& row = it->second;
-        if (row.size() < vstreamer::rs_block_erasure::k_len_prefix)
-        {
-            continue;
-        }
-        const uint16_t orig_len = load_be16(row.data());
-        if (orig_len > 0)
-        {
-            n++;
-        }
+        return;
     }
-    return n;
-}
-
-void vstreamer::rs_block_erasure::note_rx_block_loss(const rx_block_s& block)
-{
-    (void)block;
+    const int expected = sn + (block.n - block.k);
+    const int got = static_cast<int>(block.frags.size());
+    if (expected > got)
+    {
+        missing_shards_count += static_cast<uint64_t>(expected - got);
+    }
 }
 
 void vstreamer::rs_block_erasure::note_rx_block_output_shortfall(int expected, int available)
 {
     if (expected > available)
     {
-        fail_lost_app_pkts_ += static_cast<uint64_t>(expected - available);
+        fail_lost_app_pkts_count += static_cast<uint64_t>(expected - available);
     }
 }
 
@@ -790,40 +1120,6 @@ int vstreamer::rs_block_erasure::expected_sdus(const rx_block_s& block)
     return block.k;
 }
 
-void vstreamer::rs_block_erasure::finish_block_with_available(
-    const rx_block_s& block, uint16_t block_id, std::vector<std::vector<uint8_t>>* out)
-{
-    int available = 0;
-    for (int i = 0; i < block.k; i++)
-    {
-        const auto it = block.frags.find(i);
-        if (it == block.frags.end())
-        {
-            continue;
-        }
-        const auto& row = it->second;
-        if (row.size() < k_len_prefix)
-        {
-            continue;
-        }
-        const uint16_t orig_len = load_be16(row.data());
-        if (orig_len == 0)
-        {
-            continue;
-        }
-        if (k_len_prefix + orig_len > row.size())
-        {
-            continue;
-        }
-        ++available;
-        if (out != nullptr)
-        {
-            out->emplace_back(row.data() + k_len_prefix, row.data() + k_len_prefix + orig_len);
-        }
-    }
-    note_rx_block_output_shortfall(expected_sdus(block), available);
-    skip_emit_block(block_id);
-}
 
 int vstreamer::rs_block_erasure::done_hold_ms() const
 {
@@ -838,14 +1134,14 @@ int vstreamer::rs_block_erasure::emit_hold_ms() const
     return std::max(timeout_ms * 3, 60);
 }
 
-void vstreamer::rs_block_erasure::poll_rx(std::vector<std::vector<uint8_t>>* out)
+void vstreamer::rs_block_erasure::poll_rx(fec_rx_payload_list* out)
 {
     if (out != nullptr)
     {
         out->clear();
     }
     expire_rx(out);
-    drain_emit_queue(out);
+    run_emit_engine(out);
 }
 
 std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::now() const
@@ -859,9 +1155,9 @@ void vstreamer::rs_block_erasure::on_tick(std::vector<std::vector<uint8_t>>* out
     {
         out->clear();
     }
-    // Always expire incomplete RX blocks (RX decode needs no encode init).
-    expire_rx(out);
-    if (!enabled_ || !deadline_set || timeout_ms <= 0)
+    fec_rx_payload_list rx_expired;
+    expire_rx(&rx_expired);
+    if (!active || !deadline_set || timeout_ms <= 0)
     {
         return;
     }
@@ -872,7 +1168,21 @@ void vstreamer::rs_block_erasure::on_tick(std::vector<std::vector<uint8_t>>* out
     flush(out);
 }
 
-void vstreamer::rs_block_erasure::expire_rx(std::vector<std::vector<uint8_t>>* out)
+bool vstreamer::rs_block_erasure::next_deadline(
+    std::chrono::steady_clock::time_point* out) const
+{
+    if (!active || !deadline_set || timeout_ms <= 0)
+    {
+        return false;
+    }
+    if (nullptr != out)
+    {
+        *out = deadline;
+    }
+    return true;
+}
+
+void vstreamer::rs_block_erasure::expire_rx(fec_rx_payload_list* out)
 {
     expire_done();
     if (rx_blocks.empty())
@@ -885,12 +1195,11 @@ void vstreamer::rs_block_erasure::expire_rx(std::vector<std::vector<uint8_t>>* o
     {
         if (t - it->second.last_seen > hold)
         {
-            decode_fail_++;
-            note_rx_block_loss(it->second);
+            evicted_blocks_count++;
             const uint16_t expired_id = it->first;
             const rx_block_s block_snap = it->second;
             it = rx_blocks.erase(it);
-            finish_block_with_available(block_snap, expired_id, out);
+            abandon_partial_block(block_snap, expired_id, out);
         }
         else
         {
@@ -941,31 +1250,43 @@ void vstreamer::rs_block_erasure::mark_done(uint16_t block_id)
 }
 
 void vstreamer::rs_block_erasure::push_air(const uint8_t* data, size_t len,
-                              std::vector<std::vector<uint8_t>>* out)
+                                           fec_rx_payload_list* out)
+{
+    if (nullptr == data || 0 == len)
+    {
+        return;
+    }
+    push_air(shared_sized_buffer::copy_from(data, len), out);
+}
+
+void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
+                                           fec_rx_payload_list* out)
 {
     if (out != nullptr)
     {
         out->clear();
     }
-    if (out == nullptr || data == nullptr || len == 0)
+    if (out == nullptr || shard.empty())
     {
         return;
     }
+    const uint8_t* data = shard.u8();
+    const size_t   len = shard.size();
     // RX is always FEC-aware: k/n come from the shard header. Encode still
     // requires init().
     if (len < k_header_len)
     {
-        decode_fail_++;
+        hdr_errors_count++;
         return;
     }
     struct push_air_finish
     {
         rs_block_erasure*                     self;
-        std::vector<std::vector<uint8_t>>* out;
+        fec_rx_payload_list* out;
         ~push_air_finish()
         {
             self->expire_rx(out);
-            self->drain_emit_queue(out);
+            self->run_emit_engine(out);
         }
     } finish {this, out};
     uint16_t block_id = 0;
@@ -976,17 +1297,20 @@ void vstreamer::rs_block_erasure::push_air(const uint8_t* data, size_t len,
     uint8_t flags = 0;
     if (!unpack_header(data, len, &block_id, &index, &k, &n, &flags, &sdu_n))
     {
-        decode_fail_++;
+        hdr_errors_count++;
         return;
     }
-    // In-order emission starts from the first block id seen on the wire so
-    // a receiver joining mid-stream does not wait for id 0.
     note_emit_base(block_id);
-    if (done.find(block_id) != done.end())
+    touch_newest(block_id);
+    maybe_resync_on_late_shard(block_id);
+    ring_evict_stale(out);
+
+    const int d = dist_from_emit(block_id);
+    if (d < 0 && done.find(block_id) != done.end())
     {
         return;
     }
-    rx_block_s* buf = nullptr;
+
     auto it = rx_blocks.find(block_id);
     if (it == rx_blocks.end())
     {
@@ -1002,10 +1326,9 @@ void vstreamer::rs_block_erasure::push_air(const uint8_t* data, size_t len,
             }
             const uint16_t evict_id = oldest->first;
             const rx_block_s block_snap = oldest->second;
-            decode_fail_++;
-            note_rx_block_loss(block_snap);
+            evicted_blocks_count++;
             rx_blocks.erase(oldest);
-            finish_block_with_available(block_snap, evict_id, out);
+            abandon_partial_block(block_snap, evict_id, out);
         }
         rx_block_s nb;
         nb.k = k;
@@ -1018,73 +1341,99 @@ void vstreamer::rs_block_erasure::push_air(const uint8_t* data, size_t len,
     }
     else if (it->second.k != k || it->second.n != n || it->second.sdu_n != sdu_n)
     {
-        decode_fail_++;
+        kn_mismatch_count++;
         const rx_block_s block_snap = it->second;
         rx_blocks.erase(it);
-        finish_block_with_available(block_snap, block_id, out);
+        abandon_partial_block(block_snap, block_id, out);
         return;
     }
-    buf = &it->second;
+
+    rx_block_s* buf = &it->second;
     if (buf->frags.count(index) != 0)
     {
         return;
     }
-    buf->frags.emplace(index,
-                       std::vector<uint8_t>(data + k_header_len, data + len));
+    buf->frags.emplace(index, std::move(shard));
     buf->last_seen = now();
-    if (static_cast<int>(buf->frags.size()) < sdu_n)
+
+    if (wire_block_id(block_id) == emit_next)
+    {
+        try_stream_head_systematic(*buf, out);
+    }
+    else if (dist_from_emit(block_id) > 0 && !later_block_waiting)
+    {
+        later_block_waiting = true;
+        later_block_since = now();
+    }
+
+    if (try_decode_block(block_id, buf, out))
     {
         return;
     }
-    std::unordered_map<int, std::vector<uint8_t>> frags_decode = buf->frags;
-    add_virtual_empty_systematic(sdu_n, k, frags_decode);
-    if (frags_decode.size() < static_cast<size_t>(k))
-    {
-        return;
-    }
-    int rec = 0;
-    std::vector<std::vector<uint8_t>> decoded;
-    const rx_block_s block_snap = *buf;
-    const bool ok = decode_block(k, n, frags_decode, &decoded, &rec);
-    rx_blocks.erase(block_id);
-    mark_done(block_id);
-    if (!ok)
-    {
-        decode_fail_++;
-        finish_block_with_available(block_snap, block_id, out);
-        return;
-    }
-    recovered_ += static_cast<uint64_t>(rec);
-    blocks_++;
-    note_rx_block_output_shortfall(expected_sdus(block_snap),
-                                   static_cast<int>(decoded.size()));
-    queue_decoded_block(block_id, std::move(decoded), out);
+
+    run_emit_engine(out);
 }
 
 uint64_t vstreamer::rs_block_erasure::take_recovered()
 {
-    const uint64_t n = recovered_ - recovered_seen_;
-    recovered_seen_ = recovered_;
+    const uint64_t n = recovered_count - recovered_seen;
+    recovered_seen = recovered_count;
     return n;
 }
 
 uint64_t vstreamer::rs_block_erasure::take_decode_fail()
 {
-    const uint64_t n = decode_fail_ - decode_fail_seen_;
-    decode_fail_seen_ = decode_fail_;
+    const uint64_t total = decode_fail();
+    const uint64_t n = total - decode_fail_seen;
+    decode_fail_seen = total;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_hdr_errors()
+{
+    const uint64_t n = hdr_errors_count - hdr_errors_seen;
+    hdr_errors_seen = hdr_errors_count;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_kn_mismatch()
+{
+    const uint64_t n = kn_mismatch_count - kn_mismatch_seen;
+    kn_mismatch_seen = kn_mismatch_count;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_evicted_blocks()
+{
+    const uint64_t n = evicted_blocks_count - evicted_blocks_seen;
+    evicted_blocks_seen = evicted_blocks_count;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_rs_failures()
+{
+    const uint64_t n = rs_failures_count - rs_failures_seen;
+    rs_failures_seen = rs_failures_count;
     return n;
 }
 
 uint64_t vstreamer::rs_block_erasure::take_fail_missing_shards()
 {
-    const uint64_t n = fail_missing_shards_ - fail_missing_shards_seen_;
-    fail_missing_shards_seen_ = fail_missing_shards_;
+    const uint64_t n = missing_shards_count - missing_shards_seen;
+    missing_shards_seen = missing_shards_count;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_late_blocks()
+{
+    const uint64_t n = late_blocks_count - late_blocks_seen;
+    late_blocks_seen = late_blocks_count;
     return n;
 }
 
 uint64_t vstreamer::rs_block_erasure::take_fail_lost_app_pkts()
 {
-    const uint64_t n = fail_lost_app_pkts_ - fail_lost_app_pkts_seen_;
-    fail_lost_app_pkts_seen_ = fail_lost_app_pkts_;
+    const uint64_t n = fail_lost_app_pkts_count - fail_lost_app_pkts_seen;
+    fail_lost_app_pkts_seen = fail_lost_app_pkts_count;
     return n;
 }

@@ -1,5 +1,12 @@
 # VStreamer
 
+> **Bench code (2026):** The running tree uses `component_source` / `component_coder` /
+> `component_sink` with `data_packet` + `shared_sized_buffer`, `configure`/`query`, and concrete
+> types such as `stream_sender`, `stream_receiver`, `rtp_h264_pay`, `rtp_h264_depay`, `mkv_sink`,
+> and `sdl_sink`. Sections below that describe `source::fetch`, `sink::write`, `EmitFn`, a core
+> feedback plugin, or `Mp4Sink` document **target / roadmap** design — see the status table at the
+> end of this file.
+
 VStreamer is a **framework** for building RTP video paths with channel
 feedback for flow control. Applications compose **video sources**, **video
 sinks**, optional **codecs**, and a **feedback** plugin. The framework does
@@ -46,6 +53,13 @@ The core never opens V4L2, Cedar, or a UDP destination by itself. It:
 Thread layout is host-specific. On the H3, CPU0 is reserved for
 `winject-manager`; fetch and one decode worker share CPU1, the second
 decode worker CPU2, encode CPU3.
+
+`stream_sdl` pins pipeline stages with **`VSTREAMER_CPU_MAP`**: semicolon-separated
+`stage=cpulist` entries (`cpulist` = comma list and/or ranges, e.g. `4-7`).
+Stages: `source`, `jpeg`, `jpeg_workers`, `encode`, `rx`. Use `-1` to leave a
+stage unpinned. Orange Pi 5 (RK3588) default:
+`source=0;jpeg=1;encode=2;rx=3;jpeg_workers=4-7`. Rover H3 example:
+`source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 
 Queue depth 32. Width for Cedar plugins must be a multiple of 32.
 
@@ -207,3 +221,15 @@ Glue that stays in core: queues, pins, lock order (`cfg` before encoder),
 
 Out of scope: drive ESP32, drive console `:22090`, winject TCP `:2323`,
 radio firmware.
+
+## Roadmap / implementation status
+
+| Item | Status |
+|------|--------|
+| `component_*` + `data_packet` pipeline | **bench** (`stream_sdl`, rover test app) |
+| `stream_sender` / `stream_receiver` + RS FEC | **done** (review-fixes branch) |
+| `rtp_h264_pay` / `rtp_h264_depay` | **done** |
+| Core feedback plugin + reverse telemetry UDP | **not started** |
+| Config file loader + core console | **not started** (bench uses `channel_controller` UDP console) |
+| `Mp4Sink`, legacy `RtpSink`/`RtpSource` names in table above | **planned** (`mkv_sink` for record today) |
+| Winject / rover deployment wiring | **bench-only** (loopback + docs) |

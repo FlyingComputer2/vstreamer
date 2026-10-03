@@ -35,23 +35,26 @@ public:
 
     int input(uint8_t port, const data_packet &in) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     void stop_locked();
     int  start_locked(int w, int h);
     int  ensure_session_locked(int w, int h);
     int  write_frame_locked(const data_packet &in);
+    void split_output_template_locked();
+    [[nodiscard]] std::string segment_path_locked() const;
 
     mutable std::mutex mu;
 
     bool opened = false;
 
+    std::string output_template;
+    std::string output_stem;
+    std::string output_ext;
     std::string output_path;
+    int         segment_index = 0;
     int         cfg_width = 0;
     int         cfg_height = 0;
     int         fps = 30;
@@ -59,15 +62,14 @@ private:
     bool recording = false;
     int  live_w = 0;
     int  live_h = 0;
-    int64_t pts = 0;
+    int64_t last_mux_pts = -1;
+    int64_t segment_pts_base = -1;
     double  t0 = 0.0;
     uint64_t frames_out = 0;
 
     /* Opaque libav handles; typed in the .cpp. */
     void *fmt = nullptr;
     void *stream = nullptr;
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

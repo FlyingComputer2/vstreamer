@@ -8,11 +8,13 @@ namespace vstreamer
 
 /* Semi-planar (NV12/NV21 layout) with hor/ver stride → packed NV12 (linesize == width). */
 int pack_yuv420sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_stride,
-                          int ver_stride, uint8_t *dst, int dst_w, int dst_h);
+                          int ver_stride, uint8_t *dst, int dst_w, int dst_h,
+                          bool swap_chroma = false);
 
 /* Semi-planar NV16/NV61 (full-height UV) → packed NV12. */
 int pack_yuv422sp_to_nv12(const uint8_t *base, int src_w, int src_h, int hor_stride,
-                          int ver_stride, uint8_t *dst, int dst_w, int dst_h);
+                          int ver_stride, uint8_t *dst, int dst_w, int dst_h,
+                          bool swap_chroma = false);
 
 /* Planar I420 → packed NV12. */
 int pack_yuv420p_to_nv12(const uint8_t *y, int y_stride, const uint8_t *u, int u_stride,

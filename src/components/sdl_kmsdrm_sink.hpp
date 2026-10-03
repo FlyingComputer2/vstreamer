@@ -38,11 +38,8 @@ public:
 
     int input(uint8_t port, const data_packet &in) override;
 
-    int configure(uint64_t key, int64_t value) override;
-    int query(uint64_t key, int64_t *value) const override;
-
-    int configure(std::string_view key, std::string_view *value) override;
-    int query(std::string_view key, std::string_view *value) const override;
+    int configure(std::string_view key, std::string_view value) override;
+    int query(std::string_view key, std::string *value) const override;
 
 private:
     mutable std::mutex mu;
@@ -51,8 +48,6 @@ private:
     uint64_t frames_in = 0;
 
     sdl_nv12_presenter present {"sdl_kmsdrm_sink", "kmsdrm"};
-
-    mutable std::string query_buf;
 };
 
 }  // namespace vstreamer

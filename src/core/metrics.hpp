@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -31,7 +32,7 @@ public:
     metrics();
     ~metrics();
 
-    std::shared_ptr<metric> get_metric(const std::string &name, metric &metric);
+    std::shared_ptr<metric> get_metric(const std::string &name);
 
     [[nodiscard]] std::string to_string() const;
 
@@ -41,8 +42,8 @@ public:
 private:
     mutable std::mutex mu;
 
-    std::vector<std::string> order;
     std::vector<std::pair<std::string, std::shared_ptr<metric>>> entries;
+    std::unordered_map<std::string, size_t>                      index;
 };
 
 }  // namespace vstreamer

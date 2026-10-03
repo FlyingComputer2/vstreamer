@@ -199,7 +199,7 @@ def main() -> int:
             # calculate FEC N
             fec_n_ = fec_clamp(fec_map(udp_loss_long.loss))
             plot("fec_n", fec_n_)
-            console.line(f"set_fec_n {fec_n_}")
+            console.line(f"set_fec_n {int(round(fec_n_))}")
 
             # calculate CBR (receiver counter reset on peer restart gives a negative delta)
             cbr_kbps = rate_ctl.step(max(0.0, fec_gap_delta_), metrics_dt, time.monotonic())

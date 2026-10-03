@@ -184,6 +184,8 @@ void h264_decoder_mpp::free_decoder_locked()
         mpp_buffer_group_put(grp);
         frm_grp = nullptr;
     }
+    nv12_pool.reset();
+    nv12_pool_bytes = 0;
 }
 
 void h264_decoder_mpp::clear_pending_locked()
@@ -193,7 +195,12 @@ void h264_decoder_mpp::clear_pending_locked()
         f.release();
     }
     ready_frames.clear();
-    pending_capture_mono_ns = 0;
+    pts_ring_head = 0;
+    for (pts_capture_entry &e : pts_ring)
+    {
+        e.pts = 0;
+        e.capture_mono_ns = 0;
+    }
 }
 
 int h264_decoder_mpp::handle_info_change_locked(void *mpp_frame)
@@ -249,8 +256,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     auto *frame = static_cast<MppFrame>(mpp_frame);
     if (mpp_frame_get_errinfo(frame) || mpp_frame_get_discard(frame))
     {
-        static std::atomic<unsigned> n_errinfo {0};
-        if (n_errinfo.fetch_add(1) < 5)
+        if (log_errinfo_throttle++ < 5)
         {
             std::fprintf(stderr,
                          "h264_decoder_mpp: frame errinfo=%u discard=%u\n",
@@ -274,8 +280,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     MppFrameFormat raw = static_cast<MppFrameFormat>(fmt & MPP_FRAME_FMT_MASK);
     if (MPP_FRAME_FMT_IS_FBC(fmt) || MPP_FRAME_FMT_IS_TILE(fmt))
     {
-        static std::atomic<unsigned> n_fbc {0};
-        if (n_fbc.fetch_add(1) < 5)
+        if (log_fbc_throttle++ < 5)
         {
             std::fprintf(stderr, "h264_decoder_mpp: unsupported MPP fmt=0x%x (fbc/tile)\n",
                          static_cast<unsigned>(fmt));
@@ -287,8 +292,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     const bool is_422 = (raw == MPP_FMT_YUV422SP || raw == MPP_FMT_YUV422SP_VU);
     if (!is_420 && !(is_422 && output_mode == output_mode_e::convert))
     {
-        static std::atomic<unsigned> n_pix {0};
-        if (n_pix.fetch_add(1) < 5)
+        if (log_pix_throttle++ < 5)
         {
             std::fprintf(stderr, "h264_decoder_mpp: unsupported pixel raw=0x%x mode=%d\n",
                          static_cast<unsigned>(raw), static_cast<int>(output_mode));
@@ -307,39 +311,47 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     int hor = static_cast<int>(mpp_frame_get_hor_stride(frame));
     int ver = static_cast<int>(mpp_frame_get_ver_stride(frame));
 
-    size_t nv12_sz =
-        static_cast<size_t>(width) * static_cast<size_t>(height) * 3ULL / 2ULL;
-    auto *out = static_cast<uint8_t *>(std::malloc(nv12_sz));
-    if (nullptr == out)
+    const bool swap_chroma =
+        (raw == MPP_FMT_YUV420SP_VU || raw == MPP_FMT_YUV422SP_VU);
+    const int  out_w = output_size_stream ? src_w : width;
+    const int  out_h = output_size_stream ? src_h : height;
+    const size_t nv12_sz =
+        static_cast<size_t>(out_w) * static_cast<size_t>(out_h) * 3ULL / 2ULL;
+    if (!nv12_pool || nv12_pool_bytes != nv12_sz)
+    {
+        nv12_pool = std::make_unique<buffer_pool>(nv12_sz, k_max_ready_frames);
+        nv12_pool_bytes = nv12_sz;
+    }
+    shared_sized_buffer out_buf = nv12_pool->acquire(nv12_sz);
+    if (out_buf.empty())
     {
         return -ENOMEM;
     }
-    std::memset(out, 0, nv12_sz);
 
     int r = 0;
     if (is_420)
     {
-        r = pack_yuv420sp_to_nv12(base, src_w, src_h, hor, ver, out, width, height);
+        r = pack_yuv420sp_to_nv12(base, src_w, src_h, hor, ver, out_buf.u8(), out_w, out_h,
+                                  swap_chroma);
     }
     else
     {
-        r = pack_yuv422sp_to_nv12(base, src_w, src_h, hor, ver, out, width, height);
+        r = pack_yuv422sp_to_nv12(base, src_w, src_h, hor, ver, out_buf.u8(), out_w, out_h,
+                                  swap_chroma);
     }
     if (r < 0)
     {
-        std::free(out);
         return r;
     }
 
-    int64_t pts = mpp_frame_get_pts(frame);
+    const int64_t pts = mpp_frame_get_pts(frame);
+    const int64_t cap_ns = lookup_capture_pts(pts);
     vstreamer::frame packed;
-    packed.reset(media_kind_e::NV12, width, height, pts, false, out, nv12_sz,
-                 [](uint8_t *p) { std::free(p); }, pending_capture_mono_ns);
-    if (pending_capture_mono_ns > 0)
+    packed.reset(media_kind_e::NV12, out_w, out_h, pts, false, std::move(out_buf), cap_ns);
+    if (cap_ns > 0)
     {
         const int64_t now_ns = steady_mono_ns();
-        const double  ms =
-            static_cast<double>(now_ns - pending_capture_mono_ns) / 1e6;
+        const double  ms = static_cast<double>(now_ns - cap_ns) / 1e6;
         if (ms >= 0.0)
         {
             last_latency_ms = ms;
@@ -349,27 +361,61 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     return 0;
 }
 
-void h264_decoder_mpp::drain_mpp_to_ready_locked(int timeout_ms)
+void h264_decoder_mpp::remember_capture_pts(int64_t pts, int64_t capture_mono_ns)
 {
-    while (ready_frames.size() < k_max_ready_frames)
+    pts_ring[pts_ring_head % k_pts_ring] = {pts, capture_mono_ns};
+    pts_ring_head++;
+}
+
+int64_t h264_decoder_mpp::lookup_capture_pts(int64_t pts) const
+{
+    for (const pts_capture_entry &e : pts_ring)
     {
-        const int r = fetch_one_mpp_frame_locked(timeout_ms);
+        if (e.pts == pts && e.capture_mono_ns > 0)
+        {
+            return e.capture_mono_ns;
+        }
+    }
+    return 0;
+}
+
+void h264_decoder_mpp::drain_mpp_to_ready(int timeout_ms)
+{
+    for (;;)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (ready_frames.size() >= k_max_ready_frames)
+            {
+                return;
+            }
+        }
+        const int r = fetch_one_mpp_frame(timeout_ms);
         if (r < 0)
         {
-            break;
+            return;
         }
     }
 }
 
-int h264_decoder_mpp::fetch_one_mpp_frame_locked(int timeout_ms)
+int h264_decoder_mpp::fetch_one_mpp_frame(int timeout_ms)
 {
     if (ready_frames.size() >= k_max_ready_frames)
     {
         return -EAGAIN;
     }
 
-    auto *mpp_ctx = static_cast<MppCtx>(ctx);
-    auto *mpp_mpi = static_cast<MppApi *>(mpi);
+    void *mpp_ctx = nullptr;
+    void *mpp_mpi = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (nullptr == ctx || nullptr == mpi)
+        {
+            return -EBADF;
+        }
+        mpp_ctx = ctx;
+        mpp_mpi = mpi;
+    }
 
     using clock = std::chrono::steady_clock;
     auto deadline = clock::now();
@@ -389,7 +435,12 @@ int h264_decoder_mpp::fetch_one_mpp_frame_locked(int timeout_ms)
             return -ECANCELED;
         }
         MppFrame frame = nullptr;
-        MPP_RET  ret = mpp_mpi->decode_get_frame(mpp_ctx, &frame);
+        MPP_RET  ret = MPP_OK;
+        {
+            std::lock_guard<std::mutex> api_lock(mpp_io_mu);
+            ret = static_cast<MppApi *>(mpp_mpi)->decode_get_frame(static_cast<MppCtx>(mpp_ctx),
+                                                                   &frame);
+        }
         if (ret == MPP_ERR_TIMEOUT || (ret == MPP_OK && nullptr == frame))
         {
             if (timeout_ms == 0)
@@ -410,7 +461,11 @@ int h264_decoder_mpp::fetch_one_mpp_frame_locked(int timeout_ms)
 
         if (mpp_frame_get_info_change(frame))
         {
-            int r = handle_info_change_locked(frame);
+            int r = 0;
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                r = handle_info_change_locked(frame);
+            }
             mpp_frame_deinit(&frame);
             if (r < 0)
             {
@@ -419,7 +474,11 @@ int h264_decoder_mpp::fetch_one_mpp_frame_locked(int timeout_ms)
             continue;
         }
 
-        int r = pack_mpp_to_ready_locked(frame);
+        int r = 0;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            r = pack_mpp_to_ready_locked(frame);
+        }
         mpp_frame_deinit(&frame);
         return r;
     }
@@ -460,42 +519,60 @@ void h264_decoder_mpp::close()
 int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
 {
     const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::H264 || f.buf.size > k_max_au)
+    if (f.kind != media_kind_e::H264 || f.buf.size() > k_max_au)
     {
         return -EINVAL;
     }
 
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened || nullptr == ctx || nullptr == mpi)
     {
-        return -EBADF;
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened || nullptr == ctx || nullptr == mpi)
+        {
+            return -EBADF;
+        }
+        if (ready_frames.size() >= k_max_ready_frames)
+        {
+            return -EAGAIN;
+        }
+        remember_capture_pts(f.pts, f.capture_mono_ns);
     }
 
-    drain_mpp_to_ready_locked(0);
-    if (ready_frames.size() >= k_max_ready_frames)
+    drain_mpp_to_ready(0);
     {
-        return -EAGAIN;
+        std::lock_guard<std::mutex> lock(mu);
+        if (ready_frames.size() >= k_max_ready_frames)
+        {
+            return -EAGAIN;
+        }
     }
 
     MppPacket packet = nullptr;
-    MPP_RET ret = mpp_packet_init(&packet, const_cast<uint8_t *>(f.buf.data), f.buf.size);
+    MPP_RET   ret = mpp_packet_init(&packet, const_cast<uint8_t *>(f.buf.u8()), f.buf.size());
     if (ret != MPP_OK || nullptr == packet)
     {
         return -ENOMEM;
     }
     mpp_packet_set_pts(packet, f.pts);
-    mpp_packet_set_length(packet, f.buf.size);
+    mpp_packet_set_length(packet, f.buf.size());
 
-    auto *mpp_ctx = static_cast<MppCtx>(ctx);
-    auto *mpp_mpi = static_cast<MppApi *>(mpi);
-    pending_capture_mono_ns = f.capture_mono_ns;
+    void *mpp_ctx = nullptr;
+    void *mpp_mpi = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        mpp_ctx = ctx;
+        mpp_mpi = mpi;
+    }
 
-    ret = mpp_mpi->decode_put_packet(mpp_ctx, packet);
+    {
+        std::lock_guard<std::mutex> api_lock(mpp_io_mu);
+        ret = static_cast<MppApi *>(mpp_mpi)->decode_put_packet(static_cast<MppCtx>(mpp_ctx),
+                                                                packet);
+    }
     mpp_packet_deinit(&packet);
 
     if (ret == MPP_ERR_BUFFER_FULL)
     {
-        drain_mpp_to_ready_locked(0);
+        drain_mpp_to_ready(0);
         return -EAGAIN;
     }
     if (ret != MPP_OK)
@@ -503,46 +580,42 @@ int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
         return -EIO;
     }
 
-    drain_mpp_to_ready_locked(0);
+    drain_mpp_to_ready(0);
     return 0;
 }
 
 int h264_decoder_mpp::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened || nullptr == ctx || nullptr == mpi)
     {
-        return -EBADF;
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened || nullptr == ctx || nullptr == mpi)
+        {
+            return -EBADF;
+        }
+        if (!ready_frames.empty())
+        {
+            out.adopt_frame(std::move(ready_frames.front()));
+            ready_frames.pop_front();
+            return 0;
+        }
     }
 
-    drain_mpp_to_ready_locked(timeout_ms);
-    if (ready_frames.empty())
+    drain_mpp_to_ready(timeout_ms);
     {
-        return -EAGAIN;
+        std::lock_guard<std::mutex> lock(mu);
+        if (ready_frames.empty())
+        {
+            return -EAGAIN;
+        }
+        out.adopt_frame(std::move(ready_frames.front()));
+        ready_frames.pop_front();
+        return 0;
     }
-
-    out.adopt_frame(std::move(ready_frames.front()));
-    ready_frames.pop_front();
-    return 0;
 }
 
-int h264_decoder_mpp::configure(uint64_t /*key*/, int64_t /*value*/)
+int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
 {
-    return -EINVAL;
-}
-
-int h264_decoder_mpp::query(uint64_t /*key*/, int64_t * /*value*/) const
-{
-    return -EINVAL;
-}
-
-int h264_decoder_mpp::configure(std::string_view key, std::string_view *value)
-{
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-    std::string_view v = *value;
+    std::string_view v = value;
 
     std::lock_guard<std::mutex> lock(mu);
     if (key == "size")
@@ -592,21 +665,29 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view *value)
         output_format = kind;
         return 0;
     }
+    if (key == "output_size_mode")
+    {
+        if (v == "stream")
+        {
+            output_size_stream = true;
+            return 0;
+        }
+        if (v == "config")
+        {
+            output_size_stream = false;
+            return 0;
+        }
+        return -EINVAL;
+    }
     return -EINVAL;
 }
 
-int h264_decoder_mpp::query(std::string_view key, std::string_view *value) const
+int h264_decoder_mpp::query(std::string_view key, std::string *value) const
 {
-    if (nullptr == value)
-    {
-        return -EINVAL;
-    }
-
     std::lock_guard<std::mutex> lock(mu);
     if (key == "status")
     {
-        query_buf = opened ? "open" : "closed";
-        *value = query_buf;
+        *value = opened ? "open" : "closed";
         return 0;
     }
     if (key == "size")
@@ -616,8 +697,7 @@ int h264_decoder_mpp::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "fps")
@@ -627,8 +707,7 @@ int h264_decoder_mpp::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     if (key == "format" || key == "output_format")
@@ -638,14 +717,12 @@ int h264_decoder_mpp::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = name;
-        *value = query_buf;
+        *value = name;
         return 0;
     }
     if (key == "output_mode")
     {
-        query_buf = output_mode_name(output_mode);
-        *value = query_buf;
+        *value = output_mode_name(output_mode);
         return 0;
     }
     if (key == "latency_ms")
@@ -655,8 +732,7 @@ int h264_decoder_mpp::query(std::string_view key, std::string_view *value) const
         {
             return -EINVAL;
         }
-        query_buf = buf;
-        *value = query_buf;
+        *value = buf;
         return 0;
     }
     return -EINVAL;
