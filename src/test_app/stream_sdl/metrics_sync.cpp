@@ -2,6 +2,7 @@
 
 #include "test_app/stream_sdl/metrics_sync.hpp"
 
+#include "apps/common/stage_latency.hpp"
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
 #include <string>
@@ -329,26 +330,26 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     metric_store(*g_pipeline_metrics.get_metric("stream_sdl.pipeline_ok"),
                  pipeline_flowing ? "yes" : "warming");
 
-    const double glass_ms = g_glass_latency_ms.load(std::memory_order_relaxed);
+    const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
     metric_store(*g_pipeline_metrics.get_metric("stream_sdl.glass_latency_ms"),
                  glass_ms);
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
     metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
-                 g_latency_source_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_source_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
-                 g_latency_jpeg_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"),
-                 g_latency_enc_in_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_enc_in_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"),
-                 g_latency_enc_out_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_enc_out_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
-                 g_latency_depay_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
-                 g_latency_dec_in_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
-                 g_latency_dec_out_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
-                 g_latency_present_ms.load(std::memory_order_relaxed));
+                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
 
     store_source_pipeline_metrics(noise_fps, source_out_kbps, ts,
                                   jpeg_active ? jdec : nullptr);
@@ -365,7 +366,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.dropped_fps"),
                      rate_per_sec(mjpeg_q_drop, prev.tx_mjpeg_q_drop, dt));
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"),
-                     g_latency_jpeg_ms.load(std::memory_order_relaxed));
+                     apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
         if (nullptr != jdec)
         {
             std::string sz;
@@ -471,7 +472,7 @@ void update_pipeline_metrics(const bench_diag &d, h264_encoder_t &enc, stream_se
     else
     {
         metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
-                     g_latency_dec_out_ms.load(std::memory_order_relaxed));
+                     apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
     }
 
     metric_store(*g_pipeline_metrics.get_metric("sdl_sink.in_fps"), present_fps);
@@ -499,7 +500,7 @@ constexpr int k_receiver_loss_avg_samples = 5;
 
 struct receiver_loss_tracker
 {
-    stream_receiver_counters prev {};
+    stream_link_counters prev {};
     bool                     have_prev = false;
     double                   udp_loss[k_receiver_loss_avg_samples] {};
     double                   fec_loss[k_receiver_loss_avg_samples] {};
@@ -555,7 +556,7 @@ void push_loss_sample(double sample, double *buf, int &n, double &avg_out)
     avg_out = sum / static_cast<double>(n);
 }
 
-void update_receiver_loss_deltas(const stream_receiver_counters &cur, receiver_loss_tracker &tr)
+void update_receiver_loss_deltas(const stream_link_counters &cur, receiver_loss_tracker &tr)
 {
     if (tr.have_prev)
     {
@@ -575,22 +576,17 @@ void update_receiver_loss_deltas(const stream_receiver_counters &cur, receiver_l
     tr.have_prev = true;
 }
 
-void store_receiver_link_metrics(const stream_receiver_counters &c)
+void store_receiver_link_metrics(uint64_t udp_recv, uint64_t fec_recv, uint64_t udp_gap,
+                                 uint64_t fec_gap, double loss_udp_pct, double loss_fec_pct)
 {
     metric_store(
-        *g_pipeline_metrics.get_metric("stream_sender.peer_udp_packet_received"),
-        c.udp_packet_received);
+        *g_pipeline_metrics.get_metric("stream_sender.peer_udp_packet_received"), udp_recv);
     metric_store(
-        *g_pipeline_metrics.get_metric("stream_sender.peer_fec_packet_received"),
-        c.fec_packet_received);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_udp_gap_count"),
-                 c.udp_gap_count);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_fec_gap_count"),
-                 c.fec_gap_count);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_udp_pct"),
-                 c.loss_udp_pct);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_fec_pct"),
-                 c.loss_fec_pct);
+        *g_pipeline_metrics.get_metric("stream_sender.peer_fec_packet_received"), fec_recv);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_udp_gap_count"), udp_gap);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_fec_gap_count"), fec_gap);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_udp_pct"), loss_udp_pct);
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_fec_pct"), loss_fec_pct);
 }
 
 /* UDP metrics poll: cumulative counters from live atomics (rates stay on update_pipeline_metrics). */
@@ -653,17 +649,19 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender &sende
 /* UDP metrics poll: load live receiver atomics, update interval loss, publish (no staged copy). */
 void sync_peer_link_metrics_live(stream_receiver &rcv)
 {
-    const stream_receiver_counters cur = rcv.link_counters_snapshot();
+    const stream_link_counters cur = rcv.link_counters_snapshot();
 
-    stream_receiver_counters peer = cur;
+    double loss_udp = 0.;
+    double loss_fec = 0.;
     {
         std::lock_guard<std::mutex> lock(g_rcv_loss_mu);
         update_receiver_loss_deltas(cur, g_rcv_loss);
-        peer.loss_udp_pct = g_rcv_loss.loss_udp_pct;
-        peer.loss_fec_pct = g_rcv_loss.loss_fec_pct;
+        loss_udp = g_rcv_loss.loss_udp_pct;
+        loss_fec = g_rcv_loss.loss_fec_pct;
     }
 
-    store_receiver_link_metrics(peer);
+    store_receiver_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
+                                cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
 }
 
 struct metrics_serve_rate_state

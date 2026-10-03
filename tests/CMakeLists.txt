@@ -8,6 +8,7 @@ set(VSTREAMER_TEST_SOURCES
     h264_level_test.cpp
     key_util_test.cpp
     peer_link_metrics_test.cpp
+    stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
     shared_sized_buffer_test.cpp
@@ -34,10 +35,9 @@ if(ENABLE_MKV_SINK)
 endif()
 
 add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
-                              ${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/cpu_map.cpp
                               ${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/link_emulator.cpp
                               ${CMAKE_SOURCE_DIR}/src/test_app/stream_sdl/bench_console.cpp)
-target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source)
+target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source apps_common)
 target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 

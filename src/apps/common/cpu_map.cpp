@@ -1,11 +1,11 @@
-#include "test_app/stream_sdl/cpu_map.hpp"
+#include "apps/common/cpu_map.hpp"
 
 #include "core/key_util.hpp"
 
 #include <cstdio>
 #include <cstring>
 
-namespace vstreamer::test_app
+namespace vstreamer::apps
 {
 namespace
 {
@@ -43,14 +43,15 @@ bool parse_cpulist(std::string_view spec, std::vector<int> *out)
             j++;
         }
         const std::string_view token = spec.substr(i, j - i);
-        size_t                   dash = token.find('-');
+        const size_t           dash = token.find('-');
         if (dash != std::string_view::npos && dash > 0 && dash + 1 < token.size())
         {
-            int64_t a = 0;
-            int64_t b = 0;
+            int64_t     a = 0;
+            int64_t     b = 0;
             std::string left(token.substr(0, dash));
             std::string right(token.substr(dash + 1));
-            if (key_parse_i64(left.c_str(), &a) < 0 || key_parse_i64(right.c_str(), &b) < 0 || a > b)
+            if (key_parse_i64(left.c_str(), &a) < 0 || key_parse_i64(right.c_str(), &b) < 0 ||
+                a > b)
             {
                 return false;
             }
@@ -61,7 +62,7 @@ bool parse_cpulist(std::string_view spec, std::vector<int> *out)
         }
         else
         {
-            int64_t v = 0;
+            int64_t     v = 0;
             std::string tmp(token);
             if (key_parse_i64(tmp.c_str(), &v) < 0)
             {
@@ -76,7 +77,7 @@ bool parse_cpulist(std::string_view spec, std::vector<int> *out)
 
 bool set_stage_int(std::string_view /*stage*/, std::string_view val, int *target)
 {
-    int64_t v = 0;
+    int64_t     v = 0;
     std::string tmp(val);
     if (key_parse_i64(tmp.c_str(), &v) < 0)
     {
@@ -95,7 +96,7 @@ cpu_stage_map parse_cpu_map(std::string_view spec)
     {
         return m;
     }
-    bool ok = true;
+    bool   ok = true;
     size_t start = 0;
     while (start <= spec.size())
     {
@@ -168,4 +169,4 @@ std::string format_cpulist(const std::vector<int> &cpus)
     return out;
 }
 
-}  // namespace vstreamer::test_app
+}  // namespace vstreamer::apps

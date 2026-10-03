@@ -41,12 +41,13 @@
 #endif
 #include "test_app/stream_sdl/channel_controller.hpp"
 #include "test_app/stream_sdl/channel_ports.hpp"
-#include "test_app/stream_sdl/cpu_map.hpp"
+#include "apps/common/cpu_map.hpp"
+#include "apps/common/queues.hpp"
+#include "apps/common/stage_latency.hpp"
 #include "test_app/stream_sdl/diag.hpp"
 #include "test_app/stream_sdl/encoder_types.hpp"
 #include "test_app/stream_sdl/metrics_sync.hpp"
 #include "test_app/stream_sdl/pipeline_state.hpp"
-#include "test_app/stream_sdl/queues.hpp"
 #include "test_app/stream_sdl/self_test.hpp"
 #include "test_app/stream_sdl/stages.hpp"
 
@@ -78,7 +79,7 @@ void on_signal(int /*sig*/)
 
 void shutdown_pipeline(h264_encoder_t &enc, h264_decoder_mpp &dec, stream_sender &sender,
                        stream_receiver &rcv, jpeg_decoder_multicore *jdec, v4l2_source *v4l2,
-                       pipeline_queue *mjpeg_q, pipeline_queue *nv12_q)
+                       apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q)
 {
     g_run = false;
 #if defined(ENABLE_H264_ENCODER_MPP)
@@ -413,11 +414,11 @@ int main(int argc, char **argv)
 
     if (const char *cpu_spec = std::getenv("VSTREAMER_CPU_MAP"))
     {
-        g_cpu_map = test_app::parse_cpu_map(cpu_spec);
+        g_cpu_map = apps::parse_cpu_map(cpu_spec);
     }
     else
     {
-        g_cpu_map = test_app::parse_cpu_map("");
+        g_cpu_map = apps::parse_cpu_map("");
     }
 #if defined(ENABLE_H264_ENCODER_CEDAR)
     if (width < 32 || (width % 32) != 0)
@@ -553,7 +554,7 @@ int main(int argc, char **argv)
     {
         char workers_buf[16];
         std::snprintf(workers_buf, sizeof(workers_buf), "%zu", g_cpu_map.jpeg_workers.size());
-        const std::string jw_list = test_app::format_cpulist(g_cpu_map.jpeg_workers);
+        const std::string jw_list = apps::format_cpulist(g_cpu_map.jpeg_workers);
         cfg_str(jdec, "workers", workers_buf);
         cfg_str(jdec, "worker_cpus", jw_list.c_str());
     }
@@ -584,6 +585,8 @@ int main(int argc, char **argv)
                      pace);
     }
     cfg_str(rcv, "listen", listen_buf);
+    cfg_str(rcv, "telemetry", "off");
+    cfg_str(sender, "telemetry", "off");
     {
         const char *fec = std::getenv("VSTREAMER_FEC");
         const bool  fec_off =
@@ -803,18 +806,21 @@ int main(int argc, char **argv)
     }
 #endif
     g_diag = diag_log;
+    apps::stage_latency_set_diag_enabled(diag_log);
     if (diag_log)
     {
         std::fprintf(stderr,
                      "stream_sdl: diagnostic logging enabled (--diag); stage_latency lines on\n");
     }
     g_stream_fps.store(fps, std::memory_order_relaxed);
-    const size_t pipe_q_depth =
-        queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH", k_default_pipe_queue_depth, 64);
-    const size_t present_q_depth = queue_depth_from_env("VSTREAMER_PRESENT_QUEUE_DEPTH",
-                                                        k_default_present_queue_depth, 16);
+    const size_t pipe_q_depth = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
+                                                           apps::k_default_pipe_queue_depth, 64);
+    const size_t present_q_depth =
+        apps::queue_depth_from_env("VSTREAMER_PRESENT_QUEUE_DEPTH",
+                                   apps::k_default_present_queue_depth, 16);
     const size_t rx_au_q_depth =
-        queue_depth_from_env("VSTREAMER_RX_AU_QUEUE_DEPTH", k_default_rx_au_queue_depth, 256);
+        apps::queue_depth_from_env("VSTREAMER_RX_AU_QUEUE_DEPTH",
+                                   apps::k_default_rx_au_queue_depth, 256);
     std::fprintf(stderr,
                  "stream_sdl: queue depths pipe=%zu present=%zu rx_au=%zu "
                  "(override: VSTREAMER_*_QUEUE_DEPTH env)\n",
@@ -826,11 +832,11 @@ int main(int argc, char **argv)
                      "stream_sdl: encode admission pacing ON (VSTREAMER_ENC_ADMISSION); "
                      "MPP CBR only, 1080p+\n");
     }
-    pipeline_queue       mjpeg_q(pipe_q_depth);
-    pipeline_queue       nv12_q(pipe_q_depth);
+    apps::pipeline_queue      mjpeg_q(pipe_q_depth, g_run);
+    apps::pipeline_queue      nv12_q(pipe_q_depth, g_run);
     g_metrics_nv12_q = &nv12_q;
-    present_frame_queue  present_q(present_q_depth);
-    rx_au_queue          au_q(rx_au_q_depth);
+    apps::present_frame_queue present_q(present_q_depth, g_run);
+    apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
 
     std::thread source_thr(source_stage_main, source, &mjpeg_q, &nv12_q, &g_bench_diag);
     std::thread jpeg_thr;

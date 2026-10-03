@@ -4,7 +4,7 @@
 #include "test_app/stream_sdl/channel_controller.hpp"
 #include "test_app/stream_sdl/diag.hpp"
 #include "test_app/stream_sdl/encoder_types.hpp"
-#include "test_app/stream_sdl/queues.hpp"
+#include "apps/common/queues.hpp"
 
 #include "components/components.hpp"
 

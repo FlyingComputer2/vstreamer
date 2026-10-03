@@ -1,8 +1,8 @@
-#include "test_app/stream_sdl/cpu_map.hpp"
+#include "apps/common/cpu_map.hpp"
 
 #include <gtest/gtest.h>
 
-namespace vstreamer::test_app
+namespace vstreamer::apps
 {
 namespace
 {

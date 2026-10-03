@@ -85,12 +85,6 @@ struct pipeline_rate_state
     bool                                    have_snap = false;
 };
 
-void note_source_pts(const vstreamer::data_packet &pkt);
-[[nodiscard]] size_t packet_frame_bytes(const vstreamer::data_packet &pkt);
-[[nodiscard]] vstreamer::media_kind_e packet_media_kind(const vstreamer::data_packet &pkt);
-void record_stage_latency_ms(const char *stage, const vstreamer::data_packet &, double ms);
-void log_stage_latency(const char *stage, const vstreamer::data_packet &pkt);
-
 void log_bench_diag(const bench_diag &d, vstreamer::stream_receiver &rcv,
                     vstreamer::stream_sender &sender, h264_encoder_t &enc,
                     const channel_controller *channel);

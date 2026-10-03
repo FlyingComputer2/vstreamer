@@ -2,6 +2,7 @@
 
 #include "test_app/stream_sdl/stages.hpp"
 
+#include "apps/common/stage_latency.hpp"
 #include "test_app/stream_sdl/pipeline_state.hpp"
 
 #include <cerrno>
@@ -14,6 +15,10 @@ namespace vstreamer::test_app
 {
 
 using namespace vstreamer;
+using apps::log_stage_latency;
+using apps::note_source_pts;
+using apps::packet_frame_bytes;
+using apps::packet_media_kind;
 
 int cfg_str(component &c, const char *key, const char *val)
 {
@@ -142,7 +147,7 @@ bool submit_nv12_to_encoder(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sende
     return true;
 }
 
-void source_stage_main(component_source *source, pipeline_queue *mjpeg_q, pipeline_queue *nv12_q,
+void source_stage_main(component_source *source, apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
                        bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.source);
@@ -188,7 +193,7 @@ void source_stage_main(component_source *source, pipeline_queue *mjpeg_q, pipeli
     }
 }
 
-void emit_jpeg_nv12(pipeline_queue *nv12_q, bench_diag *diag, data_packet &nv12)
+void emit_jpeg_nv12(apps::pipeline_queue *nv12_q, bench_diag *diag, data_packet &nv12)
 {
     diag->tx_jpeg_nv12++;
     diag->tx_jpeg_nv12_bytes += packet_frame_bytes(nv12);
@@ -196,7 +201,7 @@ void emit_jpeg_nv12(pipeline_queue *nv12_q, bench_diag *diag, data_packet &nv12)
     (void)nv12_q->push(std::move(nv12), &diag->tx_nv12_q_drop);
 }
 
-void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_queue *mjpeg_q, pipeline_queue *nv12_q,
+void jpeg_stage_main(jpeg_decoder_multicore *jdec, apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
                      bench_diag *diag, int max_inflight)
 {
     pin_current_thread_to_cpu(g_cpu_map.jpeg);
@@ -314,7 +319,7 @@ void apply_pending_console_encoder_cfg(h264_encoder_t &enc)
 }
 
 void encode_stage_main(h264_encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
-                       pipeline_queue *nv12_q, bench_diag *diag)
+                       apps::pipeline_queue *nv12_q, bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.encode);
     data_packet nv12;
@@ -393,7 +398,7 @@ void pull_decoder_frames_locked(h264_decoder_mpp *dec, bench_diag &diag,
     }
 }
 
-void enqueue_decoded_frames(present_frame_queue *present_q, bench_diag &diag,
+void enqueue_decoded_frames(apps::present_frame_queue *present_q, bench_diag &diag,
                             std::vector<data_packet> &frames)
 {
     for (data_packet &frame_pkt : frames)
@@ -407,7 +412,7 @@ void enqueue_decoded_frames(present_frame_queue *present_q, bench_diag &diag,
     }
 }
 
-void drain_decoder_to_present(h264_decoder_mpp *dec, present_frame_queue *present_q,
+void drain_decoder_to_present(h264_decoder_mpp *dec, apps::present_frame_queue *present_q,
                               bench_diag &diag)
 {
     if (ensure_decoder_open(dec) < 0)
@@ -419,7 +424,7 @@ void drain_decoder_to_present(h264_decoder_mpp *dec, present_frame_queue *presen
     enqueue_decoded_frames(present_q, diag, frames);
 }
 
-void present_thread_main(component_sink *display, present_frame_queue *present_q, int width,
+void present_thread_main(component_sink *display, apps::present_frame_queue *present_q, int width,
                          int height, bool kmsdrm, bool sdl_open_on_thread, bench_diag *diag)
 {
     if (nullptr == display || nullptr == present_q || nullptr == diag)
@@ -463,14 +468,15 @@ void present_thread_main(component_sink *display, present_frame_queue *present_q
                 const frame_data &f = data_packet::cast<frame_data>(frame_pkt);
                 if (f.capture_mono_ns <= 0)
                 {
-                    const int64_t latest = g_latest_source_pts.load(std::memory_order_relaxed);
+                    const int64_t latest =
+                        apps::g_latest_source_pts.load(std::memory_order_relaxed);
                     const int   fps = g_stream_fps.load(std::memory_order_relaxed);
                     if (fps > 0 && latest >= f.pts)
                     {
                         const double lag_ms = static_cast<double>(latest - f.pts) * 1000.0 /
                                                 static_cast<double>(fps);
-                        g_glass_latency_ms.store(lag_ms, std::memory_order_relaxed);
-                        g_latency_present_ms.store(lag_ms, std::memory_order_relaxed);
+                        apps::g_glass_latency_ms.store(lag_ms, std::memory_order_relaxed);
+                        apps::g_latency_present_ms.store(lag_ms, std::memory_order_relaxed);
                     }
                 }
             }
@@ -507,7 +513,7 @@ void present_thread_main(component_sink *display, present_frame_queue *present_q
     }
 }
 
-int feed_decoder_au(h264_decoder_mpp *dec, data_packet &au, present_frame_queue *present_q,
+int feed_decoder_au(h264_decoder_mpp *dec, data_packet &au, apps::present_frame_queue *present_q,
                     bench_diag &diag)
 {
     if (!g_run.load())
@@ -557,7 +563,7 @@ int prepare_preview_sink(component_sink *preview, bool /*kmsdrm*/, int w, int h)
 {
     return static_cast<sdl_sink *>(preview)->prepare(w, h);
 }
-void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, rx_au_queue *au_q,
+void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, apps::rx_au_queue *au_q,
                         bench_diag *diag)
 {
     auto depay_sock = [&](data_packet &sock_pkt) {
@@ -581,7 +587,7 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, rx_au_queue
                 continue;
             }
             log_stage_latency("depay", au);
-            au_q->push(std::move(au), *diag);
+            au_q->push(std::move(au), &diag->rx_au_q_drop);
         }
     };
 
@@ -601,7 +607,7 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, rx_au_queue
     }
 }
 
-void decode_thread_main(h264_decoder_mpp *dec, present_frame_queue *present_q, rx_au_queue *au_q,
+void decode_thread_main(h264_decoder_mpp *dec, apps::present_frame_queue *present_q, apps::rx_au_queue *au_q,
                         bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.rx);
