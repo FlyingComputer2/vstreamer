@@ -496,3 +496,25 @@ TEST(StreamSenderTest, CloseJoinsTelemetryQuickly)
                         .count();
     EXPECT_LT(ms, 200);
 }
+
+/* TT-R4: known keys answer before the first report / before open(); -ENOTSUP is only for
+ * unknown keys. */
+TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
+{
+    vstreamer::stream_sender sender;
+    std::string               val;
+    ASSERT_EQ(0, sender.query("local", &val));
+    EXPECT_EQ("0.0.0.0:0", val);
+    ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, sender.open());
+    for (const char *key : {"peer_udp_packet_received", "peer_fec_packet_received",
+                            "peer_udp_gap_count", "peer_fec_gap_count", "peer_session",
+                            "peer_reports_received", "peer_reports_lost", "peer_reports_rejected"})
+    {
+        EXPECT_EQ(0, sender.query(key, &val)) << key;
+        EXPECT_EQ("0", val) << key;
+    }
+    ASSERT_EQ(0, sender.query("peer_report_age_ms", &val));
+    EXPECT_EQ("-1", val);
+    sender.close();
+}

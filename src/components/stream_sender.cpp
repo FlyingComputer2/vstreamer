@@ -992,7 +992,9 @@ int stream_sender::query(std::string_view key, std::string *value) const
         }
         if (fd < 0)
         {
-            return -ENOTSUP;
+            std::lock_guard<std::mutex> lock(mu);
+            *value = local_spec;
+            return 0;
         }
         sockaddr_in bound {};
         socklen_t   len = sizeof(bound);
@@ -1021,50 +1023,34 @@ int stream_sender::query(std::string_view key, std::string *value) const
     if ("peer_udp_packet_received" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
-        if (!peer_have)
-        {
-            return -ENOTSUP;
-        }
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64,
-                      peer_report.counters.udp_packet_received);
+                      peer_have ? peer_report.counters.udp_packet_received : 0);
         *value = buf;
         return 0;
     }
     if ("peer_fec_packet_received" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
-        if (!peer_have)
-        {
-            return -ENOTSUP;
-        }
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64,
-                      peer_report.counters.fec_packet_received);
+                      peer_have ? peer_report.counters.fec_packet_received : 0);
         *value = buf;
         return 0;
     }
     if ("peer_udp_gap_count" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
-        if (!peer_have)
-        {
-            return -ENOTSUP;
-        }
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_report.counters.udp_gap_count);
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_have ? peer_report.counters.udp_gap_count : 0);
         *value = buf;
         return 0;
     }
     if ("peer_fec_gap_count" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
-        if (!peer_have)
-        {
-            return -ENOTSUP;
-        }
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_report.counters.fec_gap_count);
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, peer_have ? peer_report.counters.fec_gap_count : 0);
         *value = buf;
         return 0;
     }
@@ -1103,12 +1089,8 @@ int stream_sender::query(std::string_view key, std::string *value) const
     if ("peer_session" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
-        if (!peer_have)
-        {
-            return -ENOTSUP;
-        }
         char buf[16];
-        std::snprintf(buf, sizeof(buf), "%" PRIu32, peer_session);
+        std::snprintf(buf, sizeof(buf), "%" PRIu32, peer_have ? peer_session : 0U);
         *value = buf;
         return 0;
     }
