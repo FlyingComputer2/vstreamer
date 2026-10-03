@@ -518,3 +518,37 @@ TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
     EXPECT_EQ("-1", val);
     sender.close();
 }
+
+/* TT-R5: local = [host:]port, validated at configure(); port 0 = ephemeral. */
+TEST(StreamSenderTest, LocalSpecForms)
+{
+    {
+        vstreamer::stream_sender sender;
+        EXPECT_EQ(-EINVAL, sender.configure("local", "junk"));
+        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:70000"));
+        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:"));
+    }
+    {
+        const int port = ephemeral_udp_port();
+        ASSERT_GT(port, 0);
+        vstreamer::stream_sender sender;
+        ASSERT_EQ(0, sender.configure("local", std::to_string(port)));
+        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+        ASSERT_EQ(0, sender.open());
+        std::string val;
+        ASSERT_EQ(0, sender.query("local", &val));
+        EXPECT_EQ("0.0.0.0:" + std::to_string(port), val);
+        sender.close();
+    }
+    {
+        vstreamer::stream_sender sender;
+        ASSERT_EQ(0, sender.configure("local", "127.0.0.1:0"));
+        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+        ASSERT_EQ(0, sender.open());
+        std::string val;
+        ASSERT_EQ(0, sender.query("local", &val));
+        EXPECT_EQ(0U, val.rfind("127.0.0.1:", 0)) << val;
+        EXPECT_NE("127.0.0.1:0", val);
+        sender.close();
+    }
+}
