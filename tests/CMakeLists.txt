@@ -1,5 +1,6 @@
 set(VSTREAMER_TEST_SOURCES
     buffer_pool_test.cpp
+    component_contract_test.cpp
     camera_noise_mux_test.cpp
     link_emulator_test.cpp
     bench_console_test.cpp

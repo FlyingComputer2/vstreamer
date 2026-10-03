@@ -480,7 +480,7 @@ int h264_encoder_cedar::configure(std::string_view key, std::string_view value)
         pending_idr = true;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int h264_encoder_cedar::query(std::string_view key, std::string *value) const
@@ -532,7 +532,7 @@ int h264_encoder_cedar::query(std::string_view key, std::string *value) const
         *value = "h264_cedrus";
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

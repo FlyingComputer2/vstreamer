@@ -563,7 +563,7 @@ int noise_source::configure(std::string_view key, std::string_view value)
         noise_block_size = r;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int noise_source::query(std::string_view key, std::string *value) const
@@ -717,7 +717,7 @@ int noise_source::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer

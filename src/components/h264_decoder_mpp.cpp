@@ -679,7 +679,7 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
         }
         return -EINVAL;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 int h264_decoder_mpp::query(std::string_view key, std::string *value) const
@@ -735,7 +735,7 @@ int h264_decoder_mpp::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
-    return -EINVAL;
+    return -ENOTSUP;
 }
 
 }  // namespace vstreamer
