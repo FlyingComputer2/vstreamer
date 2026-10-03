@@ -21,6 +21,7 @@ from utils import (  # noqa: E402
     FecMap,
     GapLoss,
     LossRateControl,
+    telemetry_stale,
     LPF,
     Metrics,
 )
@@ -177,11 +178,7 @@ def main() -> int:
             if s_peer_session is not None:
                 peer_session_prev = s_peer_session
 
-            stale = (
-                s_report_age is None
-                or s_report_age < 0.0
-                or s_report_age > 3.0 * telemetry_ms
-            )
+            stale = telemetry_stale(s_report_age, telemetry_ms)
             if stale and not stale_hold:
                 print(f"stale telemetry (age={s_report_age} ms), holding", flush=True)
                 stale_hold = True
