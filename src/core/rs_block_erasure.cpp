@@ -126,6 +126,7 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     emit_next = 0;
     newest_set = false;
     have_payload_emit = false;
+    have_shard_rx = false;
     later_block_waiting = false;
     recovered_count = 0;
     recovered_seen = 0;
@@ -168,6 +169,7 @@ void vstreamer::rs_block_erasure::disable()
     emit_next = 0;
     newest_set = false;
     have_payload_emit = false;
+    have_shard_rx = false;
     later_block_waiting = false;
 }
 
@@ -305,6 +307,33 @@ void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
     }
     emit_next = wire_block_id(block_id);
     clear_state_behind(block_id);
+    later_block_waiting = false;
+}
+
+/* C3 resync, either direction: after rx_hold_ms with no shard at all, the next shard starts a
+ * new session (peer restart or link back up). Its block id is random relative to emit_next, so
+ * holding it behind never-coming gap ids (forward jump) would stall delivery and, once the ids
+ * cross the half ring, let the backward rebase discard it. Everything held is from the old
+ * session (expire_rx has already given up on it), so drop it and emit from this block. */
+void vstreamer::rs_block_erasure::maybe_rebase_after_silence(uint16_t block_id)
+{
+    const auto t = now();
+    const bool rebase = have_shard_rx && emit_base_set &&
+                        t - last_shard_rx >= std::chrono::milliseconds(rx_hold_ms());
+    last_shard_rx = t;
+    have_shard_rx = true;
+    if (!rebase || dist_from_emit(block_id) == 0)
+    {
+        return;
+    }
+    evicted_blocks_count += rx_blocks.size();
+    rx_blocks.clear();
+    ready_blocks.clear();
+    done.clear();
+    done_order.clear();
+    emit_next = wire_block_id(block_id);
+    newest = static_cast<uint8_t>(emit_next);
+    newest_set = true;
     later_block_waiting = false;
 }
 
@@ -1300,6 +1329,7 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
         return;
     }
     note_emit_base(block_id);
+    maybe_rebase_after_silence(block_id);
     touch_newest(block_id);
     maybe_resync_on_late_shard(block_id);
     ring_evict_stale(out);

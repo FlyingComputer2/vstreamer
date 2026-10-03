@@ -153,8 +153,11 @@ void run_link(int n_packets,
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 
+    const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (expect_next < static_cast<uint32_t>(n_packets))
     {
+        ASSERT_LT(std::chrono::steady_clock::now(), drain_deadline)
+            << "stuck waiting for counter " << expect_next;
         drain_outputs(200);
     }
 
@@ -341,8 +344,11 @@ TEST(LoopbackTest, SenderRestartMidStream)
             drain_outputs(0);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
+        const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (expect_next < end_counter)
         {
+            ASSERT_LT(std::chrono::steady_clock::now(), drain_deadline)
+                << "stuck waiting for counter " << expect_next;
             drain_outputs(200);
         }
         sender.close();
@@ -396,8 +402,11 @@ TEST(LoopbackTest, SenderRestartMidStream)
             drain_outputs_resume(0);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
+        const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while (expect_next < 10400u)
         {
+            ASSERT_LT(std::chrono::steady_clock::now(), drain_deadline)
+                << "stuck waiting for counter " << expect_next;
             drain_outputs_resume(200);
         }
         sender.close();
