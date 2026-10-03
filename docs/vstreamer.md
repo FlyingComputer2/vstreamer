@@ -1,235 +1,408 @@
 # VStreamer
 
-> **Bench code (2026):** The running tree uses `component_source` / `component_coder` /
-> `component_sink` with `data_packet` + `shared_sized_buffer`, `configure`/`query`, and concrete
-> types such as `stream_sender`, `stream_receiver`, `rtp_h264_pay`, `rtp_h264_depay`, `mkv_sink`,
-> and `sdl_sink`. Sections below that describe `source::fetch`, `sink::write`, `EmitFn`, a core
-> feedback plugin, or `Mp4Sink` document **target / roadmap** design — see the status table at the
-> end of this file.
+VStreamer is a C++17 library of independent video **components** (sources, coders, sinks) and
+the bench apps that wire them into a low-latency H.264-over-UDP path with Reed–Solomon FEC.
+The target is a rover camera (UVC → H.264 → radio) and a ground-station viewer (radio → decode
+→ display). Today one bench app, `stream_sdl`, runs both ends in one process over loopback.
 
-VStreamer is a **framework** for building RTP video paths with channel
-feedback for flow control. Applications compose **video sources**, **video
-sinks**, optional **codecs**, and a **feedback** plugin. The framework does
-not assume a camera, a radio, or a display — those are plugins.
-
-The first plugins and the first application come from `~/rover/camera`
-(UVC → Cedar → RTP). Rover keeps systemd, winject-manager binds, and
-vehicle wiring. This repo owns the pipeline core and the plugin contracts.
+This page describes the code as it is. Designed-but-not-built pieces (feedback plugin, config
+loader, core console, rover/winject wiring) are listed under
+[Roadmap / target design](#roadmap--target-design).
 
 ```mermaid
 flowchart LR
-  Src[Video Source]
-  Pipe[Core pipeline]
-  Snk[Video Sink]
-  Fb[Channel Feedback]
-  Src --> Pipe --> Snk
-  Fb --> Pipe
+  src[source] --> jdec[jpeg_decoder] --> enc[h264_encoder] --> pay[rtp_h264_pay] --> snd[stream_sender]
+  snd -- UDP + RS FEC --> rcv[stream_receiver]
+  rcv --> dep[rtp_h264_depay] --> dec[h264_decoder_mpp] --> sdl[sdl_sink]
 ```
 
-A process is one graph: one source, zero or more sinks, one encoder slot,
-one feedback plugin. Change the plugins and the same core is a rover
-camera **or** a ground-station viewer. Deployments: [usecase.md](usecase.md).
+## Component model
 
-| Core owns | Plugins own |
-|-----------|-------------|
-| Job/result queues, thread pins, lock order | Capture, file, RTP in/out, display |
-| Console dispatch onto `configure` / `query` | Key semantics for that class |
-| `stream_request` gate (operator deadman) | Radio CI, QP/GOP policy |
-| Config `key = value` load | Device paths, destinations, codec opts |
+All interfaces live in `src/core/`.
 
-Capture/decode/encode keep running when RTP is gated off. A record sink
-attached **before** encode is independent of the RTP gate.
+| Interface | Header | Data path |
+|-----------|--------|-----------|
+| `component` | [component.hpp](../src/core/component.hpp) | `configure(key, value)` / `query(key, &value)` |
+| `component_source` | [component_source.hpp](../src/core/component_source.hpp) | `output(port, data_packet&, timeout_ms)` |
+| `component_coder` | [component_coder.hpp](../src/core/component_coder.hpp) | `input(port, const data_packet&)` + `output(…)` |
+| `component_sink` | [component_sink.hpp](../src/core/component_sink.hpp) | `input(port, const data_packet&)` + `set_enabled(on, timeout_ms)` |
 
-## Core
+Every component has `name()`, `open()` / `close()`, and declares what it carries:
+`input_kind()` / `output_kind()` (`media_kind_e`: `MJPEG`, `NV12`, `H264`, …) and
+`input_packet_kind()` / `output_packet_kind()` (`packet_kind_e`: `FRAME`, `AUDIO`, `SOCK`).
+Pads are numbered ports; all current components use port 0.
 
-The core never opens V4L2, Cedar, or a UDP destination by itself. It:
+**Return codes.** `0` on success, negative errno otherwise. `output()` returns `-EAGAIN` when
+nothing is ready within `timeout_ms` (`< 0` blocks, `0` polls, `> 0` waits).
 
-1. Pulls timestamped `frame_s`s from `source::fetch`.
-2. Optionally transcodes (`Decoder` then `Encoder`).
-3. Writes each frame to every `Sink` whose `input_kind()` matches.
-4. Applies feedback to encoder keys and to `Sink::set_enabled`.
-5. Exposes a UDP console that maps verbs onto `configure` / `query`.
+### `configure` / `query` contract
 
-Thread layout is host-specific. On the H3, CPU0 is reserved for
-`winject-manager`; fetch and one decode worker share CPU1, the second
-decode worker CPU2, encode CPU3.
+```cpp
+/* 0 on success, -ENOTSUP unknown key, -EINVAL bad value, other -errno. */
+virtual int configure(std::string_view key, std::string_view value) = 0;
+/* Fills *value (overwritten). 0 / -ENOTSUP / -EINVAL. Thread-safe. */
+virtual int query(std::string_view key, std::string *value) const = 0;
+```
 
-`stream_sdl` pins pipeline stages with **`VSTREAMER_CPU_MAP`**: semicolon-separated
-`stage=cpulist` entries (`cpulist` = comma list and/or ranges, e.g. `4-7`).
-Stages: `source`, `jpeg`, `jpeg_workers`, `encode`, `rx`. Use `-1` to leave a
-stage unpinned. Orange Pi 5 (RK3588) default:
-`source=0;jpeg=1;encode=2;rx=3;jpeg_workers=4-7`. Rover H3 example:
-`source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
+- Keys and values are strings. Integers are decimal (`key_parse_i64`: no `+`, no octal/hex),
+  except V4L2 control ids, which also accept `0x…`.
+- Unknown key → `-ENOTSUP`, bad value → `-EINVAL`, key only valid before `open()` → `-EBUSY`.
+  `tests/component_contract_test.cpp` checks the unknown-key rule on every built component.
+- `configure` may be called from another thread (e.g. a console) while the pipeline runs;
+  each component locks internally. Keys marked *live* below take effect without reopening.
 
-Queue depth 32. Width for Cedar plugins must be a multiple of 32.
+### `data_packet` and buffers
 
-## Plugins
+Wires carry `data_packet` ([data_packet.hpp](../src/core/data_packet.hpp)): a shared pointer to
+a `packet_body` subclass — `frame_data` (video frame / access unit), `audio_data`, or
+`sock_data` (one datagram). Bytes live in `shared_sized_buffer`
+([shared_sized_buffer.hpp](../src/core/shared_sized_buffer.hpp)), refcounted, with zero-copy
+sub-views.
 
-Each plugin is an **interface class**. Shared `frame_s` / `media_kind_e`
-live in core ([frame.hpp](../src/core/frame.hpp)).
+**Immutability rule:** once a packet is passed to `input()` or returned from `output()`, its body
+and bytes are immutable. Code that modifies bytes must hold the only reference
+(`use_count() == 1`) or copy. Components recycle storage through `buffer_pool`.
 
-| Interface | Doc | Data path |
-|-----------|-----|-----------|
-| `source` | [component-source.md](component-source.md) | `fetch` → owned `frame_s` |
-| `sink` | [component-sink.md](component-sink.md) | `write(const frame_s&)` |
-| `encoder` | [component-encoder.md](component-encoder.md) | NV12 → H.264 via `EmitFn` |
-| `decoder` | [component-decoder.md](component-decoder.md) | MJPEG or H.264 → NV12 via `EmitFn` |
+Wire layout of the forward datagram: [packet-model.md](packet-model.md).
 
-Core routes by `frame_s::kind`: MJPEG to pre-encode sinks + decoder, NV12
-to encoder or display, H.264 to RTP (source graph) or decoder (sink
-graph). Encoded output is still a `frame_s` with `kind = H264` (an access
-unit).
+### Node independence
 
-**First implementations**
+Each component validates only its own limits and formats. It never includes another
+component's header or assumes what sits upstream or downstream. Link-specific values (radio MPDU
+size, MTU) belong to the **pipeline creator** (today `stream_sdl`). Components expose their
+limits through `query()` — e.g. `stream_sender` `max_input` — and the creator configures the
+neighbours to match. The two ends of one wire protocol (`stream_sender`/`stream_receiver`,
+`rtp_h264_pay`/`rtp_h264_depay`) share that protocol's header in `core/` and nothing else.
 
-| Class | Kind | Notes |
-|-------|------|-------|
-| `V4l2Source` | MJPEG out | UVC mmap, 8 buffers |
-| `NoiseSource` | MJPEG out | 416×240 snow if capture is down |
-| `RtpSource` | H.264 out | receive; [usecase.md](usecase.md) *As Sink* |
-| `RtpSink` | H.264 in | PT 96, FU-A; send off until `stream_request` |
-| `Mp4Sink` | MJPEG in | record; independent of RTP gate |
-| `DisplaySink` | NV12 in | GS preview |
-| `CedrusEncoder` | NV12 → H.264 | reopen on qp/gop; `ENCODER=poc\|stock` |
-| `JpegDecoderMulticore` | MJPEG → NV12 | rover CPU decode workers |
-| `H264Decoder` | H.264 → NV12 | GS receive; not Cedar |
+## Components
 
-### Channel Feedback
+Create by type, or by name through `component_factory::create_source/create_coder/create_sink`
+([component_factory.cpp](../src/core/component_factory.cpp)). A factory call for a component that
+is not built returns `nullptr`.
 
-Maps radio/operator signals onto encoder knobs and the RTP send gate.
-`winject-manager` already receives radio channel-info UDP
-(`set_upstream_ci`) and prints it on `gci`; it does **not** apply
-backpressure. A feedback plugin is what actually slows encode.
+| Component | Kind | In → out | Factory names | Build option |
+|-----------|------|----------|---------------|--------------|
+| `noise_source` | source | → NV12 | `noise`, `noise_source` | `ENABLE_NOISE_SOURCE` |
+| `v4l2_source` | source | → MJPEG | `v4l2`, `v4l2_source` | `ENABLE_V4L2_SOURCE` |
+| `stream_receiver` | source | UDP → SOCK | `stream_receiver`, `stream`, `stream_source` | `ENABLE_STREAM_RECEIVER` |
+| `jpeg_decoder_multicore` | coder | MJPEG → NV12 | `jpeg_decoder_multicore`, `jpeg_decoder` | `ENABLE_JPEG_DECODER_MULTICORE` |
+| `h264_encoder_mpp` | coder | NV12 → H264 | `h264_encoder_mpp`, `h264_encoder` | `ENABLE_H264_ENCODER_MPP` |
+| `h264_encoder_cedar` | coder | NV12 → H264 | `h264_encoder_cedar`, `h264_encoder`¹ | `ENABLE_H264_ENCODER_CEDAR` |
+| `h264_encoder_intel` | coder | NV12 → H264 | `h264_encoder_intel`, `h264_encoder`¹ | `ENABLE_H264_ENCODER_INTEL` |
+| `h264_decoder_mpp` | coder | H264 → NV12 | `h264_decoder_mpp`, `h264_decoder` | `ENABLE_H264_DECODER_MPP` |
+| `rtp_h264_pay` | coder | H264 FRAME → SOCK | `rtp_h264_pay`, `rtp_pay` | `ENABLE_RTP_H264_PAY` |
+| `rtp_h264_depay` | coder | SOCK → H264 FRAME | `rtp_h264_depay`, `rtp_depay` | `ENABLE_RTP_H264_DEPAY` |
+| `stream_sender` | sink | SOCK → UDP | `stream_sender`, `stream_sink` | `ENABLE_STREAM_SENDER` |
+| `mkv_sink` | sink | MJPEG → .mkv | `mkv`, `mkv_sink` | `ENABLE_MKV_SINK` |
+| `sdl_sink` | sink | NV12 → window | `sdl`, `sdl_sink`, `display`, `sdl_kmsdrm`² | `ENABLE_SDL_SINK` |
 
-| Call | Role |
+¹ `h264_encoder` picks the first built of MPP, Cedar, Intel.
+² `sdl_kmsdrm`, `sdl_kmsdrm_sink`, `kmsdrm_sink` return an `sdl_sink` with `video_driver=kmsdrm`.
+
+### Keys
+
+Generated from each component's `configure` / `query`. **C** = configure, **Q** = query.
+`size` is `WxH`.
+
+**`noise_source`** — synthetic NV12, bandwidth-shaped spectrum → SIMD IFFT (PFFFT, OpenMP).
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `size`, `fps` | C Q | default `416x240`, `30` (fps 1..240) |
+| `format` | C Q | `nv12` only |
+| `noise-bandwidth` (`noise_bandwidth`, `noise-randomness`) | C Q | 0..100 (0 = flat gray) |
+| `noise-block-size` (`noise_block_size`) | C Q | 0..256, legacy no-op |
+| `pregenerate-frames` (`_frames`, `-frame`) | C Q | 0..128 frames looped (0 = live) |
+| `state` | Q | `running` or `pregeneration_i/N` |
+| `status`, `device`, `width`, `height`, `pixel_type`, `media_type`, `noise-fft-grid`, `noise-fft-simd`, `noise-internal-size`, `noise-luma-block-size` | Q | informational |
+
+**`v4l2_source`** — UVC MJPEG mmap capture.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `device` | C Q | default `/dev/video0` |
+| `format` | C Q | `mjpeg` (`mjpg`) only |
+| `size`, `fps` | C Q | default `1280x720`, `30` |
+| `ctrl.<id>` | C Q | V4L2 control by id (decimal or `0x…`), live |
+| `v4l2-ctl/<name>` | C Q | V4L2 control by `v4l2-ctl --list-ctrls` name, live |
+| `v4l2-ctl` | Q | all readable `name=val` |
+| `state` | Q | `capturing` / `waiting_device` |
+| `status` | Q | `live WxH fps` / `waiting_device` |
+| `width`, `height`, `media_type` | Q | informational |
+
+Controls set before `open()` are stashed and applied after STREAMON. Noise fallback when the
+camera disappears is pipeline-creator policy (`camera_noise_mux_source` in the bench app), not
+part of `v4l2_source`.
+
+**`jpeg_decoder_multicore`** — libav MJPEG → NV12 on N CPU workers, in-order results.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `size`, `fps` | C Q | default `1280x720`, `30` |
+| `workers` | C Q | 1..8, default 2; before `open()` (`-EBUSY`) |
+| `worker_cpu` | C | pin all workers to one CPU (−1 = none) |
+| `worker_cpus` | C | comma list, assigned to workers round-robin |
+| `output_mode` | C Q | `filter` / `convert` |
+| `output_format` (`format`) | C Q | `nv12` |
+| `decoded_pix_fmt`, `status` | Q | informational |
+
+**`h264_encoder_mpp`** — Rockchip MPP (RK3588). Lock order `mu` → `mpp_api_mu`.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `size`, `fps` | C Q | default `1920x1080`, `30` (fps 1..120); reopens encoder |
+| `qp` | C Q | 2..51, default 36, live |
+| `gop` | C Q | 1..255, default 30, live |
+| `rc` | C Q | `cbr` / `fixqp`, live |
+| `cbr` (`bps`) | C Q | bit/s 0..200 000 000, default 20 000 000, live in `cbr` mode |
+| `super_i_ratio`, `super_p_ratio` | C | ≥ 0, defaults 6.0 / 1.5 |
+| `idr` | C | request IDR on the next frame |
+| `latency_ms` | Q | capture → encoded AU |
+| `backend`, `status` | Q | informational |
+
+**`h264_encoder_cedar`** (libav `h264_cedrus`, width multiple of 32) and
+**`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
+Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
+`status`.
+
+**`h264_decoder_mpp`** — Rockchip MPP H.264 → NV12. Lock order `mu` → `mpp_io_mu`.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `size`, `fps` | C Q | default `1280x720`, `30` |
+| `output_mode` | C Q | `filter` / `convert` |
+| `output_format` (`format`) | C Q | `nv12` |
+| `output_size_mode` | C | `stream` (use SPS size) / `config` (use `size`) |
+| `latency_ms`, `status` | Q | informational |
+
+**`rtp_h264_pay`** — H.264 AU → RTP datagrams (PT 96, SSRC `0xC0DE0001`, single NAL / STAP-A /
+FU-A, capture-time header extension).
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `mtu` | C | 31..65507, default 1400 |
+| `fps` | C | 1..120, default 30 (90 kHz timestamps) |
+| `capture_epoch_ns` | Q | epoch of the capture-time extension |
+| `datagrams_dropped`, `pool_misses` | Q | counters |
+
+**`rtp_h264_depay`** — RTP → H.264 AU.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `fps` | C | 1..120, default 30 |
+| `capture_epoch_ns` | C | set to the payloader's value (same process only) |
+| `au_dropped`, `nal_dropped`, `loss`, `need_idr`, `rtp_reordered` | Q | counters |
+
+**`stream_sender`** — UDP egress with RS block-erasure FEC, pacing and a bounded queue. Threads:
+`input()` (caller), the send thread, and `configure()`. Lock order `mu` → `fec_mu`.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
+| `mtu` | C | 200..1500, default 1400 |
+| `max_datagram` | C Q | 64..65507, default 1472 (UDP payload incl. headers), live |
+| `max_input` | Q | largest `input()` datagram that fits after headers |
+| `max_kbps` | C | wire pace 0..500 000 (0 = off), live |
+| `queue_ms` | C Q | 10..2000, default 100 |
+| `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
+| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 15, default 10 / 12, live (block ids keep counting) |
+| `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block) |
+| `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
+
+`set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
+
+**`stream_receiver`** — UDP ingress, strips stream header, FEC-decodes and re-orders, outputs
+one `sock_data` per original datagram.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `listen` | C Q | bind `host:port` |
+| `max_datagram` | C Q | 64..65507, default 1472; before `open()` |
+| `udp_packet_received`, `udp_gap_count` | Q | wire counters (pre-FEC) |
+| `fec_packet_received`, `fec_gap_count` | Q | post-FEC counters |
+| `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
+
+`link_counters_snapshot()` returns the four link counters at once for metrics code.
+After `rx_hold_ms` (≥ 250 ms) without any shard, the next shard rebases the FEC receiver to its
+block, so a restarted sender resumes immediately whatever its random start block id.
+
+**`mkv_sink`** — MJPEG → Matroska, incremental cluster writes.
+
+| Key | C/Q | Values |
+|-----|-----|--------|
+| `output` | C Q | path template (empty = stop recording) |
+| `size`, `fps` | C | stream parameters |
+| `segment`, `stats` | Q | informational |
+
+**`sdl_sink`** — NV12 preview through `sdl_nv12_presenter` (OpenGL; the window is owned by the
+thread that opens it).
+
+| Key | C/Q | Values |
+|-----|-----|--------|
+| `title` | C | window title, live |
+| `video_driver` | C Q | `auto` (default; SDL decides), `kmsdrm`, or any SDL driver name; before `open()` |
+| `stats` | Q | informational |
+
+## Threading
+
+Components do not start pipeline threads; the app does. Threads inside components:
+
+| Component | Internal threads |
+|-----------|------------------|
+| `stream_sender` | send thread (pacing, FEC flush timer) |
+| `stream_receiver` | receive thread (poll, FEC decode) |
+| `jpeg_decoder_multicore` | `workers` decode threads |
+| `noise_source` | pregenerate worker (when `pregenerate-frames > 0`) |
+
+Lock-order rules are stated next to the mutexes in each header (`stream_sender`,
+`h264_encoder_mpp`, `h264_decoder_mpp`). Shutdown order everywhere: signal → join → close.
+Blocking calls are woken for shutdown by `close()` or component-specific hooks
+(`cancel_pending_io()` on the MPP codecs, `interrupt_shutdown()` on `v4l2_source`).
+
+## Bench app: `stream_sdl`
+
+`src/test_app/stream_sdl/` (`-DENABLE_TEST_STREAM_SDL=ON`) is the pipeline creator for the
+loopback bench: it builds and configures every component, sizes the payloader MTU from
+`stream_sender` `max_input`, and runs both ends plus a UDP link emulator in one process.
+
+```text
+source → [jpeg] → encoder → rtp_h264_pay → stream_sender ─▶ link_emulator ─▶ stream_receiver
+       → rtp_h264_depay → h264_decoder_mpp → sdl_sink
+```
+
+| File | Role |
 |------|------|
-| `open` / `close` | subscribe / poll |
-| `sample` | latest flow / RSSI / SNR / loss |
-| `apply` | QP, GOP, skip, fps, RTP enable |
+| `main.cpp` | CLI/env parsing, component construction and wiring, thread start/join |
+| `stages.{hpp,cpp}` | per-stage thread loops (source, jpeg, encode, rx, decode, present) |
+| `queues.hpp` | bounded drop-oldest queues between stages |
+| `metrics_sync.{hpp,cpp}`, `diag.{hpp,cpp}` | pipeline metrics and `--diag` lines |
+| `link_emulator.{hpp,cpp}` | UDP relay with rate cap, random loss, queue |
+| `bench_console.{hpp,cpp}` | UDP console (`:5090`) |
+| `channel_controller.{hpp,cpp}` | facade over emulator + console |
+| `camera_noise_mux.{hpp,cpp}` | UVC with noise fallback on `-ENODEV` |
+| `cpu_map.{hpp,cpp}` | `VSTREAMER_CPU_MAP` parsing |
+| `self_test.{hpp,cpp}` | `--self-test` |
 
-**Inputs** (winject `gci` / CI datagrams)
+Common runs:
 
-| Field | Meaning |
-|-------|---------|
-| `flow` `size/cap` | radio TX queue depth / capacity |
-| `rssi` / `snr` | last RX air sample on this radio |
-| `rx_pkt_loss` | air seq gaps |
-| `fec_rec` / `fec_lost` | recovered vs unrecoverable blocks |
-| `stream_request` | operator gate; still required to send |
+```bash
+out/full/src/test_app/stream_sdl/stream_sdl --diag                                  # noise source, SDL window
+out/full/src/test_app/stream_sdl/stream_sdl --display kmsdrm --source /dev/video0  # UVC on DRM/KMS
+```
 
-Radio CI wire: type 1 = `{tx_queue_size, tx_queue_capacity}`; type 2 =
-`{rssi, snr}`. Poll manager UDP `gci`, or subscribe to a CI copy. Do not
-talk to WT32 TCP `:2323`.
+`--help` lists every flag. Main environment variables: `VSTREAMER_FEC` (`none` disables FEC),
+`VSTREAMER_FEC_K` / `_N`, `VSTREAMER_WIRE_PACE_KBPS`, `VSTREAMER_CHAN_MAX_KBPS`,
+`VSTREAMER_ENC_QP` / `_GOP` / `_RC`, `VSTREAMER_PIPE_QUEUE_DEPTH` (8),
+`VSTREAMER_PRESENT_QUEUE_DEPTH` (1), `VSTREAMER_RX_AU_QUEUE_DEPTH` (4),
+`VSTREAMER_SKIP_DECODE`, `VSTREAMER_BENCH_METRICS`, `VSTREAMER_LOG_STAGE_LATENCY`.
 
-**Policy (source-side encode)**
+### CPU pinning
 
-| Condition | Action |
-|-----------|--------|
-| no live `stream_request` | RTP sink off; source+encode+record continue |
-| `flow` filling | raise QP, skip non-ref frames, and/or drop fps |
-| `flow` empty and SNR healthy | lower QP toward the configured floor |
-| CI stale / manager down | treat as full queue; stop RTP send |
-| `fec_lost` rising | raise QP / shrink GOP toward 1 |
+`VSTREAMER_CPU_MAP` is a semicolon-separated list of `stage=cpulist` (`cpulist` = comma list
+and/or ranges, `-1` = unpinned). Stages: `source`, `jpeg`, `jpeg_workers`, `encode`, `rx`.
+Default (Orange Pi 5 / RK3588): `source=0;jpeg=1;encode=2;rx=3;jpeg_workers=4-7`.
+Rover H3 example: `source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 
-Rate-limit encoder/capture reopens. Feedback **never** enables RTP when
-the operator has not requested the stream. It writes encoder keys through
-`Encoder::configure` and the RTP gate through `Sink::set_enabled`.
+### Console (UDP `:5090`, newline-terminated)
 
-`feedback_none` is valid (bench, file record). `feedback_winject` is the
-rover plugin.
+| Verb | Effect |
+|------|--------|
+| `help`, `h`, `?` | list verbs |
+| `ping` | `pong` |
+| `metrics`, `get`, empty line | full pipeline metrics report |
+| `get_metric <name>` | one metric |
+| `stats` | link emulator counters |
+| `set_max_kbps <kbps>`, `set_drop_dt_ms <ms>`, `set_constant_loss <pct>` | link emulator |
+| `set_fec none`, `set_fec_k <k>`, `set_fec_n <n>` | `stream_sender` FEC |
+| `set_encode_cbr <kbps>`, `set_encode_qp <qp>`, `set_gop <gop>`, `force_idr` | encoder |
 
-## Console
+Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
+`h264_encoder.out_bytes`, `stream_sender.peer_fec_gap_count`,
+`stream_sender.peer_fec_packet_received`, `stream_sender.peer_udp_gap_count`,
+`stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`.
+The `stream_sender.peer_*` metrics are filled in-process from `stream_receiver` counters; there
+is no reverse telemetry datagram yet.
 
-Optional UDP, newline-terminated. Replies `ok` / `err <reason>` / `pong`.
-The core parses the verb and calls `configure` / `query` on the owning
-instance. Keys are the interface; each plugin owns its key semantics.
+`scripts/cbr_controller.py` is the external rate controller: it reads FEC gap metrics from this
+console and adjusts `set_encode_cbr` (AIMD).
 
-On a winject host the process is a **connected UDP client** to the
-manager bind. Split `--console_in` / `--console_out` is local bench only.
-Client `ping` → `pong`. One `ok\n` at open seeds last-sender; no
-unsolicited keepalive.
+### Other test programs
 
-## Config
-
-One `key = value` per line (`#` comments). Core keys select plugins and
-graph edges; remaining keys are passed to the matching instance.
-
-| Core key | Role |
-|----------|------|
-| `source` | plugin name (`v4l2`, `rtp`, `noise`) |
-| `sink` | one or more (`rtp`, `mp4`, `display`) |
-| `encoder` | `cedrus` / `none` |
-| `decoder` | `mjpeg` / `h264` / `none` |
-| `feedback` | `winject` / `none` |
-| `stream` | RTP send `host:port` |
-| `listen` | RTP receive `host:port` |
-| `output` | record path |
-| `size` `fps` `qp` `gop` `mtu` `frames` | codec / RTP |
-
-Need at least one sink (or `output`). CLI: `--config <cfg>` plus optional
-`--console_in` / `--console_out`.
-
-Rover camera defaults and ports: [usecase.md](usecase.md).
+| Target | Built when | Purpose |
+|--------|-----------|---------|
+| `noise_fft_bench` | `ENABLE_NOISE_SOURCE` | noise IFFT throughput |
+| `rs_fec_test` | sender or receiver | RS FEC unit checks (also a ctest) |
+| `rs_block_id_pace_test` | sender or receiver | block-id / pacing checks (also a ctest) |
+| `vstreamer_tests` | `VSTREAMER_BUILD_TESTS` | GoogleTest suite (`ctest`) |
+| `h264_{encoder,decoder}_mpp_hw_test` | tests + MPP | hardware tests, ctest label `hw` |
 
 ## Build
 
-Components are selected at configure time (`cmake -DENABLE_<COMPONENT>=ON|OFF`).
-Generated `components/components_config.hpp` defines the same macros for `#ifdef`
-in application code. Include [`components.hpp`](../src/components/components.hpp)
-to pull in enabled headers only.
+Components are selected at configure time; generated `components/components_config.hpp`
+defines the same `ENABLE_*` macros for `#ifdef` in app code, and
+[components.hpp](../src/components/components.hpp) includes only enabled headers.
 
-| CMake option | Component |
-|--------------|-----------|
-| `ENABLE_NOISE_SOURCE` | `noise_source` (default ON) |
-| `ENABLE_V4L2_SOURCE` | `v4l2_source` (default ON; requires `ENABLE_NOISE_SOURCE`) |
-| `ENABLE_JPEG_DECODER_MULTICORE` | `jpeg_decoder_multicore` (default ON) |
-| `ENABLE_H264_DECODER_MPP` | `h264_decoder_mpp` (default ON; links `rockchip_mpp`) |
-| `ENABLE_H264_ENCODER_CEDAR` | `h264_encoder_cedar` (default OFF; links libav) |
-| `ENABLE_H264_ENCODER_INTEL` | `h264_encoder_intel` (default OFF; libav `h264_vaapi`) |
+| CMake option | Default | Effect |
+|--------------|---------|--------|
+| `ENABLE_NOISE_SOURCE` | ON | `noise_source`; fetches PFFFT, uses OpenMP if found |
+| `ENABLE_V4L2_SOURCE` | ON | `v4l2_source` |
+| `ENABLE_JPEG_DECODER_MULTICORE` | ON | `jpeg_decoder_multicore` (libavcodec) |
+| `ENABLE_H264_DECODER_MPP` | ON | `h264_decoder_mpp`; turned OFF with a warning if `rockchip_mpp` is not found |
+| `ENABLE_H264_ENCODER_MPP` | OFF | `h264_encoder_mpp`; turned OFF with a warning if `rockchip_mpp` is not found |
+| `ENABLE_H264_ENCODER_CEDAR` | OFF | `h264_encoder_cedar` (libavcodec `h264_cedrus`) |
+| `ENABLE_H264_ENCODER_INTEL` | OFF | `h264_encoder_intel` (libavcodec `h264_vaapi`) |
+| `ENABLE_MKV_SINK` | ON | `mkv_sink` (libavformat) |
+| `ENABLE_SDL_SINK` | OFF | `sdl_sink` (SDL2) |
+| `ENABLE_STREAM_SENDER` | ON | `stream_sender`; with the receiver, builds ISA-L EC and `rs_block_erasure` |
+| `ENABLE_STREAM_RECEIVER` | ON | `stream_receiver` |
+| `ENABLE_RTP_H264_PAY` | ON | `rtp_h264_pay` |
+| `ENABLE_RTP_H264_DEPAY` | ON | `rtp_h264_depay` |
+| `VSTREAMER_BUILD_TESTS` | OFF | GoogleTest suite + `ctest` registration |
+| `ENABLE_TEST_STREAM_SDL` | OFF | `stream_sdl`; needs noise or V4L2, JPEG decoder, sender/receiver, RTP pay/depay, MPP decoder, SDL sink and one encoder (configure fails otherwise) |
+| `ENABLE_TEST_NOISE_STREAM_SDL`, `ENABLE_TEST_UVC_JPEGDEC_KMSDRM`, `ENABLE_TEST_UVC_JPEGDEC_DMKS` | OFF | deprecated aliases that turn on `ENABLE_TEST_STREAM_SDL` |
 
-Example rover (no GS MPP decode):
+ASan builds (`-fsanitize=address` in `CMAKE_CXX_FLAGS`) link LeakSanitizer suppressions for
+SDL/Mesa from `cmake/lsan_suppressions.txt`.
+
+Reference configurations:
 
 ```bash
-cmake -B build -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_CEDAR=ON
-cmake --build build
+# Rockchip bench, everything incl. tests (ASan)
+cmake -S . -B out/full -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS="-fsanitize=address -g" \
+      -DENABLE_H264_ENCODER_MPP=ON -DENABLE_SDL_SINK=ON -DENABLE_TEST_STREAM_SDL=ON \
+      -DVSTREAMER_BUILD_TESTS=ON
+# Rover (Allwinner H3, Cedar encoder, no MPP decode)
+cmake -S . -B out/rover -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_CEDAR=ON
+# Intel VA-API encoder
+cmake -S . -B out/intel -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_INTEL=ON
+# Ground station (no capture path)
+cmake -S . -B out/gs -DENABLE_NOISE_SOURCE=OFF -DENABLE_V4L2_SOURCE=OFF \
+      -DENABLE_JPEG_DECODER_MULTICORE=OFF
+cmake --build out/full -j$(nproc) && ctest --test-dir out/full --output-on-failure
 ```
 
-Example ground station (no rover JPEG path):
+## Roadmap / target design
 
-```bash
-cmake -B build -DENABLE_NOISE_SOURCE=OFF -DENABLE_V4L2_SOURCE=OFF \
-  -DENABLE_JPEG_DECODER_MULTICORE=OFF -DENABLE_H264_ENCODER_CEDAR=OFF
-cmake --build build
-```
+The original design (from `~/rover/camera`) composes a process from a config file: one source,
+sinks, an encoder slot and a **channel feedback** plugin, driven by a core console. Only the
+component layer exists today; the rest is still design.
 
-## Extraction map
+| Item | Status | Notes |
+|------|--------|-------|
+| Component layer (`component_*`, `data_packet`, factory) | **done** | this page |
+| `stream_sender` / `stream_receiver` + RS block-erasure FEC | **done** | |
+| `rtp_h264_pay` / `rtp_h264_depay` | **done** | |
+| Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl` |
+| External CBR controller (FEC-gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
+| Separate `stream_sender` / `stream_receiver` apps | **planned** | needs receiver → sender link report for `peer_*` metrics |
+| Reverse telemetry datagram (receiver → sender) | **planned** | today `peer_*` metrics are in-process only |
+| Channel feedback plugin (`feedback_winject`, `feedback_none`) | **not started** | maps radio CI (`flow`, RSSI/SNR, `fec_lost`, `stream_request`) to QP/GOP/fps and the send gate |
+| Config file loader (`key = value`, `source`/`sink`/`encoder`/`decoder`/`feedback`) | **not started** | |
+| Core console (verbs → `configure`/`query`, winject-connected client) | **not started** | bench uses `bench_console` |
+| `stream_request` operator gate / deadman | **not started** | `component_sink::set_enabled(on, timeout_ms)` is the hook |
+| MP4 record sink | **not started** | `mkv_sink` records MJPEG today |
+| Rover / winject deployment wiring | **not started** | [usecase.md](usecase.md) |
 
-| rover/camera | framework |
-|--------------|-----------|
-| `camera.c` V4L2 + noise | `V4l2Source` / `NoiseSource` |
-| `camera.c` `rtp_sink` + Annex-B / FU-A | `RtpSink` |
-| `camera.c` `recorder` | `Mp4Sink` |
-| `encoder.h` + `encoder_cedrus.c` | `CedrusEncoder` |
-| JPEG workers in `camera.c` | `JpegDecoderMulticore` |
-| `camera.c` `stream_request` timeout | core → `Sink::set_enabled` |
-| *(new)* manager `gci` / CI | `feedback_winject` |
-| *(new)* RTP depay + display | `RtpSource` + `H264Decoder` + `DisplaySink` |
-| `camera.cfg` / `start.sh` / Makefile | apps on this tree |
-
-Glue that stays in core: queues, pins, lock order (`cfg` before encoder),
-`EmitFn` into sinks.
-
-Out of scope: drive ESP32, drive console `:22090`, winject TCP `:2323`,
-radio firmware.
-
-## Roadmap / implementation status
-
-| Item | Status |
-|------|--------|
-| `component_*` + `data_packet` pipeline | **bench** (`stream_sdl`, rover test app) |
-| `stream_sender` / `stream_receiver` + RS FEC | **done** (review-fixes branch) |
-| `rtp_h264_pay` / `rtp_h264_depay` | **done** |
-| Core feedback plugin + reverse telemetry UDP | **not started** |
-| Config file loader + core console | **not started** (bench uses `channel_controller` UDP console) |
-| `Mp4Sink`, legacy `RtpSink`/`RtpSource` names in table above | **planned** (`mkv_sink` for record today) |
-| Winject / rover deployment wiring | **bench-only** (loopback + docs) |
+Design constraints carried forward for those pieces: capture/decode/encode keep running when the
+send gate is off; feedback never enables sending without an operator `stream_request`; stale
+radio CI is treated as a full queue; encoder/capture reopens are rate-limited.

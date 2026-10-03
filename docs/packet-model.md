@@ -3,8 +3,8 @@
 Pipeline wires carry `data_packet` (`core/data_packet.hpp`): owned
 `packet_body` subclasses (`frame_data`, `audio_data`, `sock_data`).
 
-Receiver RX/gap counters are cached on **stream_sender** (`peer_*` via `query()`) — not
-`data_packet`. See [pipeline-flow.md](pipeline-flow.md).
+Receiver RX/gap counters are not carried in `data_packet`; the bench app publishes them as
+`stream_sender.peer_*` metrics in-process. See [pipeline-flow.md](pipeline-flow.md).
 
 ### RTP capture timestamp extension
 

@@ -1,5 +1,11 @@
 # Use case
 
+> **Target design.** This page describes the planned rover / ground-station deployment. Names such
+> as `RtpSink`, `RtpSource`, `Mp4Sink`, `DisplaySink`, `CedrusEncoder` and `feedback_winject` are
+> design names; today's components are `rtp_h264_pay` + `stream_sender`, `stream_receiver` +
+> `rtp_h264_depay`, `mkv_sink`, `sdl_sink`, `h264_encoder_cedar`, and there is no feedback plugin
+> yet. Status: [vstreamer.md § Roadmap](vstreamer.md#roadmap--target-design).
+
 VStreamer is a framework ([vstreamer.md](vstreamer.md)). The same core
 runs on either end of an RTP path: **as source** it captures and injects;
 **as sink** it receives and presents. Plugins change; the console and
