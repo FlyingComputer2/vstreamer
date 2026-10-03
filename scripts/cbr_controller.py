@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import signal
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -58,21 +57,34 @@ def _make_tune_handler(plot_csv: PlotCsv) -> Callable[[str], str]:
     return handle
 
 
+def _is_controller_argv(argv: list[str]) -> bool:
+    """True only for `python[3] [-flags] .../cbr_controller.py ...`, not for a shell or wrapper
+    whose command line merely mentions the script."""
+    if not argv or not os.path.basename(argv[0]).startswith("python"):
+        return False
+    for arg in argv[1:]:
+        if arg.startswith("-"):
+            continue
+        return os.path.basename(arg) == "cbr_controller.py"
+    return False
+
+
 def _stop_other_controllers() -> None:
     """Only one local controller should publish to PlotJuggler."""
     me = os.getpid()
-    try:
-        out = subprocess.check_output(
-            ["pgrep", "-f", "scripts/cbr_controller.py"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except subprocess.CalledProcessError:
-        return
-    for token in out.split():
-        pid = int(token)
-        if pid != me:
-            os.kill(pid, signal.SIGTERM)
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if _is_controller_argv(argv):
+            try:
+                os.kill(int(entry), signal.SIGTERM)
+            except OSError:
+                pass
 
 
 def main() -> int:
