@@ -423,3 +423,34 @@ TEST(StreamReceiverTest, TelemetryOffSuppressesReports)
     receiver.close();
     close(s);
 }
+
+/* TT-R9: telemetry counters are per open(), like the link counters. */
+TEST(StreamReceiverTest, TelemetryCountersResetOnReopen)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+    const int s = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(s, 0);
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
+    ASSERT_EQ(0, receiver.open());
+    sockaddr_in dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(static_cast<uint16_t>(port));
+    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    const auto wire = make_valid_media_datagram(1, std::vector<uint8_t>(32, 0x22));
+    sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+    vstreamer::stream_link_report rep {};
+    ASSERT_TRUE(recv_link_report(s, &rep, 200));
+    std::string sent;
+    ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
+    EXPECT_NE("0", sent);
+
+    receiver.close();
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
+    EXPECT_EQ("0", sent);
+    receiver.close();
+    close(s);
+}

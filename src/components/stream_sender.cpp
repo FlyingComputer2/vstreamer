@@ -606,6 +606,16 @@ int stream_sender::open()
         send_stop = false;
         send_thread = std::thread(&stream_sender::send_thread_main, this);
 
+        {
+            std::lock_guard<std::mutex> plock(peer_mu);
+            peer_have = false;
+            peer_report = {};
+            peer_session = 0;
+            peer_last_seq = 0;
+            peer_reports_received = 0;
+            peer_reports_lost = 0;
+            peer_reports_rejected = 0;
+        }
         telemetry_stop = false;
         if (telemetry)
         {
