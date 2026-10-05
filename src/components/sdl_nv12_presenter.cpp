@@ -145,7 +145,8 @@ bool enter_console_graphics(const char *log_tag, int &tty_fd, int &vt_num)
     }
     if (tty_fd < 0)
     {
-        std::fprintf(stderr, "%s: cannot open display VT (%d; %s); need root or tty group\n",
+        std::fprintf(stderr, "%s: cannot open display VT (%d; %s); needs root, or a systemd unit "
+                     "with TTYPath= and StandardInput=tty (tty group is write-only)\n",
                      log_tag, errno, std::strerror(errno));
         return false;
     }
