@@ -110,10 +110,12 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 
     std::string rcv_stats;
     std::string snd_stats;
+#if defined(ENABLE_STREAM_RECEIVER)
     if (nullptr != rcv)
     {
         (void)rcv->query("stats", &rcv_stats);
     }
+#endif
     if (nullptr != sender)
     {
         (void)sender->query("stats", &snd_stats);
@@ -231,9 +233,13 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
 
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
+#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     stream_sdl_test::publish_stream_sdl_status_metrics(channel, kmsdrm, present_fps,
                                                        pipeline_flowing, glass_ms);
+#endif
+#if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)
     apps::rx::publish_latency_metrics(glass_ms);
+#endif
 
     if (nullptr != sender)
     {
@@ -276,9 +282,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_fps"), 0.0);
     }
 
+#if defined(ENABLE_STREAM_RECEIVER)
     const uint64_t fec_recovered =
         nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
     const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
+#else
+    const uint64_t fec_recovered = 0;
+    const uint64_t fec_failures = 0;
+#endif
 
     if (nullptr != sender)
     {
@@ -330,6 +341,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      query_double(*depay, "capture_skew_ms"));
     }
 
+#if defined(ENABLE_STREAM_RECEIVER)
     if (nullptr != rcv)
     {
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.in_pps"), rx_pkt_ps);
@@ -351,6 +363,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
                      query_u64(*rcv, "fec_late_blocks"));
     }
+#endif
 
     if (nullptr != dec || nullptr != rcv)
     {
@@ -421,7 +434,11 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
                      static_cast<double>(channel->forward_queue_size()));
     }
 #endif
+#if defined(ENABLE_STREAM_RECEIVER)
     apps::rx::sync_rx_cumulative_counters(d, rcv);
+#else
+    (void)rcv;
+#endif
 }
 
 struct metrics_serve_rate_state
@@ -484,10 +501,12 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
     {
         apps::tx::sync_sender_peer_link_metrics_live(*sender);
     }
+#if defined(ENABLE_STREAM_RECEIVER)
     if (nullptr != rcv)
     {
         apps::rx::sync_rx_link_metrics_live(*rcv);
     }
+#endif
 }
 
 }  // namespace vstreamer::test_app

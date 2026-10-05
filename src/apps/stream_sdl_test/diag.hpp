@@ -83,9 +83,11 @@ struct pipeline_rate_state
     bool                                    have_snap = false;
 };
 
+#ifdef ENABLE_STREAM_RECEIVER
 void log_bench_diag(const bench_diag &d, vstreamer::stream_receiver &rcv,
                     vstreamer::stream_sender &sender, vstreamer::component_coder &enc,
                     const channel_controller *channel);
+#endif
 
 void log_bench_rate_line(const pipeline_rate_state &rate, vstreamer::component_coder &enc,
                          const bench_diag &diag);
