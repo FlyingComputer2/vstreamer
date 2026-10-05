@@ -10,6 +10,7 @@ set(VSTREAMER_TEST_SOURCES
     time_util_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
+    stream_header_test.cpp
     stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
