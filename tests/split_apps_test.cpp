@@ -229,6 +229,12 @@ TEST(SplitAppsTest, SenderReceiverLinkAndCleanShutdown)
     }
     EXPECT_TRUE(ok) << "expected media flow and reverse telemetry within 5s";
 
+    /* The console accepts the full 5-bit FEC range and rejects anything past it. */
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_n 31\n"), "ok\n");
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_k 20\n"), "ok\n");
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_n 32\n").rfind("err bad n", 0), 0u);
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_k 32\n").rfind("err bad k", 0), 0u);
+
     stop_process(snd_pid);
     stop_process(rcv_pid);
 }
