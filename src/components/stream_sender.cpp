@@ -114,7 +114,11 @@ size_t stream_sender::queue_byte_limit() const
      * before the send thread runs; evicting from the head then drops unsent data shards of a
      * block whose first shards are already on the wire, and the receiver rebuilds them from
      * parity only after later packets, which the depayloader sees as reordering. */
-    return std::max<size_t>(k_queue_min_unpaced_bytes, scaled);
+    const size_t unpaced_min =
+        k_queue_min_unpaced_app_bytes * static_cast<size_t>(effective_fec_n()) /
+        static_cast<size_t>(effective_fec_k());
+    const size_t wire_min = std::max<size_t>(256U * 1024U, unpaced_min);
+    return std::max<size_t>(wire_min, scaled);
 }
 
 int stream_sender::effective_fec_k() const

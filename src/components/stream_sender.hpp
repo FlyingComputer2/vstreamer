@@ -118,8 +118,8 @@ private:
     size_t                  queue_bytes = 0;
     static constexpr size_t k_queue_packet_cap = 1024;
     static constexpr size_t k_queue_min_paced_bytes = 32 * 1024;
-    /* Holds a 1080p keyframe at k=8 n=15 (several full 15-shard blocks). */
-    static constexpr size_t k_queue_min_unpaced_bytes = 256 * 1024;
+    /* App-byte budget for a 1080p keyframe at k=8 n=15; unpaced wire minimum scales by n/k. */
+    static constexpr size_t k_queue_min_unpaced_app_bytes = 136 * 1024;
 
     std::thread       send_thread;
     std::atomic<bool> send_stop {false};

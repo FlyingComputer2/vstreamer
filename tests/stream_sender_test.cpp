@@ -144,6 +144,19 @@ TEST(StreamSenderTest, QueueByteLimitHoldsKeyframeBurstWithFec)
     EXPECT_GE(query_size_t(sender, "queue_byte_limit"), 4U * 15U * 1500U);
 }
 
+TEST(StreamSenderTest, QueueByteLimitScalesWithFecN)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "fec_k", "8"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "15"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    EXPECT_GE(query_size_t(sender, "queue_byte_limit"), 256U * 1024U);
+
+    ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
+    const size_t min_n31 = (136U * 1024U * 31U) / 8U;
+    EXPECT_GE(query_size_t(sender, "queue_byte_limit"), min_n31);
+}
+
 /* Unpaced: a keyframe's data and parity are enqueued at once. None of it may be evicted, or the
  * receiver gets the missing data shards back from parity only after later packets. */
 TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
