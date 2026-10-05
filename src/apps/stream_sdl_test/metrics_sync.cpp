@@ -245,9 +245,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     apps::rx::publish_latency_metrics(glass_ms);
 #endif
 
+#if defined(ENABLE_STREAM_RECEIVER)
     const uint64_t fec_recovered =
         nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
     const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
+#else
+    const uint64_t fec_recovered = 0;
+    const uint64_t fec_failures = 0;
+#endif
 
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != sender)
