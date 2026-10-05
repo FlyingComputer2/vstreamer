@@ -49,6 +49,7 @@ private:
     int  reopen_if_needed_locked();
     int  drain_packets_locked();
     void clear_out_locked();
+    void log_opened_locked() const;
 
     mutable std::mutex      mu;
     std::condition_variable cv;
@@ -61,6 +62,11 @@ private:
     int fps = 30;
     int qp = 36;
     int gop = 30;
+    int bps = 4000000;
+    bool rc_cbr = false;
+    int low_power_cfg = -1;
+    int low_power_live = -1;
+    int vbv_ms = 500;
     std::string device;
 
     void *hw_device = nullptr;
@@ -73,6 +79,10 @@ private:
     int   live_fps = 0;
     int   live_qp = 0;
     int   live_gop = 0;
+    int   live_bps = 0;
+    bool  live_rc_cbr = false;
+    int   live_vbv_ms = 0;
+    int   live_low_power_cfg = -1;
     bool  pending_idr = false;
 
     std::deque<frame> out_q;
