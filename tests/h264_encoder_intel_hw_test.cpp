@@ -135,7 +135,7 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
             }
             ASSERT_EQ(orv, 0);
             const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-            if (f.keyframe)
+            if (f.key)
             {
                 if (key_count > 0)
                 {
@@ -167,7 +167,7 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
         if (enc.output(0, out, 50) == 0)
         {
             const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-            if (f.keyframe)
+            if (f.key)
             {
                 saw_key_after = true;
             }
