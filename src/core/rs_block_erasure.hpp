@@ -69,6 +69,11 @@ public:
     }
     const char* impl_name() const;
 
+    [[nodiscard]] uint16_t tx_sdu_seq() const
+    {
+        return sdu_seq;
+    }
+
     // App datagram -> zero or more air shards (full block or nothing).
     void push_app(const uint8_t* data, size_t len,
                   std::vector<std::vector<uint8_t>>* out);
