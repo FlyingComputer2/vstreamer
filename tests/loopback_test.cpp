@@ -753,6 +753,69 @@ TEST(LoopbackTest, PeerReportIntervalNearTelemetryMs)
     relay.stop();
 }
 
+TEST(LoopbackTest, RawMaxInputPayloadDelivered)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
+    ASSERT_EQ(0, cfg_str(sender, "max_datagram", "1476"));
+    ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "1476"));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    std::string max_in_s;
+    ASSERT_EQ(0, sender.query("max_input", &max_in_s));
+    const size_t max_in = static_cast<size_t>(std::strtoull(max_in_s.c_str(), nullptr, 10));
+    EXPECT_EQ(1472U, max_in);
+
+    auto send_and_expect = [&](size_t payload_len, uint32_t tag) {
+        std::vector<uint8_t> storage(payload_len);
+        storage[0] = static_cast<uint8_t>((tag >> 24) & 0xFF);
+        storage[1] = static_cast<uint8_t>((tag >> 16) & 0xFF);
+        storage[2] = static_cast<uint8_t>((tag >> 8) & 0xFF);
+        storage[3] = static_cast<uint8_t>(tag & 0xFF);
+        for (size_t i = 4; i < payload_len; ++i)
+        {
+            storage[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(tag, payload_len)));
+        vstreamer::data_packet out;
+        const auto             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const int rc = receiver.output(0, out, 100);
+            if (0 == rc)
+            {
+                const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
+                ASSERT_EQ(payload_len, sd.buf.size());
+                EXPECT_EQ(0, std::memcmp(storage.data(), sd.buf.u8(), payload_len));
+                return;
+            }
+            ASSERT_TRUE(rc == -EAGAIN);
+        }
+        FAIL() << "no output for payload len " << payload_len;
+    };
+
+    send_and_expect(max_in, 1U);
+    send_and_expect(1466U, 2U);
+
+    std::string stats;
+    ASSERT_EQ(0, receiver.query("stats", &stats));
+    EXPECT_NE(std::string::npos, stats.find("dropped=0"));
+
+    sender.close();
+    receiver.close();
+}
+
 TEST(LoopbackTest, FecBlockNoneBlockNoExtraGap)
 {
     run_link(

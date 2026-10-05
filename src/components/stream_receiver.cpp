@@ -114,10 +114,10 @@ packet_kind_e stream_receiver::output_packet_kind(uint8_t port) const
     return packet_kind_e::SOCK;
 }
 
-void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload)
+void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
+                                             size_t max_app_bytes)
 {
-    const size_t app_max = cached_max_decoded_app;
-    if (payload.empty() || 0 == app_max || payload.size() > app_max)
+    if (payload.empty() || 0 == max_app_bytes || payload.size() > max_app_bytes)
     {
         std::lock_guard<std::mutex> lock(mu);
         recv_dropped++;
@@ -153,7 +153,7 @@ void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload)
     q_cv.notify_all();
 }
 
-void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads)
+void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes)
 {
     if (nullptr == payloads)
     {
@@ -161,7 +161,7 @@ void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads)
     }
     for (auto &payload : *payloads)
     {
-        enqueue_payload_buffer(std::move(payload));
+        enqueue_payload_buffer(std::move(payload), max_app_bytes);
     }
     payloads->clear();
 }
@@ -170,6 +170,7 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
 {
     fec_rx_payload_list payloads;
     bool                valid_media = false;
+    size_t              enqueue_app_max = 0;
     {
         std::lock_guard<std::mutex> lock(mu);
         if (len > static_cast<size_t>(max_datagram))
@@ -228,11 +229,12 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             fec_rec = fec.recovered();
             fec_lost = fec.decode_fail();
             valid_media = fec.hdr_errors() == hdr_errors_before;
+            enqueue_app_max = cached_max_decoded_app;
         }
         else
         {
             /* Raw path (fec none): one SDU per datagram; wire loss is payload loss too. */
-            if (0 == cached_max_decoded_app || payload_len > cached_max_decoded_app)
+            if (0 == cached_max_raw_sdu || payload_len > cached_max_raw_sdu)
             {
                 recv_dropped++;
                 return false;
@@ -251,9 +253,13 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
                 fec_gap_count.fetch_add(dg, std::memory_order_relaxed);
             }
             valid_media = true;
+            enqueue_app_max = cached_max_raw_sdu;
         }
     }
-    enqueue_payloads(&payloads);
+    if (!payloads.empty() && enqueue_app_max > 0)
+    {
+        enqueue_payloads(&payloads, enqueue_app_max);
+    }
     return valid_media;
 }
 
@@ -417,13 +423,18 @@ void stream_receiver::recv_thread_main()
         }
 
         fec_rx_payload_list payloads;
+        size_t              decoded_max = 0;
         {
             std::lock_guard<std::mutex> lock(mu);
             fec.poll_rx(&payloads);
             note_fec_output_gaps(fec, fec_gap_count);
             fec_lost = fec.decode_fail();
+            decoded_max = cached_max_decoded_app;
         }
-        enqueue_payloads(&payloads);
+        if (!payloads.empty() && decoded_max > 0)
+        {
+            enqueue_payloads(&payloads, decoded_max);
+        }
     }
 }
 
@@ -538,6 +549,7 @@ int stream_receiver::open()
         rx_bad_header = 0;
         cached_max_fec_shard = stream_max_fec_shard(static_cast<size_t>(max_datagram));
         cached_max_decoded_app = max_decoded_app_bytes_from_shard(cached_max_fec_shard);
+        cached_max_raw_sdu = stream_max_raw_sdu(static_cast<size_t>(max_datagram));
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
