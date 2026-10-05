@@ -733,6 +733,14 @@ int stream_sender::input(uint8_t port, const data_packet &in)
     }
     if (fec_mode_e::none == mode)
     {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!opened)
+            {
+                dropped.fetch_add(1, std::memory_order_relaxed);
+                return 0;
+            }
+        }
         enqueue_wire_copy(src.buf.u8(), src.buf.size(), false);
     }
     else

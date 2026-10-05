@@ -291,15 +291,6 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.out_fps"), 0.0);
     }
 
-#if defined(ENABLE_STREAM_RECEIVER)
-    const uint64_t fec_recovered =
-        nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
-    const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
-#else
-    const uint64_t fec_recovered = 0;
-    const uint64_t fec_failures = 0;
-#endif
-
     if (nullptr != sender)
     {
         metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_fps"), jpeg_out_fps);

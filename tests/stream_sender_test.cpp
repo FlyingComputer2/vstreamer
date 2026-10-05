@@ -645,6 +645,45 @@ bool recv_one_udp(int fd, uint8_t *out, size_t cap, size_t *out_len, int timeout
 
 }  // namespace
 
+TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(receiver, "listen", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec", "none"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.input(0, make_sock_packet(0, 64)));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+    ASSERT_EQ(0, sender.input(0, make_sock_packet(1, 64)));
+
+    vstreamer::data_packet out;
+    const auto             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    int                    got = 0;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const int rc = receiver.output(0, out, 100);
+        if (0 == rc)
+        {
+            ++got;
+        }
+        else
+        {
+            ASSERT_EQ(-EAGAIN, rc);
+        }
+    }
+    EXPECT_EQ(1, got);
+
+    sender.close();
+    receiver.close();
+}
+
 TEST(StreamSenderTest, MaxInputRawAndFecModes)
 {
     vstreamer::stream_sender sender;

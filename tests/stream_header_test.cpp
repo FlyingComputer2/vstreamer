@@ -24,7 +24,7 @@ vstreamer::stream_header sample_hdr()
 TEST(StreamHeaderTest, RoundTripFixedHeader)
 {
     const vstreamer::stream_header in = sample_hdr();
-    uint8_t                          wire[vstreamer::k_stream_v2_header_len];
+    uint8_t                          wire[vstreamer::k_stream_header_len];
     vstreamer::stream_header_write(wire, in);
 
     EXPECT_EQ(0xAB, wire[0]);
@@ -53,7 +53,7 @@ TEST(StreamHeaderTest, StampSequencePatchesBytesZeroOneOnly)
 {
     vstreamer::stream_header h = sample_hdr();
     h.sequence_number = 0;
-    uint8_t wire[vstreamer::k_stream_v2_header_len + 1];
+    uint8_t wire[vstreamer::k_stream_header_len + 1];
     vstreamer::stream_header_write(wire, h);
     wire[4] = 0x55;
 
@@ -77,7 +77,7 @@ TEST(StreamHeaderTest, RejectTooShort)
 
 TEST(StreamHeaderTest, RejectWrongVersion)
 {
-    uint8_t wire[vstreamer::k_stream_v2_header_len] = {0x00, 0x01, 0x08, 0x00}; /* version 1 */
+    uint8_t wire[vstreamer::k_stream_header_len] = {0x00, 0x01, 0x08, 0x00}; /* version 1 */
     vstreamer::stream_header out {};
     const uint8_t           *payload = nullptr;
     size_t                   payload_len = 0;
@@ -87,7 +87,7 @@ TEST(StreamHeaderTest, RejectWrongVersion)
 
 TEST(StreamHeaderTest, RejectFlagSpareBit)
 {
-    uint8_t wire[vstreamer::k_stream_v2_header_len] = {0x00, 0x01, 0x17, 0x00}; /* spare set */
+    uint8_t wire[vstreamer::k_stream_header_len] = {0x00, 0x01, 0x17, 0x00}; /* spare set */
     vstreamer::stream_header out {};
     const uint8_t           *payload = nullptr;
     size_t                   payload_len = 0;
@@ -101,7 +101,7 @@ TEST(StreamHeaderTest, RejectFecTelemetryKind)
     h.sequence_number = 1;
     h.is_fec = true;
     h.is_stream_data = false;
-    uint8_t wire[vstreamer::k_stream_v2_header_len];
+    uint8_t wire[vstreamer::k_stream_header_len];
     vstreamer::stream_header_write(wire, h);
     wire[2] = static_cast<uint8_t>((vstreamer::k_stream_wire_version
                                     << vstreamer::k_stream_flag_version_shift) |
@@ -116,7 +116,7 @@ TEST(StreamHeaderTest, RejectFecTelemetryKind)
 
 TEST(StreamHeaderTest, SkipUnknownExtTlv)
 {
-    std::vector<uint8_t> datagram(vstreamer::k_stream_v2_header_len + 4 + 2, 0);
+    std::vector<uint8_t> datagram(vstreamer::k_stream_header_len + 4 + 2, 0);
     datagram[2] = static_cast<uint8_t>(vstreamer::k_stream_wire_version
                                          << vstreamer::k_stream_flag_version_shift);
     datagram[3] = 4;
@@ -139,7 +139,7 @@ TEST(StreamHeaderTest, SkipUnknownExtTlv)
 
 TEST(StreamHeaderTest, RejectExtPastEndOfDatagram)
 {
-    uint8_t wire[vstreamer::k_stream_v2_header_len] = {0x00, 0x01, 0x10, 0x04};
+    uint8_t wire[vstreamer::k_stream_header_len] = {0x00, 0x01, 0x10, 0x04};
     vstreamer::stream_header out {};
     const uint8_t           *payload = nullptr;
     size_t                   payload_len = 0;
@@ -149,7 +149,7 @@ TEST(StreamHeaderTest, RejectExtPastEndOfDatagram)
 
 TEST(StreamHeaderTest, RejectTruncatedTlvInExt)
 {
-    std::vector<uint8_t> datagram(vstreamer::k_stream_v2_header_len + 3, 0);
+    std::vector<uint8_t> datagram(vstreamer::k_stream_header_len + 3, 0);
     datagram[2] = static_cast<uint8_t>(vstreamer::k_stream_wire_version
                                          << vstreamer::k_stream_flag_version_shift);
     datagram[3] = 3;

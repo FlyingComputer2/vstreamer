@@ -9,11 +9,7 @@ namespace vstreamer
 {
 
 inline constexpr uint8_t k_stream_wire_version = 2;
-
-/* v2 packet header on the wire; v1 path still uses the 2-byte prefix below until migrated. */
-inline constexpr size_t k_stream_v2_header_len = 4;
-/* v2 wire header length (sender/receiver use this on the wire). */
-inline constexpr size_t k_stream_header_len = k_stream_v2_header_len;
+inline constexpr size_t k_stream_header_len = 4;
 
 inline constexpr unsigned k_stream_flag_version_shift = 3;
 inline constexpr unsigned k_stream_flag_version_mask = 0x1F;
@@ -37,11 +33,11 @@ struct stream_header
 
 [[nodiscard]] inline size_t stream_max_fec_shard(size_t max_datagram)
 {
-    if (max_datagram <= k_stream_v2_header_len)
+    if (max_datagram <= k_stream_header_len)
     {
         return 0;
     }
-    return max_datagram - k_stream_v2_header_len;
+    return max_datagram - k_stream_header_len;
 }
 
 [[nodiscard]] inline size_t stream_max_raw_sdu(size_t max_datagram)
@@ -72,11 +68,6 @@ inline void stream_header_stamp_sequence(uint8_t *wire, uint16_t sequence_number
     wire[1] = static_cast<uint8_t>(sequence_number & 0xFF);
 }
 
-inline void stream_header_store_be16(uint8_t *wire, uint16_t seq)
-{
-    stream_header_stamp_sequence(wire, seq);
-}
-
 [[nodiscard]] inline int stream_header_parse(const uint8_t *data, size_t len, stream_header *hdr,
                                              const uint8_t **payload, size_t *payload_len)
 {
@@ -84,7 +75,7 @@ inline void stream_header_store_be16(uint8_t *wire, uint16_t seq)
     {
         return -EINVAL;
     }
-    if (len < k_stream_v2_header_len)
+    if (len < k_stream_header_len)
     {
         return -EMSGSIZE;
     }
@@ -114,12 +105,12 @@ inline void stream_header_store_be16(uint8_t *wire, uint16_t seq)
     }
 
     const size_t ext_total = static_cast<size_t>(hdr->ext_len);
-    if (len < k_stream_v2_header_len + ext_total)
+    if (len < k_stream_header_len + ext_total)
     {
         return -EMSGSIZE;
     }
 
-    size_t off = k_stream_v2_header_len;
+    size_t off = k_stream_header_len;
     const size_t ext_end = off + ext_total;
     while (off < ext_end)
     {
@@ -136,8 +127,8 @@ inline void stream_header_store_be16(uint8_t *wire, uint16_t seq)
         off += tlv_total;
     }
 
-    *payload = data + k_stream_v2_header_len + ext_total;
-    *payload_len = len - k_stream_v2_header_len - ext_total;
+    *payload = data + k_stream_header_len + ext_total;
+    *payload_len = len - k_stream_header_len - ext_total;
     return 0;
 }
 
