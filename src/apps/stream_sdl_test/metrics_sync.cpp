@@ -326,6 +326,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      fec_failures);
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_oversized"),
                      query_u64(*sender, "fec_oversized"));
+        /* Packets evicted from the send queue (or rejected) before reaching the wire. */
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.dropped"),
+                     query_u64(*sender, "dropped"));
     }
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
@@ -339,6 +342,16 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      query_u64(*depay, "capture_ts_rejected"));
         metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.capture_skew_ms"),
                      query_double(*depay, "capture_skew_ms"));
+        /* RTP-level damage the decoder never reports: sequence loss, NALs and AUs dropped
+         * while waiting for a clean start. */
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.loss"),
+                     query_double(*depay, "loss"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.nal_dropped"),
+                     query_u64(*depay, "nal_dropped"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.au_dropped"),
+                     query_u64(*depay, "au_dropped"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.need_idr"),
+                     query_u64(*depay, "need_idr"));
     }
 
 #if defined(ENABLE_STREAM_RECEIVER)

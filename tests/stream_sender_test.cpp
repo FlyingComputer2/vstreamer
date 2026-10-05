@@ -132,6 +132,46 @@ TEST(StreamSenderTest, QueueByteLimitWithPacing)
     EXPECT_GE(limit, 32768U);
 }
 
+TEST(StreamSenderTest, QueueByteLimitHoldsKeyframeBurstWithFec)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "fec_n", "15"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "8"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    /* Four full k=8 n=15 blocks of max-size shards. */
+    EXPECT_GE(query_size_t(sender, "queue_byte_limit"), 4U * 15U * 1500U);
+}
+
+/* Unpaced: a keyframe's data and parity are enqueued at once. None of it may be evicted, or the
+ * receiver gets the missing data shards back from parity only after later packets. */
+TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "15"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "8"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    constexpr int    k_packets = 32;
+    constexpr size_t k_payload = 1400;
+    for (int i = 0; i < k_packets; ++i)
+    {
+        const auto pkt = make_sock_packet(static_cast<uint32_t>(i), k_payload);
+        ASSERT_EQ(0, sender.input(0, pkt));
+    }
+
+    std::string dropped_s;
+    ASSERT_EQ(0, sender.query("dropped", &dropped_s));
+    EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
+
+    sender.close();
+}
+
 TEST(StreamSenderTest, QueueByteCapEvictsOldestUnderPacing)
 {
     const int port = ephemeral_udp_port();

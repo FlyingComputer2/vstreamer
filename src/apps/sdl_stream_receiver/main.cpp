@@ -198,7 +198,7 @@ int main(int argc, char **argv)
                    });
     ctrl.add_metrics_sync([&]() {
         update_pipeline_metrics(g_bench_diag, nullptr, nullptr, &rcv, preview, kmsdrm, rate,
-                                nullptr, nullptr, false, &dec);
+                                nullptr, nullptr, false, &dec, &depay);
     });
 
     std::fprintf(stderr, "sdl_stream_receiver: listen %s console %s:%d\n", listen,

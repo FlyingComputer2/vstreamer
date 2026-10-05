@@ -98,11 +98,23 @@ size_t stream_sender::queue_byte_limit() const
     }
     else
     {
-        rate_bps = static_cast<double>(ingress_kbps) * 125.0;
+        /* ingress_kbps is the app rate; parity adds n/k on the wire. */
+        rate_bps = static_cast<double>(ingress_kbps) * 125.0 *
+                   static_cast<double>(effective_fec_n()) /
+                   static_cast<double>(effective_fec_k());
     }
     const size_t scaled =
         static_cast<size_t>(rate_bps * static_cast<double>(queue_ms) / 1000.0);
-    return std::max<size_t>(32768, scaled);
+    if (cap_kbps > 0)
+    {
+        /* Paced: the cap bounds how stale queued data may get. */
+        return std::max<size_t>(k_queue_min_paced_bytes, scaled);
+    }
+    /* Unpaced: the queue only absorbs bursts. A keyframe and all of its parity are enqueued
+     * before the send thread runs; evicting from the head then drops unsent data shards of a
+     * block whose first shards are already on the wire, and the receiver rebuilds them from
+     * parity only after later packets, which the depayloader sees as reordering. */
+    return std::max<size_t>(k_queue_min_unpaced_bytes, scaled);
 }
 
 int stream_sender::effective_fec_k() const

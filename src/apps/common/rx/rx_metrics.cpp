@@ -61,6 +61,13 @@ void sync_rx_cumulative_counters(const test_app::bench_diag &d, stream_receiver 
                  d.rx_dec_in_err.load(std::memory_order_relaxed) +
                      d.rx_depay_err.load(std::memory_order_relaxed) +
                      d.rx_au_q_drop.load(std::memory_order_relaxed));
+    /* dropped_packets is the sum of the first three; the split shows which stage loses AUs. */
+    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.depay_errors"), d.rx_depay_err);
+    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.au_queue_drops"), d.rx_au_q_drop);
+    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.decode_in_errors"), d.rx_dec_in_err);
+    /* Output errors include frames the decoder flagged as corrupt and the pipeline discarded. */
+    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.decode_out_errors"),
+                 d.rx_dec_out_err);
     metric_store(*g_pipeline_metrics.get_metric("sdl_sink.dropped_frames"), d.rx_present_q_drop);
 }
 
