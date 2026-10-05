@@ -507,54 +507,68 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
     if (later_block_waiting &&
         t - later_block_since > std::chrono::milliseconds(emit_hold_ms()))
     {
-        bool     jump = false;
+        bool     found = false;
         uint16_t target = emit_next;
         int      best_d = 0;
         for (const auto& kv : ready_blocks)
         {
             const int d = dist_from_emit(kv.first);
-            if (d > 0 && (!jump || d < best_d))
+            if (d > 0 && (!found || d < best_d))
             {
-                jump = true;
+                found = true;
                 target = kv.first;
                 best_d = d;
             }
         }
-        if (jump)
+        for (const auto& kv : rx_blocks)
         {
-            note_head_hole_sdus(best_d);
-            emit_next = target;
+            const int d = dist_from_emit(kv.first);
+            if (d > 0 && (!found || d < best_d))
+            {
+                found = true;
+                target = kv.first;
+                best_d = d;
+            }
         }
-        else
+        if (found)
         {
-            bool     found = false;
-            uint16_t ahead = 0;
-            int      ahead_d = 0;
-            for (const auto& kv : ready_blocks)
+            if (best_d > static_cast<int>(k_ring_evict_sdus))
             {
-                const int d = dist_from_emit(kv.first);
-                if (d > 0 && (!found || d < ahead_d))
+                /* Larger than any real burst: treat as a new sender session, not loss. */
+                ready_block_s saved_ready {};
+                bool          have_ready = false;
+                if (const auto rit = ready_blocks.find(target); rit != ready_blocks.end())
                 {
-                    found = true;
-                    ahead = kv.first;
-                    ahead_d = d;
+                    saved_ready = std::move(rit->second);
+                    have_ready = true;
                 }
-            }
-            for (const auto& kv : rx_blocks)
-            {
-                const int d = dist_from_emit(kv.first);
-                if (d > 0 && (!found || d < ahead_d))
+                rx_block_s saved_rx {};
+                bool       have_rx = false;
+                if (const auto rxit = rx_blocks.find(target); rxit != rx_blocks.end())
                 {
-                    found = true;
-                    ahead = kv.first;
-                    ahead_d = d;
+                    saved_rx = std::move(rxit->second);
+                    have_rx = true;
                 }
+                rx_blocks.clear();
+                ready_blocks.clear();
+                done.clear();
+                done_order.clear();
+                if (have_rx)
+                {
+                    rx_blocks.emplace(target, std::move(saved_rx));
+                }
+                if (have_ready)
+                {
+                    ready_blocks.emplace(target, std::move(saved_ready));
+                }
+                emit_next = target;
+                newest = target;
+                newest_set = true;
             }
-            if (found)
+            else
             {
-                /* Jump without mark_done so a very late shard can still be delivered. */
-                note_head_hole_sdus(ahead_d);
-                emit_next = ahead;
+                note_head_hole_sdus(best_d);
+                emit_next = target;
             }
         }
         later_block_waiting = false;

@@ -563,6 +563,57 @@ TEST(RsBlockErasureEmitTest, PeerRestartSilenceNoGapCounted)
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
 
+TEST(RsBlockErasureEmitTest, QuickForwardRestartNoPhantomLoss)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    const auto block0 = encode_block_apps(enc, 0, {1, 2, 3, 4});
+    const auto block_far = encode_block_apps(enc, 20000, {9, 10, 11, 12});
+    vstreamer::fec_rx_payload_list discard;
+    for (const auto &s : block0)
+    {
+        feed_append(dec, s, &discard);
+    }
+    for (const auto &s : block_far)
+    {
+        feed_append(dec, s, &discard);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list out;
+    dec.poll_rx(&out);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+    for (uint8_t tag : {9, 10, 11, 12})
+    {
+        EXPECT_TRUE(out_has_app_tag(out, tag));
+    }
+}
+
+TEST(RsBlockErasureEmitTest, LargeButRealHoleStillCounted)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(6, 8, 20));
+    rs_block_erasure dec;
+    const auto block0 = encode_block_apps(enc, 0, {1, 2, 3, 4, 5, 6});
+    const uint16_t far_base = static_cast<uint16_t>(6U + 2042U);
+    const auto block_far = encode_block_apps(enc, far_base, {9, 10, 11, 12, 13, 14});
+    vstreamer::fec_rx_payload_list discard;
+    for (const auto &s : block0)
+    {
+        feed_append(dec, s, &discard);
+    }
+    for (const auto &s : block_far)
+    {
+        feed_append(dec, s, &discard);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list out;
+    dec.poll_rx(&out);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 2042u);
+}
+
 TEST(RsBlockErasureEmitTest, SduSeqWrapNoLoss)
 {
     rs_block_erasure enc;
@@ -610,5 +661,43 @@ TEST(RsBlockErasureEmitTest, LateBlockAfterJumpNotUndone)
         feed_append(dec, s, &out);
     }
     EXPECT_GE(out.size(), 4u);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+}
+
+TEST(RsBlockErasureEmitTest, HeadHoleJumpCountsPartialBlockOnce)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    const auto block_a = encode_block_apps(enc, 0, {1, 2, 3, 4});
+    const auto block_b = encode_block_apps(enc, 4, {11, 12, 13, 14});
+    const auto block_c = encode_block_apps(enc, 8, {21, 22, 23, 24});
+    vstreamer::fec_rx_payload_list out;
+    vstreamer::fec_rx_payload_list discard;
+    feed_append(dec, block_a[4], &discard);
+    feed_append(dec, block_b[0], &discard);
+    feed_append(dec, block_b[1], &discard);
+    for (const auto &s : block_c)
+    {
+        feed_append(dec, s, &discard);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list step;
+    dec.poll_rx(&step);
+    out.insert(out.end(), step.begin(), step.end());
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.rx_hold_ms() + 5)));
+    dec.poll_rx(&step);
+    out.insert(out.end(), step.begin(), step.end());
+
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 6u);
+    ASSERT_GE(out.size(), 6u);
+    EXPECT_EQ(out[0].u8()[0], 11);
+    EXPECT_EQ(out[1].u8()[0], 12);
+    EXPECT_EQ(out[2].u8()[0], 21);
+    EXPECT_EQ(out[3].u8()[0], 22);
+    EXPECT_EQ(out[4].u8()[0], 23);
+    EXPECT_EQ(out[5].u8()[0], 24);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
