@@ -605,7 +605,7 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
     maybe_give_up_head(out);
 }
 
-bool vstreamer::rs_block_erasure::try_decode_block(uint16_t block_id, rx_block_s* block,
+bool vstreamer::rs_block_erasure::try_decode_block(uint16_t sdu_base, rx_block_s* block,
                                                    fec_rx_payload_list* out)
 {
     if (nullptr == block)
@@ -634,18 +634,18 @@ bool vstreamer::rs_block_erasure::try_decode_block(uint16_t block_id, rx_block_s
     const int            released_before = block->released;
     const bool           ok =
         decode_block(block->k, block->n, block->sdu_n, block->frags, &decoded, &rec);
-    rx_blocks.erase(block_id);
+    rx_blocks.erase(sdu_base);
     if (!ok)
     {
         rs_failures_count++;
-        abandon_partial_block(snap, block_id, out);
+        abandon_partial_block(snap, sdu_base, out);
         run_emit_engine(out);
         return true;
     }
     recovered_count += static_cast<uint64_t>(rec);
     blocks_count++;
     note_rx_block_output_shortfall(expected_sdus(snap), static_cast<int>(decoded.size()));
-    on_block_decoded(block_id, released_before, std::move(decoded), snap.sdu_n, out);
+    on_block_decoded(sdu_base, released_before, std::move(decoded), snap.sdu_n, out);
     return true;
 }
 
@@ -1290,13 +1290,13 @@ void vstreamer::rs_block_erasure::expire_done()
     }
 }
 
-void vstreamer::rs_block_erasure::mark_done(uint16_t block_id)
+void vstreamer::rs_block_erasure::mark_done(uint16_t sdu_base)
 {
     const auto t = now();
-    auto inserted = done.emplace(block_id, t);
+    auto inserted = done.emplace(sdu_base, t);
     if (inserted.second)
     {
-        done_order.push_back(block_id);
+        done_order.push_back(sdu_base);
     }
     else
     {

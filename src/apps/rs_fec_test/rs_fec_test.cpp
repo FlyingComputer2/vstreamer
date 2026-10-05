@@ -62,7 +62,7 @@ int main()
         }
     }
 
-    /* Blocks must be emitted in block_id order even when shards arrive OOO. */
+    /* Blocks must be emitted in sdu_base order even when shards arrive OOO. */
     rs_block_erasure enc2;
     rs_block_erasure dec2;
     if (!enc2.init(2, 4, 20))
@@ -283,7 +283,7 @@ int main()
         }
     }
 
-    /* TX block_id continues across a runtime k/n re-init. */
+    /* TX sdu_base continues across a runtime k/n re-init. */
     {
         rs_block_erasure enc6;
         if (!enc6.init(2, 4, 20))
@@ -305,7 +305,7 @@ int main()
         }
     }
 
-    /* Sender process restart (new random block_id base): receiver resyncs. */
+    /* Sender process restart (new random sdu_base): receiver resyncs. */
     {
         rs_block_erasure enc7a;
         rs_block_erasure enc7b;

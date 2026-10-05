@@ -166,7 +166,7 @@ TEST(StreamHeaderTest, RejectTruncatedTlvInExt)
 
 TEST(StreamHeaderTest, RejectV1StyleFecBytes)
 {
-    /* v1: 2-byte sequence + block_id in byte 2 — not a v2 version field. */
+    /* v1: 2-byte sequence + legacy id byte — not a v2 version field. */
     uint8_t wire[8] = {0x12, 0x34, 0x07, 0x18, 0x88, 0x04, 0x00, 0x00};
     vstreamer::stream_header out {};
     const uint8_t           *payload = nullptr;

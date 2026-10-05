@@ -13,16 +13,16 @@ using vstreamer::rs_block_erasure;
 namespace
 {
 
-std::vector<uint8_t> encode_one(rs_block_erasure &enc, uint16_t block_id, uint8_t tag)
+std::vector<uint8_t> encode_one(rs_block_erasure &enc, uint16_t sdu_base, uint8_t tag)
 {
     const std::vector<uint8_t> app = {tag};
     std::vector<std::vector<uint8_t>> air;
-    EXPECT_TRUE(enc.encode_block({app}, block_id, &air));
+    EXPECT_TRUE(enc.encode_block({app}, sdu_base, &air));
     EXPECT_EQ(air.size(), 1u);
     return air[0];
 }
 
-std::vector<std::vector<uint8_t>> encode_block_apps(rs_block_erasure &enc, uint16_t block_id,
+std::vector<std::vector<uint8_t>> encode_block_apps(rs_block_erasure &enc, uint16_t sdu_base,
                                                     const std::vector<uint8_t> &tags)
 {
     std::vector<std::vector<uint8_t>> apps;
@@ -31,7 +31,7 @@ std::vector<std::vector<uint8_t>> encode_block_apps(rs_block_erasure &enc, uint1
         apps.push_back({t});
     }
     std::vector<std::vector<uint8_t>> air;
-    EXPECT_TRUE(enc.encode_block(apps, block_id, &air));
+    EXPECT_TRUE(enc.encode_block(apps, sdu_base, &air));
     return air;
 }
 
