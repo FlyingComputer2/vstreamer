@@ -27,7 +27,7 @@ cmake -S . -B out/full  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
 cmake -S . -B out/rover -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_CEDAR=ON
 cmake -S . -B out/intel -DENABLE_H264_DECODER_MPP=OFF -DENABLE_H264_ENCODER_INTEL=ON
 cmake -S . -B out/gs    -DENABLE_NOISE_SOURCE=OFF -DENABLE_V4L2_SOURCE=OFF \
-      -DENABLE_JPEG_DECODER_MULTICORE=OFF
+      -DENABLE_JPEG_DECODER_MULTICORE=OFF -DENABLE_SDL_SINK=ON
 cmake --build out/full -j$(nproc)
 ctest --test-dir out/full --output-on-failure            # add -L hw for MPP hardware tests
 ```

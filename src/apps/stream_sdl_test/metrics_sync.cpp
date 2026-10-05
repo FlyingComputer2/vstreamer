@@ -4,7 +4,9 @@
 
 #include "apps/common/app_metrics.hpp"
 #include "apps/common/stage_latency.hpp"
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
 #include "apps/common/tx/tx_metrics.hpp"
+#endif
 #include "apps/common/rx/rx_metrics.hpp"
 #include "apps/stream_sdl_test/bench_stream_metrics.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
@@ -146,8 +148,10 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double nv12_gap_fps =
         jpeg_out_fps > enc_in_fps ? jpeg_out_fps - enc_in_fps : 0.0;
 
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     const int qp = (nullptr != enc) ? query_encoder_qp(*enc) : -1;
     const int qp_val = qp >= 0 ? qp : 0;
+#endif
 
     const uint64_t nv12_q_drop = d.tx_nv12_q_drop.load();
     const uint64_t enc_input_miss = d.tx_enc_input_miss.load();
@@ -233,7 +237,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
 
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
-#if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
+#if !defined(VSTREAMER_BENCH_TX_ONLY)
     stream_sdl_test::publish_stream_sdl_status_metrics(channel, kmsdrm, present_fps,
                                                        pipeline_flowing, glass_ms);
 #endif
@@ -241,6 +245,11 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     apps::rx::publish_latency_metrics(glass_ms);
 #endif
 
+    const uint64_t fec_recovered =
+        nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
+    const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
+
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != sender)
     {
         store_source_pipeline_metrics(noise_fps, source_out_kbps, ts,
@@ -330,12 +339,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.dropped"),
                      query_u64(*sender, "dropped"));
     }
+#endif  // !VSTREAMER_BENCH_RX_ONLY
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     stream_sdl_test::publish_channel_rate_metrics(channel, dt, rate.have_snap, prev_ch_bytes_in,
                                                   prev_ch_bytes_out, prev_ch_fwd_drops, ch);
 #endif
 
+#if !defined(VSTREAMER_BENCH_TX_ONLY)
     if (nullptr != depay)
     {
         metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.capture_ts_rejected"),
@@ -411,6 +422,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("sdl_sink.render_fps"), present_fps);
         metric_store(*g_pipeline_metrics.get_metric("sdl_sink.latency_ms"), glass_ms);
     }
+#endif  // !VSTREAMER_BENCH_TX_ONLY
 
     rate.snap = now;
     rate.t0 = t_now;
@@ -437,7 +449,9 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
 #if defined(VSTREAMER_BENCH_TX_ONLY) || defined(VSTREAMER_BENCH_RX_ONLY)
     (void)channel;
 #endif
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     apps::tx::sync_tx_cumulative_counters(d, sender);
+#endif
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != channel)
     {
@@ -447,7 +461,7 @@ void sync_cumulative_pipeline_counters(const bench_diag &d, stream_sender *sende
                      static_cast<double>(channel->forward_queue_size()));
     }
 #endif
-#if defined(ENABLE_STREAM_RECEIVER)
+#if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)
     apps::rx::sync_rx_cumulative_counters(d, rcv);
 #else
     (void)rcv;
@@ -470,6 +484,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
                                 stream_receiver *rcv,
                                 const test_app::channel_controller *channel)
 {
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     const auto   t_now = std::chrono::steady_clock::now();
     const uint64_t enc_out_bytes = d.tx_enc_out_bytes.load(std::memory_order_relaxed);
     double       enc_out_kbps = 0.0;
@@ -508,13 +523,16 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
             }
         }
     }
+#endif
     sync_cumulative_pipeline_counters(d, sender, channel, rcv);
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
     /* stream_sender.peer_* only from the sender's received link reports. */
     if (nullptr != sender)
     {
         apps::tx::sync_sender_peer_link_metrics_live(*sender);
     }
-#if defined(ENABLE_STREAM_RECEIVER)
+#endif
+#if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)
     if (nullptr != rcv)
     {
         apps::rx::sync_rx_link_metrics_live(*rcv);
