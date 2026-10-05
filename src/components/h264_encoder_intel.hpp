@@ -84,8 +84,13 @@ private:
     int   live_vbv_ms = 0;
     int   live_low_power_cfg = -1;
     bool  pending_idr = false;
+    int     enc_frame_idx = 0;
+    int     frames_since_forced_key = 0;
+    int64_t last_out_pts = -1;
+    bool    pending_output_key = false;
 
-    std::deque<frame> out_q;
+    std::deque<int64_t> in_pts_q;
+    std::deque<frame>   out_q;
 };
 
 }  // namespace vstreamer

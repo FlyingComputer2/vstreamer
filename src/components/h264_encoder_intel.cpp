@@ -82,6 +82,42 @@ int parse_low_power(std::string_view v, int *out)
     return -EINVAL;
 }
 
+bool h264_au_has_idr(const uint8_t *data, size_t len)
+{
+    if (nullptr == data || len < 5)
+    {
+        return false;
+    }
+    size_t i = 0;
+    while (i + 4 < len)
+    {
+        if (data[i] == 0 && data[i + 1] == 0)
+        {
+            size_t off = 0;
+            if (data[i + 2] == 1)
+            {
+                off = 3;
+            }
+            else if (data[i + 2] == 0 && data[i + 3] == 1)
+            {
+                off = 4;
+            }
+            if (off > 0 && i + off < len)
+            {
+                const int nal_type = data[i + off] & 0x1f;
+                if (5 == nal_type)
+                {
+                    return true;
+                }
+                i += off + 1;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return false;
+}
+
 void apply_rc_to_ctx(AVCodecContext *ctx, bool cbr, int bitrate, int qp_val, int gop_val, int vbv)
 {
     ctx->max_b_frames = 0;
@@ -140,6 +176,8 @@ int h264_encoder_intel::nv12_size_locked() const
 
 void h264_encoder_intel::clear_out_locked()
 {
+    in_pts_q.clear();
+    pending_output_key = false;
     out_q.clear();
 }
 
@@ -196,9 +234,24 @@ int h264_encoder_intel::drain_packets_locked()
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
+        int64_t out_pts = pkt->pts;
+        if (!in_pts_q.empty())
+        {
+            out_pts = in_pts_q.front();
+            in_pts_q.pop_front();
+        }
+        if (last_out_pts >= 0 && out_pts < last_out_pts)
+        {
+            out_pts = last_out_pts;
+        }
+        last_out_pts = out_pts;
+        const bool key = pending_output_key;
+        if (pending_output_key)
+        {
+            pending_output_key = false;
+        }
         frame au;
-        au.reset(media_kind_e::H264, live_w, live_h, pkt->pts, !!(pkt->flags & AV_PKT_FLAG_KEY),
-                 std::move(payload));
+        au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload));
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
         cv.notify_one();
@@ -353,11 +406,17 @@ int h264_encoder_intel::codec_open_locked()
     live_low_power_cfg = low_power_cfg;
     low_power_live = resolved_lp;
     reopen_req = false;
+    enc_frame_idx = 0;
+    frames_since_forced_key = 0;
+    last_out_pts = -1;
+    pending_output_key = false;
+    pending_idr = true;
     return 0;
 }
 
 void h264_encoder_intel::codec_close_locked()
 {
+    in_pts_q.clear();
     if (ctx)
     {
         auto *c = static_cast<AVCodecContext *>(ctx);
@@ -495,6 +554,12 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     sw->height = live_h;
     sw->format = AV_PIX_FMT_NV12;
     sw->pts = f.pts;
+    const int gop_n = live_gop > 0 ? live_gop : gop;
+    if (gop_n > 0 && enc_frame_idx > 0 && frames_since_forced_key >= gop_n)
+    {
+        pending_idr = true;
+    }
+    const bool mark_key_au = pending_idr;
     if (pending_idr)
     {
         sw->pict_type = AV_PICTURE_TYPE_I;
@@ -534,6 +599,17 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     {
         return ret;
     }
+    in_pts_q.push_back(f.pts);
+    if (mark_key_au)
+    {
+        pending_output_key = true;
+        frames_since_forced_key = 0;
+    }
+    else
+    {
+        ++frames_since_forced_key;
+    }
+    ++enc_frame_idx;
 
     return drain_packets_locked();
 }

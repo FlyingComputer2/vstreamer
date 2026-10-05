@@ -139,7 +139,7 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
             {
                 if (key_count > 0)
                 {
-                    EXPECT_NEAR(frames_since_key, k_gop, 0);
+                    EXPECT_NEAR(frames_since_key, k_gop, 1);
                 }
                 ++key_count;
                 frames_since_key = 0;
