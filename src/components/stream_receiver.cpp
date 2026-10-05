@@ -69,23 +69,21 @@ namespace vstreamer
 namespace
 {
 
-size_t max_fec_shard_bytes(int max_datagram)
+size_t max_decoded_app_bytes_from_shard(size_t shard_max)
 {
-    if (max_datagram <= static_cast<int>(k_stream_header_len))
+    if (shard_max <= rs_block_erasure::k_header_len + rs_block_erasure::k_len_prefix)
     {
         return 0;
     }
-    return static_cast<size_t>(max_datagram) - k_stream_header_len;
+    return shard_max - rs_block_erasure::k_header_len - rs_block_erasure::k_len_prefix;
 }
 
-size_t max_decoded_app_bytes(int max_datagram)
+uint64_t monotonic_timestamp_us()
 {
-    const size_t shard = max_fec_shard_bytes(max_datagram);
-    if (shard <= rs_block_erasure::k_header_len + rs_block_erasure::k_len_prefix)
-    {
-        return 0;
-    }
-    return shard - rs_block_erasure::k_header_len - rs_block_erasure::k_len_prefix;
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000ULL +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000ULL;
 }
 
 }  // namespace
@@ -118,12 +116,7 @@ packet_kind_e stream_receiver::output_packet_kind(uint8_t port) const
 
 void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload)
 {
-    int dg = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        dg = max_datagram;
-    }
-    const size_t app_max = max_decoded_app_bytes(dg);
+    const size_t app_max = cached_max_decoded_app;
     if (payload.empty() || 0 == app_max || payload.size() > app_max)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -135,7 +128,6 @@ void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload)
     data_packet  pkt;
     auto         sd = std::make_unique<sock_data>();
     sd->pts = 0;
-    sd->seq = fec_payload_sequence++;
     sd->buf = std::move(payload);
     pkt.reset(std::move(sd));
 
@@ -186,51 +178,80 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             recv_dropped++;
             return false;
         }
+
+        stream_header hdr {};
+        const uint8_t *payload = nullptr;
+        size_t         payload_len = 0;
+        if (stream_header_parse(data, len, &hdr, &payload, &payload_len) < 0)
+        {
+            recv_dropped++;
+            rx_bad_header++;
+            return false;
+        }
+
+        if (!hdr.is_stream_data)
+        {
+            recv_dropped++;
+            rx_bad_header++;
+            return false;
+        }
+
+        const uint64_t dg = note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
+        if (dg > 0)
+        {
+            udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+        }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
 
-        const size_t shard_max = max_fec_shard_bytes(max_datagram);
+        const size_t shard_max = cached_max_fec_shard;
 
-        /* stream_header_s always prefixes the FEC shard (UDP gap telemetry). */
-        const uint8_t *fec_buf = data;
-        size_t         fec_len = len;
-        if (stream_datagram_len_ok(len))
+        if (hdr.is_fec)
         {
-            const uint16_t seq = stream_header_sequence_be16(data);
-            const uint64_t dg = note_u16_forward_gap(seq, last_udp_seq, have_udp_seq);
-            if (dg > 0)
+            if (payload_len < rs_block_erasure::k_header_len || 0 == shard_max ||
+                payload_len > shard_max)
             {
-                udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+                recv_dropped++;
+                rx_bad_header++;
+                return false;
             }
-            const uint8_t *fec_ptr = stream_fec_shard(data, len, &fec_len);
-            if (fec_ptr == nullptr)
+            shared_sized_buffer shard = pool.acquire(payload_len);
+            if (0 == shard.capacity() || shard.size() != payload_len)
             {
                 recv_dropped++;
                 return false;
             }
-            fec_buf = fec_ptr;
+            std::memcpy(shard.u8(), payload, payload_len);
+            const uint64_t hdr_errors_before = fec.hdr_errors();
+            fec.push_air(std::move(shard), &payloads);
+            note_fec_output_gaps(fec, fec_gap_count);
+            fec_rec = fec.recovered();
+            fec_lost = fec.decode_fail();
+            valid_media = fec.hdr_errors() == hdr_errors_before;
         }
-
-        if (fec_len < rs_block_erasure::k_header_len || 0 == shard_max || fec_len > shard_max)
+        else
         {
-            recv_dropped++;
-            return false;
+            /* Raw path (fec none): one SDU per datagram; wire loss is payload loss too. */
+            if (0 == cached_max_decoded_app || payload_len > cached_max_decoded_app)
+            {
+                recv_dropped++;
+                return false;
+            }
+            shared_sized_buffer sdu = pool.acquire(payload_len);
+            if (0 == sdu.capacity() || sdu.size() != payload_len)
+            {
+                recv_dropped++;
+                return false;
+            }
+            std::memcpy(sdu.u8(), payload, payload_len);
+            payloads.push_back(std::move(sdu));
+            if (dg > 0)
+            {
+                /* Without FEC, a UDP gap is an SDU gap (mode switches may miscount slightly). */
+                fec_gap_count.fetch_add(dg, std::memory_order_relaxed);
+            }
+            valid_media = true;
         }
-        shared_sized_buffer shard = pool.acquire(fec_len);
-        if (0 == shard.capacity() || shard.size() != fec_len)
-        {
-            recv_dropped++;
-            return false;
-        }
-        std::memcpy(shard.u8(), fec_buf, fec_len);
-        const uint64_t hdr_errors_before = fec.hdr_errors();
-        fec.push_air(std::move(shard), &payloads);
-        note_fec_output_gaps(fec, fec_gap_count);
-        fec_rec = fec.recovered();
-        fec_lost = fec.decode_fail();
-        /* Only a datagram whose stream header and FEC shard header both parsed moves the
-         * telemetry destination. */
-        valid_media = stream_datagram_len_ok(len) && fec.hdr_errors() == hdr_errors_before;
     }
     enqueue_payloads(&payloads);
     return valid_media;
@@ -362,11 +383,20 @@ void stream_receiver::recv_thread_main()
             const int interval = telemetry_ms.load(std::memory_order_relaxed);
             stream_link_report rep {};
             rep.session_id = session_id.load(std::memory_order_relaxed);
-            rep.report_seq = report_seq.fetch_add(1, std::memory_order_relaxed);
-            rep.interval_ms = static_cast<uint16_t>(interval);
+            rep.timestamp_us = monotonic_timestamp_us();
             rep.counters = link_counters_snapshot();
-            uint8_t wire[vstreamer::k_stream_link_report_len];
-            stream_link_report_encode(rep, wire);
+            const uint16_t seq = static_cast<uint16_t>(report_seq.fetch_add(1, std::memory_order_relaxed));
+            rep.report_seq = seq;
+
+            uint8_t wire[k_stream_header_len + k_stream_link_report_payload_len];
+            stream_header thdr {};
+            thdr.sequence_number = seq;
+            thdr.is_fec = false;
+            thdr.is_stream_data = false;
+            thdr.ext_len = 0;
+            stream_header_write(wire, thdr);
+            stream_link_report_encode_payload(rep, wire + k_stream_header_len,
+                                              k_stream_link_report_payload_len);
             const ssize_t sent =
                 sendto(fd, wire, sizeof(wire), MSG_DONTWAIT,
                        reinterpret_cast<sockaddr *>(&peer_addr), peer_len);
@@ -505,7 +535,9 @@ int stream_receiver::open()
         fec_gap_count.store(0, std::memory_order_relaxed);
         last_udp_seq = 0;
         have_udp_seq = false;
-        fec_payload_sequence = 0;
+        rx_bad_header = 0;
+        cached_max_fec_shard = stream_max_fec_shard(static_cast<size_t>(max_datagram));
+        cached_max_decoded_app = max_decoded_app_bytes_from_shard(cached_max_fec_shard);
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
@@ -830,6 +862,14 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", max_datagram);
+        *value = buf;
+        return 0;
+    }
+    if ("rx_bad_header" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, rx_bad_header);
         *value = buf;
         return 0;
     }

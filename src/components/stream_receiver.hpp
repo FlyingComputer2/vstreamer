@@ -112,11 +112,13 @@ private:
     uint64_t egress_rate_bytes = 0;
     float    egress_kbps = 0.f;
     uint64_t recv_dropped = 0;
+    uint64_t rx_bad_header = 0;
 
     uint16_t last_udp_seq = 0;
     bool     have_udp_seq = false;
 
-    uint16_t fec_payload_sequence = 0;
+    size_t cached_max_fec_shard = 0;
+    size_t cached_max_decoded_app = 0;
 
     std::thread       recv_thread;
     std::atomic<bool> recv_stop {false};
