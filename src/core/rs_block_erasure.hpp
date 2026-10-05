@@ -12,16 +12,12 @@
 #include "core/shared_sized_buffer.hpp"
 
 // Packet-block Reed-Solomon erasure FEC (systematic Cauchy MDS via ISA-L).
-// k app datagrams become n on-air shards. Wire header is 4 bytes (see pack_header).
+// k app datagrams become n on-air shards. Wire header is 5 bytes (see pack_header).
 // n == k: no parity (non-FEC redundancy); same block framing and header on each shard.
-// Wire (4 bytes, 32 bits):
-//   [0] block_id (8)
-//   [1] parity(1) | reserved(3) | shard_index(4)   — index < n <= 15
-//   [2] n(4) | k(4)
-//   [3] reserved(4) | sdu_n(4)                     — sdu_n <= k
-// Spare for extensions: 8 bits if parity is derived (index >= k); we still
-// set the parity bit on TX and require byte1 bits 6..4 and byte3 bits 7..4
-// zero on RX (7 bits reserved today; the parity bit is the 8th logical spare).
+// Wire (5 bytes before orig_len):
+//   [0..1] sdu_base (u16 BE) — SDU seq of shard 0 in this block
+//   [2..3] fec_config (u16 BE): k(5) | n(5) | idx(5) | spare(1), MSB-first
+//   [4]    fec2: sdu_n(5) | spare(3), MSB-first; parity iff idx >= k
 namespace vstreamer
 {
 
@@ -30,41 +26,31 @@ using fec_rx_payload_list = std::vector<shared_sized_buffer>;
 class rs_block_erasure
 {
 public:
-    static constexpr size_t k_header_len = 4;
+    static constexpr size_t k_header_len = 5;
     static constexpr size_t k_len_prefix = 2;
-    static constexpr uint8_t k_flag_parity = 0x80;          /* bit 7 of byte 1 */
-    static constexpr uint8_t k_wire_index_mask = 0x0F;      /* byte 1 bits 3..0 */
-    static constexpr uint8_t k_wire_index_reserved = 0x70; /* byte 1 bits 6..4 */
-    static constexpr uint8_t k_wire_sdu_n_reserved = 0xF0;  /* byte 3 bits 7..4 */
+    static constexpr uint16_t k_wire_fec_config_spare = 0x0001U;
+    static constexpr uint8_t k_wire_fec2_spare = 0x07U;
     static constexpr int k_header_k_n_min = 1;
-    static constexpr int k_header_k_n_max = 15; /* 4-bit k and n on wire */
-    static constexpr int k_max_wire_n = k_header_k_n_max;
+    static constexpr int k_header_k_n_max = 31;
     static constexpr int k_default_timeout_ms = 20;
     static constexpr size_t k_max_n = 255;
     static constexpr size_t k_done_max = 128;
     static constexpr size_t k_block_max = 256;
-    /* block_id on the 4-byte shard header is one byte; emit/dedupe use this ring. */
-    static constexpr uint16_t k_wire_block_id_mod = 256;
-
-    [[nodiscard]] static constexpr uint16_t wire_block_id(uint16_t id)
-    {
-        return static_cast<uint16_t>(id & (k_wire_block_id_mod - 1U));
-    }
 
     // Incomplete RX block TTL, and finished-id TTL (duplicate-shard
     // suppression). done_hold is longer so a late shard of a completed block
     // is still dropped, but short enough that a peer restart which reuses
-    // block_id from 0 is accepted after the old ids age out.
+    // sdu_base from 0 is accepted after the old ids age out.
     int rx_hold_ms() const;
     int done_hold_ms() const;
     // Max time a decoded block waits in the in-order emit queue for an
-    // earlier block_id before the queue advances past the hole.
+    // earlier sdu_base before the queue advances past the hole.
     int emit_hold_ms() const;
 
     rs_block_erasure();
 
-    // init() / disable() keep the TX block_id counter running so a runtime
-    // k/n change does not replay ids the receiver already saw.
+    // init() / disable() keep the TX sdu_seq counter running so a runtime
+    // k/n change does not replay bases the receiver already saw.
     bool init(int k, int n, int timeout_ms, size_t max_shard_bytes = 1470);
     // Stop TX encode; flush pending first via flush()/announce_down. RX decode
     // still works from shard headers.
@@ -96,7 +82,7 @@ public:
     // periodically even when no datagram arrives.
     void poll_rx(fec_rx_payload_list* out);
 
-    // Air datagram (full 4-byte FEC shard header + body). Zero-copy RX stores the
+    // Air datagram (full 5-byte FEC shard header + body). Zero-copy RX stores the
     // buffer in the block; systematic emits are subviews of the shard body.
     void push_air(shared_sized_buffer shard, fec_rx_payload_list* out);
     void push_air(const uint8_t* data, size_t len, fec_rx_payload_list* out);
@@ -158,7 +144,7 @@ public:
     // inserts zero-length bodies before decode. Non-empty systematic shards omit
     // trailing zeros on the wire; parity is full width.
     bool encode_block(const std::vector<std::vector<uint8_t>>& packets,
-                      uint16_t block_id,
+                      uint16_t sdu_base,
                       std::vector<std::vector<uint8_t>>* out) const;
     // Decode from shard index -> body. k/n come from the wire header (or
     // from init() via the overload). Returns false if unrecoverable.
@@ -170,13 +156,14 @@ public:
 
     [[nodiscard]] size_t max_original() const;
 
-    static bool pack_header(uint8_t* out, uint16_t block_id, int index, int k, int n,
-                            uint8_t flags, int sdu_n);
-    static bool unpack_header(const uint8_t* data, size_t len, uint16_t* block_id,
-                              int* index, int* k, int* n, uint8_t* flags, int* sdu_n);
+    static bool pack_header(uint8_t* out, uint16_t sdu_base, int index, int k, int n,
+                            int sdu_n);
+    static bool unpack_header(const uint8_t* data, size_t len, uint16_t* sdu_base,
+                              int* index, int* k, int* n, int* sdu_n);
 
 private:
-    static constexpr int k_ring_evict_dist = 64;
+    /* SDU-sequence distance; ~64 max-size blocks at k≈31 stays under half the u16 ring. */
+    static constexpr int k_ring_evict_sdus = 2048;
 
     struct rx_block_s
     {
@@ -200,29 +187,30 @@ private:
     void note_rx_block_output_shortfall(int expected, int available);
     static int expected_sdus(const rx_block_s& block);
 
-    static int ring_dist(uint8_t a, uint8_t b);
-    int        dist_from_emit(uint16_t block_id) const;
+    static int ring_dist(uint16_t a, uint16_t b);
+    int        dist_from_emit(uint16_t sdu_base) const;
+    void       note_head_hole_sdus(int gap_sdus);
 
     void record_payload_emit();
     void emit_payload(fec_rx_payload_list* out, shared_sized_buffer&& app);
     static bool frag_to_app(const shared_sized_buffer& shard, shared_sized_buffer* app);
 
-    void abandon_partial_block(const rx_block_s& block, uint16_t block_id, fec_rx_payload_list* out);
+    void abandon_partial_block(const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out);
     void expire_rx(fec_rx_payload_list* out);
     void expire_done();
-    void mark_done(uint16_t block_id);
-    void note_emit_base(uint16_t block_id);
-    void touch_newest(uint16_t block_id);
+    void mark_done(uint16_t sdu_base);
+    void note_emit_base(uint16_t sdu_base);
+    void touch_newest(uint16_t sdu_base);
     void ring_evict_stale(fec_rx_payload_list* out);
-    void maybe_resync_on_late_shard(uint16_t block_id);
-    void maybe_rebase_after_silence(uint16_t block_id);
-    void clear_state_behind(uint16_t base_id);
+    void maybe_resync_on_late_shard(uint16_t sdu_base);
+    void maybe_rebase_after_silence(uint16_t sdu_base);
+    void clear_state_behind(uint16_t base);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
-    void on_block_decoded(uint16_t block_id, int released_before, fec_rx_payload_list payloads,
+    void on_block_decoded(uint16_t sdu_base, int released_before, fec_rx_payload_list payloads,
                           int sdu_n, fec_rx_payload_list* out);
     void maybe_give_up_head(fec_rx_payload_list* out);
     void run_emit_engine(fec_rx_payload_list* out);
-    bool try_decode_block(uint16_t block_id, rx_block_s* block, fec_rx_payload_list* out);
+    bool try_decode_block(uint16_t sdu_base, rx_block_s* block, fec_rx_payload_list* out);
 
     std::chrono::steady_clock::time_point now() const;
     static int gen_decode_matrix(int k, int n, const uint8_t* encode_matrix,
@@ -240,7 +228,7 @@ private:
     std::vector<std::vector<uint8_t>> pending;
     std::chrono::steady_clock::time_point deadline{};
     bool deadline_set = false;
-    uint16_t block_id = 0;
+    uint16_t sdu_seq = 0;
 
     std::unordered_map<uint16_t, rx_block_s> rx_blocks;
     std::deque<uint16_t> done_order;
@@ -249,7 +237,7 @@ private:
     std::unordered_map<uint16_t, ready_block_s> ready_blocks;
     bool                                      emit_base_set = false;
     uint16_t                                  emit_next = 0;
-    uint8_t                                   newest = 0;
+    uint16_t                                  newest = 0;
     bool                                      newest_set = false;
     std::chrono::steady_clock::time_point     last_payload_emit{};
     bool                                      have_payload_emit = false;

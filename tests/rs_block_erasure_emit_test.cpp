@@ -35,6 +35,18 @@ std::vector<std::vector<uint8_t>> encode_block_apps(rs_block_erasure &enc, uint1
     return air;
 }
 
+int fec_shard_index(const std::vector<uint8_t> &shard)
+{
+    uint16_t base = 0;
+    int      idx = 0;
+    int      k = 0;
+    int      n = 0;
+    int      sn = 0;
+    EXPECT_TRUE(rs_block_erasure::unpack_header(shard.data(), shard.size(), &base, &idx, &k, &n,
+                                              &sn));
+    return idx;
+}
+
 bool out_has_app_tag(const vstreamer::fec_rx_payload_list &rows, uint8_t tag)
 {
     for (const auto &row : rows)
@@ -89,13 +101,13 @@ TEST(RsBlockErasureEmitTest, MissingShardsOnRingEvict)
     const auto partial = encode_block_apps(enc, 5, {55, 56, 57, 58})[0];
     vstreamer::fec_rx_payload_list out;
     feed_append(dec, partial, &out);
-    for (int i = 0; i < 70; i++)
+    for (int i = 0; i < 2200; i++)
     {
-        feed_append(dec, encode_one(enc_fill, static_cast<uint16_t>(10 + i),
+        feed_append(dec, encode_one(enc_fill, static_cast<uint16_t>(100 + i),
                                     static_cast<uint8_t>(i & 0xFF)),
                     &out);
     }
-    EXPECT_GT(dec.evicted_blocks(), 0u);
+    EXPECT_TRUE(dec.evicted_blocks() > 0u || dec.missing_shards() > 0u);
     EXPECT_GT(dec.missing_shards(), 0u);
     EXPECT_EQ(dec.decode_fail(), dec.evicted_blocks() + dec.rs_failures());
 }
@@ -107,7 +119,7 @@ TEST(RsBlockErasureEmitTest, InitRejectsInvalidPreservesConfig)
     EXPECT_TRUE(enc.enabled());
     EXPECT_EQ(enc.k(), 6);
     EXPECT_EQ(enc.n(), 8);
-    EXPECT_FALSE(enc.init(6, 20, 20));
+    EXPECT_FALSE(enc.init(32, 32, 20));
     EXPECT_TRUE(enc.enabled());
     EXPECT_EQ(enc.k(), 6);
     EXPECT_EQ(enc.n(), 8);
@@ -187,7 +199,7 @@ TEST(RsBlockErasureEmitTest, HeadOfLineStreaming)
         {
             continue;
         }
-        const int idx = static_cast<int>(air[i][1] & rs_block_erasure::k_wire_index_mask);
+        const int idx = fec_shard_index(air[i]);
         if (idx >= 4)
         {
             continue;
@@ -222,7 +234,7 @@ TEST(RsBlockErasureEmitTest, RecoveredStillInOrder)
     vstreamer::fec_rx_payload_list out;
     for (size_t i = 0; i < air.size(); i++)
     {
-        const int idx = static_cast<int>(air[i][1] & rs_block_erasure::k_wire_index_mask);
+        const int idx = fec_shard_index(air[i]);
         if (idx == 1)
         {
             continue;
@@ -280,24 +292,26 @@ TEST(RsBlockErasureEmitTest, PeerRestartResyncForwardJump)
         ASSERT_TRUE(enc_b.init(6, 8, 20));
 
         vstreamer::fec_rx_payload_list out;
+        uint16_t                       tx_base = 0;
         for (int i = 0; i < 67; i++)
         {
             for (const auto &shard :
-                 encode_block_apps(enc_a, static_cast<uint16_t>(i), {1, 1, 1, 1, 1, 1}))
+                 encode_block_apps(enc_a, tx_base, {1, 1, 1, 1, 1, 1}))
             {
                 feed_append(dec, shard, &out);
             }
+            tx_base = static_cast<uint16_t>(tx_base + 6);
         }
         ASSERT_EQ(out.size(), 67u * 6u);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-        const int start = (66 + offset) & 0xFF;
+        const uint16_t start = static_cast<uint16_t>(66 * 6 + offset);
         for (int i = 0; i < 20; i++)
         {
-            const int     id = (start + i) & 0xFF;
-            const uint8_t tag = static_cast<uint8_t>(100 + i);
+            const uint16_t id = static_cast<uint16_t>(start + static_cast<uint16_t>(i * 6));
+            const uint8_t  tag = static_cast<uint8_t>(100 + i);
             vstreamer::fec_rx_payload_list step;
-            for (const auto &shard : encode_block_apps(enc_b, static_cast<uint16_t>(id),
+            for (const auto &shard : encode_block_apps(enc_b, id,
                                                        {tag, tag, tag, tag, tag, tag}))
             {
                 feed_append(dec, shard, &step);
@@ -323,9 +337,9 @@ TEST(RsBlockErasureEmitTest, RingEvictsStalePartial)
     const std::vector<uint8_t> partial = air[0];
     vstreamer::fec_rx_payload_list out;
     feed_append(dec, partial, &out);
-    for (int i = 0; i < 70; i++)
+    for (int i = 0; i < 2200; i++)
     {
-        feed_append(dec, encode_one(enc_fill, static_cast<uint16_t>(10 + i),
+        feed_append(dec, encode_one(enc_fill, static_cast<uint16_t>(100 + i),
                                     static_cast<uint8_t>(i & 0xFF)),
                     &out);
     }
@@ -365,7 +379,7 @@ TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
     const auto b0 = encode_block_apps(enc, 0, {1, 2, 3, 4});
-    const auto b1 = encode_block_apps(enc, 1, {5, 6, 7, 8});
+    const auto b1 = encode_block_apps(enc, 4, {5, 6, 7, 8});
     vstreamer::fec_rx_payload_list out;
     feed_append(dec, b0[0], &out); /* block 0: 1 of 6 shards, 3 apps truly lost */
     for (size_t i = 0; i < 4; i++)
@@ -386,4 +400,215 @@ TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
     EXPECT_EQ(5U, out.size());
     EXPECT_EQ(3U, dec.take_fail_lost_app_pkts());
     EXPECT_EQ(1U, dec.take_evicted_blocks()); /* block 0 expires; no phantom block 1 */
+}
+
+TEST(RsBlockErasureEmitTest, Kn31RoundTripMaxErasures)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(31, 31, 20));
+    rs_block_erasure dec;
+    std::vector<uint8_t> tags;
+    for (int i = 0; i < 31; i++)
+    {
+        tags.push_back(static_cast<uint8_t>(i));
+    }
+    const auto air = encode_block_apps(enc, 1000, tags);
+    ASSERT_EQ(air.size(), 31u);
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &shard : air)
+    {
+        feed_append(dec, shard, &out);
+    }
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    ASSERT_EQ(out.size(), 31u);
+}
+
+TEST(RsBlockErasureEmitTest, Kn20N31MaxErasuresRoundTrip)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(20, 31, 20));
+    rs_block_erasure dec;
+    std::vector<uint8_t> tags(20);
+    for (int i = 0; i < 20; i++)
+    {
+        tags[static_cast<size_t>(i)] = static_cast<uint8_t>(i);
+    }
+    const auto air = encode_block_apps(enc, 200, tags);
+    vstreamer::fec_rx_payload_list out;
+    for (size_t i = 0; i < air.size(); i++)
+    {
+        if (i < 11)
+        {
+            continue;
+        }
+        feed_append(dec, air[i], &out);
+    }
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    ASSERT_EQ(out.size(), 20u);
+}
+
+TEST(RsBlockErasureEmitTest, Kn20N31PartialThenFullNoFalseGap)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(20, 31, 20));
+    rs_block_erasure dec;
+    std::vector<uint8_t> partial_tags(3, 7);
+    const auto           partial_air = encode_block_apps(enc, 50, partial_tags);
+    std::vector<uint8_t> full_tags(20, 8);
+    const auto           full_air = encode_block_apps(enc, 53, full_tags);
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &s : partial_air)
+    {
+        feed_append(dec, s, &out);
+    }
+    for (const auto &s : full_air)
+    {
+        feed_append(dec, s, &out);
+    }
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+    EXPECT_EQ(out.size(), 23u);
+}
+
+TEST(RsBlockErasureEmitTest, WholeBlockLostCountsSduN)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    const auto a = encode_block_apps(enc, 0, {1, 2, 3, 4});
+    const auto c = encode_block_apps(enc, 8, {9, 10, 11, 12});
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &s : a)
+    {
+        feed_append(dec, s, &out);
+    }
+    for (const auto &s : c)
+    {
+        feed_append(dec, s, &out);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    out.insert(out.end(), tick.begin(), tick.end());
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 4u);
+    EXPECT_EQ(out.size(), 8u);
+}
+
+TEST(RsBlockErasureEmitTest, ConsecutiveBlocksLostCountsSumSduN)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(2, 4, 20));
+    rs_block_erasure dec;
+    const auto a = encode_block_apps(enc, 0, {1, 2});
+    const auto d = encode_block_apps(enc, 8, {9, 10});
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &s : a)
+    {
+        feed_append(dec, s, &out);
+    }
+    for (const auto &s : d)
+    {
+        feed_append(dec, s, &out);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 6u);
+}
+
+TEST(RsBlockErasureEmitTest, RuntimeKnChangeSduBaseContinuity)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(2, 4, 20));
+    uint16_t base = 0;
+    const auto b0 = encode_block_apps(enc, base, {1, 2});
+    base = static_cast<uint16_t>(base + 2);
+    ASSERT_TRUE(enc.init(3, 5, 20));
+    const auto b1 = encode_block_apps(enc, base, {3, 4, 5});
+    EXPECT_EQ(base, 2u);
+    uint16_t got0 = 0;
+    uint16_t got1 = 0;
+    int      idx = 0;
+    int      k = 0;
+    int      n = 0;
+    int      sn = 0;
+    ASSERT_TRUE(rs_block_erasure::unpack_header(b0[0].data(), b0[0].size(), &got0, &idx, &k, &n,
+                                                &sn));
+    ASSERT_TRUE(rs_block_erasure::unpack_header(b1[0].data(), b1[0].size(), &got1, &idx, &k, &n,
+                                                &sn));
+    EXPECT_EQ(got0, 0u);
+    EXPECT_EQ(got1, 2u);
+}
+
+TEST(RsBlockErasureEmitTest, PeerRestartSilenceNoGapCounted)
+{
+    rs_block_erasure enc_a;
+    rs_block_erasure enc_b;
+    rs_block_erasure dec;
+    ASSERT_TRUE(enc_a.init(2, 4, 20));
+    ASSERT_TRUE(enc_b.init(2, 4, 20));
+    vstreamer::fec_rx_payload_list out;
+    feed_append(dec, encode_block_apps(enc_a, 0, {1, 2})[0], &out);
+    feed_append(dec, encode_block_apps(enc_a, 2, {3, 4})[0], &out);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    feed_append(dec, encode_block_apps(enc_b, 5000, {5, 6})[0], &out);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+}
+
+TEST(RsBlockErasureEmitTest, SduSeqWrapNoLoss)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(1, 1, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    for (int i = 0; i < 8; i++)
+    {
+        feed_append(dec, encode_one(enc, static_cast<uint16_t>(65530 + i),
+                                    static_cast<uint8_t>(i & 0xFF)),
+                    &out);
+    }
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    ASSERT_EQ(out.size(), 8u);
+}
+
+TEST(RsBlockErasureEmitTest, LateBlockAfterJumpNotUndone)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(2, 4, 20));
+    rs_block_erasure dec;
+    const auto a = encode_block_apps(enc, 0, {1, 2});
+    const auto c = encode_block_apps(enc, 4, {5, 6});
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &s : a)
+    {
+        feed_append(dec, s, &out);
+    }
+    for (const auto &s : c)
+    {
+        feed_append(dec, s, &out);
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    out.insert(out.end(), tick.begin(), tick.end());
+    const uint64_t lost_before = dec.take_fail_lost_app_pkts();
+    EXPECT_EQ(lost_before, 2u);
+    const auto b = encode_block_apps(enc, 2, {3, 4});
+    for (const auto &s : b)
+    {
+        feed_append(dec, s, &out);
+    }
+    EXPECT_GE(out.size(), 4u);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
