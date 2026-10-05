@@ -13,9 +13,9 @@ alwaysApply: true
   concurrently. FEC state is guarded by `fec_mu`; lock order is `mu` → `fec_mu`.
 - `scripts/cbr_controller.py` changes encode rate **and** `fec_n` at runtime via the
   UDP console (`set_fec_k` / `set_fec_n`) → `stream_sender::configure()` → FEC
-  reinit mid-stream. `block_id` must keep counting across reinit.
-- The forward path always prepends `stream_header_s` (`stream_sequence`) before each
-  FEC shard on egress; `stream_receiver` always strips it for gap / `loss_udp_pct`.
+  reinit mid-stream. `sdu_base` must keep counting across reinit (raw SDUs do not advance it).
+- The forward path prepends the v2 `stream_header` (4 B) on every egress datagram; FEC shards and
+  raw SDUs set `is_fec` accordingly. `stream_receiver` parses it for UDP gap telemetry.
   Radio winject must preserve the same layout if it sits in the path.
 - Loss metrics (`stream_sender.peer_loss_udp_pct`, `peer_loss_fec_pct`, and the four
   `peer_*_packet_received` / `peer_*_gap_count` counters) come from **reverse UDP link reports**

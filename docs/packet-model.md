@@ -17,26 +17,29 @@ that value to local monotonic time when emitting each access unit so downstream 
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
 estimate or correct offset in-band.
 
-## Forward datagram (after FEC + RTP)
+## Forward datagram (wire v2)
 
-Bench path: `stream_sender` prepends `stream_header_s` (2 B, `stream_sequence`) before each FEC
-shard on the wire. Systematic shards add a 2 B big-endian payload length before the RTP datagram.
+`stream_sender` prepends a 4-byte `stream_header` (version 2) on every UDP datagram: stream media
+(FEC shard or raw SDU) and reverse telemetry each carry their own header. Systematic FEC shards
+add a 2-byte big-endian `orig_len` before the RTP datagram inside the shard body.
 
 ```text
-| stream_header (2) | FEC shard hdr (4) | [len prefix (2)] | RTP hdr (12) | RTP ext (16) | H.264 |
+| stream_header (4) | FEC shard hdr (5) | [orig_len (2)] | RTP hdr (12) | RTP ext (16) | H.264 |
 ```
 
 | Region | Size | Notes |
 |--------|------|--------|
-| `stream_header_s` | 2 | `stream_sequence` (BE); gap detection on raw UDP |
-| FEC shard header | 4 | `block_id`, `shard_index`, `k`, `n` (see `rs_block_erasure`) |
-| Length prefix | 2 | Systematic shards only; BE byte count of following RTP datagram |
+| `stream_header` | 4 | `sequence_number` (BE), flags: version=2, `is_fec`, `is_stream_data`, `ext_len` |
+| FEC shard header | 5 | `sdu_base`, `k`/`n`/`idx`, `sdu_n` (see `rs_block_erasure`) |
+| `orig_len` | 2 | Systematic shards: BE byte count of following app payload; parity shards carry parity bytes (not a length) |
 | RTP fixed header | 12 | PT 96, marker on AU boundary; SSRC from payloader |
 | RTP extension | 16 | RFC 5285: id 2, 8 B CLOCK_REALTIME capture ns (BE) |
 | Payload | var | Single NAL, STAP-A, or FU-A |
 
-`stream_receiver` strips FEC and length, then passes **`sock_data`** to `rtp_h264_depay` with
-`sock_data.seq` set to the post-FEC app sequence (in-process gap metric input; not on wire).
+`fec none` sends raw SDUs (`is_fec=0`) with only the 4-byte stream header prefix.
+
+`stream_receiver` strips the stream header and FEC, then passes **`sock_data`** to `rtp_h264_depay`.
+The depayloader orders RTP using the sequence inside the RTP header, not a separate sock sequence.
 
 Peer loss metrics on `stream_sender` (`peer_loss_*`, `peer_*_gap_count`) are fed from
 **reverse UDP link reports** (`core/stream_telemetry.hpp`): `stream_receiver` sends cumulative
@@ -44,21 +47,22 @@ counters to the source address of the last valid media datagram; `stream_sender`
 on its bound media socket. Loss % is derived in the app from report deltas (`stream_sdl`
 re-baselines on a new `session_id` or a counter decrease).
 
-### Reverse path: link report (v1, 48 bytes, big-endian)
+v1 and v2 wire layouts do not interoperate; upgrade both ends together. Winject radio forwards
+bytes unchanged.
+
+### Reverse path: link report payload (44 bytes, big-endian)
+
+The 4-byte `stream_header` on the reverse datagram has `is_stream_data=0`, `is_fec=0`; `report_seq`
+is the header `sequence_number`. Payload only:
 
 | Off | Size | Field |
 |----:|-----:|-------|
-| 0 | 2 | `magic` `0x5654` |
-| 2 | 1 | `version` `1` |
-| 3 | 1 | `type` `1` receiver link report |
-| 4 | 4 | `session_id` (new each receiver `open()`) |
-| 8 | 4 | `report_seq` |
-| 12 | 2 | `interval_ms` (`telemetry_ms`) |
-| 14 | 2 | `reserved` |
-| 16 | 8 | `udp_recv` |
-| 24 | 8 | `udp_gap` |
-| 32 | 8 | `fec_recv` |
-| 40 | 8 | `fec_gap` |
+| 0 | 4 | `session_id` (new each receiver `open()`) |
+| 4 | 8 | `timestamp_us` (`CLOCK_MONOTONIC`, deltas only) |
+| 12 | 8 | `udp_packet_received` |
+| 20 | 8 | `udp_gap_count` |
+| 28 | 8 | `fec_packet_received` |
+| 36 | 8 | `fec_gap_count` |
 
 ## Stream path
 

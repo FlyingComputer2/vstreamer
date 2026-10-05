@@ -202,13 +202,14 @@ FU-A, capture-time header extension).
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
 | `mtu` | C | 200..1500, default 1400 |
 | `max_datagram` | C Q | 64..65507, default 1472 (UDP payload incl. headers), live |
-| `max_input` | Q | largest `input()` datagram that fits after headers |
+| `max_input` | Q | largest `input()` SDU: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
 | `max_kbps` | C | wire pace 0..500 000 (0 = off), live |
 | `queue_ms` | C Q | 10..2000, default 100 |
 | `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
-| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 15, default 10 / 12, live (block ids keep counting) |
+| `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
+| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
 | `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block) |
-| `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
+| `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
 
 `set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
@@ -221,7 +222,7 @@ one `sock_data` per original datagram.
 | `listen` | C Q | bind `host:port` |
 | `telemetry` | C Q | `on` / `off` (default `on`), live |
 | `telemetry_ms` | C Q | 20..5000, default 100, live |
-| `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id` | Q | reverse-path telemetry |
+| `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id`, `rx_bad_header` | Q | reverse-path telemetry; `rx_bad_header` counts dropped invalid stream headers |
 | `max_datagram` | C Q | 64..65507, default 1472; before `open()` |
 | `udp_packet_received`, `udp_gap_count` | Q | wire counters (pre-FEC) |
 | `fec_packet_received`, `fec_gap_count` | Q | post-FEC counters |
