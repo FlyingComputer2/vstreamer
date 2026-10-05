@@ -169,6 +169,8 @@ public:
 private:
     /* SDU-sequence distance; ~64 max-size blocks at k≈31 stays under half the u16 ring. */
     static constexpr int k_ring_evict_sdus = 2048;
+    /* Cap on shards held while deciding whether a new sender session started behind. */
+    static constexpr size_t k_far_behind_hold_max = 1024;
 
     struct rx_block_s
     {
@@ -179,6 +181,12 @@ private:
         std::unordered_map<int, shared_sized_buffer>     frags;
         std::chrono::steady_clock::time_point            first_seen{};
         std::chrono::steady_clock::time_point            last_seen{};
+    };
+
+    struct held_shard_s
+    {
+        std::chrono::steady_clock::time_point at{};
+        shared_sized_buffer                   shard;
     };
 
     struct ready_block_s
@@ -210,6 +218,10 @@ private:
     void maybe_resync_on_late_shard(uint16_t sdu_base);
     void maybe_rebase_after_silence(uint16_t sdu_base);
     void clear_state_behind(uint16_t base);
+    void keep_state_ahead_of(uint16_t base);
+    bool hold_far_behind_shard(uint16_t sdu_base, const shared_sized_buffer& shard,
+                               fec_rx_payload_list* out);
+    void maybe_resync_to_held(fec_rx_payload_list* out);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
     void on_block_decoded(uint16_t sdu_base, int released_before, fec_rx_payload_list payloads,
                           int sdu_n, fec_rx_payload_list* out);
@@ -248,6 +260,8 @@ private:
     bool                                      have_payload_emit = false;
     std::chrono::steady_clock::time_point     last_shard_rx{};
     bool                                      have_shard_rx = false;
+    std::chrono::steady_clock::time_point     last_in_window_rx{};
+    std::deque<held_shard_s>                  far_behind_held;
     std::chrono::steady_clock::time_point     later_block_since{};
     bool                                      later_block_waiting = false;
 

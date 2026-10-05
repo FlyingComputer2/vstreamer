@@ -318,7 +318,6 @@ int main()
         fec_rx_payload_list got;
         feed(dec7, make_block(enc7a, 1), got);
         feed(dec7, make_block(enc7a, 2), got);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
         feed(dec7, make_block(enc7b, 3), got);
         feed(dec7, make_block(enc7b, 4), got);
         tick_after(dec7, dec7.emit_hold_ms() + 20, got);

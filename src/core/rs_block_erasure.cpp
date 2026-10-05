@@ -128,6 +128,7 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     newest_set = false;
     have_payload_emit = false;
     have_shard_rx = false;
+    far_behind_held.clear();
     later_block_waiting = false;
     recovered_count = 0;
     recovered_seen = 0;
@@ -171,6 +172,7 @@ void vstreamer::rs_block_erasure::disable()
     newest_set = false;
     have_payload_emit = false;
     have_shard_rx = false;
+    far_behind_held.clear();
     later_block_waiting = false;
 }
 
@@ -296,6 +298,132 @@ void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base)
     }
 }
 
+/* Keeps only blocks in [base, base + k_ring_evict_sdus]: on a sender session change those are the
+ * new session's, everything else (including the done set) belongs to the old one. */
+void vstreamer::rs_block_erasure::keep_state_ahead_of(uint16_t base)
+{
+    const auto outside = [base](uint16_t id)
+    {
+        const int d = ring_dist(id, base);
+        return d < 0 || d > k_ring_evict_sdus;
+    };
+    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
+    {
+        if (outside(it->first))
+        {
+            evicted_blocks_count++;
+            it = rx_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (auto it = ready_blocks.begin(); it != ready_blocks.end();)
+    {
+        if (outside(it->first))
+        {
+            it = ready_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    done.clear();
+    done_order.clear();
+    emit_next = base;
+    newest = base;
+    newest_set = true;
+    for (const auto& kv : rx_blocks)
+    {
+        touch_newest(kv.first);
+    }
+    for (const auto& kv : ready_blocks)
+    {
+        touch_newest(kv.first);
+    }
+    later_block_waiting = false;
+}
+
+/* A shard further behind emit_next than any real late shard is either a stray of the old session
+ * (reordered past a resync) or a new sender session whose random sdu_base landed behind. Hold it
+ * until maybe_resync_to_held() can tell the two apart. */
+bool vstreamer::rs_block_erasure::hold_far_behind_shard(uint16_t sdu_base,
+                                                        const shared_sized_buffer& shard,
+                                                        fec_rx_payload_list* out)
+{
+    const auto t = now();
+    if (dist_from_emit(sdu_base) >= -k_ring_evict_sdus)
+    {
+        last_in_window_rx = t;
+        const auto stale = std::chrono::milliseconds(emit_hold_ms());
+        while (!far_behind_held.empty() && t - far_behind_held.front().at > stale)
+        {
+            far_behind_held.pop_front();
+        }
+        return false;
+    }
+    if (far_behind_held.size() >= k_far_behind_hold_max)
+    {
+        far_behind_held.pop_front();
+    }
+    far_behind_held.push_back({t, shard});
+    maybe_resync_to_held(out);
+    return true;
+}
+
+/* Once no in-window shard has arrived for emit_hold_ms the old session is gone: resync to the
+ * earliest held base of the newest held session and replay its shards in arrival order. */
+void vstreamer::rs_block_erasure::maybe_resync_to_held(fec_rx_payload_list* out)
+{
+    if (far_behind_held.empty())
+    {
+        return;
+    }
+    const auto t = now();
+    if (t - last_in_window_rx < std::chrono::milliseconds(emit_hold_ms()))
+    {
+        return;
+    }
+    const uint16_t ref = load_be16(far_behind_held.back().shard.u8());
+    const auto in_session = [ref](uint16_t id)
+    {
+        const int d = ring_dist(id, ref);
+        return d <= 0 && d >= -k_ring_evict_sdus;
+    };
+    uint16_t start = ref;
+    for (const auto& h : far_behind_held)
+    {
+        const uint16_t id = load_be16(h.shard.u8());
+        if (in_session(id) && ring_dist(id, start) < 0)
+        {
+            start = id;
+        }
+    }
+    std::deque<held_shard_s> replay;
+    replay.swap(far_behind_held);
+    evicted_blocks_count += rx_blocks.size();
+    rx_blocks.clear();
+    ready_blocks.clear();
+    keep_state_ahead_of(start);
+    last_in_window_rx = t;
+    for (auto& h : replay)
+    {
+        if (!in_session(load_be16(h.shard.u8())))
+        {
+            continue;
+        }
+        fec_rx_payload_list step;
+        push_air(std::move(h.shard), &step);
+        if (nullptr != out)
+        {
+            out->insert(out->end(), std::make_move_iterator(step.begin()),
+                        std::make_move_iterator(step.end()));
+        }
+    }
+}
+
 void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t sdu_base)
 {
     if (dist_from_emit(sdu_base) >= 0)
@@ -312,6 +440,8 @@ void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t sdu_base)
         return;
     }
     emit_next = sdu_base;
+    newest = sdu_base;
+    newest_set = true;
     clear_state_behind(sdu_base);
     later_block_waiting = false;
 }
@@ -337,6 +467,7 @@ void vstreamer::rs_block_erasure::maybe_rebase_after_silence(uint16_t sdu_base)
     ready_blocks.clear();
     done.clear();
     done_order.clear();
+    far_behind_held.clear();
     emit_next = sdu_base;
     newest = emit_next;
     newest_set = true;
@@ -534,36 +665,8 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
         {
             if (best_d > static_cast<int>(k_ring_evict_sdus))
             {
-                /* Larger than any real burst: treat as a new sender session, not loss. */
-                ready_block_s saved_ready {};
-                bool          have_ready = false;
-                if (const auto rit = ready_blocks.find(target); rit != ready_blocks.end())
-                {
-                    saved_ready = std::move(rit->second);
-                    have_ready = true;
-                }
-                rx_block_s saved_rx {};
-                bool       have_rx = false;
-                if (const auto rxit = rx_blocks.find(target); rxit != rx_blocks.end())
-                {
-                    saved_rx = std::move(rxit->second);
-                    have_rx = true;
-                }
-                rx_blocks.clear();
-                ready_blocks.clear();
-                done.clear();
-                done_order.clear();
-                if (have_rx)
-                {
-                    rx_blocks.emplace(target, std::move(saved_rx));
-                }
-                if (have_ready)
-                {
-                    ready_blocks.emplace(target, std::move(saved_ready));
-                }
-                emit_next = target;
-                newest = target;
-                newest_set = true;
+                /* Larger than any real burst: a new sender session, not loss. */
+                keep_state_ahead_of(target);
             }
             else
             {
@@ -1214,6 +1317,7 @@ void vstreamer::rs_block_erasure::poll_rx(fec_rx_payload_list* out)
     {
         out->clear();
     }
+    maybe_resync_to_held(out);
     expire_rx(out);
     run_emit_engine(out);
 }
@@ -1375,6 +1479,10 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
     }
     note_emit_base(sdu_base);
     maybe_rebase_after_silence(sdu_base);
+    if (hold_far_behind_shard(sdu_base, shard, out))
+    {
+        return;
+    }
     touch_newest(sdu_base);
     maybe_resync_on_late_shard(sdu_base);
     ring_evict_stale(out);

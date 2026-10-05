@@ -701,3 +701,113 @@ TEST(RsBlockErasureEmitTest, HeadHoleJumpCountsPartialBlockOnce)
     EXPECT_EQ(out[5].u8()[0], 24);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
+
+namespace
+{
+
+/* Feeds one full block of a new sender session at `base`, tagged with `tag`. */
+void feed_tagged_block(rs_block_erasure &enc, rs_block_erasure &dec, uint16_t base, uint8_t tag,
+                       vstreamer::fec_rx_payload_list *out)
+{
+    for (const auto &s : encode_block_apps(enc, base, {tag, tag, tag, tag}))
+    {
+        feed_append(dec, s, out);
+    }
+}
+
+std::vector<uint8_t> app_tags(const vstreamer::fec_rx_payload_list &rows)
+{
+    std::vector<uint8_t> tags;
+    for (const auto &row : rows)
+    {
+        tags.push_back(row.empty() ? 0 : row.u8()[0]);
+    }
+    return tags;
+}
+
+/* Old session at old_base, then a new session at new_base with no silence in between: every
+ * new-session SDU is delivered in order and nothing is counted lost. */
+void expect_quick_restart_clean(uint16_t old_base, uint16_t new_base, int new_blocks)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    feed_tagged_block(enc, dec, old_base, 1, &out);
+    feed_tagged_block(enc, dec, static_cast<uint16_t>(old_base + 4), 2, &out);
+    std::vector<uint8_t> want = {1, 1, 1, 1, 2, 2, 2, 2};
+    for (int b = 0; b < new_blocks; b++)
+    {
+        const uint8_t tag = static_cast<uint8_t>(10 + b);
+        feed_tagged_block(enc, dec, static_cast<uint16_t>(new_base + 4 * b), tag, &out);
+        want.insert(want.end(), 4, tag);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        vstreamer::fec_rx_payload_list step;
+        dec.poll_rx(&step);
+        out.insert(out.end(), step.begin(), step.end());
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list step;
+    dec.poll_rx(&step);
+    out.insert(out.end(), step.begin(), step.end());
+    EXPECT_EQ(app_tags(out), want) << "old " << old_base << " new " << new_base;
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u) << "old " << old_base << " new " << new_base;
+}
+
+}  // namespace
+
+TEST(RsBlockErasureEmitTest, QuickForwardRestartKeepsLaterBlocks)
+{
+    expect_quick_restart_clean(0, 20000, 30);
+}
+
+TEST(RsBlockErasureEmitTest, QuickBackwardRestartResyncs)
+{
+    expect_quick_restart_clean(30000, 10000, 30);
+}
+
+TEST(RsBlockErasureEmitTest, QuickRestartRandomBases)
+{
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 12; i++)
+    {
+        const uint16_t old_base = static_cast<uint16_t>(rng());
+        uint16_t       new_base = 0;
+        do
+        {
+            new_base = static_cast<uint16_t>(rng());
+        } while (std::abs(static_cast<int16_t>(static_cast<uint16_t>(new_base - old_base))) <=
+                 2048 + 64);
+        expect_quick_restart_clean(old_base, new_base, 20);
+    }
+}
+
+TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncIgnored)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    feed_tagged_block(enc, dec, 0, 1, &out);
+    const auto stray = encode_block_apps(enc, 4, {2, 2, 2, 2});
+    std::vector<uint8_t> want = {1, 1, 1, 1};
+    for (int b = 0; b < 30; b++)
+    {
+        const uint8_t tag = static_cast<uint8_t>(10 + b);
+        feed_tagged_block(enc, dec, static_cast<uint16_t>(20000 + 4 * b), tag, &out);
+        want.insert(want.end(), 4, tag);
+        if (20 == b)
+        {
+            /* Late shards of the old session, reordered past the resync. */
+            feed_append(dec, stray[0], &out);
+            feed_append(dec, stray[1], &out);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        vstreamer::fec_rx_payload_list step;
+        dec.poll_rx(&step);
+        out.insert(out.end(), step.begin(), step.end());
+    }
+    EXPECT_EQ(app_tags(out), want);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+}
