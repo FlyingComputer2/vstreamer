@@ -100,7 +100,7 @@ def main() -> int:
     a.default("encode-rate-filter-cutoff-long", 0.1)
     a.default("k", 6)
     a.default("n-gain", 1.2)
-    a.default("n-max", 15)
+    a.default("n-max", 24)
     a.default("cbr-min", 100)
     a.default("cbr-max", 20000)
     a.default("loop-rate", 10.0)
