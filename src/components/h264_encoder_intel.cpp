@@ -137,10 +137,10 @@ void apply_rc_to_ctx(AVCodecContext *ctx, bool cbr, int bitrate, int qp_val, int
         av_opt_set(ctx->priv_data, "rc_mode", "CQP", 0);
         av_opt_set_int(ctx->priv_data, "qp", qp_val, 0);
     }
-    if (gop_val > 0)
-    {
-        av_opt_set_int(ctx->priv_data, "idr_interval", gop_val, 0);
-    }
+    // idr_interval counts I-frames between IDRs, not frames. Keep it at 0 so every I-frame
+    // is an IDR with in-band SPS/PPS; gop_size sets the spacing.
+    (void)gop_val;
+    av_opt_set_int(ctx->priv_data, "idr_interval", 0, 0);
 }
 
 }  // namespace
@@ -177,7 +177,6 @@ int h264_encoder_intel::nv12_size_locked() const
 void h264_encoder_intel::clear_out_locked()
 {
     in_pts_q.clear();
-    pending_output_key = false;
     out_q.clear();
 }
 
@@ -245,11 +244,7 @@ int h264_encoder_intel::drain_packets_locked()
             out_pts = last_out_pts;
         }
         last_out_pts = out_pts;
-        const bool key = pending_output_key;
-        if (pending_output_key)
-        {
-            pending_output_key = false;
-        }
+        const bool key = h264_au_has_idr(buf, sz);
         frame au;
         au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload));
         out_q.push_back(std::move(au));
@@ -406,10 +401,7 @@ int h264_encoder_intel::codec_open_locked()
     live_low_power_cfg = low_power_cfg;
     low_power_live = resolved_lp;
     reopen_req = false;
-    enc_frame_idx = 0;
-    frames_since_forced_key = 0;
     last_out_pts = -1;
-    pending_output_key = false;
     pending_idr = true;
     return 0;
 }
@@ -554,20 +546,8 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     sw->height = live_h;
     sw->format = AV_PIX_FMT_NV12;
     sw->pts = f.pts;
-    const int gop_n = live_gop > 0 ? live_gop : gop;
-    if (gop_n > 0 && enc_frame_idx > 0 && frames_since_forced_key >= gop_n)
-    {
-        pending_idr = true;
-    }
     const bool mark_key_au = pending_idr;
-    if (pending_idr)
-    {
-        sw->pict_type = AV_PICTURE_TYPE_I;
-#ifdef AV_FRAME_FLAG_KEY
-        sw->flags |= AV_FRAME_FLAG_KEY;
-#endif
-        pending_idr = false;
-    }
+    pending_idr = false;
     sw->buf[0] =
         av_buffer_create(f.buf.u8(), static_cast<size_t>(sz), nv12_keep, nullptr, 0);
     if (nullptr == sw->buf[0])
@@ -592,6 +572,13 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
         return ret;
     }
     hw->pts = f.pts;
+    if (mark_key_au)
+    {
+        hw->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
+        hw->flags |= AV_FRAME_FLAG_KEY;
+#endif
+    }
 
     ret = avcodec_send_frame(ctx, hw);
     av_frame_unref(hw);
@@ -600,16 +587,6 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
         return ret;
     }
     in_pts_q.push_back(f.pts);
-    if (mark_key_au)
-    {
-        pending_output_key = true;
-        frames_since_forced_key = 0;
-    }
-    else
-    {
-        ++frames_since_forced_key;
-    }
-    ++enc_frame_idx;
 
     return drain_packets_locked();
 }

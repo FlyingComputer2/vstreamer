@@ -13,6 +13,30 @@
 namespace
 {
 
+struct nal_mask
+{
+    bool idr = false;
+    bool sps = false;
+    bool pps = false;
+};
+
+nal_mask scan_nals(const uint8_t *d, size_t n)
+{
+    nal_mask m;
+    for (size_t i = 0; i + 3 < n; ++i)
+    {
+        if (d[i] == 0 && d[i + 1] == 0 && d[i + 2] == 1)
+        {
+            const int t = d[i + 3] & 0x1f;
+            m.idr = m.idr || t == 5;
+            m.sps = m.sps || t == 7;
+            m.pps = m.pps || t == 8;
+            i += 2;
+        }
+    }
+    return m;
+}
+
 int cfg(vstreamer::component &c, const char *key, const char *val)
 {
     return c.configure(key, val);
@@ -135,11 +159,19 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
             }
             ASSERT_EQ(orv, 0);
             const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
+            // The key flag must match the bitstream: a decoder joining mid-stream needs
+            // in-band SPS/PPS and an IDR slice to start.
+            const nal_mask m = scan_nals(f.buf.u8(), f.buf.size());
+            EXPECT_EQ(f.key, m.idr) << "AU " << i;
+            if (m.idr)
+            {
+                EXPECT_TRUE(m.sps && m.pps) << "IDR AU " << i << " lacks SPS/PPS";
+            }
             if (f.key)
             {
                 if (key_count > 0)
                 {
-                    EXPECT_NEAR(frames_since_key, k_gop, 1);
+                    EXPECT_EQ(frames_since_key, k_gop - 1);
                 }
                 ++key_count;
                 frames_since_key = 0;
