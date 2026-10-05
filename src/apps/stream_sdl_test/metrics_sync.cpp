@@ -326,6 +326,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      fec_failures);
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_oversized"),
                      query_u64(*sender, "fec_oversized"));
+        /* Packets evicted from the send queue (or rejected) before reaching the wire. */
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.dropped"),
+                     query_u64(*sender, "dropped"));
     }
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
