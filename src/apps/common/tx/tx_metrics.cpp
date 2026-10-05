@@ -230,6 +230,8 @@ void sync_sender_peer_link_metrics_live(stream_sender &sender)
                  snap.reports_rejected);
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_session"),
                  static_cast<uint64_t>(snap.have ? snap.report.session_id : 0U));
+    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_interval_ms"),
+                 snap.observed_interval_ms);
 }
 
 void telemetry_thread_main(stream_sender *sender)
