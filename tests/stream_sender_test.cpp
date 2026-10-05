@@ -4,6 +4,8 @@
 #include "core/component.hpp"
 #include "core/data_packet.hpp"
 #include "core/shared_sized_buffer.hpp"
+#include "core/rs_block_erasure.hpp"
+#include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
@@ -253,17 +255,24 @@ namespace
 
 void send_report(int fd, const sockaddr_in &dst, const vstreamer::stream_link_report &rep)
 {
-    uint8_t wire[vstreamer::k_stream_link_report_len];
-    vstreamer::stream_link_report_encode(rep, wire);
+    uint8_t wire[vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len];
+    vstreamer::stream_header hdr {};
+    hdr.sequence_number = rep.report_seq;
+    hdr.is_fec = false;
+    hdr.is_stream_data = false;
+    hdr.ext_len = 0;
+    vstreamer::stream_header_write(wire, hdr);
+    vstreamer::stream_link_report_encode_payload(rep, wire + vstreamer::k_stream_header_len,
+                                                 vstreamer::k_stream_link_report_payload_len);
     sendto(fd, wire, sizeof(wire), 0, reinterpret_cast<const sockaddr *>(&dst), sizeof(dst));
 }
 
-vstreamer::stream_link_report make_report(uint32_t session, uint32_t seq, uint64_t udp_recv)
+vstreamer::stream_link_report make_report(uint32_t session, uint16_t seq, uint64_t udp_recv)
 {
     vstreamer::stream_link_report r;
     r.session_id = session;
     r.report_seq = seq;
-    r.interval_ms = 100;
+    r.timestamp_us = 1'000'000ULL;
     r.counters.udp_packet_received = udp_recv;
     return r;
 }
@@ -480,7 +489,7 @@ TEST(StreamSenderTest, PeerReportRejectsGarbage)
 
     const char garbage[10] = {0};
     sendto(s, garbage, sizeof(garbage), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-    uint8_t bad_magic[vstreamer::k_stream_link_report_len] {};
+    uint8_t bad_magic[vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len] {};
     sendto(s, bad_magic, sizeof(bad_magic), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
     std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
@@ -591,4 +600,179 @@ TEST(StreamSenderTest, LocalSpecForms)
         EXPECT_NE("127.0.0.1:0", val);
         sender.close();
     }
+}
+
+namespace
+{
+
+uint8_t stream_flag_byte(const uint8_t *wire)
+{
+    return wire[2];
+}
+
+bool recv_one_udp(int fd, uint8_t *out, size_t cap, size_t *out_len, int timeout_ms)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        pollfd pfd {fd, POLLIN, 0};
+        if (poll(&pfd, 1, 20) <= 0)
+        {
+            continue;
+        }
+        const ssize_t n = recv(fd, out, cap, MSG_DONTWAIT);
+        if (n > 0)
+        {
+            *out_len = static_cast<size_t>(n);
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+TEST(StreamSenderTest, MaxInputRawAndFecModes)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "max_datagram", "1472"));
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
+    ASSERT_EQ(0, sender.open());
+    const size_t fec_in = query_size_t(sender, "max_input");
+    EXPECT_EQ(1472U - 11U, fec_in);
+    sender.close();
+
+    vstreamer::stream_sender raw;
+    ASSERT_EQ(0, cfg(raw, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(raw, "max_datagram", "1472"));
+    ASSERT_EQ(0, cfg(raw, "fec", "none"));
+    ASSERT_EQ(0, raw.open());
+    const size_t raw_in = query_size_t(raw, "max_input");
+    EXPECT_EQ(1472U - 4U, raw_in);
+    raw.close();
+}
+
+TEST(StreamSenderTest, FecKnAccept31Reject32)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "31"));
+    ASSERT_EQ(0, sender.open());
+    EXPECT_LT(cfg(sender, "fec_n", "32"), 0);
+    EXPECT_LT(cfg(sender, "fec_k", "32"), 0);
+    sender.close();
+}
+
+TEST(StreamSenderTest, WireSequenceStampedOnFecAndRaw)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    const int sniff = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(sniff, 0);
+    sockaddr_in bind_addr {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_addr.sin_port = htons(static_cast<uint16_t>(port));
+    ASSERT_EQ(0, bind(sniff, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)));
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "2"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    const auto pkt = make_sock_packet(0, 32);
+    ASSERT_EQ(0, sender.input(0, pkt));
+
+    uint8_t wire[2048];
+    size_t  wire_len = 0;
+    ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
+    EXPECT_GE(wire_len, vstreamer::k_stream_header_len + vstreamer::rs_block_erasure::k_header_len);
+    EXPECT_NE(0U, vstreamer::stream_header_sequence_be16(wire));
+    EXPECT_NE(0U, stream_flag_byte(wire) & (1U << vstreamer::k_stream_flag_is_fec_shift));
+
+    ASSERT_EQ(0, cfg(sender, "fec", "none"));
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+    ASSERT_EQ(0, sender.input(0, make_sock_packet(1, 32)));
+    bool saw_raw = false;
+    for (int attempt = 0; attempt < 8 && !saw_raw; ++attempt)
+    {
+        if (!recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 200))
+        {
+            break;
+        }
+        if (0 == (stream_flag_byte(wire) & (1U << vstreamer::k_stream_flag_is_fec_shift)))
+        {
+            saw_raw = true;
+        }
+    }
+    EXPECT_TRUE(saw_raw);
+
+    close(sniff);
+    sender.close();
+}
+
+TEST(StreamSenderTest, RawPathDoesNotAdvanceSduBase)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    const int sniff = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(sniff, 0);
+    sockaddr_in bind_addr {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    bind_addr.sin_port = htons(static_cast<uint16_t>(port));
+    ASSERT_EQ(0, bind(sniff, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)));
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "1"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    ASSERT_EQ(0, sender.input(0, make_sock_packet(0, 32)));
+    uint8_t wire[2048];
+    size_t  wire_len = 0;
+    ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
+    uint16_t base0 = 0;
+    int      idx = 0;
+    int      k = 0;
+    int      n = 0;
+    int      sdu_n = 0;
+    ASSERT_TRUE(vstreamer::rs_block_erasure::unpack_header(
+        wire + vstreamer::k_stream_header_len,
+        wire_len - vstreamer::k_stream_header_len, &base0, &idx, &k, &n, &sdu_n));
+    const int first_sdu_n = sdu_n;
+
+    ASSERT_EQ(0, cfg(sender, "fec", "none"));
+    for (int i = 0; i < 5; ++i)
+    {
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i + 1), 32)));
+        ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 200));
+    }
+
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, sender.input(0, make_sock_packet(99, 32)));
+    ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
+    uint16_t base1 = 0;
+    ASSERT_TRUE(vstreamer::rs_block_erasure::unpack_header(
+        wire + vstreamer::k_stream_header_len,
+        wire_len - vstreamer::k_stream_header_len, &base1, &idx, &k, &n, &sdu_n));
+    EXPECT_EQ(static_cast<uint16_t>(base0 + static_cast<uint16_t>(first_sdu_n)), base1);
+
+    close(sniff);
+    sender.close();
 }
