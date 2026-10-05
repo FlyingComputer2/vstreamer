@@ -22,6 +22,7 @@ constexpr int k_fec_k = 10;
 constexpr int k_fec_n = 11;
 constexpr int k_fec_timeout_ms = 20;
 constexpr size_t k_pkt_hdr = 8; /* uint64_t seq */
+constexpr int    k_wrap_lead_sdus = 2000;
 
 void store_u64_le(uint8_t *p, uint64_t v)
 {
@@ -81,6 +82,8 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "init failed\n");
         return 1;
     }
+    /* Start just below the u16 sdu_base wrap so every run crosses it. */
+    enc.set_tx_sdu_seq(static_cast<uint16_t>(0x10000 - k_wrap_lead_sdus));
 
     std::mt19937                            rng(0xC0DE);
     std::uniform_real_distribution<double>  jitter(0.65, 1.35);
@@ -259,14 +262,12 @@ int main(int argc, char **argv)
         run_sec, target_mbps, achieved_mbps, app_seq, blocks, shards_scheduled, wire_wrap_marks,
         decoded.size(), dec.decode_fail(), seq_errors, missing, fec_decode_wall_sec);
 
-    if (blocks < 256)
+    if (0 == wire_wrap_marks)
     {
-        std::fprintf(stderr, "warning: only %" PRIu64 " blocks (need >256 to stress wire id)\n",
-                     blocks);
+        std::fprintf(stderr, "FAIL: sdu_base never wrapped (%" PRIu64 " blocks)\n", blocks);
+        return 1;
     }
-
-    const bool stressed_wire_id = blocks >= 512;
-    if (stressed_wire_id && seq_errors > 0)
+    if (seq_errors > 0)
     {
         std::fprintf(stderr,
                      "FAIL: payload sequence errors after %" PRIu64 " blocks / %" PRIu64
@@ -282,15 +283,8 @@ int main(int argc, char **argv)
                      missing, seq_errors);
     }
 
-    if (stressed_wire_id && seq_errors == 0)
-    {
-        std::printf("PASS: no sequence corruption through %" PRIu64 " wire id wraps "
-                    "(%" PRIu64 " blocks)\n",
-                    wire_wrap_marks, blocks);
-    }
-    else
-    {
-        std::printf("PASS (short run or no seq errors)\n");
-    }
+    std::printf("PASS: no sequence corruption through %" PRIu64 " wire id wraps "
+                "(%" PRIu64 " blocks)\n",
+                wire_wrap_marks, blocks);
     return 0;
 }
