@@ -1,5 +1,5 @@
-#include "components/stream_receiver.hpp"
 #include "core/metrics.hpp"
+#include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
 

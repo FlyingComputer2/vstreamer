@@ -101,3 +101,23 @@ if(ENABLE_H264_ENCODER_MPP)
             ENVIRONMENT "TSAN_OPTIONS=suppressions=${_tsan_mpp_supp}:halt_on_error=1"
     )
 endif()
+
+if(ENABLE_H264_ENCODER_INTEL)
+    add_executable(h264_encoder_intel_test h264_encoder_intel_test.cpp)
+    target_link_libraries(h264_encoder_intel_test PRIVATE GTest::gtest_main vstreamer_source)
+    target_include_directories(h264_encoder_intel_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_options(h264_encoder_intel_test PRIVATE -Wall -Wextra -Wpedantic)
+    gtest_discover_tests(h264_encoder_intel_test DISCOVERY_MODE PRE_TEST)
+
+    add_executable(h264_encoder_intel_hw_test h264_encoder_intel_hw_test.cpp)
+    target_link_libraries(h264_encoder_intel_hw_test PRIVATE GTest::gtest_main vstreamer_source)
+    target_include_directories(h264_encoder_intel_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_options(h264_encoder_intel_hw_test PRIVATE -Wall -Wextra -Wpedantic)
+    gtest_discover_tests(
+        h264_encoder_intel_hw_test
+        DISCOVERY_MODE PRE_TEST
+        PROPERTIES
+            LABELS "hw"
+            TIMEOUT 120
+    )
+endif()

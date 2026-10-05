@@ -18,6 +18,7 @@ namespace vstreamer::test_app
 
 using namespace vstreamer;
 
+#ifdef ENABLE_STREAM_RECEIVER
 void log_bench_diag(const bench_diag &d, stream_receiver &rcv, stream_sender &sender,
                     component_coder &enc, const test_app::channel_controller *channel)
 {
@@ -60,6 +61,8 @@ void log_bench_diag(const bench_diag &d, stream_receiver &rcv, stream_sender &se
                  static_cast<int>(snd_stats.size()), snd_stats.data(),
                  static_cast<int>(enc_qp.size()), enc_qp.data());
 }
+#endif  // ENABLE_STREAM_RECEIVER
+
 [[nodiscard]] pipeline_counters snapshot_counters(const bench_diag &d)
 {
     pipeline_counters c;

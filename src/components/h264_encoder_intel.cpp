@@ -67,6 +67,82 @@ int parse_size(std::string_view s, int *w, int *h)
     return 0;
 }
 
+int parse_low_power(std::string_view v, int *out)
+{
+    if (v == "auto")
+    {
+        *out = -1;
+        return 0;
+    }
+    if (v == "0" || v == "1")
+    {
+        *out = v[0] - '0';
+        return 0;
+    }
+    return -EINVAL;
+}
+
+bool h264_au_has_idr(const uint8_t *data, size_t len)
+{
+    if (nullptr == data || len < 5)
+    {
+        return false;
+    }
+    size_t i = 0;
+    while (i + 4 < len)
+    {
+        if (data[i] == 0 && data[i + 1] == 0)
+        {
+            size_t off = 0;
+            if (data[i + 2] == 1)
+            {
+                off = 3;
+            }
+            else if (data[i + 2] == 0 && data[i + 3] == 1)
+            {
+                off = 4;
+            }
+            if (off > 0 && i + off < len)
+            {
+                const int nal_type = data[i + off] & 0x1f;
+                if (5 == nal_type)
+                {
+                    return true;
+                }
+                i += off + 1;
+                continue;
+            }
+        }
+        ++i;
+    }
+    return false;
+}
+
+void apply_rc_to_ctx(AVCodecContext *ctx, bool cbr, int bitrate, int qp_val, int gop_val, int vbv)
+{
+    ctx->max_b_frames = 0;
+    if (cbr)
+    {
+        ctx->bit_rate = bitrate;
+        ctx->rc_max_rate = bitrate;
+        ctx->rc_buffer_size =
+            static_cast<int>(static_cast<int64_t>(bitrate) * static_cast<int64_t>(vbv) / 1000);
+        av_opt_set(ctx->priv_data, "rc_mode", "CBR", 0);
+    }
+    else
+    {
+        ctx->bit_rate = 0;
+        ctx->rc_max_rate = 0;
+        ctx->rc_buffer_size = 0;
+        av_opt_set(ctx->priv_data, "rc_mode", "CQP", 0);
+        av_opt_set_int(ctx->priv_data, "qp", qp_val, 0);
+    }
+    // idr_interval counts I-frames between IDRs, not frames. Keep it at 0 so every I-frame
+    // is an IDR with in-band SPS/PPS; gop_size sets the spacing.
+    (void)gop_val;
+    av_opt_set_int(ctx->priv_data, "idr_interval", 0, 0);
+}
+
 }  // namespace
 
 h264_encoder_intel::h264_encoder_intel() = default;
@@ -100,7 +176,16 @@ int h264_encoder_intel::nv12_size_locked() const
 
 void h264_encoder_intel::clear_out_locked()
 {
+    in_pts_q.clear();
     out_q.clear();
+}
+
+void h264_encoder_intel::log_opened_locked() const
+{
+    const char *rc = live_rc_cbr ? "cbr" : "cqp";
+    std::fprintf(stderr,
+                 "h264_encoder_intel: opened %dx%d@%d rc=%s bps=%d vbv_ms=%d gop=%d low_power=%d\n",
+                 live_w, live_h, live_fps, rc, live_bps, live_vbv_ms, live_gop, low_power_live);
 }
 
 int h264_encoder_intel::drain_packets_locked()
@@ -148,9 +233,20 @@ int h264_encoder_intel::drain_packets_locked()
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
+        int64_t out_pts = pkt->pts;
+        if (!in_pts_q.empty())
+        {
+            out_pts = in_pts_q.front();
+            in_pts_q.pop_front();
+        }
+        if (last_out_pts >= 0 && out_pts < last_out_pts)
+        {
+            out_pts = last_out_pts;
+        }
+        last_out_pts = out_pts;
+        const bool key = h264_au_has_idr(buf, sz);
         frame au;
-        au.reset(media_kind_e::H264, live_w, live_h, pkt->pts, !!(pkt->flags & AV_PKT_FLAG_KEY),
-                 std::move(payload));
+        au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload));
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
         cv.notify_one();
@@ -182,34 +278,9 @@ int h264_encoder_intel::codec_open_locked()
         return -ENOENT;
     }
 
-    AVCodecContext *ctx = avcodec_alloc_context3(codec);
-    AVFrame *sw = av_frame_alloc();
-    AVFrame *hw = av_frame_alloc();
-    AVPacket *pkt = av_packet_alloc();
-    if (nullptr == ctx || nullptr == sw || nullptr == hw || nullptr == pkt)
-    {
-        av_frame_free(&sw);
-        av_frame_free(&hw);
-        av_packet_free(&pkt);
-        avcodec_free_context(&ctx);
-        av_buffer_unref(&hw_dev);
-        return -ENOMEM;
-    }
-
-    ctx->width = width;
-    ctx->height = height;
-    ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-    ctx->time_base = AVRational{1, fps};
-    ctx->framerate = AVRational{fps, 1};
-    ctx->gop_size = gop > 0 ? gop : 1;
-
     AVBufferRef *hw_frames = av_hwframe_ctx_alloc(hw_dev);
     if (nullptr == hw_frames)
     {
-        av_frame_free(&sw);
-        av_frame_free(&hw);
-        av_packet_free(&pkt);
-        avcodec_free_context(&ctx);
         av_buffer_unref(&hw_dev);
         return -ENOMEM;
     }
@@ -224,44 +295,92 @@ int h264_encoder_intel::codec_open_locked()
     if (ret < 0)
     {
         av_buffer_unref(&hw_frames);
-        av_frame_free(&sw);
-        av_frame_free(&hw);
-        av_packet_free(&pkt);
-        avcodec_free_context(&ctx);
         av_buffer_unref(&hw_dev);
         return -EIO;
     }
 
-    ctx->hw_frames_ctx = av_buffer_ref(hw_frames);
-    ctx->hw_device_ctx = av_buffer_ref(hw_dev);
-    if (nullptr == ctx->hw_frames_ctx || nullptr == ctx->hw_device_ctx)
+    const bool try_auto_lp = (low_power_cfg < 0);
+    int lp_try[2] = {low_power_cfg >= 0 ? low_power_cfg : 0, 1};
+    int lp_count = try_auto_lp ? 2 : 1;
+
+    AVCodecContext *ctx = nullptr;
+    AVFrame *sw = nullptr;
+    AVFrame *hw = nullptr;
+    AVPacket *pkt = nullptr;
+    int resolved_lp = -1;
+
+    for (int attempt = 0; attempt < lp_count; ++attempt)
     {
-        av_buffer_unref(&hw_frames);
+        const int lp = lp_try[attempt];
+
+        if (ctx)
+        {
+            avcodec_free_context(&ctx);
+        }
+        ctx = avcodec_alloc_context3(codec);
+        sw = av_frame_alloc();
+        hw = av_frame_alloc();
+        pkt = av_packet_alloc();
+        if (nullptr == ctx || nullptr == sw || nullptr == hw || nullptr == pkt)
+        {
+            av_frame_free(&sw);
+            av_frame_free(&hw);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
+            return -ENOMEM;
+        }
+
+        ctx->width = width;
+        ctx->height = height;
+        ctx->pix_fmt = AV_PIX_FMT_VAAPI;
+        ctx->time_base = AVRational{1, fps};
+        ctx->framerate = AVRational{fps, 1};
+        ctx->gop_size = gop > 0 ? gop : 1;
+
+        ctx->hw_frames_ctx = av_buffer_ref(hw_frames);
+        ctx->hw_device_ctx = av_buffer_ref(hw_dev);
+        if (nullptr == ctx->hw_frames_ctx || nullptr == ctx->hw_device_ctx)
+        {
+            av_frame_free(&sw);
+            av_frame_free(&hw);
+            av_packet_free(&pkt);
+            avcodec_free_context(&ctx);
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
+            return -ENOMEM;
+        }
+
+        apply_rc_to_ctx(ctx, rc_cbr, bps, qp, gop, vbv_ms);
+        av_opt_set_int(ctx->priv_data, "low_power", lp, 0);
+
+        if (avcodec_open2(ctx, codec, nullptr) >= 0)
+        {
+            resolved_lp = lp;
+            if (try_auto_lp && attempt == 1)
+            {
+                std::fprintf(stderr, "h264_encoder_intel: opened with low_power=1 after retry\n");
+            }
+            break;
+        }
+
         av_frame_free(&sw);
         av_frame_free(&hw);
         av_packet_free(&pkt);
         avcodec_free_context(&ctx);
-        av_buffer_unref(&hw_dev);
-        return -ENOMEM;
-    }
+        ctx = nullptr;
+        sw = nullptr;
+        hw = nullptr;
+        pkt = nullptr;
 
-    av_opt_set(ctx->priv_data, "rc_mode", "CQP", 0);
-    av_opt_set_int(ctx->priv_data, "qp", qp, 0);
-    if (gop > 0)
-    {
-        av_opt_set_int(ctx->priv_data, "idr_interval", gop, 0);
-    }
-
-    if (avcodec_open2(ctx, codec, nullptr) < 0)
-    {
-        std::fprintf(stderr, "h264_encoder_intel: open h264_vaapi failed\n");
-        av_buffer_unref(&hw_frames);
-        av_frame_free(&sw);
-        av_frame_free(&hw);
-        av_packet_free(&pkt);
-        avcodec_free_context(&ctx);
-        av_buffer_unref(&hw_dev);
-        return -EIO;
+        if (!try_auto_lp || attempt + 1 >= lp_count)
+        {
+            std::fprintf(stderr, "h264_encoder_intel: open h264_vaapi failed\n");
+            av_buffer_unref(&hw_frames);
+            av_buffer_unref(&hw_dev);
+            return -EIO;
+        }
     }
 
     av_buffer_unref(&hw_frames);
@@ -276,12 +395,20 @@ int h264_encoder_intel::codec_open_locked()
     live_fps = fps;
     live_qp = qp;
     live_gop = gop;
+    live_bps = bps;
+    live_rc_cbr = rc_cbr;
+    live_vbv_ms = vbv_ms;
+    live_low_power_cfg = low_power_cfg;
+    low_power_live = resolved_lp;
     reopen_req = false;
+    last_out_pts = -1;
+    pending_idr = true;
     return 0;
 }
 
 void h264_encoder_intel::codec_close_locked()
 {
+    in_pts_q.clear();
     if (ctx)
     {
         auto *c = static_cast<AVCodecContext *>(ctx);
@@ -324,6 +451,11 @@ void h264_encoder_intel::codec_close_locked()
     live_fps = 0;
     live_qp = 0;
     live_gop = 0;
+    live_bps = 0;
+    live_rc_cbr = false;
+    live_vbv_ms = 0;
+    live_low_power_cfg = -1;
+    low_power_live = -1;
 }
 
 int h264_encoder_intel::reopen_if_needed_locked()
@@ -338,8 +470,7 @@ int h264_encoder_intel::reopen_if_needed_locked()
     {
         return r;
     }
-    std::fprintf(stderr, "h264_encoder_intel: opened %dx%d@%d qp=%d gop=%d\n", live_w, live_h,
-                 live_fps, live_qp, live_gop);
+    log_opened_locked();
     return 0;
 }
 
@@ -356,8 +487,7 @@ int h264_encoder_intel::open()
         return r;
     }
     opened = true;
-    std::fprintf(stderr, "h264_encoder_intel: opened %dx%d@%d qp=%d gop=%d\n", live_w, live_h,
-                 live_fps, live_qp, live_gop);
+    log_opened_locked();
     return 0;
 }
 
@@ -416,14 +546,8 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     sw->height = live_h;
     sw->format = AV_PIX_FMT_NV12;
     sw->pts = f.pts;
-    if (pending_idr)
-    {
-        sw->pict_type = AV_PICTURE_TYPE_I;
-#ifdef AV_FRAME_FLAG_KEY
-        sw->flags |= AV_FRAME_FLAG_KEY;
-#endif
-        pending_idr = false;
-    }
+    const bool mark_key_au = pending_idr;
+    pending_idr = false;
     sw->buf[0] =
         av_buffer_create(f.buf.u8(), static_cast<size_t>(sz), nv12_keep, nullptr, 0);
     if (nullptr == sw->buf[0])
@@ -448,6 +572,13 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
         return ret;
     }
     hw->pts = f.pts;
+    if (mark_key_au)
+    {
+        hw->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
+        hw->flags |= AV_FRAME_FLAG_KEY;
+#endif
+    }
 
     ret = avcodec_send_frame(ctx, hw);
     av_frame_unref(hw);
@@ -455,6 +586,7 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     {
         return ret;
     }
+    in_pts_q.push_back(f.pts);
 
     return drain_packets_locked();
 }
@@ -589,6 +721,80 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
+    if (key == "cbr" || key == "bps")
+    {
+        int64_t n = 0;
+        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 0 || n > 200000000LL)
+        {
+            return -EINVAL;
+        }
+        const int nv = static_cast<int>(n);
+        if (nv != bps)
+        {
+            bps = nv;
+            if (opened && rc_cbr)
+            {
+                reopen_req = true;
+                pending_idr = true;
+            }
+        }
+        return 0;
+    }
+    if (key == "rc")
+    {
+        bool want_cbr = (tmp == "cbr");
+        bool want_cqp = (tmp == "cqp" || tmp == "fixqp");
+        if (!want_cbr && !want_cqp)
+        {
+            return -EINVAL;
+        }
+        const bool nv = want_cbr;
+        if (nv != rc_cbr)
+        {
+            rc_cbr = nv;
+            if (opened)
+            {
+                reopen_req = true;
+                pending_idr = true;
+            }
+        }
+        return 0;
+    }
+    if (key == "low_power")
+    {
+        int nv = 0;
+        if (parse_low_power(v, &nv) < 0)
+        {
+            return -EINVAL;
+        }
+        if (nv != low_power_cfg)
+        {
+            low_power_cfg = nv;
+            if (opened)
+            {
+                reopen_req = true;
+            }
+        }
+        return 0;
+    }
+    if (key == "vbv_ms")
+    {
+        int64_t n = 0;
+        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 1 || n > 2000)
+        {
+            return -EINVAL;
+        }
+        const int nv = static_cast<int>(n);
+        if (nv != vbv_ms)
+        {
+            vbv_ms = nv;
+            if (opened)
+            {
+                reopen_req = true;
+            }
+        }
+        return 0;
+    }
     if (key == "idr")
     {
         pending_idr = true;
@@ -638,6 +844,59 @@ int h264_encoder_intel::query(std::string_view key, std::string *value) const
         {
             n = live_gop > 0 ? live_gop : gop;
         }
+        char buf[32];
+        if (key_format_i64(n, buf, sizeof(buf)) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
+    if (key == "rc")
+    {
+        const bool cbr = opened ? live_rc_cbr : rc_cbr;
+        *value = cbr ? "cbr" : "cqp";
+        return 0;
+    }
+    if (key == "cbr" || key == "bps")
+    {
+        const int n = opened && live_bps > 0 ? live_bps : bps;
+        char buf[32];
+        if (key_format_i64(n, buf, sizeof(buf)) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
+    if (key == "low_power")
+    {
+        if (opened && low_power_live >= 0)
+        {
+            char buf[8];
+            if (std::snprintf(buf, sizeof(buf), "%d", low_power_live) < 0)
+            {
+                return -EINVAL;
+            }
+            *value = buf;
+            return 0;
+        }
+        if (low_power_cfg < 0)
+        {
+            *value = "auto";
+            return 0;
+        }
+        char buf[8];
+        if (std::snprintf(buf, sizeof(buf), "%d", low_power_cfg) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
+    if (key == "vbv_ms")
+    {
+        const int n = opened && live_vbv_ms > 0 ? live_vbv_ms : vbv_ms;
         char buf[32];
         if (key_format_i64(n, buf, sizeof(buf)) < 0)
         {
