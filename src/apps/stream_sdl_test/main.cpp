@@ -17,7 +17,7 @@
  *   help | h | ?
  *   set_max_kbps <kbps>
  *   set_constant_loss <pct>
- *   set_fec none | set_fec_k <k> | set_fec_n <n>  (stream_sender RS_BLOCK_ERASURE)
+ *   set_fec none | set_fec_k <k> | set_fec_n <n> | set_fec_spread <ms> | set_fec_timeout <ms>
  *   set_encode_cbr <kbps> | set_encode_qp <qp> | set_gop <gop> | force_idr | get_metric <name>
  *   ping / stats / metrics | get | empty line → pipeline metrics report
  *

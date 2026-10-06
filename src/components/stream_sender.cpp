@@ -1444,6 +1444,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("fec_timeout_ms" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", fec_timeout_ms);
+        *value = buf;
+        return 0;
+    }
     if ("dropped" == key)
     {
         char buf[32];

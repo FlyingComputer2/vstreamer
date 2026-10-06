@@ -707,6 +707,20 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
     raw.close();
 }
 
+TEST(StreamSenderTest, FecTimeoutMsLiveReinit)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "fec", "block"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, cfg(sender, "fec_timeout_ms", "35"));
+    std::string v;
+    ASSERT_EQ(0, sender.query("fec_timeout_ms", &v));
+    EXPECT_EQ("35", v);
+    EXPECT_LT(cfg(sender, "fec_timeout_ms", "60001"), 0);
+    sender.close();
+}
+
 TEST(StreamSenderTest, FecKnAccept32Reject256)
 {
     vstreamer::stream_sender sender;

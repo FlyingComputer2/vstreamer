@@ -239,6 +239,9 @@ TEST(SplitAppsTest, SenderReceiverLinkAndCleanShutdown)
     EXPECT_EQ(udp_exchange(tx_console, "set_fec_spread 100\n"), "ok\n");
     EXPECT_EQ(udp_exchange(tx_console, "set_fec_spread -1\n").rfind("err bad fec spread", 0),
               0u);
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_timeout 50\n"), "ok\n");
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_timeout 60001\n").rfind("err bad fec timeout", 0),
+              0u);
 
     stop_process(snd_pid);
     stop_process(rcv_pid);
