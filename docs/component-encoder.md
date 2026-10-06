@@ -34,7 +34,7 @@ Rules:
 | Class | Backend | Rate control | Notes |
 |-------|---------|--------------|-------|
 | `h264_encoder_mpp` | Rockchip MPP (RK3588) | `cbr` (default target 20 Mb/s) or `fixqp` | `latency_ms` query; super-frame ratios |
-| `h264_encoder_cedar` | libavcodec `h264_cedrus` (`/dev/cedar_dev`) | fixed QP 2..47 | width multiple of 32; QP/GOP reopen (PPS written at open) |
+| `h264_encoder_cedar` | libavcodec `h264_cedrus` (`/dev/cedar_dev`) | fixed QP 2..47 | width multiple of 32; QP/GOP reopen (PPS written at open); does not pass `capture_mono_ns` through to AUs |
 | `h264_encoder_intel` | libavcodec `h264_vaapi` | fixed QP 0..52 | `device` = VA render node; `latency_ms` query when input carries `capture_mono_ns` |
 
 The bench app picks the encoder at compile time (`h264_encoder_t` in

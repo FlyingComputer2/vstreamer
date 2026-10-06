@@ -283,16 +283,76 @@ One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`
 `max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
 reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`).
 
-**Latency on `sdl_stream_receiver` (`:5091`):** stages use `frame_data.capture_mono_ns` from the
-RTP capture extension (sender stamps at encode; depay maps to local monotonic). The console
-publishes `latency.glass_ms`, `latency.depay_ms`, `latency.dec_in_ms`, `latency.dec_out_ms`, and
-`latency.present_ms` only — not TX-only keys (`latency.source_ms`, `jpeg_ms`, `enc_*`). Those
-appear on the sender console or in `stream_sdl_test` loopback. Glass latency across hosts needs
-aligned `CLOCK_REALTIME` (chrony); see [packet-model.md](packet-model.md).
+Split TX/RX consoles and the full `latency.*` metric set are documented in
+[Latency metrics](#latency-metrics).
 
 Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
 `tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
 so `stream_sdl_test` and the split apps stay aligned.
+
+## Latency metrics
+
+End-to-end latency is measured from **`frame_data.capture_mono_ns`**: local
+`CLOCK_MONOTONIC` nanoseconds when the frame was captured (or synthesized) at the source.
+Each pipeline stage recomputes `steady_mono_ns() − capture_mono_ns` when a frame passes that
+stage (`apps/common/stage_latency.cpp`, called from `tx_stages` / `rx_stages`). On the wire,
+`rtp_h264_pay` converts capture time to **CLOCK_REALTIME** in the RTP extension;
+`rtp_h264_depay` maps it back to local monotonic on each access unit so RX stages use the same
+field. Wire format and clock requirements: [packet-model.md](packet-model.md).
+
+Encoders must **preserve** `capture_mono_ns` from NV12 input to H.264 output (`h264_encoder_mpp`,
+`h264_encoder_intel`). Without that, the payloader cannot stamp the extension and glass latency on
+a split receiver stays at 0. `h264_encoder_cedar` does not propagate capture time today.
+
+### Pipeline metrics (`latency.*`)
+
+Published by `rx_metrics::publish_latency_metrics()` (console sync, ~10 Hz). Values are the latest
+per-stage capture age in milliseconds.
+
+| Metric | Stage (internal name) | TX path | RX path |
+|--------|------------------------|---------|---------|
+| `latency.source_ms` | `source` | yes | — |
+| `latency.jpeg_ms` | `jpeg_nv12` | yes (JPEG mode) | — |
+| `latency.enc_in_ms` | `enc_in` | yes | — |
+| `latency.enc_out_ms` | `enc_out` | yes | — |
+| `latency.depay_ms` | `depay` | loopback | yes |
+| `latency.dec_in_ms` | `dec_in` | loopback | yes |
+| `latency.dec_out_ms` | `dec_out` | loopback | yes |
+| `latency.present_ms` | `present` | loopback | yes |
+| `latency.glass_ms` | same as `present_ms` | loopback | yes |
+
+On **`sdl_stream_receiver`** (`VSTREAMER_APP_SPLIT_RX_ONLY`), only the RX rows plus `glass_ms`
+are published and exposed on the console (`:5091`). TX-only keys are omitted from `get` / full
+metrics dumps (`get_metric latency.source_ms` → `err unknown metric`). Sender
+**`uvc_stream_sender`** (`:5090`) and **`stream_sdl_test`** publish the full set when both halves
+run in-process or over the channel emulator.
+
+### Component queries
+
+| Query key | Component | Meaning |
+|-----------|-----------|---------|
+| `latency_ms` | `h264_encoder_mpp`, `h264_encoder_intel` | capture → last encoded AU (when input had `capture_mono_ns`) |
+| `latency_ms` | `h264_decoder_mpp`, `sdl_nv12_presenter` / `sdl_sink` | capture → last frame at that stage |
+
+Bench metrics also expose `stream_sdl.glass_latency_ms` (alias of glass latency in
+`stream_sdl_test`).
+
+### `encoder_queue.latency_ms` (sender)
+
+NV12 frames wait in `g_tx.metrics_nv12_q` between JPEG decode and H.264 encode. The metric is:
+
+1. **`latency.enc_in_ms`** if the encode thread has updated it; else **`latency.jpeg_ms`** (frame
+   still upstream of the queue), plus
+2. **`encoder_queue.size` × (1000 / jpeg_decoder.out_fps)** when queue depth > 0 — estimated
+   extra wait for frames already buffered (not a second full capture-age term).
+
+Related counters: `encoder_queue.size`, `encoder_queue.in_fps`, `encoder_queue.out_fps`.
+
+### Debugging
+
+Per-frame stage lines on stderr: `stream_sdl_test --diag` or `VSTREAMER_LOG_STAGE_LATENCY=1`.
+Optional `VSTREAMER_STAGE_LATENCY_EVERY=N` (log every Nth frame by PTS). Depay diagnostics:
+`rtp_h264_depay` queries `capture_ts_rejected`, `capture_skew_ms`.
 
 ## Bench app: `stream_sdl_test`
 
@@ -339,7 +399,12 @@ and/or ranges, `-1` = unpinned). Stages: `source`, `jpeg`, `jpeg_workers`, `enco
 Default (Orange Pi 5 / RK3588): `source=0;jpeg=1;encode=2;rx=3;jpeg_workers=4-7`.
 Rover H3 example: `source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 
-### Console (UDP `:5090`, newline-terminated)
+### Console (UDP, newline-terminated)
+
+Default bind: **`uvc_stream_sender`** and **`stream_sdl_test`** → `127.0.0.1:5090`;
+**`sdl_stream_receiver`** → `127.0.0.1:5091` (override with `--console-port` where supported).
+On the split GS receiver, `latency.*` dumps omit TX-only keys; see
+[Latency metrics](#latency-metrics).
 
 | Verb | Effect |
 |------|--------|
@@ -355,7 +420,8 @@ Rover H3 example: `source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
 `h264_encoder.out_bytes`, `stream_sender.peer_fec_gap_count`,
 `stream_sender.peer_fec_packet_received`, `stream_sender.peer_udp_gap_count`,
-`stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`.
+`stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`,
+`latency.depay_ms`, `encoder_queue.latency_ms`, `h264_encoder.latency_ms`.
 `stream_sender.peer_*` packet/gap counters come from the link reports the sender received, never
 from the receiver object. The reports travel the emulator's reverse direction, so
 `set_constant_loss` affects them too. `peer_report_age_ms` (`-1` if never), `peer_reports_*` and

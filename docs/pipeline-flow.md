@@ -65,6 +65,11 @@ capture time to **CLOCK_REALTIME** in the RTP extension; `rtp_h264_depay` conver
 monotonic on output. Glass latency (`stream_sdl.glass_latency_ms`, `latency.glass_ms`) is
 capture → display and is meaningful across hosts when clocks are synchronized.
 
+Stage names map to `latency.*` metrics (`source` → `latency.source_ms`, `jpeg_nv12` →
+`latency.jpeg_ms`, …, `present` → `latency.glass_ms`). Split apps: TX stages on
+`uvc_stream_sender` (`:5090`), RX stages on `sdl_stream_receiver` (`:5091`). See
+[vstreamer.md § Latency metrics](vstreamer.md#latency-metrics).
+
 ## Legacy aliases
 
 `stream_sink` / `stream_source` factory names map to `stream_sender` /
