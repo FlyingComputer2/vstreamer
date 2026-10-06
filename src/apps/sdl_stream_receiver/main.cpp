@@ -3,6 +3,7 @@
 #include "apps/common/cpu_map.hpp"
 #include "apps/common/queues.hpp"
 #include "apps/common/stage_latency.hpp"
+#include "apps/common/rx/rx_metrics.hpp"
 #include "components/components.hpp"
 #include "apps/stream_sdl_test/metrics_sync.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
@@ -174,6 +175,9 @@ int main(int argc, char **argv)
     console.set_pipeline_metrics_sync_live([&]() {
         sync_pipeline_metrics_live(g_bench_diag, nullptr, nullptr, &rcv, nullptr);
     });
+#if defined(VSTREAMER_APP_SPLIT_RX_ONLY)
+    console.set_metric_name_filter(apps::rx::latency_metric_visible);
+#endif
     if (console.start(console_port) < 0)
     {
         return 1;

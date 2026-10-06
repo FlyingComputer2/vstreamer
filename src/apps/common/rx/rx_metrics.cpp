@@ -86,7 +86,7 @@ void telemetry_thread_main(stream_receiver *rcv)
 void publish_latency_metrics(double glass_ms)
 {
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
-#if defined(VSTREAMER_APP_RX_OK) && !defined(VSTREAMER_APP_TX_OK)
+#if defined(VSTREAMER_APP_SPLIT_RX_ONLY)
     /* Split GS receiver: capture enters on the wire (RTP ext → depay). No TX stages in-process. */
     metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
                  apps::g_latency_depay_ms.load(std::memory_order_relaxed));
@@ -115,5 +115,15 @@ void publish_latency_metrics(double glass_ms)
                  apps::g_latency_present_ms.load(std::memory_order_relaxed));
 #endif
 }
+
+#if defined(VSTREAMER_APP_SPLIT_RX_ONLY)
+
+bool latency_metric_visible(std::string_view full_name)
+{
+    return full_name != "latency.source_ms" && full_name != "latency.jpeg_ms" &&
+           full_name != "latency.enc_in_ms" && full_name != "latency.enc_out_ms";
+}
+
+#endif
 
 }  // namespace vstreamer::apps::rx
