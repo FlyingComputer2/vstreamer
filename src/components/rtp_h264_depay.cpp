@@ -109,6 +109,7 @@ int rtp_h264_depay::input(uint8_t port, const data_packet &in)
     const shared_sized_buffer &feed = s.buf;
     for (;;)
     {
+        const int64_t        feed_in_ns = steady_mono_ns();
         std::vector<uint8_t> au;
         const int            ready = depay.feed(feed.u8(), feed.size(), &au);
         if (ready < 0)
@@ -118,6 +119,12 @@ int rtp_h264_depay::input(uint8_t port, const data_packet &in)
         if (0 == ready)
         {
             break;
+        }
+        const int64_t feed_out_ns = steady_mono_ns();
+        if (feed_out_ns > feed_in_ns)
+        {
+            last_node_latency_ms =
+                static_cast<double>(feed_out_ns - feed_in_ns) / 1e6;
         }
         au_item item;
         item.buf = std::move(au);
@@ -241,6 +248,17 @@ int rtp_h264_depay::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[64];
         std::snprintf(buf, sizeof(buf), "%.3f", capture_skew_ms);
+        *value = buf;
+        return 0;
+    }
+    if ("node_latency_ms" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%.2f", last_node_latency_ms) < 0)
+        {
+            return -EINVAL;
+        }
         *value = buf;
         return 0;
     }

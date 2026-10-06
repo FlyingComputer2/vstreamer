@@ -62,6 +62,7 @@ private:
         size_t   size = 0;
         int64_t  pts = 0;
         int64_t  capture_mono_ns = 0;
+        int64_t  in_mono_ns = 0;
     };
 
     struct result_slot
@@ -111,6 +112,9 @@ private:
     mutable std::mutex              nv12_pool_mu;
     mutable std::unique_ptr<buffer_pool> nv12_pool;
     mutable size_t                  nv12_pool_bytes = 0;
+
+    mutable std::mutex lat_mu;
+    double             last_node_latency_ms = 0.0;
 };
 
 }  // namespace vstreamer

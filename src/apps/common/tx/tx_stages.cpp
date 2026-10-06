@@ -14,6 +14,7 @@
 #include "components/components.hpp"
 #include "core/data_packet.hpp"
 #include "core/thread_affinity.hpp"
+#include "core/time_util.hpp"
 
 namespace vstreamer::test_app
 {
@@ -22,6 +23,7 @@ using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
 using apps::log_stage_latency;
+using apps::record_stage_node_latency_ms;
 using apps::note_source_pts;
 using apps::packet_frame_bytes;
 using apps::packet_media_kind;
@@ -32,6 +34,7 @@ using apps::tx::g_tx;
 bool forward_encoded_au(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag,
                         data_packet &pkt)
 {
+    const int64_t enc_out_in_ns = steady_mono_ns();
     log_stage_latency("enc_out", pkt);
     if (pay.input(0, pkt) < 0)
     {
@@ -47,6 +50,7 @@ bool forward_encoded_au(rtp_h264_pay &pay, stream_sender &sender, bench_diag &di
             sent = true;
         }
     }
+    record_stage_node_latency_ms("enc_out", enc_out_in_ns, steady_mono_ns());
     return sent;
 }
 
@@ -78,7 +82,8 @@ void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &s
 }
 
 bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
-                            bench_diag *diag, data_packet &nv12, bool *accepted)
+                            bench_diag *diag, data_packet &nv12, int64_t enc_in_mono_ns,
+                            bool *accepted)
 {
     if (nullptr != accepted)
     {
@@ -94,6 +99,10 @@ bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_
             diag->tx_nv12++;
             got_enc_in = true;
             log_stage_latency("enc_in", nv12);
+            if (enc_in_mono_ns > 0)
+            {
+                record_stage_node_latency_ms("enc_in", enc_in_mono_ns, steady_mono_ns());
+            }
             break;
         }
         if (-ECANCELED == enc_in)
@@ -159,12 +168,20 @@ bool handle_source_poll_error(int got)
 
 }  // namespace
 
-bool enqueue_source_frame(data_packet &&raw, apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
+bool enqueue_source_frame(data_packet &&raw, int64_t source_out_mono_ns,
+                          apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
                           bench_diag *diag)
 {
     diag->tx_noise++;
     diag->tx_source_bytes += packet_frame_bytes(raw);
     note_source_pts(raw);
+    if (raw.get_type() == packet_kind_e::FRAME)
+    {
+        const frame_data &f = data_packet::cast<frame_data>(raw);
+        const int64_t node_in_ns =
+            f.capture_mono_ns > 0 ? f.capture_mono_ns : source_out_mono_ns;
+        record_stage_node_latency_ms("source", node_in_ns, source_out_mono_ns);
+    }
     log_stage_latency("source", raw);
     if (packet_media_kind(raw) == media_kind_e::NV12)
     {
@@ -191,8 +208,9 @@ void source_stage_main(component_source *source, apps::pipeline_queue *mjpeg_q, 
             }
             continue;
         }
+        const int64_t source_out_mono_ns = steady_mono_ns();
         data_packet moved = std::move(raw);
-        if (!enqueue_source_frame(std::move(moved), mjpeg_q, nv12_q, diag))
+        if (!enqueue_source_frame(std::move(moved), source_out_mono_ns, mjpeg_q, nv12_q, diag))
         {
             break;
         }
@@ -218,6 +236,11 @@ void emit_jpeg_nv12(apps::pipeline_queue *nv12_q, bench_diag *diag, data_packet 
     diag->tx_jpeg_nv12++;
     diag->tx_jpeg_nv12_bytes += packet_frame_bytes(nv12);
     log_stage_latency("jpeg_nv12", nv12);
+    if (nv12.get_type() == packet_kind_e::FRAME)
+    {
+        auto &f = data_packet::cast<frame_data>(nv12);
+        f.queue_in_mono_ns = steady_mono_ns();
+    }
     (void)nv12_q->push(std::move(nv12), &diag->tx_nv12_q_drop);
 }
 
@@ -354,12 +377,22 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
                 drain_encoder(*enc, *pay, *sender, *diag);
                 continue;
             }
+            const int64_t pop_mono_ns = steady_mono_ns();
             diag->tx_enc_nv12_popped++;
+            if (nv12.get_type() == packet_kind_e::FRAME)
+            {
+                const frame_data &f = data_packet::cast<frame_data>(nv12);
+                if (f.queue_in_mono_ns > 0)
+                {
+                    record_stage_node_latency_ms("encoder_queue", f.queue_in_mono_ns, pop_mono_ns);
+                }
+            }
             holding = true;
         }
 
-        bool accepted = false;
-        if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12, &accepted))
+        bool          accepted = false;
+        const int64_t enc_in_mono_ns = steady_mono_ns();
+        if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12, enc_in_mono_ns, &accepted))
         {
             break;
         }

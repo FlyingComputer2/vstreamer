@@ -800,15 +800,20 @@ void h264_encoder_mpp::enqueue_completed_aus_locked(std::vector<frame> &&aus)
     const bool had_frames = !aus.empty();
     for (frame &au : aus)
     {
+        const int64_t now_ns = steady_mono_ns();
         if (au.capture_mono_ns() > 0)
         {
-            const int64_t now_ns = steady_mono_ns();
-            const double  ms =
+            const double ms =
                 static_cast<double>(now_ns - au.capture_mono_ns()) / 1e6;
             if (ms >= 0.0)
             {
                 last_latency_ms = ms;
             }
+        }
+        if (enc_au_in_mono_ns > 0 && now_ns > enc_au_in_mono_ns)
+        {
+            last_node_latency_ms =
+                static_cast<double>(now_ns - enc_au_in_mono_ns) / 1e6;
         }
         while (out_q.size() >= k_out_q_max && !out_q.empty())
         {
@@ -873,6 +878,7 @@ void h264_encoder_mpp::ingest_enc_packet(void *mpp_packet_opaque,
         {
             const int slot_idx = enc_pending_slots.front();
             enc_au_capture_mono_ns = enc_slots[slot_idx].capture_mono_ns;
+            enc_au_in_mono_ns = enc_slots[slot_idx].in_mono_ns;
         }
         if (nullptr != completed_aus)
         {
@@ -952,6 +958,7 @@ int h264_encoder_mpp::put_nv12_frame_unlocked(const frame_data &f)
             const int slot_idx = enc_free_slots.front();
             enc_free_slots.pop_front();
             enc_slots[slot_idx].capture_mono_ns = f.capture_mono_ns;
+            enc_slots[slot_idx].in_mono_ns = steady_mono_ns();
             auto in_buf = static_cast<MppBuffer>(enc_slots[slot_idx].frm);
             auto out_buf = static_cast<MppBuffer>(enc_slots[slot_idx].pkt);
             if (nullptr == in_buf || nullptr == out_buf)
@@ -1405,6 +1412,16 @@ int h264_encoder_mpp::query(std::string_view key, std::string *value) const
     {
         char buf[32];
         if (std::snprintf(buf, sizeof(buf), "%.2f", last_latency_ms) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
+    if (key == "node_latency_ms")
+    {
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%.2f", last_node_latency_ms) < 0)
         {
             return -EINVAL;
         }

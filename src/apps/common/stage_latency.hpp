@@ -21,6 +21,16 @@ extern std::atomic<double>  g_latency_dec_in_ms;
 extern std::atomic<double>  g_latency_dec_out_ms;
 extern std::atomic<double>  g_latency_present_ms;
 
+extern std::atomic<double> g_node_latency_source_ms;
+extern std::atomic<double> g_node_latency_jpeg_ms;
+extern std::atomic<double> g_node_latency_encoder_queue_ms;
+extern std::atomic<double> g_node_latency_enc_in_ms;
+extern std::atomic<double> g_node_latency_enc_out_ms;
+extern std::atomic<double> g_node_latency_depay_ms;
+extern std::atomic<double> g_node_latency_dec_in_ms;
+extern std::atomic<double> g_node_latency_dec_out_ms;
+extern std::atomic<double> g_node_latency_present_ms;
+
 void stage_latency_set_diag_enabled(bool enabled);
 
 void note_source_pts(const vstreamer::data_packet &pkt);
@@ -29,9 +39,10 @@ void note_source_pts(const vstreamer::data_packet &pkt);
 void record_stage_latency_ms(const char *stage, const vstreamer::data_packet &, double ms);
 void log_stage_latency(const char *stage, const vstreamer::data_packet &pkt);
 
-/* Per-node delay: max(0, cumulative_ms - prev_cumulative_ms). When prev is unset (<= 0), returns
- * cumulative_ms (first segment in the chain). */
-[[nodiscard]] double stage_node_latency_ms(double cumulative_ms, double prev_cumulative_ms);
+/* Per-node delay from monotonic input/output stamps on the same frame (ms). */
+[[nodiscard]] double mono_interval_ms(int64_t input_mono_ns, int64_t output_mono_ns);
+
+void record_stage_node_latency_ms(const char *stage, int64_t input_mono_ns, int64_t output_mono_ns);
 
 }  // namespace vstreamer::apps
 

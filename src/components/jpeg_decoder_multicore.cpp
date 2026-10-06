@@ -4,6 +4,7 @@
 #include "core/output_opts.hpp"
 #include "core/pix_convert.hpp"
 #include "core/thread_affinity.hpp"
+#include "core/time_util.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -313,7 +314,14 @@ void jpeg_decoder_multicore::worker_main(int worker_index)
         }
 
         frame out;
-        int   status = decode_one(dec, avf, pkt, j, &out);
+        int                        status = decode_one(dec, avf, pkt, j, &out);
+        const int64_t              work_end_ns = steady_mono_ns();
+        if (j.in_mono_ns > 0 && work_end_ns > j.in_mono_ns)
+        {
+            std::lock_guard<std::mutex> lat(lat_mu);
+            last_node_latency_ms =
+                static_cast<double>(work_end_ns - j.in_mono_ns) / 1e6;
+        }
         std::free(j.data);
         j.data = nullptr;
 
@@ -486,6 +494,7 @@ int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
     jobs[job_tail].size = f.buf.size();
     jobs[job_tail].pts = f.pts;
     jobs[job_tail].capture_mono_ns = f.capture_mono_ns;
+    jobs[job_tail].in_mono_ns = steady_mono_ns();
     job_tail = (job_tail + 1) % k_queue_depth;
     job_count++;
     job_cv.notify_one();
@@ -725,6 +734,17 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string *value) cons
     if (key == "decoded_pix_fmt")
     {
         *value = decoded_pix_fmt;
+        return 0;
+    }
+    if (key == "node_latency_ms")
+    {
+        std::lock_guard<std::mutex> lat(lat_mu);
+        char                        buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%.2f", last_node_latency_ms) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
         return 0;
     }
     return -ENOTSUP;

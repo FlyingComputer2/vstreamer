@@ -93,6 +93,7 @@ void log_bench_rate_line(const pipeline_rate_state &rate, vstreamer::component_c
                          const bench_diag &diag);
 
 double query_component_latency_ms(vstreamer::component &c);
+double query_component_node_latency_ms(vstreamer::component &c);
 
 }  // namespace vstreamer::test_app
 

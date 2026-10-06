@@ -156,4 +156,20 @@ double query_component_latency_ms(component &c)
     return ms;
 }
 
+double query_component_node_latency_ms(component &c)
+{
+    std::string v;
+    if (c.query("node_latency_ms", &v) != 0 || v.empty())
+    {
+        return 0.0;
+    }
+    char *end = nullptr;
+    const double ms = std::strtod(v.c_str(), &end);
+    if (end == v.c_str() || ms < 0.0)
+    {
+        return 0.0;
+    }
+    return ms;
+}
+
 }  // namespace vstreamer::test_app

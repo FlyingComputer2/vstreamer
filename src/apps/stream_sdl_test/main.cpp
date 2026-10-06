@@ -71,6 +71,7 @@
 
 #include "core/component_source.hpp"
 #include "core/metrics.hpp"
+#include "core/time_util.hpp"
 
 namespace vstreamer::test_app
 {
@@ -878,10 +879,12 @@ int main(int argc, char **argv)
     {
         uvc_selector->set_push_handlers(
             [&](data_packet &&pkt) {
-                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
+                (void)enqueue_source_frame(std::move(pkt), vstreamer::steady_mono_ns(), &mjpeg_q,
+                                          &nv12_q, &g_bench_diag);
             },
             [&](data_packet &&pkt) {
-                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
+                (void)enqueue_source_frame(std::move(pkt), vstreamer::steady_mono_ns(), &mjpeg_q,
+                                          &nv12_q, &g_bench_diag);
             });
         ctrl.add_stage("source", "source",
                        [&, sel = uvc_selector.get()](std::atomic<bool> & /*run*/) {

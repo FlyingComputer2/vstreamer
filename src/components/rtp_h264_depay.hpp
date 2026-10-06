@@ -66,6 +66,7 @@ private:
     uint64_t              au_dropped = 0;
     uint64_t              capture_ts_rejected = 0;
     double                capture_skew_ms = 0.0;
+    double                last_node_latency_ms = 0.0;
 
     [[nodiscard]] int64_t accept_capture_rt_ns(int64_t capture_rt_ns);
 };

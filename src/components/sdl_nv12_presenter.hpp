@@ -33,6 +33,9 @@ public:
     void set_title(std::string_view title);
     void stats_string(char *buf, size_t buflen, uint64_t frames_in) const;
 
+    [[nodiscard]] double last_latency_ms_value() const;
+    [[nodiscard]] double last_node_latency_ms_value() const;
+
     [[nodiscard]] int live_width() const { return live_w; }
     [[nodiscard]] int live_height() const { return live_h; }
 
@@ -71,6 +74,7 @@ private:
     uint64_t present_ok_count = 0;
     uint64_t present_fail_count = 0;
     double   last_latency_ms = 0.0;
+    double   last_node_latency_ms = 0.0;
     mutable std::string last_err;
 
     void note_present_failure(const char *op);

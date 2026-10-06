@@ -21,8 +21,9 @@ namespace vstreamer::test_app
 
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
 
-bool enqueue_source_frame(vstreamer::data_packet &&raw, apps::pipeline_queue *mjpeg_q,
-                          apps::pipeline_queue *nv12_q, bench_diag *diag);
+bool enqueue_source_frame(vstreamer::data_packet &&raw, int64_t source_out_mono_ns,
+                          apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q,
+                          bench_diag *diag);
 
 void source_stage_main(vstreamer::component_source *source, apps::pipeline_queue *mjpeg_q,
                        apps::pipeline_queue *nv12_q, bench_diag *diag);

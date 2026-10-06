@@ -187,6 +187,23 @@ int sdl_sink::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("latency_ms" == key || "node_latency_ms" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!present.has_value())
+        {
+            return -ENOTSUP;
+        }
+        char buf[32];
+        const double ms = ("latency_ms" == key) ? present->last_latency_ms_value()
+                                                : present->last_node_latency_ms_value();
+        if (std::snprintf(buf, sizeof(buf), "%.2f", ms) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
     return -ENOTSUP;
 }
 
