@@ -515,6 +515,11 @@ void stream_sender::send_thread_main()
                 {
                     break;
                 }
+                if (fec_deadline_changed)
+                {
+                    fec_deadline_changed = false;
+                    break;
+                }
                 const auto t = std::chrono::steady_clock::now();
                 if (!queue.empty() && queue.front().release <= t)
                 {
@@ -762,6 +767,7 @@ int stream_sender::input(uint8_t port, const data_packet &in)
     const size_t     ingress_bytes = src.buf.size();
 
     bool oversized = false;
+    bool opened_block = false;
     fec_mode_e mode = fec_mode_e::block;
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -791,13 +797,26 @@ int stream_sender::input(uint8_t port, const data_packet &in)
                 dropped.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
-            const uint64_t before = fec.oversized();
+            const uint64_t                        before = fec.oversized();
+            std::chrono::steady_clock::time_point dl;
+            const bool had_deadline = fec.next_deadline(&dl);
             fec.push_app(src.buf.u8(), src.buf.size(), &air);
             oversized = fec.oversized() != before;
+            opened_block = !had_deadline && fec.next_deadline(&dl);
         }
         if (!air.empty())
         {
             enqueue_fec_air(&air);
+        }
+        if (opened_block)
+        {
+            /* The send thread runs the timeout flush; wake it to sleep toward this block's
+             * deadline instead of an older, later one. */
+            {
+                std::lock_guard<std::mutex> lock(q_mu);
+                fec_deadline_changed = true;
+            }
+            q_cv.notify_one();
         }
     }
     {

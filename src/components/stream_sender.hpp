@@ -125,6 +125,9 @@ private:
     /* Ordered by release time (ties keep enqueue order). */
     std::deque<queued_wire> queue;
     size_t                  queue_bytes = 0;
+    /* Set (under q_mu) when input() opens a new FEC block: its timeout deadline is earlier
+     * than whatever the send thread is sleeping toward, so the thread must recompute it. */
+    bool                    fec_deadline_changed = false;
     static constexpr size_t k_queue_packet_cap = 1024;
     static constexpr size_t k_queue_min_paced_bytes = 32 * 1024;
     /* App-byte budget for a 1080p keyframe at k=8 n=15; unpaced wire minimum scales by n/k. */

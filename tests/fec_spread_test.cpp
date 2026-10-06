@@ -454,3 +454,25 @@ TEST(FecSpreadTest, LoopbackInOrderWithSpread)
     sender.close();
     receiver.close();
 }
+
+/* The timeout flush runs on the send thread. A packet that opens a new block while the thread
+ * sleeps (no other traffic) must still be flushed about timeout_ms later, not when the thread's
+ * older, longer sleep ends. Repeated so the packet lands at different points of that sleep. */
+TEST(FecSpreadTest, TimeoutFlushOnTimeWhenIdle)
+{
+    wire_sniffer             sniff;
+    vstreamer::stream_sender sender;
+    open_fec_sender(sender, sniff.host_port(), 8, 12, 0);
+    double worst_ms = 0.;
+    for (int i = 0; i < 12; i++)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(7 * i % 50 + 60));
+        const auto t0 = clock_type::now();
+        ASSERT_EQ(0, sender.input(0, app_packet(static_cast<uint8_t>(i))));
+        const auto got = sniff.collect(5, 500);  // 1 data + 4 parity
+        ASSERT_EQ(5u, got.size());
+        worst_ms = std::max(worst_ms, ms_between(t0, got.front().at));
+    }
+    EXPECT_LT(worst_ms, 30.0) << "timeout is 20 ms";
+    sender.close();
+}
