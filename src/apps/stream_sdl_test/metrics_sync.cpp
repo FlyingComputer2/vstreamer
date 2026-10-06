@@ -211,10 +211,15 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 #else
     const size_t enc_q_depth = 0;
 #endif
-    double       enc_q_latency_ms = 0.0;
-    if (jpeg_out_fps > 0.5)
+    // Capture-age at enc_in (or jpeg_nv12 if enc_in not updated yet), plus queued-frame backlog.
+    double enc_q_latency_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    if (enc_q_latency_ms <= 0.0)
     {
-        enc_q_latency_ms = static_cast<double>(enc_q_depth) * 1000.0 / jpeg_out_fps;
+        enc_q_latency_ms = apps::g_latency_jpeg_ms.load(std::memory_order_relaxed);
+    }
+    if (jpeg_out_fps > 0.5 && enc_q_depth > 0)
+    {
+        enc_q_latency_ms += static_cast<double>(enc_q_depth) * 1000.0 / jpeg_out_fps;
     }
     uint64_t ch_fwd_drops = 0;
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
