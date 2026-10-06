@@ -73,6 +73,11 @@ public:
     {
         return sdu_seq;
     }
+    // Overrides the random start of the TX sdu_seq; tests use it to cross the u16 wrap.
+    void set_tx_sdu_seq(uint16_t seq)
+    {
+        sdu_seq = seq;
+    }
 
     // App datagram -> zero or more air shards (full block or nothing).
     void push_app(const uint8_t* data, size_t len,

@@ -230,7 +230,10 @@ one `sock_data` per original datagram.
 
 `link_counters_snapshot()` returns the four link counters at once for metrics code.
 After `rx_hold_ms` (≥ 250 ms) without any shard, the next shard rebases the FEC receiver to its
-block, so a restarted sender resumes immediately whatever its random start block id.
+block, so a restarted sender resumes immediately whatever its random start `sdu_base`. A quicker
+restart is recognised by distance: a base more than 2048 SDUs ahead of the emit position, or a
+held shard that far behind once the old session has been silent for `emit_hold_ms`, resyncs to
+the new session without counting the jump as loss.
 
 **`mkv_sink`** — MJPEG → Matroska, incremental cluster writes.
 

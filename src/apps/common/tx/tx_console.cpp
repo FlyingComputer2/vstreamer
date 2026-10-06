@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace vstreamer::apps::tx
 {
@@ -22,6 +23,13 @@ bool parse_long(const char *arg, long *out)
     *out = v;
     return true;
 }
+
+constexpr long k_fec_kn_min = rs_block_erasure::k_header_k_n_min;
+constexpr long k_fec_kn_max = rs_block_erasure::k_header_k_n_max;
+
+const std::string k_bad_k_reply =
+    "err bad k (" + std::to_string(k_fec_kn_min) + ".." + std::to_string(k_fec_kn_max) + ")\n";
+const std::string k_bad_n_reply = "err bad n (k.." + std::to_string(k_fec_kn_max) + ")\n";
 
 }  // namespace
 
@@ -65,9 +73,9 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     return true;
                 }
                 long k = 0;
-                if (!parse_long(work + 10, &k) || k < 1 || k > 15)
+                if (!parse_long(work + 10, &k) || k < k_fec_kn_min || k > k_fec_kn_max)
                 {
-                    reply = "err bad k (1..15)\n";
+                    reply = k_bad_k_reply;
                     return true;
                 }
                 char buf[16];
@@ -75,7 +83,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 std::string_view val = buf;
                 if (stream_tx->configure("fec_k", val) < 0)
                 {
-                    reply = "err bad k (1..15)\n";
+                    reply = k_bad_k_reply;
                     return true;
                 }
                 reply = "ok\n";
@@ -89,9 +97,9 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     return true;
                 }
                 long n = 0;
-                if (!parse_long(work + 10, &n) || n < 1 || n > 15)
+                if (!parse_long(work + 10, &n) || n < k_fec_kn_min || n > k_fec_kn_max)
                 {
-                    reply = "err bad n (k..15)\n";
+                    reply = k_bad_n_reply;
                     return true;
                 }
                 char buf[16];
@@ -99,7 +107,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 std::string_view val = buf;
                 if (stream_tx->configure("fec_n", val) < 0)
                 {
-                    reply = "err bad n (k..15)\n";
+                    reply = k_bad_n_reply;
                     return true;
                 }
                 reply = "ok\n";
