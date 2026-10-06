@@ -1,5 +1,6 @@
 #include "components/stream_sender.hpp"
 
+#include "core/fec_spread.hpp"
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
 #include "core/stream_header.hpp"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iterator>
 #include <poll.h>
 #include <random>
 #include <thread>
@@ -175,7 +177,8 @@ packet_kind_e stream_sender::input_packet_kind(uint8_t port) const
     return packet_kind_e::SOCK;
 }
 
-void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard)
+void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                                      std::chrono::steady_clock::time_point release)
 {
     if (nullptr == data || 0 == len)
     {
@@ -203,7 +206,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         while (!queue.empty() &&
                (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
         {
-            queue_bytes -= wire_packet_bytes(queue.front());
+            queue_bytes -= wire_packet_bytes(queue.front().pkt);
             queue.pop_front();
             evicted = true;
         }
@@ -233,7 +236,13 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
-        queue.push_back(std::move(copy));
+        /* Usually the newest release time, so the search ends at the back. */
+        auto pos = queue.end();
+        while (pos != queue.begin() && std::prev(pos)->release > release)
+        {
+            --pos;
+        }
+        queue.insert(pos, queued_wire {std::move(copy), release});
     }
     if (evicted)
     {
@@ -249,9 +258,13 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
     {
         return;
     }
-    for (auto &pkt : *air)
+    const auto t0 = std::chrono::steady_clock::now();
+    const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
+    for (size_t j = 0; j < air->size(); j++)
     {
-        enqueue_wire_copy(pkt.data(), pkt.size(), true);
+        auto &pkt = (*air)[j];
+        enqueue_wire_copy(pkt.data(), pkt.size(), true,
+                          t0 + fec_spread_offset(j, air->size(), spread));
     }
 }
 
@@ -492,18 +505,41 @@ void stream_sender::send_thread_main()
 
         data_packet pkt;
         {
+            /* Wake for the earliest release, a new enqueue, or the next FEC tick. */
             std::unique_lock<std::mutex> lock(q_mu);
-            q_cv.wait_for(lock, std::chrono::milliseconds(wait_ms),
-                          [this] { return send_stop || !queue.empty(); });
+            const auto tick_at =
+                std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+            for (;;)
+            {
+                if (send_stop)
+                {
+                    break;
+                }
+                const auto t = std::chrono::steady_clock::now();
+                if (!queue.empty() && queue.front().release <= t)
+                {
+                    break;
+                }
+                if (t >= tick_at)
+                {
+                    break;
+                }
+                auto until = tick_at;
+                if (!queue.empty() && queue.front().release < until)
+                {
+                    until = queue.front().release;
+                }
+                q_cv.wait_until(lock, until);
+            }
             if (send_stop)
             {
                 break;
             }
-            if (queue.empty())
+            if (queue.empty() || queue.front().release > std::chrono::steady_clock::now())
             {
                 continue;
             }
-            pkt = std::move(queue.front());
+            pkt = std::move(queue.front().pkt);
             queue_bytes -= wire_packet_bytes(pkt);
             queue.pop_front();
         }
@@ -741,7 +777,8 @@ int stream_sender::input(uint8_t port, const data_packet &in)
                 return 0;
             }
         }
-        enqueue_wire_copy(src.buf.u8(), src.buf.size(), false);
+        enqueue_wire_copy(src.buf.u8(), src.buf.size(), false,
+                          std::chrono::steady_clock::now());
     }
     else
     {
@@ -988,6 +1025,17 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         }
         max_wire_kbps.store(static_cast<int>(v), std::memory_order_relaxed);
         pace_reset.store(true, std::memory_order_relaxed);
+        return 0;
+    }
+    if ("fec_spread_ms" == key)
+    {
+        int64_t v = 0;
+        if (key_parse_i64(value, &v) < 0 || v < 0 || v > k_fec_spread_ms_max ||
+            value.size() > 31)
+        {
+            return -EINVAL;
+        }
+        fec_spread_ms.store(static_cast<int>(v), std::memory_order_relaxed);
         return 0;
     }
     if ("queue_ms" == key)
@@ -1367,6 +1415,13 @@ int stream_sender::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", queue_ms);
+        *value = buf;
+        return 0;
+    }
+    if ("fec_spread_ms" == key)
+    {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", fec_spread_ms.load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }

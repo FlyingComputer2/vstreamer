@@ -42,6 +42,7 @@ void usage(const char *prog)
                  "  --cbr KBPS          default 4000\n"
                  "  --gop N             default fps\n"
                  "  --max-datagram N    default 1476\n"
+                 "  --fec-spread-ms N   spread each FEC block over N ms (0..40, default 0)\n"
                  "  --local [HOST:]PORT stream_sender bind (winject static)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
@@ -70,6 +71,7 @@ int main(int argc, char **argv)
     int         cbr_kbps = 4000;
     int         gop = 0;
     int         max_datagram = 1476;
+    int         fec_spread_ms = 0;
     const char *local_bind = nullptr;
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
@@ -124,6 +126,11 @@ int main(int argc, char **argv)
         if (0 == std::strcmp(argv[i], "--max-datagram") && i + 1 < argc)
         {
             max_datagram = std::atoi(argv[++i]);
+            continue;
+        }
+        if (0 == std::strcmp(argv[i], "--fec-spread-ms") && i + 1 < argc)
+        {
+            fec_spread_ms = std::atoi(argv[++i]);
             continue;
         }
         if (0 == std::strcmp(argv[i], "--local") && i + 1 < argc)
@@ -258,6 +265,13 @@ int main(int argc, char **argv)
     char maxdg[16];
     std::snprintf(maxdg, sizeof(maxdg), "%d", max_datagram);
     cfg(sender, "max_datagram", maxdg);
+    char spread_buf[16];
+    std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
+    if (cfg(sender, "fec_spread_ms", spread_buf) < 0)
+    {
+        std::fprintf(stderr, "uvc_stream_sender: --fec-spread-ms must be 0..40\n");
+        return 1;
+    }
 
     char cbr_bps[24];
     std::snprintf(cbr_bps, sizeof(cbr_bps), "%d", cbr_kbps * 1000);

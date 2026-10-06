@@ -79,7 +79,8 @@ private:
     void telemetry_thread_main();
     void handle_link_report(const stream_link_report &report);
     void pace_wire_send(size_t bytes);
-    void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard);
+    void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                           std::chrono::steady_clock::time_point release);
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
 
     [[nodiscard]] size_t queue_byte_limit() const;
@@ -112,9 +113,17 @@ private:
 
     buffer_pool pool;
 
+    /* A wire datagram and the earliest time the send thread may send it. */
+    struct queued_wire
+    {
+        data_packet                           pkt;
+        std::chrono::steady_clock::time_point release {};
+    };
+
     mutable std::mutex      q_mu;
     std::condition_variable q_cv;
-    std::deque<data_packet> queue;
+    /* Ordered by release time (ties keep enqueue order). */
+    std::deque<queued_wire> queue;
     size_t                  queue_bytes = 0;
     static constexpr size_t k_queue_packet_cap = 1024;
     static constexpr size_t k_queue_min_paced_bytes = 32 * 1024;
@@ -152,6 +161,11 @@ private:
     double            pace_bucket_bytes = 0.;
     double            pace_last_sec = 0.;
     int               queue_ms = 100;
+    /* FEC block spreading: a block's shards are released evenly over this window instead of
+     * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the
+     * wire. Kept well under the receiver's head-of-line give-up (emit_hold_ms, 60 ms). */
+    std::atomic<int>     fec_spread_ms {0};
+    static constexpr int k_fec_spread_ms_max = 40;
 
     /* Guards fec (touched by input(), the send thread and configure()).
      * Lock order: mu -> fec_mu; never hold fec_mu while taking mu/q_mu. */

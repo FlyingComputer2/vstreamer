@@ -234,6 +234,10 @@ TEST(SplitAppsTest, SenderReceiverLinkAndCleanShutdown)
     EXPECT_EQ(udp_exchange(tx_console, "set_fec_k 20\n"), "ok\n");
     EXPECT_EQ(udp_exchange(tx_console, "set_fec_n 32\n").rfind("err bad n", 0), 0u);
     EXPECT_EQ(udp_exchange(tx_console, "set_fec_k 32\n").rfind("err bad k", 0), 0u);
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_spread 20\n"), "ok\n");
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_spread 0\n"), "ok\n");
+    EXPECT_EQ(udp_exchange(tx_console, "set_fec_spread 41\n").rfind("err bad fec spread", 0),
+              0u);
 
     stop_process(snd_pid);
     stop_process(rcv_pid);
