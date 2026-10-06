@@ -86,6 +86,17 @@ void telemetry_thread_main(stream_receiver *rcv)
 void publish_latency_metrics(double glass_ms)
 {
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
+#if defined(VSTREAMER_APP_RX_OK) && !defined(VSTREAMER_APP_TX_OK)
+    /* Split GS receiver: capture enters on the wire (RTP ext → depay). No TX stages in-process. */
+    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
+                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
+                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
+                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
+    metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
+                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
+#else
     metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
                  apps::g_latency_source_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
@@ -102,6 +113,7 @@ void publish_latency_metrics(double glass_ms)
                  apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
                  apps::g_latency_present_ms.load(std::memory_order_relaxed));
+#endif
 }
 
 }  // namespace vstreamer::apps::rx

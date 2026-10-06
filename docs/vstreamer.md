@@ -281,9 +281,14 @@ Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_O
 
 One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
 `max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
-reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). Capture-to-display latency
-across two hosts needs clock sync, which is not implemented; `latency.glass_ms` is only meaningful
-in `stream_sdl_test`.
+reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`).
+
+**Latency on `sdl_stream_receiver` (`:5091`):** stages use `frame_data.capture_mono_ns` from the
+RTP capture extension (sender stamps at encode; depay maps to local monotonic). The console
+publishes `latency.glass_ms`, `latency.depay_ms`, `latency.dec_in_ms`, `latency.dec_out_ms`, and
+`latency.present_ms` only — not TX-only keys (`latency.source_ms`, `jpeg_ms`, `enc_*`). Those
+appear on the sender console or in `stream_sdl_test` loopback. Glass latency across hosts needs
+aligned `CLOCK_REALTIME` (chrony); see [packet-model.md](packet-model.md).
 
 Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
 `tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
