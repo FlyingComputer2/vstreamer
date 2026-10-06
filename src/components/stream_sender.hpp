@@ -167,8 +167,7 @@ private:
     /* FEC block spreading: a block's shards are released evenly over this window instead of
      * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the
      * wire. Kept well under the receiver's head-of-line give-up (emit_hold_ms, 60 ms). */
-    std::atomic<int>     fec_spread_ms {0};
-    static constexpr int k_fec_spread_ms_max = 40;
+    std::atomic<int> fec_spread_ms {0};
 
     /* Guards fec (touched by input(), the send thread and configure()).
      * Lock order: mu -> fec_mu; never hold fec_mu while taking mu/q_mu. */
