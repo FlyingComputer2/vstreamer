@@ -335,9 +335,9 @@ Published by `rx_metrics::publish_latency_metrics()` (console sync, ~10 Hz).
 | `latency.glass_ms` | same as `present_ms` | cumulative | loopback | yes |
 | `latency.glass_node_ms` | same as `present_node_ms` | node | loopback | yes |
 
-On **`sdl_stream_receiver`** (`VSTREAMER_APP_SPLIT_RX_ONLY`), only the RX cumulative keys above
-plus `latency.*_node_ms` for decoder/present (not TX or `depay_node_ms`) are published and
-exposed on the console (`:5091`). TX-only keys are omitted from `get` / full metrics dumps.
+On **`sdl_stream_receiver`** (`VSTREAMER_APP_SPLIT_RX_ONLY`), the RX rows in the table above
+(including `depay_node_ms` from the depay component) are published and exposed on the console
+(`:5091`). TX cumulative and TX `*_node_ms` keys are omitted from `get` / full metrics dumps.
 Sender **`uvc_stream_sender`** (`:5090`) and **`stream_sdl_test`** publish the full set when both
 halves run in-process or over the channel emulator.
 
