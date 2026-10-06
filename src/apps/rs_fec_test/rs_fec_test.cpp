@@ -509,23 +509,23 @@ int main()
         int      kk = 0;
         int      nn = 0;
         int      sn = 0;
-        uint8_t  good[5] = {0x00, 0x07, 0x23, 0x04, 0x18};
-        if (!rs_block_erasure::unpack_header(good, 5, &bid, &idx, &kk, &nn, &sn) || bid != 7 ||
+        uint8_t good[6] = {0x00, 0x07, 4, 12, 2, 3};
+        if (!rs_block_erasure::unpack_header(good, 6, &bid, &idx, &kk, &nn, &sn) || bid != 7 ||
             idx != 2 || kk != 4 || nn != 12 || sn != 3)
         {
             std::fprintf(stderr, "header unpack good sample failed\n");
             return 1;
         }
-        uint8_t bad_cfg[5] = {0x00, 0x07, 0x23, 0x05, 0x18};
-        if (rs_block_erasure::unpack_header(bad_cfg, 5, &bid, &idx, &kk, &nn, &sn))
+        uint8_t bad_k[6] = {0x00, 0x07, 0, 12, 2, 3};
+        if (rs_block_erasure::unpack_header(bad_k, 6, &bid, &idx, &kk, &nn, &sn))
         {
-            std::fprintf(stderr, "header unpack should reject fec_config spare bit\n");
+            std::fprintf(stderr, "header unpack should reject k=0\n");
             return 1;
         }
-        uint8_t bad_sn[5] = {0x00, 0x07, 0x23, 0x04, 0x19};
-        if (rs_block_erasure::unpack_header(bad_sn, 5, &bid, &idx, &kk, &nn, &sn))
+        uint8_t bad_sn[6] = {0x00, 0x07, 4, 12, 2, 5};
+        if (rs_block_erasure::unpack_header(bad_sn, 6, &bid, &idx, &kk, &nn, &sn))
         {
-            std::fprintf(stderr, "header unpack should reject fec2 spare bits\n");
+            std::fprintf(stderr, "header unpack should reject sdu_n > k\n");
             return 1;
         }
     }

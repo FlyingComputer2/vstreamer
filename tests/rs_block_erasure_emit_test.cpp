@@ -119,7 +119,7 @@ TEST(RsBlockErasureEmitTest, InitRejectsInvalidPreservesConfig)
     EXPECT_TRUE(enc.enabled());
     EXPECT_EQ(enc.k(), 6);
     EXPECT_EQ(enc.n(), 8);
-    EXPECT_FALSE(enc.init(32, 32, 20));
+    EXPECT_FALSE(enc.init(256, 256, 20));
     EXPECT_TRUE(enc.enabled());
     EXPECT_EQ(enc.k(), 6);
     EXPECT_EQ(enc.n(), 8);
@@ -400,6 +400,29 @@ TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
     EXPECT_EQ(5U, out.size());
     EXPECT_EQ(3U, dec.take_fail_lost_app_pkts());
     EXPECT_EQ(1U, dec.take_evicted_blocks()); /* block 0 expires; no phantom block 1 */
+}
+
+TEST(RsBlockErasureEmitTest, Kn32RoundTripMaxErasures)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(32, 32, 20));
+    rs_block_erasure dec;
+    std::vector<uint8_t> tags;
+    for (int i = 0; i < 32; i++)
+    {
+        tags.push_back(static_cast<uint8_t>(i));
+    }
+    const auto air = encode_block_apps(enc, 1001, tags);
+    ASSERT_EQ(air.size(), 32u);
+    vstreamer::fec_rx_payload_list out;
+    for (const auto &shard : air)
+    {
+        feed_append(dec, shard, &out);
+    }
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    ASSERT_EQ(out.size(), 32u);
 }
 
 TEST(RsBlockErasureEmitTest, Kn31RoundTripMaxErasures)

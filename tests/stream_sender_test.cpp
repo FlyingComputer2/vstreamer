@@ -694,7 +694,7 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
     ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
     ASSERT_EQ(0, sender.open());
     const size_t fec_in = query_size_t(sender, "max_input");
-    EXPECT_EQ(1472U - 11U, fec_in);
+    EXPECT_EQ(1472U - 12U, fec_in);
     sender.close();
 
     vstreamer::stream_sender raw;
@@ -707,16 +707,16 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
     raw.close();
 }
 
-TEST(StreamSenderTest, FecKnAccept31Reject32)
+TEST(StreamSenderTest, FecKnAccept32Reject256)
 {
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "31"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "32"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "32"));
     ASSERT_EQ(0, sender.open());
-    EXPECT_LT(cfg(sender, "fec_n", "32"), 0);
-    EXPECT_LT(cfg(sender, "fec_k", "32"), 0);
+    EXPECT_LT(cfg(sender, "fec_n", "256"), 0);
+    EXPECT_LT(cfg(sender, "fec_k", "256"), 0);
     sender.close();
 }
 

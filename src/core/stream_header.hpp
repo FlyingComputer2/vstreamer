@@ -8,7 +8,7 @@
 namespace vstreamer
 {
 
-inline constexpr uint8_t k_stream_wire_version = 2;
+inline constexpr uint8_t k_stream_wire_version = 3;
 inline constexpr size_t k_stream_header_len = 4;
 
 inline constexpr unsigned k_stream_flag_version_shift = 3;

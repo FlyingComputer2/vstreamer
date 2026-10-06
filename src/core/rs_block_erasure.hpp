@@ -12,12 +12,14 @@
 #include "core/shared_sized_buffer.hpp"
 
 // Packet-block Reed-Solomon erasure FEC (systematic Cauchy MDS via ISA-L).
-// k app datagrams become n on-air shards. Wire header is 5 bytes (see pack_header).
+// k app datagrams become n on-air shards. Wire header is 6 bytes (see pack_header).
 // n == k: no parity (non-FEC redundancy); same block framing and header on each shard.
-// Wire (5 bytes before orig_len):
+// Wire (6 bytes before orig_len, stream wire version 3):
 //   [0..1] sdu_base (u16 BE) — SDU seq of shard 0 in this block
-//   [2..3] fec_config (u16 BE): k(5) | n(5) | idx(5) | spare(1), MSB-first
-//   [4]    fec2: sdu_n(5) | spare(3), MSB-first; parity iff idx >= k
+//   [2]    k (u8)
+//   [3]    n (u8)
+//   [4]    shard_idx (u8)
+//   [5]    sdu_n (u8); parity iff shard_idx >= k
 namespace vstreamer
 {
 
@@ -26,12 +28,10 @@ using fec_rx_payload_list = std::vector<shared_sized_buffer>;
 class rs_block_erasure
 {
 public:
-    static constexpr size_t k_header_len = 5;
+    static constexpr size_t k_header_len = 6;
     static constexpr size_t k_len_prefix = 2;
-    static constexpr uint16_t k_wire_fec_config_spare = 0x0001U;
-    static constexpr uint8_t k_wire_fec2_spare = 0x07U;
     static constexpr int k_header_k_n_min = 1;
-    static constexpr int k_header_k_n_max = 31;
+    static constexpr int k_header_k_n_max = 255;
     static constexpr int k_default_timeout_ms = 20;
     static constexpr size_t k_max_n = 255;
     static constexpr size_t k_done_max = 128;

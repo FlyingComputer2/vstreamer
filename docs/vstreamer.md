@@ -207,7 +207,7 @@ FU-A, capture-time header extension).
 | `queue_ms` | C Q | 10..2000, default 100 |
 | `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
 | `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
-| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
+| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 255, default 10 / 12, live (`sdu_base` keeps counting) |
 | `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block) |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |

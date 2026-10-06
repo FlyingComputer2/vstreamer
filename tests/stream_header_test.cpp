@@ -29,7 +29,7 @@ TEST(StreamHeaderTest, RoundTripFixedHeader)
 
     EXPECT_EQ(0xAB, wire[0]);
     EXPECT_EQ(0xCD, wire[1]);
-    EXPECT_EQ(0x16, wire[2]); /* v2, fec, stream */
+    EXPECT_EQ(0x1E, wire[2]); /* v3, fec, stream */
     EXPECT_EQ(0x00, wire[3]);
 
     vstreamer::stream_header          out {};
@@ -60,7 +60,7 @@ TEST(StreamHeaderTest, StampSequencePatchesBytesZeroOneOnly)
     vstreamer::stream_header_stamp_sequence(wire, 0x1234);
     EXPECT_EQ(0x12, wire[0]);
     EXPECT_EQ(0x34, wire[1]);
-    EXPECT_EQ(0x16, wire[2]);
+    EXPECT_EQ(0x1E, wire[2]);
     EXPECT_EQ(0x00, wire[3]);
     EXPECT_EQ(0x55, wire[4]);
 }
@@ -139,7 +139,7 @@ TEST(StreamHeaderTest, SkipUnknownExtTlv)
 
 TEST(StreamHeaderTest, RejectExtPastEndOfDatagram)
 {
-    uint8_t wire[vstreamer::k_stream_header_len] = {0x00, 0x01, 0x10, 0x04};
+    uint8_t wire[vstreamer::k_stream_header_len] = {0x00, 0x01, 0x18, 0x04};
     vstreamer::stream_header out {};
     const uint8_t           *payload = nullptr;
     size_t                   payload_len = 0;

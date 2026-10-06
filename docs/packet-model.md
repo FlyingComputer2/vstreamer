@@ -17,20 +17,20 @@ that value to local monotonic time when emitting each access unit so downstream 
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
 estimate or correct offset in-band.
 
-## Forward datagram (wire v2)
+## Forward datagram (wire v3)
 
-`stream_sender` prepends a 4-byte `stream_header` (version 2) on every UDP datagram: stream media
+`stream_sender` prepends a 4-byte `stream_header` (version 3) on every UDP datagram: stream media
 (FEC shard or raw SDU) and reverse telemetry each carry their own header. Systematic FEC shards
 add a 2-byte big-endian `orig_len` before the RTP datagram inside the shard body.
 
 ```text
-| stream_header (4) | FEC shard hdr (5) | [orig_len (2)] | RTP hdr (12) | RTP ext (16) | H.264 |
+| stream_header (4) | FEC shard hdr (6) | [orig_len (2)] | RTP hdr (12) | RTP ext (16) | H.264 |
 ```
 
 | Region | Size | Notes |
 |--------|------|--------|
-| `stream_header` | 4 | `sequence_number` (BE), flags: version=2, `is_fec`, `is_stream_data`, `ext_len` |
-| FEC shard header | 5 | `sdu_base`, `k`/`n`/`idx`, `sdu_n` (see `rs_block_erasure`) |
+| `stream_header` | 4 | `sequence_number` (BE), flags: version=3, `is_fec`, `is_stream_data`, `ext_len` |
+| FEC shard header | 6 | `sdu_base` (u16 BE), `k`, `n`, `shard_idx`, `sdu_n` (each u8; see `rs_block_erasure`) |
 | `orig_len` | 2 | Systematic shards: BE byte count of following app payload; parity shards carry parity bytes (not a length) |
 | RTP fixed header | 12 | PT 96, marker on AU boundary; SSRC from payloader |
 | RTP extension | 16 | RFC 5285: id 2, 8 B CLOCK_REALTIME capture ns (BE) |

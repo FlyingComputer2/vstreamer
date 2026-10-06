@@ -353,8 +353,8 @@ TEST(LoopbackTest, RuntimeFecNRejectedThenAccepted)
         [](vstreamer::stream_sender &sender, int packets_sent) {
             if (packets_sent == 500)
             {
-                EXPECT_EQ(-EINVAL, cfg_str(sender, "fec_n", "32"));
-                EXPECT_EQ(0, cfg_str(sender, "fec_n", "10"));
+                EXPECT_EQ(-EINVAL, cfg_str(sender, "fec_n", "256"));
+                EXPECT_EQ(0, cfg_str(sender, "fec_n", "32"));
             }
         });
 }

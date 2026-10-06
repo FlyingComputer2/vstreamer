@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <arpa/inet.h>
+#include <deque>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <utility>
 #include <cstring>
 #include <random>
@@ -27,7 +29,12 @@ extern "C" void vstreamer_ec_encode_data(int len, int k, int rows,
 namespace
 {
 constexpr size_t k_min_shard = 16;  // ISA-L NEON kernels need >= 16 bytes.
-constexpr int    k_kn_cache = 32;
+constexpr size_t k_kn_cache_max = 32;
+
+uint32_t kn_cache_key(int k, int n)
+{
+    return (static_cast<uint32_t>(k) << 8U) | static_cast<uint32_t>(n);
+}
 
 void store_be16(uint8_t* p, uint16_t v)
 {
@@ -55,22 +62,30 @@ struct kn_encode_tables
 
 const kn_encode_tables& kn_encode_tables_for(int k, int n)
 {
-    static std::mutex mu;
-    static std::array<std::array<std::optional<kn_encode_tables>, k_kn_cache>, k_kn_cache> cache;
-    std::lock_guard<std::mutex>                          lock(mu);
-    std::optional<kn_encode_tables>&                     slot = cache[static_cast<size_t>(k)]
-        [static_cast<size_t>(n)];
-    if (!slot.has_value())
+    static std::mutex                                      mu;
+    static std::unordered_map<uint32_t, kn_encode_tables>  cache;
+    static std::deque<uint32_t>                            order;
+    const uint32_t                                         key = kn_cache_key(k, n);
+    std::lock_guard<std::mutex>                            lock(mu);
+    auto                                                   it = cache.find(key);
+    if (it != cache.end())
     {
-        kn_encode_tables built;
-        const int        p = n - k;
-        built.encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
-        built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
-        gf_gen_cauchy1_matrix(built.encode_matrix.data(), n, k);
-        ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
-        slot = std::move(built);
+        return it->second;
     }
-    return *slot;
+    if (cache.size() >= k_kn_cache_max && !order.empty())
+    {
+        cache.erase(order.front());
+        order.pop_front();
+    }
+    kn_encode_tables built;
+    const int        p = n - k;
+    built.encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
+    built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
+    gf_gen_cauchy1_matrix(built.encode_matrix.data(), n, k);
+    ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+    order.push_back(key);
+    const auto ins = cache.emplace(key, std::move(built));
+    return ins.first->second;
 }
 }  // namespace
 
@@ -775,12 +790,10 @@ bool vstreamer::rs_block_erasure::pack_header(uint8_t* out, uint16_t sdu_base, i
         return false;
     }
     store_be16(out, sdu_base);
-    const uint16_t fec_config = static_cast<uint16_t>(
-        ((static_cast<uint16_t>(k) & 0x1FU) << 11) |
-        ((static_cast<uint16_t>(n) & 0x1FU) << 6) |
-        ((static_cast<uint16_t>(index) & 0x1FU) << 1));
-    store_be16(out + 2, fec_config);
-    out[4] = static_cast<uint8_t>((static_cast<uint8_t>(sdu_n) & 0x1FU) << 3);
+    out[2] = static_cast<uint8_t>(k);
+    out[3] = static_cast<uint8_t>(n);
+    out[4] = static_cast<uint8_t>(index);
+    out[5] = static_cast<uint8_t>(sdu_n);
     return true;
 }
 
@@ -793,20 +806,10 @@ bool vstreamer::rs_block_erasure::unpack_header(const uint8_t* data, size_t len,
     {
         return false;
     }
-    const uint16_t fec_config = load_be16(data + 2);
-    if (0 != (fec_config & k_wire_fec_config_spare))
-    {
-        return false;
-    }
-    const int kk = static_cast<int>((fec_config >> 11) & 0x1F);
-    const int nn = static_cast<int>((fec_config >> 6) & 0x1F);
-    const int idx = static_cast<int>((fec_config >> 1) & 0x1F);
-    const uint8_t fec2 = data[4];
-    if (0 != (fec2 & k_wire_fec2_spare))
-    {
-        return false;
-    }
-    const int sn = static_cast<int>((fec2 >> 3) & 0x1F);
+    const int kk = static_cast<int>(data[2]);
+    const int nn = static_cast<int>(data[3]);
+    const int idx = static_cast<int>(data[4]);
+    const int sn = static_cast<int>(data[5]);
     if (kk < k_header_k_n_min || kk > k_header_k_n_max || nn < kk || nn > k_header_k_n_max ||
         idx >= nn || sn < 1 || sn > kk)
     {
