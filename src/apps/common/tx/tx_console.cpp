@@ -39,6 +39,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
         "set_fec none\n"
         "set_fec_k <k>\n"
         "set_fec_n <n>\n"
+        "set_fec_spread <ms>\n"
         "set_encode_cbr <kbps>\n"
         "set_encode_qp <qp>\n"
         "set_gop <gop>\n"
@@ -196,6 +197,29 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 {
                     reply = targets.set_gop || nullptr != encode_target ? "err set gop failed\n"
                                                                         : "err encoder not configured\n";
+                    return true;
+                }
+                reply = "ok\n";
+                return true;
+            }
+            if (0 == std::strncmp(work, "set_fec_spread ", 15))
+            {
+                if (nullptr == stream_tx)
+                {
+                    reply = "err stream_sender not configured\n";
+                    return true;
+                }
+                long ms = 0;
+                char buf[16];
+                if (!parse_long(work + 15, &ms) || ms < 0 || ms > 999)
+                {
+                    reply = "err bad fec spread ms\n";
+                    return true;
+                }
+                std::snprintf(buf, sizeof(buf), "%ld", ms);
+                if (stream_tx->configure("fec_spread_ms", std::string_view(buf)) < 0)
+                {
+                    reply = "err bad fec spread ms (0..40)\n";
                     return true;
                 }
                 reply = "ok\n";
