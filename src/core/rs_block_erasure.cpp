@@ -27,6 +27,7 @@ extern "C" void vstreamer_ec_encode_data(int len, int k, int rows,
 namespace
 {
 constexpr size_t k_min_shard = 16;  // ISA-L NEON kernels need >= 16 bytes.
+constexpr int    k_kn_cache = 32;
 
 void store_be16(uint8_t* p, uint16_t v)
 {
@@ -54,8 +55,8 @@ struct kn_encode_tables
 
 const kn_encode_tables& kn_encode_tables_for(int k, int n)
 {
-    static std::mutex                                    mu;
-    static std::array<std::array<std::optional<kn_encode_tables>, 16>, 16> cache;
+    static std::mutex mu;
+    static std::array<std::array<std::optional<kn_encode_tables>, k_kn_cache>, k_kn_cache> cache;
     std::lock_guard<std::mutex>                          lock(mu);
     std::optional<kn_encode_tables>&                     slot = cache[static_cast<size_t>(k)]
         [static_cast<size_t>(n)];
@@ -96,7 +97,7 @@ vstreamer::rs_block_erasure::rs_block_erasure()
     // Random TX start id: a restarted sender must not replay ids that the
     // receiver's duplicate filter / in-order emit queue still remembers.
     std::random_device rd;
-    block_id = static_cast<uint16_t>(rd());
+    sdu_seq = static_cast<uint16_t>(rd());
 }
 
 bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_shard_bytes_in)
@@ -127,6 +128,7 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     newest_set = false;
     have_payload_emit = false;
     have_shard_rx = false;
+    far_behind_held.clear();
     later_block_waiting = false;
     recovered_count = 0;
     recovered_seen = 0;
@@ -170,18 +172,26 @@ void vstreamer::rs_block_erasure::disable()
     newest_set = false;
     have_payload_emit = false;
     have_shard_rx = false;
+    far_behind_held.clear();
     later_block_waiting = false;
 }
 
-int vstreamer::rs_block_erasure::ring_dist(uint8_t a, uint8_t b)
+int vstreamer::rs_block_erasure::ring_dist(uint16_t a, uint16_t b)
 {
-    return static_cast<int>(static_cast<int8_t>(static_cast<uint8_t>(a - b)));
+    return static_cast<int>(static_cast<int16_t>(static_cast<uint16_t>(a - b)));
 }
 
-int vstreamer::rs_block_erasure::dist_from_emit(uint16_t block_id) const
+int vstreamer::rs_block_erasure::dist_from_emit(uint16_t sdu_base) const
 {
-    return ring_dist(static_cast<uint8_t>(wire_block_id(block_id)),
-                     static_cast<uint8_t>(emit_next));
+    return ring_dist(sdu_base, emit_next);
+}
+
+void vstreamer::rs_block_erasure::note_head_hole_sdus(int gap_sdus)
+{
+    if (gap_sdus > 0)
+    {
+        fail_lost_app_pkts_count += static_cast<uint64_t>(gap_sdus);
+    }
 }
 
 void vstreamer::rs_block_erasure::record_payload_emit()
@@ -224,38 +234,36 @@ bool vstreamer::rs_block_erasure::frag_to_app(const shared_sized_buffer& shard,
     return !app->empty();
 }
 
-void vstreamer::rs_block_erasure::note_emit_base(uint16_t block_id)
+void vstreamer::rs_block_erasure::note_emit_base(uint16_t sdu_base)
 {
     if (!emit_base_set)
     {
         emit_base_set = true;
-        emit_next = wire_block_id(block_id);
-        newest = static_cast<uint8_t>(emit_next);
+        emit_next = sdu_base;
+        newest = emit_next;
         newest_set = true;
     }
 }
 
-void vstreamer::rs_block_erasure::touch_newest(uint16_t block_id)
+void vstreamer::rs_block_erasure::touch_newest(uint16_t sdu_base)
 {
-    const uint8_t bid = static_cast<uint8_t>(wire_block_id(block_id));
     if (!newest_set)
     {
-        newest = bid;
+        newest = sdu_base;
         newest_set = true;
         return;
     }
-    if (ring_dist(bid, newest) > 0)
+    if (ring_dist(sdu_base, newest) > 0)
     {
-        newest = bid;
+        newest = sdu_base;
     }
 }
 
-void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base_id)
+void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base)
 {
-    const uint8_t base = static_cast<uint8_t>(wire_block_id(base_id));
     for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
     {
-        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
+        if (ring_dist(it->first, base) < 0)
         {
             it = rx_blocks.erase(it);
         }
@@ -266,7 +274,7 @@ void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base_id)
     }
     for (auto it = ready_blocks.begin(); it != ready_blocks.end();)
     {
-        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
+        if (ring_dist(it->first, base) < 0)
         {
             it = ready_blocks.erase(it);
         }
@@ -277,7 +285,7 @@ void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base_id)
     }
     for (auto it = done.begin(); it != done.end();)
     {
-        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), base) < 0)
+        if (ring_dist(it->first, base) < 0)
         {
             done_order.erase(std::remove(done_order.begin(), done_order.end(), it->first),
                              done_order.end());
@@ -290,9 +298,135 @@ void vstreamer::rs_block_erasure::clear_state_behind(uint16_t base_id)
     }
 }
 
-void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
+/* Keeps only blocks in [base, base + k_ring_evict_sdus]: on a sender session change those are the
+ * new session's, everything else (including the done set) belongs to the old one. */
+void vstreamer::rs_block_erasure::keep_state_ahead_of(uint16_t base)
 {
-    if (dist_from_emit(block_id) >= 0)
+    const auto outside = [base](uint16_t id)
+    {
+        const int d = ring_dist(id, base);
+        return d < 0 || d > k_ring_evict_sdus;
+    };
+    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
+    {
+        if (outside(it->first))
+        {
+            evicted_blocks_count++;
+            it = rx_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (auto it = ready_blocks.begin(); it != ready_blocks.end();)
+    {
+        if (outside(it->first))
+        {
+            it = ready_blocks.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    done.clear();
+    done_order.clear();
+    emit_next = base;
+    newest = base;
+    newest_set = true;
+    for (const auto& kv : rx_blocks)
+    {
+        touch_newest(kv.first);
+    }
+    for (const auto& kv : ready_blocks)
+    {
+        touch_newest(kv.first);
+    }
+    later_block_waiting = false;
+}
+
+/* A shard further behind emit_next than any real late shard is either a stray of the old session
+ * (reordered past a resync) or a new sender session whose random sdu_base landed behind. Hold it
+ * until maybe_resync_to_held() can tell the two apart. */
+bool vstreamer::rs_block_erasure::hold_far_behind_shard(uint16_t sdu_base,
+                                                        const shared_sized_buffer& shard,
+                                                        fec_rx_payload_list* out)
+{
+    const auto t = now();
+    if (dist_from_emit(sdu_base) >= -k_ring_evict_sdus)
+    {
+        last_in_window_rx = t;
+        const auto stale = std::chrono::milliseconds(emit_hold_ms());
+        while (!far_behind_held.empty() && t - far_behind_held.front().at > stale)
+        {
+            far_behind_held.pop_front();
+        }
+        return false;
+    }
+    if (far_behind_held.size() >= k_far_behind_hold_max)
+    {
+        far_behind_held.pop_front();
+    }
+    far_behind_held.push_back({t, shard});
+    maybe_resync_to_held(out);
+    return true;
+}
+
+/* Once no in-window shard has arrived for emit_hold_ms the old session is gone: resync to the
+ * earliest held base of the newest held session and replay its shards in arrival order. */
+void vstreamer::rs_block_erasure::maybe_resync_to_held(fec_rx_payload_list* out)
+{
+    if (far_behind_held.empty())
+    {
+        return;
+    }
+    const auto t = now();
+    if (t - last_in_window_rx < std::chrono::milliseconds(emit_hold_ms()))
+    {
+        return;
+    }
+    const uint16_t ref = load_be16(far_behind_held.back().shard.u8());
+    const auto in_session = [ref](uint16_t id)
+    {
+        const int d = ring_dist(id, ref);
+        return d <= 0 && d >= -k_ring_evict_sdus;
+    };
+    uint16_t start = ref;
+    for (const auto& h : far_behind_held)
+    {
+        const uint16_t id = load_be16(h.shard.u8());
+        if (in_session(id) && ring_dist(id, start) < 0)
+        {
+            start = id;
+        }
+    }
+    std::deque<held_shard_s> replay;
+    replay.swap(far_behind_held);
+    evicted_blocks_count += rx_blocks.size();
+    rx_blocks.clear();
+    ready_blocks.clear();
+    keep_state_ahead_of(start);
+    last_in_window_rx = t;
+    for (auto& h : replay)
+    {
+        if (!in_session(load_be16(h.shard.u8())))
+        {
+            continue;
+        }
+        fec_rx_payload_list step;
+        push_air(std::move(h.shard), &step);
+        if (nullptr != out)
+        {
+            out->insert(out->end(), std::make_move_iterator(step.begin()),
+                        std::make_move_iterator(step.end()));
+        }
+    }
+}
+
+void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t sdu_base)
+{
+    if (dist_from_emit(sdu_base) >= 0)
     {
         return;
     }
@@ -305,8 +439,10 @@ void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
     {
         return;
     }
-    emit_next = wire_block_id(block_id);
-    clear_state_behind(block_id);
+    emit_next = sdu_base;
+    newest = sdu_base;
+    newest_set = true;
+    clear_state_behind(sdu_base);
     later_block_waiting = false;
 }
 
@@ -315,14 +451,14 @@ void vstreamer::rs_block_erasure::maybe_resync_on_late_shard(uint16_t block_id)
  * holding it behind never-coming gap ids (forward jump) would stall delivery and, once the ids
  * cross the half ring, let the backward rebase discard it. Everything held is from the old
  * session (expire_rx has already given up on it), so drop it and emit from this block. */
-void vstreamer::rs_block_erasure::maybe_rebase_after_silence(uint16_t block_id)
+void vstreamer::rs_block_erasure::maybe_rebase_after_silence(uint16_t sdu_base)
 {
     const auto t = now();
     const bool rebase = have_shard_rx && emit_base_set &&
                         t - last_shard_rx >= std::chrono::milliseconds(rx_hold_ms());
     last_shard_rx = t;
     have_shard_rx = true;
-    if (!rebase || dist_from_emit(block_id) == 0)
+    if (!rebase || dist_from_emit(sdu_base) == 0)
     {
         return;
     }
@@ -331,8 +467,9 @@ void vstreamer::rs_block_erasure::maybe_rebase_after_silence(uint16_t block_id)
     ready_blocks.clear();
     done.clear();
     done_order.clear();
-    emit_next = wire_block_id(block_id);
-    newest = static_cast<uint8_t>(emit_next);
+    far_behind_held.clear();
+    emit_next = sdu_base;
+    newest = emit_next;
     newest_set = true;
     later_block_waiting = false;
 }
@@ -345,8 +482,8 @@ void vstreamer::rs_block_erasure::ring_evict_stale(fec_rx_payload_list* out)
     }
     for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
     {
-        const uint8_t bid = static_cast<uint8_t>(wire_block_id(it->first));
-        if (ring_dist(bid, newest) < -k_ring_evict_dist)
+        const uint16_t bid = it->first;
+        if (ring_dist(bid, newest) < -k_ring_evict_sdus)
         {
             evicted_blocks_count++;
             const rx_block_s snap = it->second;
@@ -361,8 +498,7 @@ void vstreamer::rs_block_erasure::ring_evict_stale(fec_rx_payload_list* out)
     }
     for (auto it = done.begin(); it != done.end();)
     {
-        if (ring_dist(static_cast<uint8_t>(wire_block_id(it->first)), newest) <
-            -k_ring_evict_dist)
+        if (ring_dist(it->first, newest) < -k_ring_evict_sdus)
         {
             done_order.erase(std::remove(done_order.begin(), done_order.end(), it->first),
                              done_order.end());
@@ -397,7 +533,7 @@ void vstreamer::rs_block_erasure::try_stream_head_systematic(
 }
 
 void vstreamer::rs_block_erasure::abandon_partial_block(
-    const rx_block_s& block, uint16_t block_id, fec_rx_payload_list* out)
+    const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out)
 {
     account_missing_shards(block);
     const int sn = expected_sdus(block);
@@ -418,19 +554,19 @@ void vstreamer::rs_block_erasure::abandon_partial_block(
         emitted++;
     }
     note_rx_block_output_shortfall(sn, block.released + emitted);
-    if (wire_block_id(block_id) == emit_next)
+    if (sdu_base == emit_next)
     {
         mark_done(emit_next);
-        emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+        emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(sn));
         later_block_waiting = false;
     }
 }
 
-void vstreamer::rs_block_erasure::on_block_decoded(uint16_t block_id, int released_before,
+void vstreamer::rs_block_erasure::on_block_decoded(uint16_t sdu_base, int released_before,
                                                    fec_rx_payload_list payloads, int sdu_n,
                                                    fec_rx_payload_list* out)
 {
-    const int d = dist_from_emit(block_id);
+    const int d = dist_from_emit(sdu_base);
     if (d < 0)
     {
         late_blocks_count++;
@@ -438,17 +574,17 @@ void vstreamer::rs_block_erasure::on_block_decoded(uint16_t block_id, int releas
         {
             emit_payload(out, std::move(payloads[static_cast<size_t>(i)]));
         }
-        mark_done(block_id);
+        mark_done(sdu_base);
         return;
     }
-    if (wire_block_id(block_id) == emit_next)
+    if (sdu_base == emit_next)
     {
         for (int i = released_before; i < sdu_n && i < static_cast<int>(payloads.size()); i++)
         {
             emit_payload(out, std::move(payloads[static_cast<size_t>(i)]));
         }
         mark_done(emit_next);
-        emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+        emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(sdu_n));
         later_block_waiting = false;
         run_emit_engine(out);
         return;
@@ -457,7 +593,7 @@ void vstreamer::rs_block_erasure::on_block_decoded(uint16_t block_id, int releas
     ready.payloads = std::move(payloads);
     ready.released = released_before;
     ready.sdu_n = sdu_n;
-    ready_blocks[block_id] = std::move(ready);
+    ready_blocks[sdu_base] = std::move(ready);
     if (d > 0 && !later_block_waiting)
     {
         later_block_waiting = true;
@@ -502,28 +638,41 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
     if (later_block_waiting &&
         t - later_block_since > std::chrono::milliseconds(emit_hold_ms()))
     {
-        bool     jump = false;
+        bool     found = false;
         uint16_t target = emit_next;
         int      best_d = 0;
         for (const auto& kv : ready_blocks)
         {
             const int d = dist_from_emit(kv.first);
-            if (d > 0 && (!jump || d < best_d))
+            if (d > 0 && (!found || d < best_d))
             {
-                jump = true;
+                found = true;
                 target = kv.first;
                 best_d = d;
             }
         }
-        if (jump)
+        for (const auto& kv : rx_blocks)
         {
-            emit_next = wire_block_id(target);
+            const int d = dist_from_emit(kv.first);
+            if (d > 0 && (!found || d < best_d))
+            {
+                found = true;
+                target = kv.first;
+                best_d = d;
+            }
         }
-        else
+        if (found)
         {
-            /* Never-seen head hole: step without mark_done so a very late shard
-             * can still be delivered (rs_fec_test hole / peer reorder). */
-            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+            if (best_d > static_cast<int>(k_ring_evict_sdus))
+            {
+                /* Larger than any real burst: a new sender session, not loss. */
+                keep_state_ahead_of(target);
+            }
+            else
+            {
+                note_head_hole_sdus(best_d);
+                emit_next = target;
+            }
         }
         later_block_waiting = false;
         run_emit_engine(out);
@@ -548,9 +697,10 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
             {
                 emit_payload(out, std::move(rb.payloads[static_cast<size_t>(i)]));
             }
+            const int released_sdu_n = rb.sdu_n;
             ready_blocks.erase(rit);
             mark_done(emit_next);
-            emit_next = wire_block_id(static_cast<uint16_t>(emit_next + 1));
+            emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(released_sdu_n));
             progressed = true;
             continue;
         }
@@ -572,7 +722,7 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
     maybe_give_up_head(out);
 }
 
-bool vstreamer::rs_block_erasure::try_decode_block(uint16_t block_id, rx_block_s* block,
+bool vstreamer::rs_block_erasure::try_decode_block(uint16_t sdu_base, rx_block_s* block,
                                                    fec_rx_payload_list* out)
 {
     if (nullptr == block)
@@ -601,78 +751,77 @@ bool vstreamer::rs_block_erasure::try_decode_block(uint16_t block_id, rx_block_s
     const int            released_before = block->released;
     const bool           ok =
         decode_block(block->k, block->n, block->sdu_n, block->frags, &decoded, &rec);
-    rx_blocks.erase(block_id);
+    rx_blocks.erase(sdu_base);
     if (!ok)
     {
         rs_failures_count++;
-        abandon_partial_block(snap, block_id, out);
+        abandon_partial_block(snap, sdu_base, out);
         run_emit_engine(out);
         return true;
     }
     recovered_count += static_cast<uint64_t>(rec);
     blocks_count++;
     note_rx_block_output_shortfall(expected_sdus(snap), static_cast<int>(decoded.size()));
-    on_block_decoded(block_id, released_before, std::move(decoded), snap.sdu_n, out);
+    on_block_decoded(sdu_base, released_before, std::move(decoded), snap.sdu_n, out);
     return true;
 }
 
-bool vstreamer::rs_block_erasure::pack_header(uint8_t* out, uint16_t block_id, int index,
-                                 int k, int n, uint8_t flags, int sdu_n)
+bool vstreamer::rs_block_erasure::pack_header(uint8_t* out, uint16_t sdu_base, int index, int k,
+                                              int n, int sdu_n)
 {
-    if (out == nullptr || index < 0 || index >= n || index > k_wire_index_mask ||
-        k < k_header_k_n_min || k > k_header_k_n_max || n < k ||
-        n > k_header_k_n_max || sdu_n < 0 || sdu_n > k)
+    if (out == nullptr || index < 0 || index >= n || k < k_header_k_n_min ||
+        k > k_header_k_n_max || n < k || n > k_header_k_n_max || sdu_n < 1 || sdu_n > k)
     {
         return false;
     }
-    out[0] = static_cast<uint8_t>(block_id & 0xFF);
-    uint8_t index_flag = static_cast<uint8_t>(index & k_wire_index_mask);
-    if (0 != (flags & k_flag_parity))
-    {
-        index_flag = static_cast<uint8_t>(index_flag | k_flag_parity);
-    }
-    out[1] = index_flag;
-    out[2] = static_cast<uint8_t>(((n & 0xF) << 4) | (k & 0xF));
-    out[3] = static_cast<uint8_t>(sdu_n & k_wire_index_mask);
+    store_be16(out, sdu_base);
+    const uint16_t fec_config = static_cast<uint16_t>(
+        ((static_cast<uint16_t>(k) & 0x1FU) << 11) |
+        ((static_cast<uint16_t>(n) & 0x1FU) << 6) |
+        ((static_cast<uint16_t>(index) & 0x1FU) << 1));
+    store_be16(out + 2, fec_config);
+    out[4] = static_cast<uint8_t>((static_cast<uint8_t>(sdu_n) & 0x1FU) << 3);
     return true;
 }
 
 bool vstreamer::rs_block_erasure::unpack_header(const uint8_t* data, size_t len,
-                                   uint16_t* block_id, int* index, int* k,
-                                   int* n, uint8_t* flags, int* sdu_n)
+                                                uint16_t* sdu_base, int* index, int* k, int* n,
+                                                int* sdu_n)
 {
-    if (data == nullptr || len < k_header_len || block_id == nullptr || index == nullptr ||
-        k == nullptr || n == nullptr || flags == nullptr || sdu_n == nullptr)
+    if (data == nullptr || len < k_header_len || sdu_base == nullptr || index == nullptr ||
+        k == nullptr || n == nullptr || sdu_n == nullptr)
     {
         return false;
     }
-    const uint8_t kn = data[2];
-    const int kk = static_cast<int>(kn & 0xF);
-    const int nn = static_cast<int>((kn >> 4) & 0xF);
-    const uint8_t index_flag = data[1];
-    if (0 != (index_flag & k_wire_index_reserved) ||
-        0 != (data[3] & k_wire_sdu_n_reserved))
+    const uint16_t fec_config = load_be16(data + 2);
+    if (0 != (fec_config & k_wire_fec_config_spare))
     {
         return false;
     }
-    const int idx = static_cast<int>(index_flag & k_wire_index_mask);
-    const int sn = static_cast<int>(data[3] & k_wire_index_mask);
-    if (kk < k_header_k_n_min || kk > k_header_k_n_max || nn < kk ||
-        nn > k_header_k_n_max || idx >= nn || sn < 0 || sn > kk)
+    const int kk = static_cast<int>((fec_config >> 11) & 0x1F);
+    const int nn = static_cast<int>((fec_config >> 6) & 0x1F);
+    const int idx = static_cast<int>((fec_config >> 1) & 0x1F);
+    const uint8_t fec2 = data[4];
+    if (0 != (fec2 & k_wire_fec2_spare))
     {
         return false;
     }
-    *block_id = data[0];
+    const int sn = static_cast<int>((fec2 >> 3) & 0x1F);
+    if (kk < k_header_k_n_min || kk > k_header_k_n_max || nn < kk || nn > k_header_k_n_max ||
+        idx >= nn || sn < 1 || sn > kk)
+    {
+        return false;
+    }
+    *sdu_base = load_be16(data);
     *index = idx;
     *k = kk;
     *n = nn;
     *sdu_n = sn;
-    *flags = (0 != (index_flag & k_flag_parity)) ? k_flag_parity : 0;
     return true;
 }
 
 bool vstreamer::rs_block_erasure::encode_block(
-    const std::vector<std::vector<uint8_t>>& packets, uint16_t block_id,
+    const std::vector<std::vector<uint8_t>>& packets, uint16_t sdu_base,
     std::vector<std::vector<uint8_t>>* out) const
 {
     if (!active || out == nullptr || packets.size() > static_cast<size_t>(cfg_k))
@@ -739,7 +888,6 @@ bool vstreamer::rs_block_erasure::encode_block(
         {
             continue;
         }
-        const uint8_t flags = i >= cfg_k ? k_flag_parity : 0;
         size_t body_len = shard_len;
         const uint8_t* body = nullptr;
         if (i < cfg_k)
@@ -753,7 +901,7 @@ bool vstreamer::rs_block_erasure::encode_block(
             body = parity[static_cast<size_t>(i - cfg_k)].data();
         }
         std::vector<uint8_t> pkt(k_header_len + body_len);
-        pack_header(pkt.data(), block_id, i, cfg_k, cfg_n, flags, sdu_n);
+        pack_header(pkt.data(), sdu_base, i, cfg_k, cfg_n, sdu_n);
         memcpy(pkt.data() + k_header_len, body, body_len);
         out->push_back(std::move(pkt));
     }
@@ -1097,7 +1245,8 @@ void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
     {
         return;
     }
-    if (!encode_block(pending, block_id, out))
+    const int sdu_n = static_cast<int>(pending.size());
+    if (!encode_block(pending, sdu_seq, out))
     {
         oversized_count++;
         out->clear();
@@ -1105,7 +1254,7 @@ void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
         deadline_set = false;
         return;
     }
-    block_id = static_cast<uint16_t>(block_id + 1);
+    sdu_seq = static_cast<uint16_t>(sdu_seq + static_cast<uint16_t>(sdu_n));
     pending.clear();
     deadline_set = false;
     blocks_count++;
@@ -1168,6 +1317,7 @@ void vstreamer::rs_block_erasure::poll_rx(fec_rx_payload_list* out)
     {
         out->clear();
     }
+    maybe_resync_to_held(out);
     expire_rx(out);
     run_emit_engine(out);
 }
@@ -1258,13 +1408,13 @@ void vstreamer::rs_block_erasure::expire_done()
     }
 }
 
-void vstreamer::rs_block_erasure::mark_done(uint16_t block_id)
+void vstreamer::rs_block_erasure::mark_done(uint16_t sdu_base)
 {
     const auto t = now();
-    auto inserted = done.emplace(block_id, t);
+    auto inserted = done.emplace(sdu_base, t);
     if (inserted.second)
     {
-        done_order.push_back(block_id);
+        done_order.push_back(sdu_base);
     }
     else
     {
@@ -1317,36 +1467,39 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
             self->run_emit_engine(out);
         }
     } finish {this, out};
-    uint16_t block_id = 0;
+    uint16_t sdu_base = 0;
     int index = 0;
     int k = 0;
     int n = 0;
     int sdu_n = 0;
-    uint8_t flags = 0;
-    if (!unpack_header(data, len, &block_id, &index, &k, &n, &flags, &sdu_n))
+    if (!unpack_header(data, len, &sdu_base, &index, &k, &n, &sdu_n))
     {
         hdr_errors_count++;
         return;
     }
-    note_emit_base(block_id);
-    maybe_rebase_after_silence(block_id);
-    touch_newest(block_id);
-    maybe_resync_on_late_shard(block_id);
+    note_emit_base(sdu_base);
+    maybe_rebase_after_silence(sdu_base);
+    if (hold_far_behind_shard(sdu_base, shard, out))
+    {
+        return;
+    }
+    touch_newest(sdu_base);
+    maybe_resync_on_late_shard(sdu_base);
     ring_evict_stale(out);
 
-    const int d = dist_from_emit(block_id);
-    if (d < 0 && done.find(block_id) != done.end())
+    const int d = dist_from_emit(sdu_base);
+    if (d < 0 && done.find(sdu_base) != done.end())
     {
         return;
     }
     /* Already decoded and waiting for the head: a late (parity) shard is redundant. Creating a
      * new rx block here would later be abandoned and count the whole block as lost again. */
-    if (ready_blocks.find(block_id) != ready_blocks.end())
+    if (ready_blocks.find(sdu_base) != ready_blocks.end())
     {
         return;
     }
 
-    auto it = rx_blocks.find(block_id);
+    auto it = rx_blocks.find(sdu_base);
     if (it == rx_blocks.end())
     {
         while (rx_blocks.size() >= k_block_max)
@@ -1372,14 +1525,14 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
         const auto t_now = now();
         nb.first_seen = t_now;
         nb.last_seen = t_now;
-        it = rx_blocks.emplace(block_id, std::move(nb)).first;
+        it = rx_blocks.emplace(sdu_base, std::move(nb)).first;
     }
     else if (it->second.k != k || it->second.n != n || it->second.sdu_n != sdu_n)
     {
         kn_mismatch_count++;
         const rx_block_s block_snap = it->second;
         rx_blocks.erase(it);
-        abandon_partial_block(block_snap, block_id, out);
+        abandon_partial_block(block_snap, sdu_base, out);
         return;
     }
 
@@ -1391,17 +1544,17 @@ void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
     buf->frags.emplace(index, std::move(shard));
     buf->last_seen = now();
 
-    if (wire_block_id(block_id) == emit_next)
+    if (sdu_base == emit_next)
     {
         try_stream_head_systematic(*buf, out);
     }
-    else if (dist_from_emit(block_id) > 0 && !later_block_waiting)
+    else if (dist_from_emit(sdu_base) > 0 && !later_block_waiting)
     {
         later_block_waiting = true;
         later_block_since = now();
     }
 
-    if (try_decode_block(block_id, buf, out))
+    if (try_decode_block(sdu_base, buf, out))
     {
         return;
     }

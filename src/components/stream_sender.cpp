@@ -114,7 +114,11 @@ size_t stream_sender::queue_byte_limit() const
      * before the send thread runs; evicting from the head then drops unsent data shards of a
      * block whose first shards are already on the wire, and the receiver rebuilds them from
      * parity only after later packets, which the depayloader sees as reordering. */
-    return std::max<size_t>(k_queue_min_unpaced_bytes, scaled);
+    const size_t unpaced_min =
+        k_queue_min_unpaced_app_bytes * static_cast<size_t>(effective_fec_n()) /
+        static_cast<size_t>(effective_fec_k());
+    const size_t wire_min = std::max<size_t>(256U * 1024U, unpaced_min);
+    return std::max<size_t>(wire_min, scaled);
 }
 
 int stream_sender::effective_fec_k() const
@@ -135,14 +139,16 @@ int stream_sender::effective_fec_n() const
     return fec_n;
 }
 
-size_t stream_sender::fec_max_shard_bytes() const
+size_t stream_sender::max_fec_shard_bytes() const
 {
     std::lock_guard<std::mutex> lock(mu);
-    if (max_datagram <= static_cast<int>(k_stream_header_len))
-    {
-        return 0;
-    }
-    return static_cast<size_t>(max_datagram) - k_stream_header_len;
+    return stream_max_fec_shard(static_cast<size_t>(max_datagram));
+}
+
+size_t stream_sender::max_raw_sdu_bytes() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return stream_max_raw_sdu(static_cast<size_t>(max_datagram));
 }
 
 stream_sender::~stream_sender()
@@ -169,14 +175,20 @@ packet_kind_e stream_sender::input_packet_kind(uint8_t port) const
     return packet_kind_e::SOCK;
 }
 
-void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len)
+void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard)
 {
     if (nullptr == data || 0 == len)
     {
         return;
     }
-    const size_t shard_max = fec_max_shard_bytes();
-    if (0 == shard_max || len > shard_max)
+    size_t payload_max = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        payload_max =
+            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(max_datagram))
+                         : stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+    }
+    if (0 == payload_max || len > payload_max)
     {
         std::lock_guard<std::mutex> lock(mu);
         dropped.fetch_add(1, std::memory_order_relaxed);
@@ -205,9 +217,13 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len)
         dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    /* stream_sequence is stamped in send_thread_main() so each egress datagram gets a
-     * unique value even if a buffer is reused before send. */
-    std::memset(buf.u8(), 0, k_stream_header_len);
+    /* sequence_number is stamped in send_thread_main() on every datagram. */
+    stream_header hdr {};
+    hdr.sequence_number = 0;
+    hdr.is_fec = is_fec_shard;
+    hdr.is_stream_data = true;
+    hdr.ext_len = 0;
+    stream_header_write(buf.u8(), hdr);
     std::memcpy(buf.u8() + k_stream_header_len, data, len);
     auto sd = std::make_unique<sock_data>();
     sd->pts = 0;
@@ -235,7 +251,7 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
     }
     for (auto &pkt : *air)
     {
-        enqueue_wire_copy(pkt.data(), pkt.size());
+        enqueue_wire_copy(pkt.data(), pkt.size(), true);
     }
 }
 
@@ -306,9 +322,12 @@ void stream_sender::stop_telemetry_thread()
 void stream_sender::handle_link_report(const stream_link_report &report)
 {
     std::lock_guard<std::mutex> lock(peer_mu);
+    int64_t observed_ms = -1;
     if (peer_have && report.session_id == peer_session)
     {
-        const int32_t diff = static_cast<int32_t>(report.report_seq - peer_last_seq);
+        const int16_t diff =
+            static_cast<int16_t>(static_cast<uint16_t>(report.report_seq) -
+                                 static_cast<uint16_t>(peer_last_seq));
         if (diff <= 0)
         {
             peer_reports_rejected++;
@@ -318,10 +337,24 @@ void stream_sender::handle_link_report(const stream_link_report &report)
         {
             peer_reports_lost += static_cast<uint64_t>(diff - 1);
         }
+        if (peer_have_timestamp && diff > 0 && report.timestamp_us > peer_last_timestamp_us)
+        {
+            const uint64_t delta_us = report.timestamp_us - peer_last_timestamp_us;
+            observed_ms =
+                static_cast<int64_t>(delta_us / static_cast<uint64_t>(diff) / 1000ULL);
+        }
     }
+    else
+    {
+        observed_ms = -1;
+        peer_have_timestamp = false;
+    }
+    peer_observed_interval_ms = observed_ms;
     peer_report = report;
     peer_session = report.session_id;
     peer_last_seq = report.report_seq;
+    peer_last_timestamp_us = report.timestamp_us;
+    peer_have_timestamp = true;
     peer_have = true;
     peer_report_at = std::chrono::steady_clock::now();
     peer_reports_received++;
@@ -361,19 +394,29 @@ void stream_sender::telemetry_thread_main()
         {
             continue;
         }
-        if (n != static_cast<ssize_t>(k_stream_link_report_len))
+        stream_header hdr {};
+        const uint8_t *payload = nullptr;
+        size_t         payload_len = 0;
+        if (stream_header_parse(buf, static_cast<size_t>(n), &hdr, &payload, &payload_len) < 0)
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        if (hdr.is_fec || hdr.is_stream_data)
         {
             std::lock_guard<std::mutex> lock(peer_mu);
             peer_reports_rejected++;
             continue;
         }
         stream_link_report rep {};
-        if (stream_link_report_decode(buf, static_cast<size_t>(n), &rep) < 0)
+        if (stream_link_report_decode(payload, payload_len, &rep) < 0)
         {
             std::lock_guard<std::mutex> lock(peer_mu);
             peer_reports_rejected++;
             continue;
         }
+        rep.report_seq = hdr.sequence_number;
         handle_link_report(rep);
     }
 }
@@ -387,6 +430,7 @@ stream_peer_link stream_sender::peer_link_snapshot() const
     snap.reports_received = peer_reports_received;
     snap.reports_lost = peer_reports_lost;
     snap.reports_rejected = peer_reports_rejected;
+    snap.observed_interval_ms = peer_have ? peer_observed_interval_ms : -1;
     if (!peer_have)
     {
         snap.age_ms = -1;
@@ -484,17 +528,10 @@ void stream_sender::send_thread_main()
         }
 
         const sock_data &sd = data_packet::cast<sock_data>(pkt);
-        bool stamp_stream_header = false;
-        {
-            std::lock_guard<std::mutex> flock(fec_mu);
-            stamp_stream_header =
-                fec.enabled() &&
-                sd.buf.size() >= k_stream_header_len + rs_block_erasure::k_header_len;
-        }
-        if (stamp_stream_header)
+        if (sd.buf.size() >= k_stream_header_len)
         {
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
-            stream_header_store_be16(sd.buf.u8(), seq);
+            stream_header_stamp_sequence(sd.buf.u8(), seq);
         }
         pace_wire_send(sd.buf.size());
         const ssize_t n = sendto(send_fd, sd.buf.u8(), sd.buf.size(), 0,
@@ -531,7 +568,8 @@ int stream_sender::open()
         timeout_ms = fec_timeout_ms;
         mtu_local = mtu;
     }
-    const size_t shard_bytes = fec_max_shard_bytes();
+    const size_t shard_bytes = max_fec_shard_bytes();
+    const bool   raw_mode = (fec_mode == fec_mode_e::none);
 
     char host[128];
     int  port = 0;
@@ -586,16 +624,23 @@ int stream_sender::open()
 
     {
         std::lock_guard<std::mutex> flock(fec_mu);
-        if (0 == shard_bytes || !fec.init(k, n, timeout_ms, shard_bytes))
-        {
-            ::close(fd);
-            return -EINVAL;
-        }
         fec_oversized = 0;
-        std::fprintf(stderr,
-                     "stream_sender: fec k=%d n=%d timeout=%d ms mode=%s (%s)\n", k, n,
-                     timeout_ms,
-                     (fec_mode == fec_mode_e::none) ? "none" : "block", fec.impl_name());
+        if (raw_mode)
+        {
+            fec.disable();
+            std::fprintf(stderr, "stream_sender: fec mode=none (raw SDU path)\n");
+        }
+        else
+        {
+            if (0 == shard_bytes || !fec.init(k, n, timeout_ms, shard_bytes))
+            {
+                ::close(fd);
+                return -EINVAL;
+            }
+            std::fprintf(stderr,
+                         "stream_sender: fec k=%d n=%d timeout=%d ms mode=block (%s)\n", k, n,
+                         timeout_ms, fec.impl_name());
+        }
     }
 
     {
@@ -681,6 +726,24 @@ int stream_sender::input(uint8_t port, const data_packet &in)
     const size_t     ingress_bytes = src.buf.size();
 
     bool oversized = false;
+    fec_mode_e mode = fec_mode_e::block;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        mode = fec_mode;
+    }
+    if (fec_mode_e::none == mode)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!opened)
+            {
+                dropped.fetch_add(1, std::memory_order_relaxed);
+                return 0;
+            }
+        }
+        enqueue_wire_copy(src.buf.u8(), src.buf.size(), false);
+    }
+    else
     {
         std::vector<std::vector<uint8_t>> air;
         {
@@ -761,33 +824,53 @@ int stream_sender::reinit_fec_if_active()
         n = effective_fec_n();
         timeout_ms = fec_timeout_ms;
     }
-    const size_t shard_bytes = fec_max_shard_bytes();
-    if (0 == shard_bytes)
+    fec_mode_e mode = fec_mode_e::block;
     {
-        return -EINVAL;
+        std::lock_guard<std::mutex> lock(mu);
+        mode = fec_mode;
     }
-    if (k > n || k > rs_block_erasure::k_header_k_n_max ||
-        n > rs_block_erasure::k_header_k_n_max)
+
+    const size_t shard_bytes = max_fec_shard_bytes();
+    if (fec_mode_e::block == mode)
     {
-        return -EINVAL;
+        if (0 == shard_bytes)
+        {
+            return -EINVAL;
+        }
+        if (k > n || k > rs_block_erasure::k_header_k_n_max ||
+            n > rs_block_erasure::k_header_k_n_max)
+        {
+            return -EINVAL;
+        }
     }
 
     /* Flush the partial block under the old k/n so no app packet is lost;
-     * block_id keeps counting so the receiver's dedupe/order state stays valid. */
+     * sdu_seq keeps counting so the receiver's order state stays valid. */
     std::vector<std::vector<uint8_t>> air;
-    bool                              ok = false;
+    bool                              ok = true;
     {
         std::lock_guard<std::mutex> flock(fec_mu);
         fec.flush(&air);
-        ok = fec.init(k, n, timeout_ms, shard_bytes);
+        if (fec_mode_e::none == mode)
+        {
+            fec.disable();
+        }
+        else
+        {
+            ok = fec.init(k, n, timeout_ms, shard_bytes);
+        }
     }
     enqueue_fec_air(&air);
     if (!ok)
     {
         return -EINVAL;
     }
-    std::fprintf(stderr, "stream_sender: fec RS_BLOCK_ERASURE k=%d n=%d timeout=%d ms shard=%zu\n",
-                 k, n, timeout_ms, shard_bytes);
+    if (fec_mode_e::block == mode)
+    {
+        std::fprintf(stderr,
+                     "stream_sender: fec RS_BLOCK_ERASURE k=%d n=%d timeout=%d ms shard=%zu\n", k,
+                     n, timeout_ms, shard_bytes);
+    }
     return 0;
 }
 
@@ -1127,6 +1210,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("peer_report_interval_ms" == key)
+    {
+        const stream_peer_link snap = peer_link_snapshot();
+        char                   buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRId64, snap.observed_interval_ms);
+        *value = buf;
+        return 0;
+    }
     if ("peer_session" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
@@ -1161,13 +1252,29 @@ int stream_sender::query(std::string_view key, std::string *value) const
     }
     if ("max_input" == key)
     {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        if (!fec.enabled())
+        fec_mode_e mode = fec_mode_e::block;
+        int        dg = 0;
         {
-            return -EINVAL;
+            std::lock_guard<std::mutex> lock(mu);
+            mode = fec_mode;
+            dg = max_datagram;
+        }
+        size_t max_in = 0;
+        if (fec_mode_e::none == mode)
+        {
+            max_in = stream_max_raw_sdu(static_cast<size_t>(dg));
+        }
+        else
+        {
+            std::lock_guard<std::mutex> flock(fec_mu);
+            if (!fec.enabled())
+            {
+                return -EINVAL;
+            }
+            max_in = fec.max_original();
         }
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%zu", fec.max_original());
+        std::snprintf(buf, sizeof(buf), "%zu", max_in);
         *value = buf;
         return 0;
     }

@@ -132,7 +132,8 @@ std::vector<uint8_t> make_valid_media_datagram(uint16_t stream_seq,
                                               const std::vector<uint8_t> &app)
 {
     vstreamer::rs_block_erasure enc;
-    if (!enc.init(1, 1, 20, 1500))
+    const size_t                shard_max = vstreamer::stream_max_fec_shard(1500);
+    if (!enc.init(1, 1, 20, shard_max))
     {
         return {};
     }
@@ -143,16 +144,23 @@ std::vector<uint8_t> make_valid_media_datagram(uint16_t stream_seq,
         return {};
     }
     std::vector<uint8_t> wire(vstreamer::k_stream_header_len + air[0].size());
-    vstreamer::stream_header_store_be16(wire.data(), stream_seq);
+    vstreamer::stream_header hdr {};
+    hdr.sequence_number = stream_seq;
+    hdr.is_fec = true;
+    hdr.is_stream_data = true;
+    hdr.ext_len = 0;
+    vstreamer::stream_header_write(wire.data(), hdr);
     std::memcpy(wire.data() + vstreamer::k_stream_header_len, air[0].data(), air[0].size());
     return wire;
 }
 
-bool recv_link_report(int fd, vstreamer::stream_link_report *out, int timeout_ms)
+bool recv_link_report_wire(int fd, vstreamer::stream_link_report *out, int timeout_ms)
 {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     uint8_t buf[128];
+    const size_t expect =
+        vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len;
     while (std::chrono::steady_clock::now() < deadline)
     {
         pollfd pfd {fd, POLLIN, 0};
@@ -161,10 +169,28 @@ bool recv_link_report(int fd, vstreamer::stream_link_report *out, int timeout_ms
             continue;
         }
         const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
-        if (n == static_cast<ssize_t>(vstreamer::k_stream_link_report_len))
+        if (n != static_cast<ssize_t>(expect))
         {
-            return vstreamer::stream_link_report_decode(buf, static_cast<size_t>(n), out) == 0;
+            continue;
         }
+        vstreamer::stream_header hdr {};
+        const uint8_t *payload = nullptr;
+        size_t         payload_len = 0;
+        if (vstreamer::stream_header_parse(buf, static_cast<size_t>(n), &hdr, &payload,
+                                           &payload_len) < 0)
+        {
+            continue;
+        }
+        if (hdr.is_fec || hdr.is_stream_data)
+        {
+            continue;
+        }
+        if (vstreamer::stream_link_report_decode(payload, payload_len, out) < 0)
+        {
+            continue;
+        }
+        out->report_seq = hdr.sequence_number;
+        return true;
     }
     return false;
 }
@@ -185,7 +211,7 @@ TEST(StreamReceiverTest, TelemetryWaitsForValidMedia)
     ASSERT_EQ(0, receiver.open());
 
     vstreamer::stream_link_report rep {};
-    EXPECT_FALSE(recv_link_report(s, &rep, 100));
+    EXPECT_FALSE(recv_link_report_wire(s, &rep, 100));
 
     receiver.close();
     close(s);
@@ -227,7 +253,7 @@ TEST(StreamReceiverTest, TelemetryReportsAfterMedia)
     while (got < 5 && std::chrono::steady_clock::now() < deadline)
     {
         vstreamer::stream_link_report rep {};
-        if (!recv_link_report(s, &rep, 50))
+        if (!recv_link_report_wire(s, &rep, 50))
         {
             continue;
         }
@@ -241,7 +267,6 @@ TEST(StreamReceiverTest, TelemetryReportsAfterMedia)
             last_seq = rep.report_seq;
         }
         EXPECT_EQ(session, rep.session_id);
-        EXPECT_EQ(20, rep.interval_ms);
         EXPECT_EQ(1U, rep.counters.udp_packet_received);
         ++got;
     }
@@ -277,11 +302,11 @@ TEST(StreamReceiverTest, TelemetryPeerFollowsLatestSender)
     sendto(s1, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
 
     vstreamer::stream_link_report rep {};
-    ASSERT_TRUE(recv_link_report(s1, &rep, 200));
+    ASSERT_TRUE(recv_link_report_wire(s1, &rep, 200));
 
     sendto(s2, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-    ASSERT_TRUE(recv_link_report(s2, &rep, 200));
-    EXPECT_FALSE(recv_link_report(s1, &rep, 80));
+    ASSERT_TRUE(recv_link_report_wire(s2, &rep, 200));
+    EXPECT_FALSE(recv_link_report_wire(s1, &rep, 80));
 
     std::string changes;
     ASSERT_EQ(0, receiver.query("telemetry_peer_changes", &changes));
@@ -316,20 +341,20 @@ TEST(StreamReceiverTest, TelemetryInvalidMediaDoesNotMovePeer)
     const auto                 wire = make_valid_media_datagram(1, app);
     sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
     vstreamer::stream_link_report rep {};
-    ASSERT_TRUE(recv_link_report(s, &rep, 200));
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
 
     const char garbage[] = "bad";
     sendto(s3, garbage, sizeof(garbage), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-    ASSERT_TRUE(recv_link_report(s, &rep, 200));
-    EXPECT_FALSE(recv_link_report(s3, &rep, 80));
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
+    EXPECT_FALSE(recv_link_report_wire(s3, &rep, 80));
 
     /* Long enough for a stream header + FEC header, but the FEC header does not parse (k = 0). */
     for (const size_t junk_len : {size_t {8}, size_t {64}})
     {
         const std::vector<uint8_t> junk(junk_len, 0);
         sendto(s3, junk.data(), junk.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-        ASSERT_TRUE(recv_link_report(s, &rep, 200)) << "junk_len=" << junk_len;
-        EXPECT_FALSE(recv_link_report(s3, &rep, 80)) << "junk_len=" << junk_len;
+        ASSERT_TRUE(recv_link_report_wire(s, &rep, 200)) << "junk_len=" << junk_len;
+        EXPECT_FALSE(recv_link_report_wire(s3, &rep, 80)) << "junk_len=" << junk_len;
     }
     std::string changes;
     ASSERT_EQ(0, receiver.query("telemetry_peer_changes", &changes));
@@ -366,7 +391,7 @@ TEST(StreamReceiverTest, TelemetrySessionResetsOnReopen)
     std::string session_a;
     ASSERT_EQ(0, receiver.query("session_id", &session_a));
     vstreamer::stream_link_report rep {};
-    ASSERT_TRUE(recv_link_report(s, &rep, 200));
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
     EXPECT_EQ(0U, rep.report_seq);
 
     receiver.close();
@@ -376,9 +401,9 @@ TEST(StreamReceiverTest, TelemetrySessionResetsOnReopen)
     ASSERT_EQ(0, receiver.query("session_id", &session_b));
     EXPECT_NE(session_a, session_b);
 
-    EXPECT_FALSE(recv_link_report(s, &rep, 100));
+    EXPECT_FALSE(recv_link_report_wire(s, &rep, 100));
     sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-    ASSERT_TRUE(recv_link_report(s, &rep, 200));
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
     EXPECT_EQ(0U, rep.report_seq);
 
     receiver.close();
@@ -418,7 +443,7 @@ TEST(StreamReceiverTest, TelemetryOffSuppressesReports)
     sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
 
     vstreamer::stream_link_report rep {};
-    EXPECT_FALSE(recv_link_report(s, &rep, 150));
+    EXPECT_FALSE(recv_link_report_wire(s, &rep, 150));
 
     receiver.close();
     close(s);
@@ -442,7 +467,7 @@ TEST(StreamReceiverTest, TelemetryCountersResetOnReopen)
     const auto wire = make_valid_media_datagram(1, std::vector<uint8_t>(32, 0x22));
     sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
     vstreamer::stream_link_report rep {};
-    ASSERT_TRUE(recv_link_report(s, &rep, 200));
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
     std::string sent;
     ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
     EXPECT_NE("0", sent);
@@ -453,4 +478,52 @@ TEST(StreamReceiverTest, TelemetryCountersResetOnReopen)
     EXPECT_EQ("0", sent);
     receiver.close();
     close(s);
+}
+
+TEST(StreamReceiverTest, BadHeaderCountedAndDoesNotMoveTelemetryPeer)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    const int s = socket(AF_INET, SOCK_DGRAM, 0);
+    const int s_bad = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(s, 0);
+    ASSERT_GE(s_bad, 0);
+
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
+    ASSERT_EQ(0, receiver.open());
+
+    sockaddr_in dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(static_cast<uint16_t>(port));
+    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+
+    const auto good = make_valid_media_datagram(1, std::vector<uint8_t>(32, 0x55));
+    sendto(s, good.data(), good.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+    vstreamer::stream_link_report rep {};
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
+
+    const uint8_t v1ish[] = {0, 1, 0, 0, 0, 0, 0, 0};
+    sendto(s_bad, v1ish, sizeof(v1ish), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+
+    uint8_t tele[vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len] {};
+    vstreamer::stream_header th {};
+    th.sequence_number = 1;
+    th.is_fec = false;
+    th.is_stream_data = false;
+    vstreamer::stream_header_write(tele, th);
+    sendto(s_bad, tele, sizeof(tele), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    std::string bad;
+    ASSERT_EQ(0, receiver.query("rx_bad_header", &bad));
+    EXPECT_GE(std::strtoull(bad.c_str(), nullptr, 10), 2ULL);
+    ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
+    EXPECT_FALSE(recv_link_report_wire(s_bad, &rep, 80));
+
+    receiver.close();
+    close(s);
+    close(s_bad);
 }

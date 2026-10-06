@@ -62,7 +62,7 @@ int main()
         }
     }
 
-    /* Blocks must be emitted in block_id order even when shards arrive OOO. */
+    /* Blocks must be emitted in sdu_base order even when shards arrive OOO. */
     rs_block_erasure enc2;
     rs_block_erasure dec2;
     if (!enc2.init(2, 4, 20))
@@ -193,8 +193,19 @@ int main()
                         std::make_move_iterator(b.end()));
         }
     };
-    auto block_id_of = [](const std::vector<std::vector<uint8_t>>& air) {
-        return static_cast<uint16_t>(air[0][0]);
+    auto sdu_base_of = [](const std::vector<std::vector<uint8_t>>& air) {
+        uint16_t base = 0;
+        int      idx = 0;
+        int      k = 0;
+        int      n = 0;
+        int      sn = 0;
+        if (air.empty() ||
+            !rs_block_erasure::unpack_header(air[0].data(), air[0].size(), &base, &idx, &k, &n,
+                                             &sn))
+        {
+            return static_cast<uint16_t>(0);
+        }
+        return base;
     };
     auto tick_after = [](rs_block_erasure& d, int ms, fec_rx_payload_list& sink) {
         std::this_thread::sleep_for(std::chrono::milliseconds(ms));
@@ -272,7 +283,7 @@ int main()
         }
     }
 
-    /* TX block_id continues across a runtime k/n re-init. */
+    /* TX sdu_base continues across a runtime k/n re-init. */
     {
         rs_block_erasure enc6;
         if (!enc6.init(2, 4, 20))
@@ -280,21 +291,21 @@ int main()
             std::fprintf(stderr, "init6 failed\n");
             return 1;
         }
-        const uint16_t id0 = block_id_of(make_block(enc6, 1));
+        const uint16_t id0 = sdu_base_of(make_block(enc6, 1));
         if (!enc6.init(3, 5, 20))
         {
             std::fprintf(stderr, "reinit6 failed\n");
             return 1;
         }
-        const uint16_t id1 = block_id_of(make_block(enc6, 2));
-        if (id1 != static_cast<uint16_t>(id0 + 1))
+        const uint16_t id1 = sdu_base_of(make_block(enc6, 2));
+        if (id1 != static_cast<uint16_t>(id0 + 2))
         {
-            std::fprintf(stderr, "block_id reset on reinit (%u -> %u)\n", id0, id1);
+            std::fprintf(stderr, "sdu_base reset on reinit (%u -> %u)\n", id0, id1);
             return 1;
         }
     }
 
-    /* Sender process restart (new random block_id base): receiver resyncs. */
+    /* Sender process restart (new random sdu_base): receiver resyncs. */
     {
         rs_block_erasure enc7a;
         rs_block_erasure enc7b;
@@ -346,11 +357,14 @@ int main()
         }
         for (const auto& shard : block)
         {
+            uint16_t base = 0;
+            int      idx = 0;
+            int      k = 0;
+            int      n = 0;
+            int      sn = 0;
             if (shard.size() < rs_block_erasure::k_header_len ||
-                (shard[2] & 0xF) != 4 || ((shard[2] >> 4) & 0xF) != 4 || shard[3] != 4 ||
-                (shard[1] & rs_block_erasure::k_wire_index_mask) >= 4 ||
-                0 != (shard[1] & rs_block_erasure::k_wire_index_reserved) ||
-                0 != (shard[3] & rs_block_erasure::k_wire_sdu_n_reserved))
+                !rs_block_erasure::unpack_header(shard.data(), shard.size(), &base, &idx, &k, &n,
+                                                 &sn) || k != 4 || n != 4 || sn != 4 || idx >= 4)
             {
                 std::fprintf(stderr, "n=k: bad shard header\n");
                 return 1;
@@ -421,11 +435,23 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
         std::vector<std::vector<uint8_t>> block;
         enc_part.on_tick(&block);
-        if (block.empty() || block[0][3] != 3)
+        int partial_sn = 0;
+        if (block.empty())
         {
-            std::fprintf(stderr, "partial flush: expected header N=3 got %u\n",
-                         block.empty() ? 0U : static_cast<unsigned>(block[0][3]));
+            std::fprintf(stderr, "partial flush: empty block\n");
             return 1;
+        }
+        {
+            uint16_t base = 0;
+            int      idx = 0;
+            int      k = 0;
+            int      n = 0;
+            if (!rs_block_erasure::unpack_header(block[0].data(), block[0].size(), &base, &idx, &k,
+                                                 &n, &partial_sn) || partial_sn != 3)
+            {
+                std::fprintf(stderr, "partial flush: expected sdu_n=3 got %d\n", partial_sn);
+                return 1;
+            }
         }
         if (block.size() != 5U)
         {
@@ -453,7 +479,7 @@ int main()
         }
     }
 
-    /* 8-bit wire block_id wrap (255 -> 0): in-order emit must stay lossless. */
+    /* u16 sdu_base wrap: in-order emit must stay lossless. */
     {
         rs_block_erasure enc8;
         rs_block_erasure dec8;
@@ -471,7 +497,7 @@ int main()
         if (got.size() != 516U || dec8.decode_fail() != 0)
         {
             std::fprintf(stderr,
-                         "block_id wrap: expected 516 payloads decode_fail=0 got %zu fail=%llu\n",
+                         "sdu_base wrap: expected 516 payloads decode_fail=0 got %zu fail=%llu\n",
                          got.size(), static_cast<unsigned long long>(dec8.decode_fail()));
             return 1;
         }
@@ -479,29 +505,27 @@ int main()
 
     {
         uint16_t bid = 0;
-        int idx = 0;
-        int kk = 0;
-        int nn = 0;
-        int sn = 0;
-        uint8_t flags = 0;
-        uint8_t good[4] = {7, 0x82, 0xC4, 0x03};
-        if (!rs_block_erasure::unpack_header(good, 4, &bid, &idx, &kk, &nn, &flags, &sn) ||
-            bid != 7 || idx != 2 || kk != 4 || nn != 12 || sn != 3 ||
-            0 == (flags & rs_block_erasure::k_flag_parity))
+        int      idx = 0;
+        int      kk = 0;
+        int      nn = 0;
+        int      sn = 0;
+        uint8_t  good[5] = {0x00, 0x07, 0x23, 0x04, 0x18};
+        if (!rs_block_erasure::unpack_header(good, 5, &bid, &idx, &kk, &nn, &sn) || bid != 7 ||
+            idx != 2 || kk != 4 || nn != 12 || sn != 3)
         {
             std::fprintf(stderr, "header unpack good sample failed\n");
             return 1;
         }
-        uint8_t bad_idx[4] = {0, 0x32, 0x44, 0x04};
-        if (rs_block_erasure::unpack_header(bad_idx, 4, &bid, &idx, &kk, &nn, &flags, &sn))
+        uint8_t bad_cfg[5] = {0x00, 0x07, 0x23, 0x05, 0x18};
+        if (rs_block_erasure::unpack_header(bad_cfg, 5, &bid, &idx, &kk, &nn, &sn))
         {
-            std::fprintf(stderr, "header unpack should reject reserved index bits\n");
+            std::fprintf(stderr, "header unpack should reject fec_config spare bit\n");
             return 1;
         }
-        uint8_t bad_sn[4] = {0, 0x02, 0x44, 0x14};
-        if (rs_block_erasure::unpack_header(bad_sn, 4, &bid, &idx, &kk, &nn, &flags, &sn))
+        uint8_t bad_sn[5] = {0x00, 0x07, 0x23, 0x04, 0x19};
+        if (rs_block_erasure::unpack_header(bad_sn, 5, &bid, &idx, &kk, &nn, &sn))
         {
-            std::fprintf(stderr, "header unpack should reject reserved sdu_n bits\n");
+            std::fprintf(stderr, "header unpack should reject fec2 spare bits\n");
             return 1;
         }
     }

@@ -79,14 +79,15 @@ private:
     void telemetry_thread_main();
     void handle_link_report(const stream_link_report &report);
     void pace_wire_send(size_t bytes);
-    void enqueue_wire_copy(const uint8_t *data, size_t len);
+    void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard);
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
 
     [[nodiscard]] size_t queue_byte_limit() const;
 
     [[nodiscard]] int effective_fec_k() const;
     [[nodiscard]] int effective_fec_n() const;
-    [[nodiscard]] size_t fec_max_shard_bytes() const;
+    [[nodiscard]] size_t max_fec_shard_bytes() const;
+    [[nodiscard]] size_t max_raw_sdu_bytes() const;
     /* Flush partial block, (re)init with current k/n/timeout. No locks held. */
     int  reinit_fec_if_active();
     /* Flush partial block and stop encoding. No locks held. */
@@ -117,8 +118,8 @@ private:
     size_t                  queue_bytes = 0;
     static constexpr size_t k_queue_packet_cap = 1024;
     static constexpr size_t k_queue_min_paced_bytes = 32 * 1024;
-    /* Holds a 1080p keyframe at k=8 n=15 (several full 15-shard blocks). */
-    static constexpr size_t k_queue_min_unpaced_bytes = 256 * 1024;
+    /* App-byte budget for a 1080p keyframe at k=8 n=15; unpaced wire minimum scales by n/k. */
+    static constexpr size_t k_queue_min_unpaced_app_bytes = 136 * 1024;
 
     std::thread       send_thread;
     std::atomic<bool> send_stop {false};
@@ -130,7 +131,10 @@ private:
     stream_link_report peer_report {};
     std::chrono::steady_clock::time_point peer_report_at {};
     uint32_t           peer_session = 0;
-    uint32_t           peer_last_seq = 0;
+    uint16_t           peer_last_seq = 0;
+    uint64_t           peer_last_timestamp_us = 0;
+    bool               peer_have_timestamp = false;
+    int64_t            peer_observed_interval_ms = -1;
     uint64_t           peer_reports_received = 0;
     uint64_t           peer_reports_lost = 0;
     uint64_t           peer_reports_rejected = 0;

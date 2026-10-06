@@ -4,6 +4,7 @@
 #include "core/data_packet.hpp"
 #include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
+#include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
@@ -93,9 +94,19 @@ public:
         stop();
     }
 
+    void set_drop_burst(uint64_t after_media, int count)
+    {
+        drop_burst_after_ = after_media;
+        drop_burst_count_ = count;
+        drop_burst_remaining_ = count;
+    }
+
     int start(int relay_port, int receiver_port, int drop_every_n)
     {
         drop_every_n_ = drop_every_n;
+        drop_burst_after_ = 0;
+        drop_burst_count_ = 0;
+        drop_burst_remaining_ = 0;
         fd_ = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd_ < 0)
         {
@@ -143,8 +154,19 @@ public:
 private:
     static bool is_link_report(const uint8_t *data, size_t len)
     {
-        return len == vstreamer::k_stream_link_report_len &&
-               data[0] == 0x56 && data[1] == 0x54;
+        if (len != vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len)
+        {
+            return false;
+        }
+        vstreamer::stream_header hdr {};
+        const uint8_t *payload = nullptr;
+        size_t         payload_len = 0;
+        if (vstreamer::stream_header_parse(data, len, &hdr, &payload, &payload_len) < 0)
+        {
+            return false;
+        }
+        return !hdr.is_fec && !hdr.is_stream_data &&
+               payload_len == vstreamer::k_stream_link_report_payload_len;
     }
 
     void loop()
@@ -189,6 +211,11 @@ private:
                     have_sender = true;
                 }
                 ++media_seen;
+                if (drop_burst_remaining_ > 0 && media_seen >= drop_burst_after_)
+                {
+                    --drop_burst_remaining_;
+                    continue;
+                }
                 if (drop_every_n_ > 0 && (media_seen % static_cast<uint64_t>(drop_every_n_)) == 0)
                 {
                     continue;
@@ -201,6 +228,9 @@ private:
 
     int                fd_ = -1;
     int                drop_every_n_ = 0;
+    uint64_t           drop_burst_after_ = 0;
+    int                drop_burst_count_ = 0;
+    int                drop_burst_remaining_ = 0;
     sockaddr_in        forward_ {};
     std::atomic<bool>  stop_ {false};
     std::thread        thread_;
@@ -323,7 +353,7 @@ TEST(LoopbackTest, RuntimeFecNRejectedThenAccepted)
         [](vstreamer::stream_sender &sender, int packets_sent) {
             if (packets_sent == 500)
             {
-                EXPECT_EQ(-EINVAL, cfg_str(sender, "fec_n", "20"));
+                EXPECT_EQ(-EINVAL, cfg_str(sender, "fec_n", "32"));
                 EXPECT_EQ(0, cfg_str(sender, "fec_n", "10"));
             }
         });
@@ -588,6 +618,266 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
     EXPECT_EQ(rcv_cnt.fec_gap_count, peer.report.counters.fec_gap_count);
     EXPECT_GT(rcv_cnt.udp_gap_count, 0U);
     EXPECT_EQ(0U, peer.reports_lost);
+
+    sender.close();
+    receiver.close();
+    relay.stop();
+}
+
+TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
+{
+    const int rcv_port = ephemeral_udp_port();
+    const int relay_port = ephemeral_udp_port();
+    ASSERT_GT(rcv_port, 0);
+    ASSERT_GT(relay_port, 0);
+
+    UdpNatRelay relay;
+    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 100));
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
+    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_n", "31"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_k", "31"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    constexpr int k_packets = 80;
+    for (int i = 0; i < k_packets; ++i)
+    {
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        std::this_thread::sleep_for(std::chrono::microseconds(800));
+    }
+    uint32_t delivered = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (delivered < static_cast<uint32_t>(k_packets) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        vstreamer::data_packet out;
+        if (receiver.output(0, out, 100) == 0)
+        {
+            ++delivered;
+        }
+    }
+    EXPECT_EQ(static_cast<uint32_t>(k_packets), delivered);
+    const auto cnt = receiver.link_counters_snapshot();
+    EXPECT_EQ(0U, cnt.fec_gap_count);
+
+    sender.close();
+    receiver.close();
+    relay.stop();
+}
+
+TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
+{
+    const int rcv_port = ephemeral_udp_port();
+    const int relay_port = ephemeral_udp_port();
+    ASSERT_GT(rcv_port, 0);
+    ASSERT_GT(relay_port, 0);
+
+    UdpNatRelay relay;
+    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 5));
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
+    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    for (int i = 0; i < 200; ++i)
+    {
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const auto cnt = receiver.link_counters_snapshot();
+    EXPECT_EQ(cnt.udp_gap_count, cnt.fec_gap_count);
+
+    sender.close();
+    receiver.close();
+    relay.stop();
+}
+
+TEST(LoopbackTest, PeerReportIntervalNearTelemetryMs)
+{
+    const int rcv_port = ephemeral_udp_port();
+    const int relay_port = ephemeral_udp_port();
+    ASSERT_GT(rcv_port, 0);
+    ASSERT_GT(relay_port, 0);
+
+    UdpNatRelay relay;
+    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 0));
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
+    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
+    ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "100"));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    for (int i = 0; i < 30; ++i)
+    {
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(450));
+
+    std::string interval_s;
+    ASSERT_EQ(0, sender.query("peer_report_interval_ms", &interval_s));
+    const int64_t observed = std::strtoll(interval_s.c_str(), nullptr, 10);
+    EXPECT_GE(observed, 50);
+    EXPECT_LE(observed, 150);
+
+    sender.close();
+    receiver.close();
+    relay.stop();
+}
+
+TEST(LoopbackTest, RawMaxInputPayloadDelivered)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
+    ASSERT_EQ(0, cfg_str(sender, "max_datagram", "1476"));
+    ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "1476"));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    std::string max_in_s;
+    ASSERT_EQ(0, sender.query("max_input", &max_in_s));
+    const size_t max_in = static_cast<size_t>(std::strtoull(max_in_s.c_str(), nullptr, 10));
+    EXPECT_EQ(1472U, max_in);
+
+    auto send_and_expect = [&](size_t payload_len, uint32_t tag) {
+        std::vector<uint8_t> storage(payload_len);
+        storage[0] = static_cast<uint8_t>((tag >> 24) & 0xFF);
+        storage[1] = static_cast<uint8_t>((tag >> 16) & 0xFF);
+        storage[2] = static_cast<uint8_t>((tag >> 8) & 0xFF);
+        storage[3] = static_cast<uint8_t>(tag & 0xFF);
+        for (size_t i = 4; i < payload_len; ++i)
+        {
+            storage[i] = static_cast<uint8_t>(i & 0xFF);
+        }
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(tag, payload_len)));
+        vstreamer::data_packet out;
+        const auto             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            const int rc = receiver.output(0, out, 100);
+            if (0 == rc)
+            {
+                const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
+                ASSERT_EQ(payload_len, sd.buf.size());
+                EXPECT_EQ(0, std::memcmp(storage.data(), sd.buf.u8(), payload_len));
+                return;
+            }
+            ASSERT_TRUE(rc == -EAGAIN);
+        }
+        FAIL() << "no output for payload len " << payload_len;
+    };
+
+    send_and_expect(max_in, 1U);
+    send_and_expect(1466U, 2U);
+
+    std::string stats;
+    ASSERT_EQ(0, receiver.query("stats", &stats));
+    EXPECT_NE(std::string::npos, stats.find("dropped=0"));
+
+    sender.close();
+    receiver.close();
+}
+
+TEST(LoopbackTest, FecBlockNoneBlockNoExtraGap)
+{
+    run_link(
+        400,
+        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
+            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
+            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
+            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
+            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+        },
+        [](vstreamer::stream_sender &sender, int packets_sent) {
+            if (100 == packets_sent)
+            {
+                EXPECT_EQ(0, cfg_str(sender, "fec", "none"));
+            }
+            if (200 == packets_sent)
+            {
+                EXPECT_EQ(0, cfg_str(sender, "fec", "block"));
+            }
+        },
+        [](vstreamer::stream_sender &, vstreamer::stream_receiver &receiver) {
+            const auto cnt = receiver.link_counters_snapshot();
+            EXPECT_EQ(0U, cnt.fec_gap_count);
+        });
+}
+
+TEST(LoopbackTest, WholeBlockLossViaBurstDrop)
+{
+    const int rcv_port = ephemeral_udp_port();
+    const int relay_port = ephemeral_udp_port();
+    ASSERT_GT(rcv_port, 0);
+    ASSERT_GT(relay_port, 0);
+
+    UdpNatRelay relay;
+    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 0));
+    /* k=6 n=8 → 8 air shards per block; drop the second block wholesale. */
+    relay.set_drop_burst(8, 8);
+
+    vstreamer::stream_sender   sender;
+    vstreamer::stream_receiver receiver;
+    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
+    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
+    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
+    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
+    ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
+    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
+
+    ASSERT_EQ(0, receiver.open());
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    for (int i = 0; i < 24; ++i)
+    {
+        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        std::this_thread::sleep_for(std::chrono::microseconds(400));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    const auto cnt = receiver.link_counters_snapshot();
+    EXPECT_EQ(6U, cnt.fec_gap_count);
 
     sender.close();
     receiver.close();

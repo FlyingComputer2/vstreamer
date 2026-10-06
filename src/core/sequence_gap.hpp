@@ -8,7 +8,7 @@ namespace vstreamer
 
 /*
  * Forward gap count for a monotonic sequence in a finite ring (e.g. u16 wire
- * stream_sequence, u8 FEC block_id). Reordered / duplicate values (backward
+ * stream_sequence, FEC sdu_base). Reordered / duplicate values (backward
  * more than half the ring) return 0 and leave last unchanged.
  */
 template <typename T>

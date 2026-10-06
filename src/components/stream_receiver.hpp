@@ -78,8 +78,8 @@ private:
     void stop_recv_thread();
     /* Returns true when the datagram is valid stream media (telemetry peer update). */
     bool ingest_datagram(const uint8_t *data, size_t len);
-    void enqueue_payloads(fec_rx_payload_list *payloads);
-    void enqueue_payload_buffer(shared_sized_buffer &&payload);
+    void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
+    void enqueue_payload_buffer(shared_sized_buffer &&payload, size_t max_app_bytes);
 
     mutable std::mutex mu;
     bool               opened = false;
@@ -112,11 +112,14 @@ private:
     uint64_t egress_rate_bytes = 0;
     float    egress_kbps = 0.f;
     uint64_t recv_dropped = 0;
+    uint64_t rx_bad_header = 0;
 
     uint16_t last_udp_seq = 0;
     bool     have_udp_seq = false;
 
-    uint16_t fec_payload_sequence = 0;
+    size_t cached_max_fec_shard = 0;
+    size_t cached_max_decoded_app = 0;
+    size_t cached_max_raw_sdu = 0;
 
     std::thread       recv_thread;
     std::atomic<bool> recv_stop {false};

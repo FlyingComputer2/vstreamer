@@ -113,6 +113,12 @@ template <typename Comp>
 void log_bench_rate_line(const pipeline_rate_state &rate, component_coder &enc,
                          const bench_diag &diag)
 {
+#if defined(VSTREAMER_BENCH_RX_ONLY)
+    (void)rate;
+    (void)enc;
+    (void)diag;
+    return;
+#else
     if (!rate.have_snap)
     {
         return;
@@ -132,6 +138,7 @@ void log_bench_rate_line(const pipeline_rate_state &rate, component_coder &enc,
     const int qp = query_encoder_qp(enc);
     std::fprintf(stderr, "bench_metrics: out_kbps=%.0f cbr=%d qp=%d dt=%.1f\n", enc_out_kbps,
                  cbr_kbps, qp >= 0 ? qp : 0, dt);
+#endif
 }
 double query_component_latency_ms(component &c)
 {

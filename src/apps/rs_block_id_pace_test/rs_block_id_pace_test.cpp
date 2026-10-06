@@ -1,5 +1,7 @@
 #include "core/rs_block_erasure.hpp"
 
+#include <arpa/inet.h>
+
 #include <chrono>
 #include <cinttypes>
 #include <cstdio>
@@ -95,9 +97,9 @@ int main(int argc, char **argv)
     uint64_t app_seq = 0;
     uint64_t bytes_scheduled = 0;
     uint64_t shards_scheduled = 0;
-    uint64_t wire_wrap_marks = 0;
-    uint8_t  last_wire_block = 0xFF;
-    bool     have_wire = false;
+    uint64_t  wire_wrap_marks = 0;
+    uint16_t  last_wire_base = 0;
+    bool      have_wire = false;
 
     auto schedule_shard = [&](std::vector<uint8_t> &&shard, double *schedule_cursor_sec) {
         const double send_sec =
@@ -108,12 +110,17 @@ int main(int argc, char **argv)
         item.due = t0 + std::chrono::duration_cast<steady_clk::duration>(
                              std::chrono::duration<double>(send_sec));
         item.bytes = std::move(shard);
-        const uint8_t wire_id = item.bytes[0];
-        if (have_wire && wire_id < last_wire_block)
+        uint16_t wire_base = 0;
+        if (item.bytes.size() >= rs_block_erasure::k_header_len)
+        {
+            memcpy(&wire_base, item.bytes.data(), sizeof(wire_base));
+            wire_base = ntohs(wire_base);
+        }
+        if (have_wire && wire_base < last_wire_base)
         {
             wire_wrap_marks++;
         }
-        last_wire_block = wire_id;
+        last_wire_base = wire_base;
         have_wire = true;
         bytes_scheduled += item.bytes.size();
         shards_scheduled++;
@@ -263,7 +270,7 @@ int main(int argc, char **argv)
     {
         std::fprintf(stderr,
                      "FAIL: payload sequence errors after %" PRIu64 " blocks / %" PRIu64
-                     " wire wraps — 8-bit block_id collision likely\n",
+                     " wire wraps — sdu_base collision likely\n",
                      blocks, wire_wrap_marks);
         return 1;
     }

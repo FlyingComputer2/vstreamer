@@ -11,26 +11,6 @@ namespace vstreamer::stream_sdl_test
 
 using test_app::g_pipeline_metrics;
 
-void publish_stream_sdl_status_metrics(const test_app::channel_controller *channel, bool kmsdrm,
-                                       double present_fps, bool pipeline_flowing, double glass_ms)
-{
-    if (nullptr == channel)
-    {
-        return;
-    }
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.status"), "running");
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.display"), kmsdrm ? "kmsdrm" : "sdl");
-    if (kmsdrm)
-    {
-        const char *note = present_fps > 0.5 ? "kmsdrm presenting decoded frames"
-                                             : "kmsdrm active; waiting for decode/present";
-        metric_store(*g_pipeline_metrics.get_metric("stream_sdl.note"), note);
-    }
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.pipeline_ok"),
-                 pipeline_flowing ? "yes" : "warming");
-    metric_store(*g_pipeline_metrics.get_metric("stream_sdl.glass_latency_ms"), glass_ms);
-}
-
 void publish_channel_rate_metrics(const test_app::channel_controller *channel, double dt,
                                   bool have_snap, uint64_t prev_ch_bytes_in,
                                   uint64_t prev_ch_bytes_out, uint64_t prev_ch_fwd_drops,

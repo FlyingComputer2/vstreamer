@@ -569,7 +569,7 @@ int main(int argc, char **argv)
     cfg_str(pay, "mtu", mtu_buf);
     cfg_str(sender, "stream", stream_buf);
     cfg_str(sender, "mtu", mtu_buf);
-    /* Winject WiFi MPDU cap (1476-byte UDP payload including stream_header_s). */
+    /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
     cfg_str(sender, "max_datagram", "1476");
     cfg_str(rcv, "max_datagram", "1476");
     if (const char *pace = std::getenv("VSTREAMER_WIRE_PACE_KBPS");
