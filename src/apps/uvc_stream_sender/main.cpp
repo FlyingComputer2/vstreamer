@@ -42,7 +42,7 @@ void usage(const char *prog)
                  "  --cbr KBPS          default 4000\n"
                  "  --gop N             default fps\n"
                  "  --max-datagram N    default 1476\n"
-                 "  --fec-spread-ms N   spread each FEC block over N ms (0..40, default 0)\n"
+                 "  --fec-spread-ms N   spread each FEC block over N ms (>=0, default 0)\n"
                  "  --local [HOST:]PORT stream_sender bind (winject static)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
@@ -269,7 +269,7 @@ int main(int argc, char **argv)
     std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
     if (cfg(sender, "fec_spread_ms", spread_buf) < 0)
     {
-        std::fprintf(stderr, "uvc_stream_sender: --fec-spread-ms must be 0..40\n");
+        std::fprintf(stderr, "uvc_stream_sender: --fec-spread-ms must be >= 0\n");
         return 1;
     }
 

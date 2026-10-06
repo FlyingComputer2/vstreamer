@@ -6,6 +6,7 @@
 #include "core/stream_header.hpp"
 
 #include <cerrno>
+#include <climits>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
@@ -1049,8 +1050,7 @@ int stream_sender::configure(std::string_view key, std::string_view value)
     if ("fec_spread_ms" == key)
     {
         int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 0 || v > k_fec_spread_ms_max ||
-            value.size() > 31)
+        if (key_parse_i64(value, &v) < 0 || v < 0 || v > INT_MAX || value.size() > 31)
         {
             return -EINVAL;
         }

@@ -201,12 +201,12 @@ TEST(FecSpreadTest, ConfigRangeAndQuery)
     vstreamer::stream_sender sender;
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "40"));
-    EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "41"));
+    EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "500"));
     EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "-1"));
     EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "x"));
     std::string v;
     ASSERT_EQ(0, sender.query("fec_spread_ms", &v));
-    EXPECT_EQ("40", v);
+    EXPECT_EQ("500", v);
 }
 
 /* spread 0 is today's behaviour: a whole block leaves back to back. */
