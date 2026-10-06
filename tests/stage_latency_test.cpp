@@ -7,12 +7,11 @@ namespace vstreamer::apps
 namespace
 {
 
-TEST(StageLatencyTest, NodeLatencyDelta)
+TEST(StageLatencyTest, MonoIntervalMs)
 {
-    EXPECT_DOUBLE_EQ(stage_node_latency_ms(0.0, 0.0), 0.0);
-    EXPECT_DOUBLE_EQ(stage_node_latency_ms(12.5, 0.0), 12.5);
-    EXPECT_DOUBLE_EQ(stage_node_latency_ms(40.0, 12.5), 27.5);
-    EXPECT_DOUBLE_EQ(stage_node_latency_ms(10.0, 15.0), 0.0);
+    EXPECT_DOUBLE_EQ(mono_interval_ms(0, 100), 0.0);
+    EXPECT_DOUBLE_EQ(mono_interval_ms(1'000'000, 500'000), 0.0);
+    EXPECT_DOUBLE_EQ(mono_interval_ms(1'000'000, 13'500'000), 12.5);
 }
 
 }  // namespace

@@ -348,23 +348,42 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     const int64_t cap_ns = lookup_capture_pts(pts);
     vstreamer::frame packed;
     packed.reset(media_kind_e::NV12, out_w, out_h, pts, false, std::move(out_buf), cap_ns);
+    const int64_t now_ns = steady_mono_ns();
     if (cap_ns > 0)
     {
-        const int64_t now_ns = steady_mono_ns();
-        const double  ms = static_cast<double>(now_ns - cap_ns) / 1e6;
+        const double ms = static_cast<double>(now_ns - cap_ns) / 1e6;
         if (ms >= 0.0)
         {
             last_latency_ms = ms;
         }
     }
+    const int64_t in_mono_ns = lookup_input_mono_pts(pts);
+    if (in_mono_ns > 0 && now_ns > in_mono_ns)
+    {
+        last_node_latency_ms = static_cast<double>(now_ns - in_mono_ns) / 1e6;
+    }
     ready_frames.push_back(std::move(packed));
     return 0;
 }
 
-void h264_decoder_mpp::remember_capture_pts(int64_t pts, int64_t capture_mono_ns)
+void h264_decoder_mpp::remember_capture_pts(int64_t pts, int64_t capture_mono_ns,
+                                            int64_t input_mono_ns)
 {
-    pts_ring[pts_ring_head % k_pts_ring] = {pts, capture_mono_ns};
+    pts_ring[pts_ring_head % k_pts_ring] = {pts, capture_mono_ns, input_mono_ns};
     pts_ring_head++;
+}
+
+int64_t h264_decoder_mpp::lookup_input_mono_pts(int64_t pts) const
+{
+    for (size_t i = 0; i < k_pts_ring; i++)
+    {
+        const pts_capture_entry &e = pts_ring[i];
+        if (e.pts == pts && e.input_mono_ns > 0)
+        {
+            return e.input_mono_ns;
+        }
+    }
+    return 0;
 }
 
 int64_t h264_decoder_mpp::lookup_capture_pts(int64_t pts) const
@@ -534,7 +553,7 @@ int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
         {
             return -EAGAIN;
         }
-        remember_capture_pts(f.pts, f.capture_mono_ns);
+        remember_capture_pts(f.pts, f.capture_mono_ns, steady_mono_ns());
     }
 
     drain_mpp_to_ready(0);
@@ -729,6 +748,16 @@ int h264_decoder_mpp::query(std::string_view key, std::string *value) const
     {
         char buf[32];
         if (std::snprintf(buf, sizeof(buf), "%.2f", last_latency_ms) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
+        return 0;
+    }
+    if (key == "node_latency_ms")
+    {
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%.2f", last_node_latency_ms) < 0)
         {
             return -EINVAL;
         }

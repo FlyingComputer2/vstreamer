@@ -13,6 +13,7 @@
 #include "components/components.hpp"
 #include "core/data_packet.hpp"
 #include "core/thread_affinity.hpp"
+#include "core/time_util.hpp"
 
 namespace vstreamer::test_app
 {
@@ -21,6 +22,7 @@ using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
 using apps::log_stage_latency;
+using apps::record_stage_node_latency_ms;
 using apps::packet_frame_bytes;
 using apps::rx::ensure_decoder_open;
 using apps::rx::g_rx;
@@ -130,11 +132,13 @@ void present_thread_main(component_sink *display, apps::present_frame_queue *pre
         {
             continue;
         }
-        const int pr = display->input(0, frame_pkt);
+        const int64_t present_in_ns = steady_mono_ns();
+        const int     pr = display->input(0, frame_pkt);
         if (0 == pr)
         {
             diag->rx_present_ok++;
             log_stage_latency("present", frame_pkt);
+            record_stage_node_latency_ms("present", present_in_ns, steady_mono_ns());
             if (frame_pkt.get_type() == packet_kind_e::FRAME)
             {
                 const frame_data &f = data_packet::cast<frame_data>(frame_pkt);
@@ -304,10 +308,12 @@ void decode_thread_main(h264_decoder_mpp *dec, apps::present_frame_queue *presen
             have_holding = true;
         }
 
+        const int64_t dec_in_mono_ns = steady_mono_ns();
         log_stage_latency("dec_in", holding);
         const int r = feed_decoder_au(dec, holding, present_q, *diag);
         if (0 == r)
         {
+            record_stage_node_latency_ms("dec_in", dec_in_mono_ns, steady_mono_ns());
             have_holding = false;
             holding.release();
             drain_decoder_to_present(dec, present_q, *diag);

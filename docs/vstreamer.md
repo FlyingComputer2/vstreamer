@@ -313,12 +313,11 @@ Two naming conventions:
 | Suffix | Meaning |
 |--------|---------|
 | **`latency_ms`** (component query or `*.latency_ms` bench metric) | **Cumulative** time from frame capture (`capture_mono_ns`) to the latest frame at that component or stage. |
-| **`node_latency_ms`** (`*.node_latency_ms` bench metric) | **Per-node** time: delay in that segment only, computed as `max(0, cumulative_stage − cumulative_previous_stage)` using the latest `latency.*_ms` globals (`stage_node_latency_ms()`). |
+| **`node_latency_ms`** (`*.node_latency_ms` bench metric) | **Per-node** time for the last completed frame through that component or stage: `output_mono_ns − input_mono_ns` on the same logical frame (matched by PTS / encoder slot queue where I/O is not 1:1). |
 | **`latency.<stage>_ms`** | Cumulative capture age when the frame left that pipeline stage. |
-| **`latency.<stage>_node_ms`** | Per-node delay for that stage (same delta rule; `source` uses full cumulative). |
+| **`latency.<stage>_node_ms`** | Per-node delay for that stage (stamp-based; see below). |
 
-Stage globals are updated independently per stage, so node deltas are approximate when stages run
-at different rates; they are intended for ops tuning, not frame-accurate profiling.
+**Node measurement:** pipeline stages record monotonic stamps at entry and exit (`record_stage_latency_ms` / `record_stage_node_latency_ms` in `stage_latency.cpp`). Components expose `query("node_latency_ms")` (encoders, decoder, JPEG decoder, depay, SDL sink). The NV12 encoder queue stamps `frame_data.queue_in_mono_ns` on push and measures wait until pop.
 
 ### Pipeline metrics (`latency.*`)
 
@@ -330,8 +329,7 @@ Published by `rx_metrics::publish_latency_metrics()` (console sync, ~10 Hz).
 | `latency.jpeg_ms` / `jpeg_node_ms` | `jpeg_nv12` | cum / node | yes (JPEG) | hidden |
 | `latency.enc_in_ms` / `enc_in_node_ms` | `enc_in` | cum / node | yes | hidden |
 | `latency.enc_out_ms` / `enc_out_node_ms` | `enc_out` | cum / node | yes | hidden |
-| `latency.depay_ms` | `depay` | cumulative | loopback | yes |
-| `latency.depay_node_ms` | `depay` | node | loopback | — (not published; cumulative includes off-process TX + link) |
+| `latency.depay_ms` / `depay_node_ms` | `depay` | cum / node | loopback | yes (node = depay component processing) |
 | `latency.dec_in_ms` / `dec_in_node_ms` | `dec_in` | cum / node | loopback | yes |
 | `latency.dec_out_ms` / `dec_out_node_ms` | `dec_out` | cum / node | loopback | yes |
 | `latency.present_ms` / `present_node_ms` | `present` | cum / node | loopback | yes |
@@ -351,15 +349,15 @@ halves run in-process or over the channel emulator.
 | `latency_ms` on `h264_encoder_mpp`, `h264_encoder_intel` | cumulative | capture → last encoded AU |
 | `latency_ms` on `h264_decoder_mpp`, `sdl_nv12_presenter` | cumulative | capture → last frame at that component |
 | `jpeg_decoder.latency_ms` | cumulative | same as `latency.jpeg_ms` |
-| `jpeg_decoder.node_latency_ms` | node | `jpeg_node_ms` |
+| `jpeg_decoder.node_latency_ms` | node | JPEG component `node_latency_ms` (job queued → NV12 out) |
 | `encoder_queue.latency_ms` | cumulative | see below |
-| `encoder_queue.node_latency_ms` | node | `enc_in_node_ms` (JPEG → encode-thread input) |
+| `encoder_queue.node_latency_ms` | node | `queue_in_mono_ns` → pop (`encoder_queue` stage) |
 | `h264_encoder.latency_ms` | cumulative | encoder component query (≈ `latency.enc_out_ms`) |
-| `h264_encoder.node_latency_ms` | node | `enc_out_node_ms` |
+| `h264_encoder.node_latency_ms` | node | encoder component `node_latency_ms` (NV12 in → AU out, PTS-paired) |
 | `h264_decoder.latency_ms` | cumulative | decoder component query (≈ `latency.dec_out_ms`) |
-| `h264_decoder.node_latency_ms` | node | `dec_out_node_ms` |
+| `h264_decoder.node_latency_ms` | node | decoder component `node_latency_ms` (AU in → NV12 out, PTS ring) |
 | `sdl_sink.latency_ms` | cumulative | same as `latency.glass_ms` |
-| `sdl_sink.node_latency_ms` | node | `glass_node_ms` (present − decode out) |
+| `sdl_sink.node_latency_ms` | node | present stage stamp (pop → SDL present) |
 
 `stream_sdl.glass_latency_ms` in `stream_sdl_test` is cumulative glass latency.
 
@@ -373,9 +371,9 @@ is **cumulative** (not node-only):
 2. **`encoder_queue.size` × (1000 / jpeg_decoder.out_fps)** when queue depth > 0 — estimated
    extra wait for frames already buffered (not a second full capture-age term).
 
-**`encoder_queue.node_latency_ms`** is the per-node segment from JPEG output to encode-thread
-input (`latency.enc_in_node_ms`). Related counters: `encoder_queue.size`, `encoder_queue.in_fps`,
-`encoder_queue.out_fps`.
+**`encoder_queue.node_latency_ms`** is queue wait only (`queue_in_mono_ns` at NV12 push → pop).
+**`latency.enc_in_node_ms`** is pop → successful `h264_encoder.input()`. Related counters:
+`encoder_queue.size`, `encoder_queue.in_fps`, `encoder_queue.out_fps`.
 
 ### Debugging
 

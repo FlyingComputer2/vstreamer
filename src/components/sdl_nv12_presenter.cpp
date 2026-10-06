@@ -415,6 +415,7 @@ int sdl_nv12_presenter::ensure_video_locked(int w, int h)
 
 int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_open)
 {
+    const int64_t present_in_ns = steady_mono_ns();
     const int need = nv12_byte_size(f.width, f.height);
     if (need < 0 || static_cast<size_t>(need) != f.buf.size() || nullptr == f.buf.u8())
     {
@@ -502,6 +503,12 @@ int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_o
     }
 
     pump_events_locked(session_open);
+    const int64_t present_out_ns = steady_mono_ns();
+    if (present_out_ns > present_in_ns)
+    {
+        last_node_latency_ms =
+            static_cast<double>(present_out_ns - present_in_ns) / 1e6;
+    }
     return 0;
 }
 
@@ -663,6 +670,18 @@ int sdl_nv12_presenter::present(const frame_data &f, bool &session_open)
         return -EBADF;
     }
     return present_nv12_locked(f, session_open);
+}
+
+double sdl_nv12_presenter::last_latency_ms_value() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return last_latency_ms;
+}
+
+double sdl_nv12_presenter::last_node_latency_ms_value() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return last_node_latency_ms;
 }
 
 void sdl_nv12_presenter::stats_string(char *buf, size_t buflen, uint64_t frames_in) const

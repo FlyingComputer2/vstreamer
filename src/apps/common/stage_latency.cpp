@@ -23,6 +23,16 @@ std::atomic<double>  g_latency_dec_in_ms {0.0};
 std::atomic<double>  g_latency_dec_out_ms {0.0};
 std::atomic<double>  g_latency_present_ms {0.0};
 
+std::atomic<double> g_node_latency_source_ms {0.0};
+std::atomic<double> g_node_latency_jpeg_ms {0.0};
+std::atomic<double> g_node_latency_encoder_queue_ms {0.0};
+std::atomic<double> g_node_latency_enc_in_ms {0.0};
+std::atomic<double> g_node_latency_enc_out_ms {0.0};
+std::atomic<double> g_node_latency_depay_ms {0.0};
+std::atomic<double> g_node_latency_dec_in_ms {0.0};
+std::atomic<double> g_node_latency_dec_out_ms {0.0};
+std::atomic<double> g_node_latency_present_ms {0.0};
+
 namespace
 {
 
@@ -128,18 +138,62 @@ void record_stage_latency_ms(const char *stage, const data_packet &, double ms)
     }
 }
 
-double stage_node_latency_ms(double cumulative_ms, double prev_cumulative_ms)
+double mono_interval_ms(int64_t input_mono_ns, int64_t output_mono_ns)
 {
-    if (cumulative_ms <= 0.0)
+    if (input_mono_ns <= 0 || output_mono_ns <= input_mono_ns)
     {
         return 0.0;
     }
-    if (prev_cumulative_ms <= 0.0)
+    return static_cast<double>(output_mono_ns - input_mono_ns) / 1e6;
+}
+
+void record_stage_node_latency_ms(const char *stage, int64_t input_mono_ns, int64_t output_mono_ns)
+{
+    if (nullptr == stage)
     {
-        return cumulative_ms;
+        return;
     }
-    const double delta = cumulative_ms - prev_cumulative_ms;
-    return delta > 0.0 ? delta : 0.0;
+    const double ms = mono_interval_ms(input_mono_ns, output_mono_ns);
+    if (ms <= 0.0)
+    {
+        return;
+    }
+    if (0 == std::strcmp(stage, "source"))
+    {
+        g_node_latency_source_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "jpeg_nv12"))
+    {
+        g_node_latency_jpeg_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "encoder_queue"))
+    {
+        g_node_latency_encoder_queue_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "enc_in"))
+    {
+        g_node_latency_enc_in_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "enc_out"))
+    {
+        g_node_latency_enc_out_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "depay"))
+    {
+        g_node_latency_depay_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "dec_in"))
+    {
+        g_node_latency_dec_in_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "dec_out"))
+    {
+        g_node_latency_dec_out_ms.store(ms, std::memory_order_relaxed);
+    }
+    else if (0 == std::strcmp(stage, "present"))
+    {
+        g_node_latency_present_ms.store(ms, std::memory_order_relaxed);
+    }
 }
 
 void log_stage_latency(const char *stage, const data_packet &pkt)

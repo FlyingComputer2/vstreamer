@@ -10,6 +10,7 @@
 #include "apps/stream_sdl_test/metrics_sync.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
 #include "apps/stream_sdl_test/stages.hpp"
+#include "core/time_util.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -322,10 +323,12 @@ int main(int argc, char **argv)
 
     selector->set_push_handlers(
         [&](data_packet &&p) {
-            (void)enqueue_source_frame(std::move(p), &mjpeg_q, &nv12_q, &g_bench_diag);
+            (void)enqueue_source_frame(std::move(p), vstreamer::steady_mono_ns(), &mjpeg_q,
+                                      &nv12_q, &g_bench_diag);
         },
         [&](data_packet &&p) {
-            (void)enqueue_source_frame(std::move(p), &mjpeg_q, &nv12_q, &g_bench_diag);
+            (void)enqueue_source_frame(std::move(p), vstreamer::steady_mono_ns(), &mjpeg_q,
+                                      &nv12_q, &g_bench_diag);
         });
 
     pipeline_rate_state       rate;

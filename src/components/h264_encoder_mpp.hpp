@@ -106,6 +106,7 @@ private:
     std::vector<uint8_t> enc_au_accum;
     int64_t              enc_au_pts = 0;
     int64_t              enc_au_capture_mono_ns = 0;
+    int64_t              enc_au_in_mono_ns = 0;
     bool                 enc_au_key = false;
 
     static constexpr int enc_slot_count = 8;
@@ -114,6 +115,7 @@ private:
         void   *frm = nullptr;
         void   *pkt = nullptr;
         int64_t capture_mono_ns = 0;
+        int64_t in_mono_ns = 0;
     };
     std::array<enc_slot, enc_slot_count> enc_slots {};
     std::deque<int>                      enc_free_slots;
@@ -121,8 +123,8 @@ private:
 
     std::deque<frame> out_q;
 
-    /* Capture-to-encoded-AU (ms); updated when output carries capture_mono_ns. */
     double last_latency_ms = 0.0;
+    double last_node_latency_ms = 0.0;
 };
 
 }  // namespace vstreamer

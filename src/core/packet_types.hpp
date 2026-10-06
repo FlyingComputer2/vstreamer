@@ -30,6 +30,8 @@ public:
     int                  height = 0;
     int64_t              pts = 0;
     int64_t              capture_mono_ns = 0;
+    /* Monotonic time when the frame entered the NV12 encoder queue (push); used for queue node latency. */
+    int64_t              queue_in_mono_ns = 0;
     bool                 key = false;
     shared_sized_buffer  buf;
 };

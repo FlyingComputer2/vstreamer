@@ -57,7 +57,8 @@ private:
     void drain_mpp_to_ready(int timeout_ms);
     int  fetch_one_mpp_frame(int timeout_ms);
     int  pack_mpp_to_ready_locked(void *mpp_frame);
-    void remember_capture_pts(int64_t pts, int64_t capture_mono_ns);
+    void remember_capture_pts(int64_t pts, int64_t capture_mono_ns, int64_t input_mono_ns);
+    [[nodiscard]] int64_t lookup_input_mono_pts(int64_t pts) const;
     int64_t lookup_capture_pts(int64_t pts) const;
 
     /* Lock order: mu → mpp_io_mu only. */
@@ -84,6 +85,7 @@ private:
     {
         int64_t pts = 0;
         int64_t capture_mono_ns = 0;
+        int64_t input_mono_ns = 0;
     };
     std::array<pts_capture_entry, k_pts_ring> pts_ring {};
     size_t                                   pts_ring_head = 0;
@@ -95,6 +97,7 @@ private:
 
     /* Capture-to-decoded-frame (ms); updated when output carries capture_mono_ns. */
     double last_latency_ms = 0.0;
+    double last_node_latency_ms = 0.0;
 
     unsigned log_errinfo_throttle = 0;
     unsigned log_fbc_throttle = 0;

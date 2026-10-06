@@ -90,13 +90,15 @@ private:
     {
         int64_t pts = 0;
         int64_t capture_mono_ns = 0;
+        int64_t in_mono_ns = 0;
     };
 
     std::deque<in_frame_meta> in_meta_q;
     std::deque<frame>         out_q;
 
-    /* Capture-to-encoded-AU (ms); updated when output carries capture_mono_ns. */
+    /* Cumulative capture-to-AU (ms); node = in_mono_ns → encoded AU (ms). */
     double last_latency_ms = 0.0;
+    double last_node_latency_ms = 0.0;
 };
 
 }  // namespace vstreamer
