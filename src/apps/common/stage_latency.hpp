@@ -29,6 +29,10 @@ void note_source_pts(const vstreamer::data_packet &pkt);
 void record_stage_latency_ms(const char *stage, const vstreamer::data_packet &, double ms);
 void log_stage_latency(const char *stage, const vstreamer::data_packet &pkt);
 
+/* Per-node delay: max(0, cumulative_ms - prev_cumulative_ms). When prev is unset (<= 0), returns
+ * cumulative_ms (first segment in the chain). */
+[[nodiscard]] double stage_node_latency_ms(double cumulative_ms, double prev_cumulative_ms);
+
 }  // namespace vstreamer::apps
 
 #endif  // VSTREAMER_APPS_STAGE_LATENCY_HPP

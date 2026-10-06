@@ -128,6 +128,20 @@ void record_stage_latency_ms(const char *stage, const data_packet &, double ms)
     }
 }
 
+double stage_node_latency_ms(double cumulative_ms, double prev_cumulative_ms)
+{
+    if (cumulative_ms <= 0.0)
+    {
+        return 0.0;
+    }
+    if (prev_cumulative_ms <= 0.0)
+    {
+        return cumulative_ms;
+    }
+    const double delta = cumulative_ms - prev_cumulative_ms;
+    return delta > 0.0 ? delta : 0.0;
+}
+
 void log_stage_latency(const char *stage, const data_packet &pkt)
 {
     if (nullptr == stage || pkt.get_type() != packet_kind_e::FRAME)

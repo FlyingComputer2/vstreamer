@@ -17,8 +17,9 @@ that value to local monotonic time when emitting each access unit so downstream 
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
 estimate or correct offset in-band.
 
-Console metrics (`latency.glass_ms`, per-stage `latency.*`, component `latency_ms` queries) are
-described in [vstreamer.md § Latency metrics](vstreamer.md#latency-metrics).
+Console metrics (`latency.glass_ms`, cumulative `latency.*` / `*.latency_ms`, per-node
+`latency.*_node_ms` / `*.node_latency_ms`) are described in
+[vstreamer.md § Latency metrics](vstreamer.md#latency-metrics).
 
 ## Forward datagram (wire v2)
 

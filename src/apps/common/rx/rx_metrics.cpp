@@ -83,36 +83,56 @@ void telemetry_thread_main(stream_receiver *rcv)
     }
 }
 
+namespace
+{
+
+void publish_stage_latency_ms(const char *stage, double cumulative_ms, double prev_cumulative_ms)
+{
+    const std::string prefix = std::string("latency.") + stage;
+    metric_store(*g_pipeline_metrics.get_metric(prefix + "_ms"), cumulative_ms);
+    metric_store(*g_pipeline_metrics.get_metric(prefix + "_node_ms"),
+                 apps::stage_node_latency_ms(cumulative_ms, prev_cumulative_ms));
+}
+
+}  // namespace
+
 void publish_latency_metrics(double glass_ms)
 {
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
 #if defined(VSTREAMER_APP_SPLIT_RX_ONLY)
     /* Split GS receiver: capture enters on the wire (RTP ext → depay). No TX stages in-process. */
-    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
-                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
-                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
-                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
-                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
+    const double depay_ms = apps::g_latency_depay_ms.load(std::memory_order_relaxed);
+    const double dec_in_ms = apps::g_latency_dec_in_ms.load(std::memory_order_relaxed);
+    const double dec_out_ms = apps::g_latency_dec_out_ms.load(std::memory_order_relaxed);
+    const double present_ms = apps::g_latency_present_ms.load(std::memory_order_relaxed);
+
+    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"), depay_ms);
+    /* depay_node_ms omitted: cumulative includes off-process TX + link; no local prior stage. */
+    publish_stage_latency_ms("dec_in", dec_in_ms, depay_ms);
+    publish_stage_latency_ms("dec_out", dec_out_ms, dec_in_ms);
+    publish_stage_latency_ms("present", present_ms, dec_out_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.glass_node_ms"),
+                 apps::stage_node_latency_ms(present_ms, dec_out_ms));
 #else
-    metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
-                 apps::g_latency_source_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
-                 apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"),
-                 apps::g_latency_enc_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"),
-                 apps::g_latency_enc_out_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
-                 apps::g_latency_depay_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),
-                 apps::g_latency_dec_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_out_ms"),
-                 apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
-                 apps::g_latency_present_ms.load(std::memory_order_relaxed));
+    const double source_ms = apps::g_latency_source_ms.load(std::memory_order_relaxed);
+    const double jpeg_ms = apps::g_latency_jpeg_ms.load(std::memory_order_relaxed);
+    const double enc_in_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    const double enc_out_ms = apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+    const double depay_ms = apps::g_latency_depay_ms.load(std::memory_order_relaxed);
+    const double dec_in_ms = apps::g_latency_dec_in_ms.load(std::memory_order_relaxed);
+    const double dec_out_ms = apps::g_latency_dec_out_ms.load(std::memory_order_relaxed);
+    const double present_ms = apps::g_latency_present_ms.load(std::memory_order_relaxed);
+
+    publish_stage_latency_ms("source", source_ms, 0.0);
+    publish_stage_latency_ms("jpeg", jpeg_ms, source_ms);
+    publish_stage_latency_ms("enc_in", enc_in_ms, jpeg_ms);
+    publish_stage_latency_ms("enc_out", enc_out_ms, enc_in_ms);
+    publish_stage_latency_ms("depay", depay_ms, enc_out_ms);
+    publish_stage_latency_ms("dec_in", dec_in_ms, depay_ms);
+    publish_stage_latency_ms("dec_out", dec_out_ms, dec_in_ms);
+    publish_stage_latency_ms("present", present_ms, dec_out_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.glass_node_ms"),
+                 apps::stage_node_latency_ms(present_ms, dec_out_ms));
 #endif
 }
 
@@ -121,7 +141,9 @@ void publish_latency_metrics(double glass_ms)
 bool latency_metric_visible(std::string_view full_name)
 {
     return full_name != "latency.source_ms" && full_name != "latency.jpeg_ms" &&
-           full_name != "latency.enc_in_ms" && full_name != "latency.enc_out_ms";
+           full_name != "latency.enc_in_ms" && full_name != "latency.enc_out_ms" &&
+           full_name != "latency.source_node_ms" && full_name != "latency.jpeg_node_ms" &&
+           full_name != "latency.enc_in_node_ms" && full_name != "latency.enc_out_node_ms";
 }
 
 #endif

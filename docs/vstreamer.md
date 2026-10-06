@@ -157,13 +157,14 @@ part of `v4l2_source`.
 | `cbr` (`bps`) | C Q | bit/s 0..200 000 000, default 20 000 000, live in `cbr` mode |
 | `super_i_ratio`, `super_p_ratio` | C | ≥ 0, defaults 6.0 / 1.5 |
 | `idr` | C | request IDR on the next frame |
-| `latency_ms` | Q | capture → encoded AU |
+| `latency_ms` | Q | **cumulative** capture → encoded AU |
 | `backend`, `status` | Q | informational |
 
 **`h264_encoder_cedar`** (libav `h264_cedrus`, width multiple of 32) and
 **`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
 Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
-`status`; Intel also `latency_ms` (capture → encoded AU when input carried `capture_mono_ns`).
+`status`; Intel also **`latency_ms`** (**cumulative** capture → encoded AU when input carried
+`capture_mono_ns`).
 
 **`h264_decoder_mpp`** — Rockchip MPP H.264 → NV12. Lock order `mu` → `mpp_io_mu`.
 
@@ -173,7 +174,7 @@ Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query
 | `output_mode` | C Q | `filter` / `convert` |
 | `output_format` (`format`) | C Q | `nv12` |
 | `output_size_mode` | C | `stream` (use SPS size) / `config` (use `size`) |
-| `latency_ms`, `status` | Q | informational |
+| `latency_ms`, `status` | Q | **`latency_ms`**: cumulative capture → decoded frame; informational |
 
 **`rtp_h264_pay`** — H.264 AU → RTP datagrams (PT 96, SSRC `0xC0DE0001`, single NAL / STAP-A /
 FU-A, capture-time header extension).
@@ -304,49 +305,76 @@ Encoders must **preserve** `capture_mono_ns` from NV12 input to H.264 output (`h
 `h264_encoder_intel`). Without that, the payloader cannot stamp the extension and glass latency on
 a split receiver stays at 0. `h264_encoder_cedar` does not propagate capture time today.
 
+### Cumulative vs per-node latency
+
+Two naming conventions:
+
+| Suffix | Meaning |
+|--------|---------|
+| **`latency_ms`** (component query or `*.latency_ms` bench metric) | **Cumulative** time from frame capture (`capture_mono_ns`) to the latest frame at that component or stage. |
+| **`node_latency_ms`** (`*.node_latency_ms` bench metric) | **Per-node** time: delay in that segment only, computed as `max(0, cumulative_stage − cumulative_previous_stage)` using the latest `latency.*_ms` globals (`stage_node_latency_ms()`). |
+| **`latency.<stage>_ms`** | Cumulative capture age when the frame left that pipeline stage. |
+| **`latency.<stage>_node_ms`** | Per-node delay for that stage (same delta rule; `source` uses full cumulative). |
+
+Stage globals are updated independently per stage, so node deltas are approximate when stages run
+at different rates; they are intended for ops tuning, not frame-accurate profiling.
+
 ### Pipeline metrics (`latency.*`)
 
-Published by `rx_metrics::publish_latency_metrics()` (console sync, ~10 Hz). Values are the latest
-per-stage capture age in milliseconds.
+Published by `rx_metrics::publish_latency_metrics()` (console sync, ~10 Hz).
 
-| Metric | Stage (internal name) | TX path | RX path |
-|--------|------------------------|---------|---------|
-| `latency.source_ms` | `source` | yes | — |
-| `latency.jpeg_ms` | `jpeg_nv12` | yes (JPEG mode) | — |
-| `latency.enc_in_ms` | `enc_in` | yes | — |
-| `latency.enc_out_ms` | `enc_out` | yes | — |
-| `latency.depay_ms` | `depay` | loopback | yes |
-| `latency.dec_in_ms` | `dec_in` | loopback | yes |
-| `latency.dec_out_ms` | `dec_out` | loopback | yes |
-| `latency.present_ms` | `present` | loopback | yes |
-| `latency.glass_ms` | same as `present_ms` | loopback | yes |
+| Metric | Stage (internal name) | Kind | TX | RX (split GS) |
+|--------|------------------------|------|----|----------------|
+| `latency.source_ms` / `source_node_ms` | `source` | cum / node | yes | hidden |
+| `latency.jpeg_ms` / `jpeg_node_ms` | `jpeg_nv12` | cum / node | yes (JPEG) | hidden |
+| `latency.enc_in_ms` / `enc_in_node_ms` | `enc_in` | cum / node | yes | hidden |
+| `latency.enc_out_ms` / `enc_out_node_ms` | `enc_out` | cum / node | yes | hidden |
+| `latency.depay_ms` | `depay` | cumulative | loopback | yes |
+| `latency.depay_node_ms` | `depay` | node | loopback | — (not published; cumulative includes off-process TX + link) |
+| `latency.dec_in_ms` / `dec_in_node_ms` | `dec_in` | cum / node | loopback | yes |
+| `latency.dec_out_ms` / `dec_out_node_ms` | `dec_out` | cum / node | loopback | yes |
+| `latency.present_ms` / `present_node_ms` | `present` | cum / node | loopback | yes |
+| `latency.glass_ms` | same as `present_ms` | cumulative | loopback | yes |
+| `latency.glass_node_ms` | same as `present_node_ms` | node | loopback | yes |
 
-On **`sdl_stream_receiver`** (`VSTREAMER_APP_SPLIT_RX_ONLY`), only the RX rows plus `glass_ms`
-are published and exposed on the console (`:5091`). TX-only keys are omitted from `get` / full
-metrics dumps (`get_metric latency.source_ms` → `err unknown metric`). Sender
-**`uvc_stream_sender`** (`:5090`) and **`stream_sdl_test`** publish the full set when both halves
-run in-process or over the channel emulator.
+On **`sdl_stream_receiver`** (`VSTREAMER_APP_SPLIT_RX_ONLY`), only the RX cumulative keys above
+plus `latency.*_node_ms` for decoder/present (not TX or `depay_node_ms`) are published and
+exposed on the console (`:5091`). TX-only keys are omitted from `get` / full metrics dumps.
+Sender **`uvc_stream_sender`** (`:5090`) and **`stream_sdl_test`** publish the full set when both
+halves run in-process or over the channel emulator.
 
-### Component queries
+### Component queries and bench metrics
 
-| Query key | Component | Meaning |
-|-----------|-----------|---------|
-| `latency_ms` | `h264_encoder_mpp`, `h264_encoder_intel` | capture → last encoded AU (when input had `capture_mono_ns`) |
-| `latency_ms` | `h264_decoder_mpp`, `sdl_nv12_presenter` / `sdl_sink` | capture → last frame at that stage |
+| Query / metric | Kind | Meaning |
+|----------------|------|---------|
+| `latency_ms` on `h264_encoder_mpp`, `h264_encoder_intel` | cumulative | capture → last encoded AU |
+| `latency_ms` on `h264_decoder_mpp`, `sdl_nv12_presenter` | cumulative | capture → last frame at that component |
+| `jpeg_decoder.latency_ms` | cumulative | same as `latency.jpeg_ms` |
+| `jpeg_decoder.node_latency_ms` | node | `jpeg_node_ms` |
+| `encoder_queue.latency_ms` | cumulative | see below |
+| `encoder_queue.node_latency_ms` | node | `enc_in_node_ms` (JPEG → encode-thread input) |
+| `h264_encoder.latency_ms` | cumulative | encoder component query (≈ `latency.enc_out_ms`) |
+| `h264_encoder.node_latency_ms` | node | `enc_out_node_ms` |
+| `h264_decoder.latency_ms` | cumulative | decoder component query (≈ `latency.dec_out_ms`) |
+| `h264_decoder.node_latency_ms` | node | `dec_out_node_ms` |
+| `sdl_sink.latency_ms` | cumulative | same as `latency.glass_ms` |
+| `sdl_sink.node_latency_ms` | node | `glass_node_ms` (present − decode out) |
 
-Bench metrics also expose `stream_sdl.glass_latency_ms` (alias of glass latency in
-`stream_sdl_test`).
+`stream_sdl.glass_latency_ms` in `stream_sdl_test` is cumulative glass latency.
 
 ### `encoder_queue.latency_ms` (sender)
 
-NV12 frames wait in `g_tx.metrics_nv12_q` between JPEG decode and H.264 encode. The metric is:
+NV12 frames wait in `g_tx.metrics_nv12_q` between JPEG decode and H.264 encode. **`latency_ms`**
+is **cumulative** (not node-only):
 
 1. **`latency.enc_in_ms`** if the encode thread has updated it; else **`latency.jpeg_ms`** (frame
    still upstream of the queue), plus
 2. **`encoder_queue.size` × (1000 / jpeg_decoder.out_fps)** when queue depth > 0 — estimated
    extra wait for frames already buffered (not a second full capture-age term).
 
-Related counters: `encoder_queue.size`, `encoder_queue.in_fps`, `encoder_queue.out_fps`.
+**`encoder_queue.node_latency_ms`** is the per-node segment from JPEG output to encode-thread
+input (`latency.enc_in_node_ms`). Related counters: `encoder_queue.size`, `encoder_queue.in_fps`,
+`encoder_queue.out_fps`.
 
 ### Debugging
 
@@ -421,7 +449,8 @@ Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
 `h264_encoder.out_bytes`, `stream_sender.peer_fec_gap_count`,
 `stream_sender.peer_fec_packet_received`, `stream_sender.peer_udp_gap_count`,
 `stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`,
-`latency.depay_ms`, `encoder_queue.latency_ms`, `h264_encoder.latency_ms`.
+`latency.depay_ms`, `latency.dec_in_node_ms`, `encoder_queue.latency_ms`,
+`encoder_queue.node_latency_ms`, `h264_encoder.latency_ms`, `h264_encoder.node_latency_ms`.
 `stream_sender.peer_*` packet/gap counters come from the link reports the sender received, never
 from the receiver object. The reports travel the emulator's reverse direction, so
 `set_constant_loss` affects them too. `peer_report_age_ms` (`-1` if never), `peer_reports_*` and

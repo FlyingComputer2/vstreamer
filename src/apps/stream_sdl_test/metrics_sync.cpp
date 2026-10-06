@@ -242,6 +242,13 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
 
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
+    const double latency_source_ms =
+        apps::g_latency_source_ms.load(std::memory_order_relaxed);
+    const double latency_jpeg_ms = apps::g_latency_jpeg_ms.load(std::memory_order_relaxed);
+    const double latency_enc_in_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    const double latency_enc_out_ms = apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+    const double latency_dec_in_ms = apps::g_latency_dec_in_ms.load(std::memory_order_relaxed);
+    const double latency_dec_out_ms = apps::g_latency_dec_out_ms.load(std::memory_order_relaxed);
 #if !defined(VSTREAMER_BENCH_TX_ONLY)
     stream_sdl_test::publish_stream_sdl_status_metrics(channel, kmsdrm, present_fps,
                                                        pipeline_flowing, glass_ms);
@@ -277,8 +284,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         const uint64_t mjpeg_q_drop = d.tx_mjpeg_q_drop.load();
         metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.dropped_fps"),
                      apps::rate_per_sec(mjpeg_q_drop, prev.tx_mjpeg_q_drop, dt));
-        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"),
-                     apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"), latency_jpeg_ms);
+        metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.node_latency_ms"),
+                     apps::stage_node_latency_ms(latency_jpeg_ms, latency_source_ms));
         if (nullptr != jdec)
         {
             std::string sz;
@@ -309,6 +317,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      static_cast<int64_t>(enc_q_depth));
         metric_store(*g_pipeline_metrics.get_metric("encoder_queue.latency_ms"),
                      enc_q_latency_ms);
+        metric_store(*g_pipeline_metrics.get_metric("encoder_queue.node_latency_ms"),
+                     apps::stage_node_latency_ms(latency_enc_in_ms, latency_jpeg_ms));
 
         metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_fps"), enc_in_fps);
         metric_store(*g_pipeline_metrics.get_metric("h264_encoder.dropped_fps"),
@@ -320,8 +330,11 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      static_cast<int64_t>(qp_val));
         if (nullptr != enc)
         {
+            const double enc_cumulative_ms = query_component_latency_ms(*enc);
             metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"),
-                         query_component_latency_ms(*enc));
+                         enc_cumulative_ms);
+            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.node_latency_ms"),
+                         apps::stage_node_latency_ms(latency_enc_out_ms, latency_enc_in_ms));
         }
 
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
@@ -402,16 +415,12 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_fps"), dec_out_fps);
         metric_store(*g_pipeline_metrics.get_metric("h264_decoder.out_kbps"),
                      dec_nv12_out_kbps);
-        if (nullptr != dec)
-        {
-            metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
-                         query_component_latency_ms(*dec));
-        }
-        else
-        {
-            metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
-                         apps::g_latency_dec_out_ms.load(std::memory_order_relaxed));
-        }
+        const double dec_cumulative_ms =
+            nullptr != dec ? query_component_latency_ms(*dec) : latency_dec_out_ms;
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.latency_ms"),
+                     dec_cumulative_ms);
+        metric_store(*g_pipeline_metrics.get_metric("h264_decoder.node_latency_ms"),
+                     apps::stage_node_latency_ms(latency_dec_out_ms, latency_dec_in_ms));
     }
 
     if (nullptr != preview)
@@ -422,6 +431,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      sink_drop_fps);
         metric_store(*g_pipeline_metrics.get_metric("sdl_sink.render_fps"), present_fps);
         metric_store(*g_pipeline_metrics.get_metric("sdl_sink.latency_ms"), glass_ms);
+        metric_store(*g_pipeline_metrics.get_metric("sdl_sink.node_latency_ms"),
+                     apps::stage_node_latency_ms(glass_ms, latency_dec_out_ms));
     }
 #endif  // !VSTREAMER_BENCH_TX_ONLY
 
