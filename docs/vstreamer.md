@@ -161,9 +161,9 @@ part of `v4l2_source`.
 | `backend`, `status` | Q | informational |
 
 **`h264_encoder_cedar`** (libav `h264_cedrus`, width multiple of 32) and
-**`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
+**`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (0..52,
 Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
-`status`.
+`status`, `latency_ms` (capture → encoded AU when input carried `capture_mono_ns`).
 
 **`h264_decoder_mpp`** — Rockchip MPP H.264 → NV12. Lock order `mu` → `mpp_io_mu`.
 

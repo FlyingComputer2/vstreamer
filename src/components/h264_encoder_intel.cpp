@@ -1,6 +1,7 @@
 #include "components/h264_encoder_intel.hpp"
 
 #include "core/key_util.hpp"
+#include "core/time_util.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -176,7 +177,7 @@ int h264_encoder_intel::nv12_size_locked() const
 
 void h264_encoder_intel::clear_out_locked()
 {
-    in_pts_q.clear();
+    in_meta_q.clear();
     out_q.clear();
 }
 
@@ -234,10 +235,12 @@ int h264_encoder_intel::drain_packets_locked()
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
         int64_t out_pts = pkt->pts;
-        if (!in_pts_q.empty())
+        int64_t out_capture_mono_ns = 0;
+        if (!in_meta_q.empty())
         {
-            out_pts = in_pts_q.front();
-            in_pts_q.pop_front();
+            out_pts = in_meta_q.front().pts;
+            out_capture_mono_ns = in_meta_q.front().capture_mono_ns;
+            in_meta_q.pop_front();
         }
         if (last_out_pts >= 0 && out_pts < last_out_pts)
         {
@@ -246,7 +249,18 @@ int h264_encoder_intel::drain_packets_locked()
         last_out_pts = out_pts;
         const bool key = h264_au_has_idr(buf, sz);
         frame au;
-        au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload));
+        au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload),
+                  out_capture_mono_ns);
+        if (out_capture_mono_ns > 0)
+        {
+            const int64_t now_ns = steady_mono_ns();
+            const double  ms =
+                static_cast<double>(now_ns - out_capture_mono_ns) / 1e6;
+            if (ms >= 0.0)
+            {
+                last_latency_ms = ms;
+            }
+        }
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
         cv.notify_one();
@@ -402,13 +416,14 @@ int h264_encoder_intel::codec_open_locked()
     low_power_live = resolved_lp;
     reopen_req = false;
     last_out_pts = -1;
+    last_latency_ms = 0.0;
     pending_idr = true;
     return 0;
 }
 
 void h264_encoder_intel::codec_close_locked()
 {
-    in_pts_q.clear();
+    in_meta_q.clear();
     if (ctx)
     {
         auto *c = static_cast<AVCodecContext *>(ctx);
@@ -586,7 +601,7 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     {
         return ret;
     }
-    in_pts_q.push_back(f.pts);
+    in_meta_q.push_back(in_frame_meta {f.pts, f.capture_mono_ns});
 
     return drain_packets_locked();
 }
@@ -908,6 +923,16 @@ int h264_encoder_intel::query(std::string_view key, std::string *value) const
     if (key == "backend" || key == "codec")
     {
         *value = "h264_vaapi";
+        return 0;
+    }
+    if (key == "latency_ms")
+    {
+        char buf[32];
+        if (std::snprintf(buf, sizeof(buf), "%.2f", last_latency_ms) < 0)
+        {
+            return -EINVAL;
+        }
+        *value = buf;
         return 0;
     }
     return -ENOTSUP;

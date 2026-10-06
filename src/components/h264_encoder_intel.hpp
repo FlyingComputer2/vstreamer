@@ -86,8 +86,17 @@ private:
     bool  pending_idr = false;
     int64_t last_out_pts = -1;
 
-    std::deque<int64_t> in_pts_q;
-    std::deque<frame>   out_q;
+    struct in_frame_meta
+    {
+        int64_t pts = 0;
+        int64_t capture_mono_ns = 0;
+    };
+
+    std::deque<in_frame_meta> in_meta_q;
+    std::deque<frame>         out_q;
+
+    /* Capture-to-encoded-AU (ms); updated when output carries capture_mono_ns. */
+    double last_latency_ms = 0.0;
 };
 
 }  // namespace vstreamer

@@ -3,11 +3,13 @@
 #include "core/data_packet.hpp"
 #include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
+#include "core/time_util.hpp"
 
 #include <gtest/gtest.h>
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 namespace
@@ -42,7 +44,8 @@ int cfg(vstreamer::component &c, const char *key, const char *val)
     return c.configure(key, val);
 }
 
-vstreamer::data_packet make_nv12_gradient(int w, int h, int64_t pts, int frame_idx)
+vstreamer::data_packet make_nv12_gradient(int w, int h, int64_t pts, int frame_idx,
+                                          int64_t capture_mono_ns = 0)
 {
     const size_t y_sz = static_cast<size_t>(w) * static_cast<size_t>(h);
     const size_t uv_sz = y_sz / 2U;
@@ -66,6 +69,7 @@ vstreamer::data_packet make_nv12_gradient(int w, int h, int64_t pts, int frame_i
     fd->width = w;
     fd->height = h;
     fd->pts = pts;
+    fd->capture_mono_ns = capture_mono_ns;
     fd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
     vstreamer::data_packet pkt;
     pkt.reset(std::move(fd));
@@ -210,6 +214,50 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
     const double bps2 = encode_window_bps(enc, k_w, k_h, 300, 30);
     ASSERT_GT(bps2, 0.0);
     EXPECT_NEAR(bps2, 15000000.0, 15000000.0 * 0.20);
+
+    enc.close();
+}
+
+TEST(H264EncoderIntelHwTest, CaptureMonoPreservedOnAccessUnit)
+{
+    vstreamer::h264_encoder_intel enc;
+    if (cfg(enc, "size", "416x240") < 0 || cfg(enc, "fps", "30") < 0 || cfg(enc, "rc", "cqp") < 0 ||
+        cfg(enc, "qp", "36") < 0 || cfg(enc, "gop", "30") < 0)
+    {
+        GTEST_SKIP() << "configure failed";
+    }
+    if (enc.open() < 0)
+    {
+        GTEST_SKIP() << "VA-API encoder open failed";
+    }
+
+    const int64_t cap_mono = vstreamer::steady_mono_ns() - 25'000'000LL;
+    const vstreamer::data_packet in = make_nv12_gradient(416, 240, 0, 0, cap_mono);
+    ASSERT_EQ(enc.input(0, in), 0);
+
+    vstreamer::data_packet out;
+    bool                 got_au = false;
+    for (int attempt = 0; attempt < 80; ++attempt)
+    {
+        const int orv = enc.output(0, out, 50);
+        if (orv == -EAGAIN)
+        {
+            continue;
+        }
+        ASSERT_EQ(orv, 0);
+        got_au = true;
+        break;
+    }
+    ASSERT_TRUE(got_au);
+    const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
+    EXPECT_GT(f.capture_mono_ns, 0);
+    EXPECT_EQ(f.capture_mono_ns, cap_mono);
+
+    std::string lat;
+    ASSERT_EQ(enc.query("latency_ms", &lat), 0);
+    const double lat_ms = std::strtod(lat.c_str(), nullptr);
+    EXPECT_GE(lat_ms, 20.0);
+    EXPECT_LE(lat_ms, 500.0);
 
     enc.close();
 }
