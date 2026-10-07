@@ -7,6 +7,7 @@
 #endif
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -89,9 +90,11 @@ class v4l2_source : public component_source
     int      caps_h = 0;
     uint64_t out_seq_ = 0;
 
-    std::thread       poll_thread_;
-    std::atomic<bool> poll_stop_ {false};
-    bool              poll_edge_notified_ = false;
+    std::thread              poll_thread_;
+    std::atomic<bool>        poll_stop_ {false};
+    bool                     poll_edge_notified_ = false;
+    std::condition_variable  poll_edge_cv_;
+    int                      poll_probe_fd_ = -1;
 
     double cap_retry_due = 0;
 

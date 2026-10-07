@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 namespace
@@ -82,4 +83,28 @@ TEST(V4l2SourceTest, PollWatcherIdleCpuWhileCaptureUnavailable)
     src.close();
     const uint64_t delta = t1 - t0;
     EXPECT_LT(delta, 50U) << "poll watcher should sleep when capture fd is unavailable (jiffies)";
+}
+
+TEST(V4l2SourceTest, PollWatcherIdleCpuWhileProbeReadableNotConsumed)
+{
+    int pipe_fds[2] = {-1, -1};
+    ASSERT_EQ(0, ::pipe(pipe_fds));
+
+    vstreamer::v4l2_source src;
+    (void)src.configure("device", "/dev/video255_nonexistent");
+    char fd_buf[16];
+    std::snprintf(fd_buf, sizeof(fd_buf), "%d", pipe_fds[0]);
+    ASSERT_EQ(0, src.configure("poll_probe_fd", fd_buf));
+    ASSERT_EQ(0, src.open());
+    ASSERT_EQ(1, ::write(pipe_fds[1], "x", 1));
+
+    const uint64_t t0 = sum_thread_utime_jiffies();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    const uint64_t t1 = sum_thread_utime_jiffies();
+    src.close();
+    ::close(pipe_fds[0]);
+    ::close(pipe_fds[1]);
+
+    const uint64_t delta = t1 - t0;
+    EXPECT_LT(delta, 80U) << "poll watcher should block on edge cv while probe fd stays readable";
 }

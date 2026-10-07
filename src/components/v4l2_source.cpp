@@ -204,20 +204,39 @@ void v4l2_source::poll_watcher_main()
     while (!poll_stop_.load(std::memory_order_acquire))
     {
         int local_fd = -1;
+        int probe_fd = -1;
         {
-            std::lock_guard<std::mutex> lock(mu);
+            std::unique_lock<std::mutex> lock(mu);
+            if (poll_edge_notified_)
+            {
+                poll_edge_cv_.wait_for(lock, std::chrono::milliseconds(200),
+                                       [this] {
+                                           return poll_stop_.load(std::memory_order_acquire) ||
+                                                  !poll_edge_notified_;
+                                       });
+                if (poll_stop_.load(std::memory_order_acquire))
+                {
+                    break;
+                }
+                if (poll_edge_notified_)
+                {
+                    continue;
+                }
+            }
             if (capture_open && fd >= 0)
             {
                 local_fd = fd;
             }
+            probe_fd = poll_probe_fd_;
         }
-        if (local_fd < 0)
+        const int poll_fd = local_fd >= 0 ? local_fd : probe_fd;
+        if (poll_fd < 0)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
         struct pollfd pfd {};
-        pfd.fd = local_fd;
+        pfd.fd = poll_fd;
         pfd.events = POLLIN;
         const int pr = ::poll(&pfd, 1, 200);
         if (pr > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0)
@@ -806,6 +825,7 @@ int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
             out.sdu = std::move(payload);
             ret = 0;
             poll_edge_notified_ = false;
+            poll_edge_cv_.notify_all();
         }
     }
     else
@@ -884,6 +904,20 @@ int v4l2_source::configure(std::string_view key, std::string_view value)
             return -EINVAL;
         }
         fps = static_cast<int>(n);
+        return 0;
+    }
+    if (key == "poll_probe_fd")
+    {
+        if (source_open)
+        {
+            return -EBUSY;
+        }
+        int64_t n = 0;
+        if (key_parse_i64(v, &n) < 0 || n < -1)
+        {
+            return -EINVAL;
+        }
+        poll_probe_fd_ = static_cast<int>(n);
         return 0;
     }
     if (key.rfind("ctrl.", 0) == 0 || key.rfind("v4l2-ctl/", 0) == 0)
