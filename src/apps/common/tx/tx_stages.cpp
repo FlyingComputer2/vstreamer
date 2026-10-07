@@ -1,4 +1,4 @@
-/* tx_stages.cpp — PDU-native stage threads (legacy packet API at encoder/pay bridge). */
+/* tx_stages.cpp — PDU-native stage threads. */
 
 #include "apps/common/tx/tx_stages.hpp"
 
@@ -110,28 +110,27 @@ bool handle_source_poll_error(int got)
 
 bool forward_encoded_au(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag, data_packet &pkt)
 {
-    apps::log_stage_latency("enc_out", pkt);
+    log_stage_latency("enc_out", pkt);
     if (pay.input(0, pkt) < 0)
     {
         return false;
     }
-    bool sent = false;
     data_packet sock_pkt;
     while (g_run.load(std::memory_order_relaxed) && pay.output(0, sock_pkt, 0) == 0)
     {
         if (sender.input(0, sock_pkt) == 0)
         {
             diag.tx_rtp_sock++;
-            sent = true;
         }
     }
-    return sent;
+    return true;
 }
 
-void forward_aus_and_note_emitted(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag,
-                                  std::vector<data_packet> &aus)
+void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
+                   bench_diag &diag)
 {
-    for (data_packet &pkt : aus)
+    data_packet pkt;
+    while (g_run.load(std::memory_order_relaxed) && enc.output(0, pkt, 0) == 0)
     {
         const frame_data &f = data_packet::cast<frame_data>(pkt);
         diag.tx_enc_out_bytes.fetch_add(f.buf.size(), std::memory_order_relaxed);
@@ -139,47 +138,36 @@ void forward_aus_and_note_emitted(rtp_h264_pay &pay, stream_sender &sender, benc
     }
 }
 
-void pull_encoded_aus(apps::tx::encoder_t &enc, std::vector<data_packet> &out)
-{
-    data_packet pkt;
-    while (g_run.load(std::memory_order_relaxed) && enc.output(0, pkt, 0) == 0)
-    {
-        out.push_back(std::move(pkt));
-    }
-}
-
-void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
-                   bench_diag &diag)
-{
-    std::vector<data_packet> aus;
-    pull_encoded_aus(enc, aus);
-    forward_aus_and_note_emitted(pay, sender, diag, aus);
-}
-
 bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
-                            bench_diag *diag, data_packet &nv12, bool *accepted)
+                            bench_diag *diag, component_pdu &nv12, bool *accepted)
 {
     if (nullptr != accepted)
     {
         *accepted = false;
     }
+    auto *enc_in = dynamic_cast<pdu_input *>(enc);
+    if (nullptr == enc_in)
+    {
+        return false;
+    }
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     bool       got_enc_in = false;
     while (g_run.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline)
     {
-        const int enc_in = enc->input(0, nv12);
-        if (0 == enc_in)
+        component_pdu attempt = nv12;
+        const int     enc_in_r = enc_in->input(std::move(attempt));
+        if (0 == enc_in_r)
         {
             diag->tx_nv12++;
             got_enc_in = true;
-            apps::log_stage_latency("enc_in", nv12);
+            log_pdu_stage_latency("enc_in", nv12);
             break;
         }
-        if (-ECANCELED == enc_in)
+        if (-ECANCELED == enc_in_r)
         {
             return false;
         }
-        if (-EAGAIN == enc_in)
+        if (-EAGAIN == enc_in_r)
         {
             drain_encoder(*enc, *pay, *sender, *diag);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -388,10 +376,8 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     sender->set_wakeup(wake);
     std::unordered_map<uint64_t, int64_t> queue_in_mono_ns;
     nv12_pipe->bind_enqueue_mono_tracker(&queue_in_mono_ns);
-    apps::pdu_to_legacy                   to_legacy;
-    component_pdu                         nv12_pdu;
-    data_packet                           nv12;
-    bool                                  holding = false;
+    component_pdu nv12_pdu;
+    bool          holding = false;
     uint64_t                              last_seq = 0;
     bool                                  have_seq = false;
     while (g_run.load(std::memory_order_relaxed))
@@ -408,8 +394,6 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
             note_pdu_sequence_gap(nv12_pdu.seq, last_seq, have_seq, nullptr);
             if (is_caps(nv12_pdu.sdu_type))
             {
-                /* Keep pdu_to_legacy caps state in sync with enc PDU caps. */
-                (void)to_legacy.convert(nv12_pdu, &nv12);
                 if (nullptr != enc_pdu_in)
                 {
                     (void)enc_pdu_in->input(std::move(nv12_pdu));
@@ -418,23 +402,16 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
                 continue;
             }
             record_pdu_edge_latency_ms("enc_in", nv12_pdu, &queue_in_mono_ns);
-            log_pdu_stage_latency("enc_in", nv12_pdu);
-            const int cr = to_legacy.convert(nv12_pdu, &nv12);
-            if (0 != cr)
-            {
-                continue;
-            }
             holding = true;
         }
         bool accepted = false;
-        if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12, &accepted))
+        if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12_pdu, &accepted))
         {
             break;
         }
         if (accepted)
         {
             holding = false;
-            nv12.release();
             continue;
         }
         drain_encoder(*enc, *pay, *sender, *diag);

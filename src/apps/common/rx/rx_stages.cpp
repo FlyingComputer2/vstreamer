@@ -70,20 +70,27 @@ void drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, ben
     }
 }
 
-int feed_decoder_legacy(h264_decoder_mpp *dec, data_packet &au, present_pdu_queue *present_queue,
-                        bench_diag &diag)
+int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queue *present_queue,
+                     bench_diag &diag)
 {
     if (ensure_decoder_open(dec) < 0)
     {
         return -EINVAL;
     }
+    auto *dec_in = dynamic_cast<pdu_input *>(dec);
+    if (nullptr == dec_in)
+    {
+        return -ENOTSUP;
+    }
+    const size_t bytes = pdu.sdu.size();
     for (int attempt = 0; g_run.load(std::memory_order_relaxed) && attempt < 48; attempt++)
     {
-        const int r = dec->input(0, au);
+        component_pdu attempt_pdu = pdu;
+        const int     r = dec_in->input(std::move(attempt_pdu));
         if (0 == r)
         {
             diag.rx_dec_in_ok++;
-            diag.rx_dec_in_bytes += packet_frame_bytes(au);
+            diag.rx_dec_in_bytes += bytes;
             return 0;
         }
         if (-ECANCELED == r)
@@ -133,8 +140,6 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
     present_queue->bind_wakeup(wake);
     auto *sink_pdu = dynamic_cast<pdu_input *>(display);
     component &deadline_owner = *display;
-    apps::pdu_to_legacy to_legacy;
-    data_packet         legacy;
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
@@ -142,21 +147,22 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
         {
             continue;
         }
-        if (is_caps(pdu.sdu_type))
+        if (nullptr != sink_pdu)
         {
-            (void)to_legacy.convert(pdu, &legacy);
-            if (nullptr != sink_pdu)
+            log_pdu_stage_latency("present", pdu);
+            if (sink_pdu->input(std::move(pdu)) == 0)
             {
-                (void)sink_pdu->input(std::move(pdu));
+                diag->rx_present_ok++;
+            }
+            else
+            {
+                diag->rx_present_err++;
             }
             continue;
         }
-        if (to_legacy.convert(pdu, &legacy) != 0)
-        {
-            continue;
-        }
-        const int pr = display->input(0, legacy);
-        if (0 == pr)
+        apps::pdu_to_legacy to_legacy;
+        data_packet         legacy;
+        if (to_legacy.convert(pdu, &legacy) == 0 && display->input(0, legacy) == 0)
         {
             diag->rx_present_ok++;
             log_stage_latency("present", legacy);
@@ -224,11 +230,8 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
     owner->set_wakeup(wake);
     au_in_queue->bind_wakeup(wake);
     present_queue->bind_wakeup(wake);
-    auto *dec_pdu_in = dynamic_cast<pdu_input *>(dec);
-    apps::pdu_to_legacy to_legacy;
-    component_pdu       pdu;
-    data_packet         legacy;
-    bool                holding = false;
+    component_pdu pdu;
+    bool          holding = false;
     uint64_t            last_seq = 0;
     bool                have_seq = false;
     while (g_run.load(std::memory_order_relaxed))
@@ -248,7 +251,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
             if (is_caps(pdu.sdu_type))
             {
-                (void)to_legacy.convert(pdu, &legacy);
+                auto *dec_pdu_in = dynamic_cast<pdu_input *>(dec);
                 if (nullptr != dec_pdu_in)
                 {
                     (void)dec_pdu_in->input(std::move(pdu));
@@ -257,18 +260,12 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
                 continue;
             }
             log_pdu_stage_latency("dec_in", pdu);
-            const int cr = to_legacy.convert(pdu, &legacy);
-            if (0 != cr)
-            {
-                continue;
-            }
             holding = true;
         }
-        const int r = feed_decoder_legacy(dec, legacy, present_queue, *diag);
+        const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag);
         if (0 == r)
         {
             holding = false;
-            legacy.release();
             drain_dec_pdus(dec, present_queue, *diag);
             continue;
         }
@@ -282,7 +279,6 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             break;
         }
         holding = false;
-        legacy.release();
     }
     drain_dec_pdus(dec, present_queue, *diag);
 }
