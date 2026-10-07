@@ -5,6 +5,11 @@ Pipeline stages exchange **`component_pdu`** (`core/component_pdu.hpp`): a typed
 (`CAPS_VIDEO_RAW`, `CAPS_VIDEO_CODED`, …) describe geometry and codec parameters via
 `sdu_caps.hpp`.
 
+When a component accepts input caps (`CAPS_VIDEO_*`), it emits matching output caps on its
+output port even if the geometry is unchanged from its last output caps. Downstream stages use
+that to resync after source switches or other paths that changed size without this component
+seeing new input caps.
+
 Receiver RX/gap counters are not carried in PDUs; they are sent on the reverse UDP
 link-report path and surfaced as `stream_sender.peer_*` metrics (see [pipeline-flow.md](pipeline-flow.md)).
 

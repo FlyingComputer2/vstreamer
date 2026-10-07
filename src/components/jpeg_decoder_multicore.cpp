@@ -120,11 +120,6 @@ void jpeg_decoder_multicore::maybe_emit_output_caps_locked(uint64_t ts_us)
     raw.height = input_caps_.height;
     raw.hor_stride = input_caps_.width;
     raw.ver_stride = input_caps_.height;
-    if (have_output_caps_ && raw.width == output_caps_.width && raw.height == output_caps_.height &&
-        raw.hor_stride == output_caps_.hor_stride && raw.ver_stride == output_caps_.ver_stride)
-    {
-        return;
-    }
     output_caps_ = raw;
     have_output_caps_ = true;
     component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, raw, ts_us, 0);
