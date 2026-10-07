@@ -547,18 +547,25 @@ int h264_decoder_mpp::fetch_one_mpp_frame(int timeout_ms)
 
 int h264_decoder_mpp::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
     {
-        return 0;
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return 0;
+        }
+        const int r = ensure_decoder_locked();
+        if (r < 0)
+        {
+            return r;
+        }
+        opened = true;
+        cancel_io = false;
     }
-    int r = ensure_decoder_locked();
-    if (r < 0)
+    drain_stop_.store(false, std::memory_order_relaxed);
+    if (!drain_thread_.joinable())
     {
-        return r;
+        drain_thread_ = std::thread([this]() { drain_thread_main(); });
     }
-    opened = true;
-    cancel_io = false;
     return 0;
 }
 
@@ -570,6 +577,12 @@ void h264_decoder_mpp::cancel_pending_io()
 void h264_decoder_mpp::close()
 {
     cancel_pending_io();
+    drain_stop_.store(true, std::memory_order_relaxed);
+    notify_wakeup();
+    if (drain_thread_.joinable())
+    {
+        drain_thread_.join();
+    }
     std::lock_guard<std::mutex> lock(mu);
     clear_pending_locked();
     free_decoder_locked();
@@ -687,7 +700,6 @@ int h264_decoder_mpp::input_pdu_locked(component_pdu &&in)
     {
         return -EIO;
     }
-    drain_mpp_to_ready(0);
     return 0;
 }
 
