@@ -1,8 +1,12 @@
 #include "apps/common/tx/source_selector.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
 #include "core/data_packet.hpp"
 #include "core/packet_types.hpp"
+#include "core/pdu_output.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
 
 #include <gtest/gtest.h>
 
@@ -14,12 +18,13 @@
 namespace
 {
 
-class fake_source : public vstreamer::component_source
+class fake_source : public vstreamer::component_source, public vstreamer::pdu_output
 {
 public:
     int open_rc = 0;
     int next_output = -ENODEV;
     vstreamer::media_kind_e frame_kind = vstreamer::media_kind_e::MJPEG;
+    vstreamer::sdu_type_e pdu_kind = vstreamer::sdu_type_e::MJPEG;
 
     void set_output_sequence(std::vector<int> seq)
     {
@@ -59,6 +64,26 @@ public:
             out.reset(std::move(fd));
         }
         return code;
+    }
+
+    int output(vstreamer::component_pdu &out) override
+    {
+        int code = next_output;
+        if (!output_seq.empty())
+        {
+            code = output_seq[output_idx % output_seq.size()];
+            output_idx++;
+        }
+        if (0 != code)
+        {
+            return code;
+        }
+        out.ts_us = 1;
+        out.seq = 0;
+        out.port = 0;
+        out.flags = 0;
+        out.sdu_type = pdu_kind;
+        return 0;
     }
 
     int configure(std::string_view /*key*/, std::string_view /*value*/) override
@@ -201,6 +226,34 @@ TEST(SourceSelectorTest, NonEnodevErrorDoesNotSwitch)
     ASSERT_EQ(0, sel.open());
     EXPECT_EQ(-EIO, sel.poll_once(0));
     EXPECT_EQ(0, switch_count);
+}
+
+TEST(SourceSelectorTest, SwitchEmitsCapsPduForNoiseFallback)
+{
+    fake_source camera;
+    fake_source noise;
+    noise.pdu_kind = vstreamer::sdu_type_e::NV12;
+    camera.set_output_sequence({-ENODEV});
+    noise.next_output = 0;
+
+    int caps_count = 0;
+    vstreamer::apps::tx::source_selector sel(
+        camera, noise, 320, 240, 25, {}, {}, {});
+    sel.set_push_pdu_handler([&](vstreamer::component_pdu &&pdu) {
+        if (vstreamer::is_caps(pdu.sdu_type))
+        {
+            caps_count++;
+            vstreamer::video_raw_caps caps {};
+            ASSERT_EQ(0, vstreamer::read_caps(pdu, &caps));
+            EXPECT_EQ(320, caps.width);
+            EXPECT_EQ(240, caps.height);
+        }
+    });
+
+    ASSERT_EQ(0, sel.open());
+    EXPECT_EQ(0, caps_count);
+    ASSERT_EQ(0, sel.poll_once(0));
+    EXPECT_EQ(1, caps_count);
 }
 
 TEST(SourceSelectorTest, NoFlappingMoreThanOneSwitchPer500ms)

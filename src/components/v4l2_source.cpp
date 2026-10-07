@@ -1,8 +1,10 @@
 #include "components/v4l2_source.hpp"
 
-#include "core/time_util.hpp"
-
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
+#include "core/time_util.hpp"
 
 #include <cctype>
 #include <cerrno>
@@ -14,6 +16,7 @@
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <poll.h>
 #include <sys/select.h>
 #include <unistd.h>
 
@@ -144,6 +147,21 @@ bool eq_ci(std::string_view a, std::string_view b)
 
 }  // namespace
 
+const std::vector<port_desc> &v4l2_source::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry coded {};
+        coded.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(coded);
+        port_caps_entry mjpeg {};
+        mjpeg.sdu_type = sdu_type_e::MJPEG;
+        p.caps.push_back(mjpeg);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
 v4l2_source::v4l2_source()
 {
     maps.assign(k_nbufs, nullptr);
@@ -153,6 +171,74 @@ v4l2_source::v4l2_source()
 v4l2_source::~v4l2_source()
 {
     close();
+}
+
+void v4l2_source::stop_poll_watcher_locked()
+{
+    poll_stop_.store(true, std::memory_order_release);
+    if (poll_thread_.joinable())
+    {
+        poll_thread_.join();
+    }
+    poll_stop_.store(false, std::memory_order_release);
+}
+
+void v4l2_source::start_poll_watcher_locked()
+{
+    stop_poll_watcher_locked();
+    if (!source_open)
+    {
+        return;
+    }
+    poll_thread_ = std::thread([this] { poll_watcher_main(); });
+}
+
+void v4l2_source::poll_watcher_main()
+{
+    while (!poll_stop_.load(std::memory_order_acquire))
+    {
+        int local_fd = -1;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (capture_open && fd >= 0)
+            {
+                local_fd = fd;
+            }
+        }
+        if (local_fd < 0)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        struct pollfd pfd {};
+        pfd.fd = local_fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, 100);
+        if (pr > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0)
+        {
+            notify_wakeup();
+        }
+    }
+}
+
+bool v4l2_source::coded_caps_match_locked() const
+{
+    return caps_w == live_w && caps_h == live_h && caps_w > 0 && caps_h > 0;
+}
+
+int v4l2_source::emit_coded_caps_locked(component_pdu &out)
+{
+    video_coded_caps caps {};
+    caps.width = live_w;
+    caps.height = live_h;
+    caps.fps_num = fps > 0 ? fps : 30;
+    caps.fps_den = 1;
+    const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000LL);
+    out = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, ts_us, 0);
+    out.seq = out_seq_++;
+    caps_w = live_w;
+    caps_h = live_h;
+    return 0;
 }
 
 std::string v4l2_source::name() const
@@ -191,6 +277,8 @@ void v4l2_source::capture_close_locked()
     capture_open = false;
     live_w = 0;
     live_h = 0;
+    caps_w = 0;
+    caps_h = 0;
 }
 
 int v4l2_source::capture_open_locked(bool log_fail)
@@ -572,21 +660,26 @@ int v4l2_source::open()
                      device.c_str(), width, height, fps);
     }
     source_open = true;
+    start_poll_watcher_locked();
     return 0;
 }
 
 void v4l2_source::interrupt_shutdown()
 {
     std::lock_guard<std::mutex> lock(mu);
+    stop_poll_watcher_locked();
     capture_close_locked();
 }
 
 void v4l2_source::close()
 {
-    interrupt_shutdown();
-    std::lock_guard<std::mutex> lock(mu);
-    source_open = false;
-    cap_retry_due = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        stop_poll_watcher_locked();
+        capture_close_locked();
+        source_open = false;
+        cap_retry_due = 0;
+    }
 }
 
 bool v4l2_source::maybe_retry_capture_locked()
@@ -710,6 +803,51 @@ int v4l2_source::dequeue_capture_locked(frame &out)
 
     xioctl(fd, VIDIOC_QBUF, &buf);
     return ret;
+}
+
+int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
+{
+    frame fr;
+    const int r = dequeue_capture_locked(fr);
+    if (r < 0)
+    {
+        return r;
+    }
+    out.ts_us = fr.capture_mono_ns() > 0
+                    ? static_cast<uint64_t>(fr.capture_mono_ns() / 1000LL)
+                    : 0ULL;
+    out.seq = out_seq_++;
+    out.sdu_type = sdu_type_e::MJPEG;
+    out.port = 0;
+    out.flags = 0;
+    if (fr.key())
+    {
+        out.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+    }
+    out.sdu = fr.payload_buffer();
+    return 0;
+}
+
+int v4l2_source::output(component_pdu &out)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!source_open)
+    {
+        return -EBADF;
+    }
+    if (!capture_open)
+    {
+        maybe_retry_capture_locked();
+    }
+    if (!capture_open)
+    {
+        return -ENODEV;
+    }
+    if (!coded_caps_match_locked())
+    {
+        return emit_coded_caps_locked(out);
+    }
+    return dequeue_capture_pdu_locked(out);
 }
 
 int v4l2_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
@@ -929,6 +1067,11 @@ int v4l2_source::query(std::string_view key, std::string *value) const
         std::snprintf(buf, sizeof(buf), "%d", h);
         *value = buf;
         return 0;
+    }
+    int r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
     }
     if (key == "v4l2-ctl")
     {

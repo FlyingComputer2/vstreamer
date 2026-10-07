@@ -6,21 +6,26 @@
 #error "v4l2_source requires -DENABLE_V4L2_SOURCE=ON"
 #endif
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
+#include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
+#include "core/pdu_output.hpp"
+#include "core/port_caps.hpp"
 
 namespace vstreamer
 {
 
 /* UVC MJPEG mmap capture. */
-class v4l2_source : public component_source
+class v4l2_source : public component_source, public pdu_output
 {
    public:
     static constexpr unsigned k_nbufs = 8;
@@ -41,6 +46,7 @@ class v4l2_source : public component_source
     void interrupt_shutdown();
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
+    int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -55,7 +61,15 @@ class v4l2_source : public component_source
     int  list_ctrls_locked(std::string *out) const;
     static int wait_capture_fd(int fd, int timeout_ms);
     int        dequeue_capture_locked(frame &out);
+    int        dequeue_capture_pdu_locked(component_pdu &out);
+    int        emit_coded_caps_locked(component_pdu &out);
+    bool       coded_caps_match_locked() const;
+    void       poll_watcher_main();
+    void       start_poll_watcher_locked();
+    void       stop_poll_watcher_locked();
     bool       maybe_retry_capture_locked();
+
+    static const std::vector<port_desc> &output_ports();
 
     mutable std::mutex mu;
 
@@ -75,6 +89,13 @@ class v4l2_source : public component_source
     int     live_w = 0;
     int     live_h = 0;
     int64_t pts = 0;
+
+    int      caps_w = 0;
+    int      caps_h = 0;
+    uint64_t out_seq_ = 0;
+
+    std::thread       poll_thread_;
+    std::atomic<bool> poll_stop_ {false};
 
     double cap_retry_due = 0;
 

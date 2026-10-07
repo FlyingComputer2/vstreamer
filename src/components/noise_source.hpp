@@ -14,14 +14,17 @@
 #include <string_view>
 #include <vector>
 
+#include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
 #include "core/noise_fft2.hpp"
+#include "core/pdu_output.hpp"
+#include "core/port_caps.hpp"
 
 namespace vstreamer
 {
 
 /* Synthetic NV12: bandwidth-shaped spectrum → SIMD IFFT (PFFFT). Default 416x240@30. */
-class noise_source : public component_source
+class noise_source : public component_source, public pdu_output
 {
 public:
     noise_source();
@@ -39,12 +42,19 @@ public:
     void stop_pregenerate();
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
+    int output(component_pdu &out) override;
+
+    [[nodiscard]] int64_t next_deadline_ns() const override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
 private:
     int  fill_nv12_locked(uint8_t *dst, size_t dst_sz);
+    int  emit_raw_caps_locked(component_pdu &out);
+    bool raw_caps_match_locked() const;
+    void advance_pace_locked();
+    bool pace_ready_locked() const;
     void pace_unlocked(int fps, int timeout_ms);
     void invalidate_pregenerated_locked();
     int  ensure_pregenerated_locked();
@@ -66,8 +76,13 @@ private:
     int noise_block_size = 0;
     int pregenerate_count = 0;
 
-    int64_t pts = 0;
-    double  due_sec = 0;
+    double due_sec = 0;
+
+    int      caps_w = 0;
+    int      caps_h = 0;
+    uint64_t out_seq_ = 0;
+
+    static const std::vector<port_desc> &output_ports();
     uint32_t rng = 1;
 
     std::vector<uint8_t> scratch_chroma;
