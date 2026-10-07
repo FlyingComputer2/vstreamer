@@ -4,6 +4,9 @@
 #if defined(ENABLE_H264_ENCODER_INTEL)
 #include "components/h264_encoder_intel.hpp"
 #endif
+#if defined(ENABLE_H264_ENCODER_CEDAR)
+#include "components/h264_encoder_cedar.hpp"
+#endif
 
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
@@ -118,6 +121,27 @@ TEST(H264EncoderIntelTest, CapsRejectionPdu)
     if (enc.open() < 0)
     {
         GTEST_SKIP() << "VAAPI encoder unavailable on this host";
+    }
+
+    vstreamer::component_pdu bad_caps = make_raw_caps(640, 480);
+    EXPECT_EQ(-ENOTSUP, enc.input(std::move(bad_caps)));
+    EXPECT_EQ(-ENOTSUP, enc.input(make_nv12_pdu(320, 240)));
+
+    vstreamer::component_pdu good_caps = make_raw_caps(320, 240);
+    EXPECT_EQ(0, enc.input(std::move(good_caps)));
+    EXPECT_EQ(0, enc.input(make_nv12_pdu(320, 240)));
+    enc.close();
+}
+#endif
+
+#if defined(ENABLE_H264_ENCODER_CEDAR)
+TEST(H264EncoderCedarTest, CapsRejectionPdu)
+{
+    vstreamer::h264_encoder_cedar enc;
+    ASSERT_EQ(0, enc.configure("size", "320x240"));
+    if (enc.open() < 0)
+    {
+        GTEST_SKIP() << "Cedar encoder unavailable on this host";
     }
 
     vstreamer::component_pdu bad_caps = make_raw_caps(640, 480);
