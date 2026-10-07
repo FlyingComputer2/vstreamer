@@ -36,6 +36,8 @@ int query_encoder_cbr_bps(vstreamer::component_coder &enc);
 void sync_tx_cumulative_counters(const vstreamer::test_app::bench_diag &d,
                                 vstreamer::stream_sender *sender);
 
+void publish_tx_latency_metrics(vstreamer::component_coder *enc);
+
 }  // namespace vstreamer::apps::tx
 
 #endif

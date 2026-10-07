@@ -245,6 +245,12 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 #if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)
     apps::rx::publish_latency_metrics(glass_ms);
 #endif
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
+    if (nullptr != sender)
+    {
+        apps::tx::publish_tx_latency_metrics(enc);
+    }
+#endif
 
 #if defined(ENABLE_STREAM_RECEIVER)
     const uint64_t fec_recovered =
@@ -316,8 +322,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      static_cast<int64_t>(qp_val));
         if (nullptr != enc)
         {
-            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"),
-                         query_component_latency_ms(*enc));
+            double enc_lat_ms =
+                apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+            const double queried = query_component_latency_ms(*enc);
+            if (queried > 0.0)
+            {
+                enc_lat_ms = queried;
+            }
+            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"), enc_lat_ms);
         }
 
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
@@ -527,6 +539,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
     if (nullptr != sender)
     {
         apps::tx::sync_sender_peer_link_metrics_live(*sender);
+        apps::tx::publish_tx_latency_metrics(enc);
     }
 #endif
 #if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)

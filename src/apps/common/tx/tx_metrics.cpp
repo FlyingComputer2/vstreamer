@@ -1,7 +1,9 @@
 #include "apps/common/tx/tx_metrics.hpp"
 
 #include "apps/common/pipeline_state.hpp"
+#include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/tx_state.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -292,6 +294,27 @@ int query_encoder_cbr_bps(component_coder &enc)
         return -1;
     }
     return std::atoi(val.c_str());
+}
+
+void publish_tx_latency_metrics(component_coder *enc)
+{
+    const double jpeg_ms = apps::g_latency_jpeg_ms.load(std::memory_order_relaxed);
+    const double enc_in_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    const double enc_out_ms = apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"), jpeg_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"), enc_in_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"), enc_out_ms);
+    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"), jpeg_ms);
+    double enc_lat_ms = enc_out_ms;
+    if (nullptr != enc)
+    {
+        const double queried = test_app::query_component_latency_ms(*enc);
+        if (queried > 0.0)
+        {
+            enc_lat_ms = queried;
+        }
+    }
+    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"), enc_lat_ms);
 }
 
 }  // namespace vstreamer::apps::tx
