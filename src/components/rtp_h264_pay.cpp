@@ -67,25 +67,9 @@ std::string rtp_h264_pay::name() const
     return "rtp_h264_pay";
 }
 
-media_kind_e rtp_h264_pay::input_kind() const
-{
-    return media_kind_e::H264;
-}
 
-media_kind_e rtp_h264_pay::output_kind() const
-{
-    return media_kind_e::UNKNOWN;
-}
 
-packet_kind_e rtp_h264_pay::input_packet_kind() const
-{
-    return packet_kind_e::FRAME;
-}
 
-packet_kind_e rtp_h264_pay::output_packet_kind() const
-{
-    return packet_kind_e::SOCK;
-}
 
 void rtp_h264_pay::rebuild_packer()
 {
@@ -185,39 +169,6 @@ int rtp_h264_pay::input(component_pdu &&in)
     return input_pdu_locked(std::move(in));
 }
 
-int rtp_h264_pay::input(uint8_t port, const data_packet &in)
-{
-    if (0 != port || in.get_type() != packet_kind_e::FRAME)
-    {
-        return -EINVAL;
-    }
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::H264)
-    {
-        return -EINVAL;
-    }
-    component_pdu pdu;
-    pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
-                                      : static_cast<uint64_t>(f.pts);
-    pdu.sdu_type = sdu_type_e::H264_AU;
-    pdu.port = 0;
-    pdu.sdu = f.buf;
-    if (f.key)
-    {
-        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-    }
-    std::lock_guard<std::mutex> lock(mu);
-    video_coded_caps caps {};
-    caps.width = f.width;
-    caps.height = f.height;
-    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, pdu.ts_us, 0);
-    const int     cr = input_pdu_locked(std::move(caps_pdu));
-    if (cr < 0)
-    {
-        return cr;
-    }
-    return input_pdu_locked(std::move(pdu));
-}
 
 int rtp_h264_pay::output(component_pdu &out)
 {
@@ -249,24 +200,6 @@ int rtp_h264_pay::output(component_pdu &out)
     return 0;
 }
 
-int rtp_h264_pay::output(uint8_t port, data_packet &out, int /*timeout_ms*/)
-{
-    if (0 != port)
-    {
-        return -EINVAL;
-    }
-    component_pdu pdu;
-    const int     r = output(pdu);
-    if (0 != r)
-    {
-        return r;
-    }
-    auto sd = std::make_unique<sock_data>();
-    sd->pts = static_cast<int64_t>(pdu.ts_us);
-    sd->buf = std::move(pdu.sdu);
-    out.reset(std::move(sd));
-    return 0;
-}
 
 int rtp_h264_pay::configure(std::string_view key, std::string_view value)
 {

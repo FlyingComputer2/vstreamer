@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string_view>
 
-#include "core/frame.hpp"
+#include "core/sdu_type.hpp"
 
 namespace vstreamer
 {
@@ -48,7 +48,7 @@ inline const char *output_mode_name(output_mode_e mode)
 }
 
 /* Exact lowercase; only nv12 for now. */
-inline int parse_output_format(std::string_view s, media_kind_e *out)
+inline int parse_output_format(std::string_view s, sdu_type_e *out)
 {
     if (nullptr == out)
     {
@@ -56,15 +56,15 @@ inline int parse_output_format(std::string_view s, media_kind_e *out)
     }
     if (s == "nv12")
     {
-        *out = media_kind_e::NV12;
+        *out = sdu_type_e::NV12;
         return 0;
     }
     return -EINVAL;
 }
 
-inline const char *output_format_name(media_kind_e kind)
+inline const char *output_format_name(sdu_type_e kind)
 {
-    if (kind == media_kind_e::NV12)
+    if (kind == sdu_type_e::NV12)
     {
         return "nv12";
     }

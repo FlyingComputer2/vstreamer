@@ -1,8 +1,6 @@
 #include "components/jpeg_decoder_multicore.hpp"
 
-#include "core/data_packet.hpp"
 #include "core/key_util.hpp"
-#include "core/packet_types.hpp"
 #include "core/sdu_type.hpp"
 #include "core/output_opts.hpp"
 #include "core/pix_convert.hpp"
@@ -146,16 +144,7 @@ std::string jpeg_decoder_multicore::name() const
     return "jpeg_decoder_multicore";
 }
 
-media_kind_e jpeg_decoder_multicore::input_kind() const
-{
-    return media_kind_e::MJPEG;
-}
 
-media_kind_e jpeg_decoder_multicore::output_kind() const
-{
-    std::lock_guard<std::mutex> lock(cfg_mu);
-    return output_format;
-}
 
 int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v, const job &j,
                                        component_pdu *out)
@@ -166,7 +155,7 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
 
     int          dw = 0;
     int          dh = 0;
-    media_kind_e fmt = media_kind_e::NV12;
+    sdu_type_e fmt = sdu_type_e::NV12;
     {
         std::lock_guard<std::mutex> lock(cfg_mu);
         if (have_input_caps_ && input_caps_.width > 0 && input_caps_.height > 0)
@@ -181,7 +170,7 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
         }
         fmt = output_format;
     }
-    if (fmt != media_kind_e::NV12)
+    if (fmt != sdu_type_e::NV12)
     {
         return -ENOTSUP;
     }
@@ -559,21 +548,6 @@ int jpeg_decoder_multicore::input(component_pdu &&in)
     if (!opened) { return -EBADF; }
     return input_pdu_locked(std::move(in));
 }
-int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
-{
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::MJPEG || f.buf.size() > k_max_jpeg) { return -EINVAL; }
-    component_pdu pdu;
-    pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL) : static_cast<uint64_t>(f.pts);
-    pdu.sdu_type = sdu_type_e::MJPEG; pdu.port = 0; pdu.sdu = f.buf;
-    video_coded_caps caps {}; caps.width = f.width > 0 ? f.width : width; caps.height = f.height > 0 ? f.height : height;
-    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, pdu.ts_us, 0);
-    std::lock_guard<std::mutex> life(life_mu);
-    if (!opened) { return -EBADF; }
-    const int cr = input_pdu_locked(std::move(caps_pdu));
-    if (cr < 0) { return cr; }
-    return input_pdu_locked(std::move(pdu));
-}
 
 
 int jpeg_decoder_multicore::output(component_pdu &out)
@@ -592,19 +566,6 @@ int jpeg_decoder_multicore::output(component_pdu &out)
     else { results[slot].pdu.sdu = {}; }
     results[slot].ready = false; results[slot].status = 0; next_out_seq++; res_cv.notify_all();
     return status == 0 ? 0 : status;
-}
-int jpeg_decoder_multicore::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
-{
-    (void)timeout_ms;
-    for (;;) {
-        component_pdu pdu; const int r = output(pdu);
-        if (0 != r) { return r; }
-        if (is_caps(pdu.sdu_type)) { continue; }
-        auto fd = std::make_unique<frame_data>();
-        fd->kind = media_kind_e::NV12; fd->width = output_caps_.width; fd->height = output_caps_.height;
-        fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL; fd->pts = fd->capture_mono_ns;
-        fd->buf = std::move(pdu.sdu); out.reset(std::move(fd)); return 0;
-    }
 }
 
 
@@ -706,7 +667,7 @@ int jpeg_decoder_multicore::configure(std::string_view key, std::string_view val
     }
     if (key == "output_format")
     {
-        media_kind_e kind = media_kind_e::UNKNOWN;
+        sdu_type_e kind = sdu_type_e::UNKNOWN;
         int          r = parse_output_format(v, &kind);
         if (r < 0)
         {

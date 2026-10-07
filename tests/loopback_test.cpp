@@ -1,13 +1,13 @@
 #include "components/stream_receiver.hpp"
 #include "components/stream_sender.hpp"
 
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -63,27 +63,6 @@ int cfg_str(vstreamer::component &c, std::string_view key, std::string_view valu
     return c.configure(key, val);
 }
 
-vstreamer::data_packet make_sock_packet(uint32_t counter, size_t payload_bytes)
-{
-    EXPECT_GE(payload_bytes, 4U);
-    std::vector<uint8_t> storage(payload_bytes);
-    storage[0] = static_cast<uint8_t>((counter >> 24) & 0xFF);
-    storage[1] = static_cast<uint8_t>((counter >> 16) & 0xFF);
-    storage[2] = static_cast<uint8_t>((counter >> 8) & 0xFF);
-    storage[3] = static_cast<uint8_t>(counter & 0xFF);
-    for (size_t i = 4; i < payload_bytes; i++)
-    {
-        storage[i] = static_cast<uint8_t>(i & 0xFF);
-    }
-
-    auto sd = std::make_unique<vstreamer::sock_data>();
-    sd->pts = static_cast<int64_t>(counter);
-    sd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
-
-    vstreamer::data_packet pkt;
-    pkt.reset(std::move(sd));
-    return pkt;
-}
 
 /* Test-only NAT relay: forward media (drop every Nth), return link reports to the sender. */
 class UdpNatRelay
@@ -278,17 +257,16 @@ void run_link(int n_packets,
     auto drain_outputs = [&](int timeout_ms) {
         for (;;)
         {
-            vstreamer::data_packet out;
-            const int              rc = receiver.output(0, out, timeout_ms);
+            vstreamer::component_pdu out;
+            const int              rc = receiver.output(out);
             if (rc == -EAGAIN)
             {
                 return;
             }
             ASSERT_EQ(0, rc);
-            const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
-            ASSERT_GE(sd.buf.size(), 4U);
-            const uint8_t *payload = sd.buf.u8();
-            const size_t   payload_len = sd.buf.size();
+            ASSERT_GE(out.sdu.size(), 4U);
+            const uint8_t *payload = out.sdu.u8();
+            const size_t   payload_len = out.sdu.size();
             const uint32_t ctr = read_counter_be32(payload, payload_len);
             ASSERT_EQ(ctr, expect_next);
             expect_next++;
@@ -301,8 +279,8 @@ void run_link(int n_packets,
         {
             mid_fn(sender, i);
         }
-        const vstreamer::data_packet in = make_sock_packet(static_cast<uint32_t>(i), k_payload);
-        ASSERT_EQ(0, sender.input(0, in));
+        vstreamer::component_pdu in = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
+        ASSERT_EQ(0, sender.input(std::move(in)));
         drain_outputs(0);
         /* Avoid overrunning the UDP recv path on loopback (drops look like out-of-order FEC). */
         std::this_thread::sleep_for(std::chrono::microseconds(200));
@@ -403,11 +381,11 @@ TEST(LoopbackTest, MaxInputOversizedNotSent)
     const size_t limit = static_cast<size_t>(std::strtoul(max_in.c_str(), nullptr, 10));
     ASSERT_GT(limit, 64U);
 
-    const vstreamer::data_packet ok_pkt = make_sock_packet(0, 64);
-    ASSERT_EQ(0, sender.input(0, ok_pkt));
+    vstreamer::component_pdu ok_pkt = vstreamer::test_pdu::make_stream_dgram(0, 64);
+    ASSERT_EQ(0, sender.input(std::move(ok_pkt)));
 
-    const vstreamer::data_packet big_pkt = make_sock_packet(1, limit + 1);
-    ASSERT_EQ(0, sender.input(0, big_pkt));
+    vstreamer::component_pdu big_pkt = vstreamer::test_pdu::make_stream_dgram(1, limit + 1);
+    ASSERT_EQ(0, sender.input(std::move(big_pkt)));
 
     std::string overs;
     ASSERT_EQ(0, sender.query("fec_oversized", &overs));
@@ -464,17 +442,16 @@ TEST(LoopbackTest, SenderRestartMidStream)
     auto     drain_outputs = [&](int timeout_ms) {
         for (;;)
         {
-            vstreamer::data_packet out;
-            const int              rc = receiver.output(0, out, timeout_ms);
+            vstreamer::component_pdu out;
+            const int              rc = receiver.output(out);
             if (rc == -EAGAIN)
             {
                 return;
             }
             ASSERT_EQ(0, rc);
-            const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
-            ASSERT_GE(sd.buf.size(), 4U);
-            const uint8_t *payload = sd.buf.u8();
-            const size_t   payload_len = sd.buf.size();
+            ASSERT_GE(out.sdu.size(), 4U);
+            const uint8_t *payload = out.sdu.u8();
+            const size_t   payload_len = out.sdu.size();
             const uint32_t ctr = read_counter_be32(payload, payload_len);
             ASSERT_EQ(ctr, expect_next);
             expect_next++;
@@ -493,9 +470,9 @@ TEST(LoopbackTest, SenderRestartMidStream)
         const uint32_t end_counter = static_cast<uint32_t>(start_counter + n_packets);
         for (int i = 0; i < n_packets; i++)
         {
-            const vstreamer::data_packet in =
-                make_sock_packet(static_cast<uint32_t>(start_counter + i), 64);
-            ASSERT_EQ(0, sender.input(0, in));
+            vstreamer::component_pdu in =
+                vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(start_counter + i), 64);
+            ASSERT_EQ(0, sender.input(std::move(in)));
             drain_outputs(0);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
@@ -517,17 +494,16 @@ TEST(LoopbackTest, SenderRestartMidStream)
     auto       drain_outputs_resume = [&](int timeout_ms) {
         for (;;)
         {
-            vstreamer::data_packet out;
-            const int              rc = receiver.output(0, out, timeout_ms);
+            vstreamer::component_pdu out;
+            const int              rc = receiver.output(out);
             if (rc == -EAGAIN)
             {
                 return;
             }
             ASSERT_EQ(0, rc);
-            const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
-            ASSERT_GE(sd.buf.size(), 4U);
-            const uint8_t *payload = sd.buf.u8();
-            const size_t   payload_len = sd.buf.size();
+            ASSERT_GE(out.sdu.size(), 4U);
+            const uint8_t *payload = out.sdu.u8();
+            const size_t   payload_len = out.sdu.size();
             const uint32_t ctr = read_counter_be32(payload, payload_len);
             ASSERT_EQ(ctr, expect_next);
             if (!saw_resume && expect_next == 10000u)
@@ -552,8 +528,8 @@ TEST(LoopbackTest, SenderRestartMidStream)
         t_restart = std::chrono::steady_clock::now();
         for (int i = 0; i < 400; i++)
         {
-            const vstreamer::data_packet in = make_sock_packet(static_cast<uint32_t>(10000 + i), 64);
-            ASSERT_EQ(0, sender.input(0, in));
+            vstreamer::component_pdu in = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(10000 + i), 64);
+            ASSERT_EQ(0, sender.input(std::move(in)));
             drain_outputs_resume(0);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
@@ -602,8 +578,8 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
     constexpr int    k_packets = 200;
     for (int i = 0; i < k_packets; ++i)
     {
-        const vstreamer::data_packet in = make_sock_packet(static_cast<uint32_t>(i), k_payload);
-        ASSERT_EQ(0, sender.input(0, in));
+        vstreamer::component_pdu in = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
+        ASSERT_EQ(0, sender.input(std::move(in)));
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 
@@ -652,7 +628,7 @@ TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
     constexpr int k_packets = 80;
     for (int i = 0; i < k_packets; ++i)
     {
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
         std::this_thread::sleep_for(std::chrono::microseconds(800));
     }
     uint32_t delivered = 0;
@@ -660,8 +636,8 @@ TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
     while (delivered < static_cast<uint32_t>(k_packets) &&
            std::chrono::steady_clock::now() < deadline)
     {
-        vstreamer::data_packet out;
-        if (receiver.output(0, out, 100) == 0)
+        vstreamer::component_pdu out;
+        if (receiver.output(out) == 0)
         {
             ++delivered;
         }
@@ -700,7 +676,7 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
 
     for (int i = 0; i < 200; ++i)
     {
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
         std::this_thread::sleep_for(std::chrono::microseconds(300));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -737,7 +713,7 @@ TEST(LoopbackTest, PeerReportIntervalNearTelemetryMs)
 
     for (int i = 0; i < 30; ++i)
     {
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(450));
@@ -787,17 +763,16 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
         {
             storage[i] = static_cast<uint8_t>(i & 0xFF);
         }
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(tag, payload_len)));
-        vstreamer::data_packet out;
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(tag, payload_len))));
+        vstreamer::component_pdu out;
         const auto             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline)
         {
-            const int rc = receiver.output(0, out, 100);
+            const int rc = receiver.output(out);
             if (0 == rc)
             {
-                const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
-                ASSERT_EQ(payload_len, sd.buf.size());
-                EXPECT_EQ(0, std::memcmp(storage.data(), sd.buf.u8(), payload_len));
+                ASSERT_EQ(payload_len, out.sdu.size());
+                EXPECT_EQ(0, std::memcmp(storage.data(), out.sdu.u8(), payload_len));
                 return;
             }
             ASSERT_TRUE(rc == -EAGAIN);
@@ -871,7 +846,7 @@ TEST(LoopbackTest, WholeBlockLossViaBurstDrop)
 
     for (int i = 0; i < 24; ++i)
     {
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i), 64)));
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
         std::this_thread::sleep_for(std::chrono::microseconds(400));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

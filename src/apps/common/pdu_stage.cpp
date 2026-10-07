@@ -20,7 +20,7 @@ void log_pdu_stage_latency(const char *stage, const component_pdu &pdu)
     const double  ms = static_cast<double>(now_ns - cap_ns) / 1e6;
     if (ms >= 0.0)
     {
-        record_stage_latency_ms(stage, data_packet(), ms);
+        record_stage_latency_ms(stage, ms);
     }
 }
 
@@ -50,7 +50,7 @@ void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
     const double  ms = static_cast<double>(now_ns - it->second) / 1e6;
     if (ms >= 0.0)
     {
-        record_stage_latency_ms(stage, data_packet(), ms);
+        record_stage_latency_ms(stage, ms);
     }
     edge_mono_by_ts_us->erase(it);
 }

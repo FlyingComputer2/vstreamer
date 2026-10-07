@@ -55,25 +55,9 @@ std::string rtp_h264_depay::name() const
     return "rtp_h264_depay";
 }
 
-media_kind_e rtp_h264_depay::input_kind() const
-{
-    return media_kind_e::UNKNOWN;
-}
 
-media_kind_e rtp_h264_depay::output_kind() const
-{
-    return media_kind_e::H264;
-}
 
-packet_kind_e rtp_h264_depay::input_packet_kind() const
-{
-    return packet_kind_e::SOCK;
-}
 
-packet_kind_e rtp_h264_depay::output_packet_kind() const
-{
-    return packet_kind_e::FRAME;
-}
 
 int rtp_h264_depay::open()
 {
@@ -206,20 +190,6 @@ int rtp_h264_depay::input(component_pdu &&in)
     return 0;
 }
 
-int rtp_h264_depay::input(uint8_t port, const data_packet &in)
-{
-    if (0 != port || in.get_type() != packet_kind_e::SOCK)
-    {
-        return -EINVAL;
-    }
-    const sock_data &s = data_packet::cast<sock_data>(in);
-    component_pdu pdu;
-    pdu.ts_us = s.pts > 0 ? static_cast<uint64_t>(s.pts) : 0ULL;
-    pdu.sdu_type = sdu_type_e::RTP;
-    pdu.port = 0;
-    pdu.sdu = s.buf;
-    return input(std::move(pdu));
-}
 
 int rtp_h264_depay::output(component_pdu &out)
 {
@@ -233,37 +203,6 @@ int rtp_h264_depay::output(component_pdu &out)
     return 0;
 }
 
-int rtp_h264_depay::output(uint8_t port, data_packet &out, int timeout_ms)
-{
-    (void)timeout_ms;
-    if (0 != port)
-    {
-        return -EINVAL;
-    }
-    for (;;)
-    {
-        component_pdu pdu;
-        const int     r = rtp_h264_depay::output(pdu);
-        if (0 != r)
-        {
-            return r;
-        }
-        if (is_caps(pdu.sdu_type))
-        {
-            continue;
-        }
-        auto fd = std::make_unique<frame_data>();
-        fd->kind = media_kind_e::H264;
-        fd->width = last_caps_w_;
-        fd->height = last_caps_h_;
-        fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL;
-        fd->pts = fd->capture_mono_ns;
-        fd->key = has_flag(pdu, pdu_flag_e::KEY);
-        fd->buf = std::move(pdu.sdu);
-        out.reset(std::move(fd));
-        return 0;
-    }
-}
 
 int rtp_h264_depay::configure(std::string_view key, std::string_view value)
 {

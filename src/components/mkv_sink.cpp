@@ -97,10 +97,6 @@ std::string mkv_sink::name() const
     return "mkv_sink";
 }
 
-media_kind_e mkv_sink::input_kind() const
-{
-    return media_kind_e::MJPEG;
-}
 
 void mkv_sink::stop_locked()
 {
@@ -261,7 +257,7 @@ int mkv_sink::ensure_session_locked(int w, int h)
     return 0;
 }
 
-int mkv_sink::write_frame_locked(const data_packet &in)
+int mkv_sink::write_frame_locked(const component_pdu &in)
 {
     auto *oc = static_cast<AVFormatContext *>(fmt);
     auto *st = static_cast<AVStream *>(stream);
@@ -272,25 +268,24 @@ int mkv_sink::write_frame_locked(const data_packet &in)
         return -ENOMEM;
     }
 
-    const frame_data &f = data_packet::cast<frame_data>(in);
-
-    uint8_t *buf = static_cast<uint8_t *>(av_malloc(f.buf.size()));
+    uint8_t *buf = static_cast<uint8_t *>(av_malloc(in.sdu.size()));
     if (nullptr == buf)
     {
         av_packet_free(&pkt);
         return -ENOMEM;
     }
-    std::memcpy(buf, f.buf.u8(), f.buf.size());
+    std::memcpy(buf, in.sdu.u8(), in.sdu.size());
 
     pkt->data = buf;
-    pkt->size = static_cast<int>(f.buf.size());
+    pkt->size = static_cast<int>(in.sdu.size());
 
     const int use_fps = fps > 0 ? fps : 30;
+    const int64_t frame_pts = static_cast<int64_t>(in.ts_us);
     if (segment_pts_base < 0)
     {
-        segment_pts_base = f.pts;
+        segment_pts_base = frame_pts;
     }
-    int64_t mux_pts = f.pts - segment_pts_base;
+    int64_t mux_pts = frame_pts - segment_pts_base;
     if (mux_pts < 0)
     {
         mux_pts = 0;
@@ -305,7 +300,7 @@ int mkv_sink::write_frame_locked(const data_packet &in)
     pkt->duration = 1;
     pkt->stream_index = st->index;
     pkt->flags |= AV_PKT_FLAG_KEY;
-    pkt->buf = av_buffer_create(buf, f.buf.size(), av_buffer_default_free, nullptr, 0);
+    pkt->buf = av_buffer_create(buf, in.sdu.size(), av_buffer_default_free, nullptr, 0);
     if (nullptr == pkt->buf)
     {
         av_free(buf);
@@ -342,19 +337,7 @@ bool mkv_sink::coded_caps_acceptable(const video_coded_caps &caps) const
     return false;
 }
 
-data_packet mkv_sink::packet_from_pdu(const component_pdu &in) const
-{
-    auto body = std::make_shared<frame_data>();
-    body->kind = media_kind_e::MJPEG;
-    body->width = input_caps_.width;
-    body->height = input_caps_.height;
-    body->pts = static_cast<int64_t>(in.ts_us);
-    body->key = has_flag(in, pdu_flag_e::KEY);
-    body->buf = in.sdu;
-    return data_packet(std::move(body));
-}
-
-int mkv_sink::try_enqueue_locked(data_packet &&pkt)
+int mkv_sink::try_enqueue_locked(component_pdu &&pkt)
 {
     if (queue.size() >= queue_cap)
     {
@@ -364,7 +347,7 @@ int mkv_sink::try_enqueue_locked(data_packet &&pkt)
     return 0;
 }
 
-int mkv_sink::enqueue_drop_locked(data_packet &&pkt, bool *dropped_oldest)
+int mkv_sink::enqueue_drop_locked(component_pdu &&pkt, bool *dropped_oldest)
 {
     if (nullptr != dropped_oldest)
     {
@@ -386,7 +369,7 @@ void mkv_sink::mux_thread_main()
 {
     while (true)
     {
-        data_packet pkt;
+        component_pdu pkt;
         {
             std::unique_lock<std::mutex> lock(q_mu);
             q_cv.wait(lock, [this] {
@@ -409,10 +392,9 @@ void mkv_sink::mux_thread_main()
             std::lock_guard<std::mutex> lock(mu);
             if (opened)
             {
-                const frame_data &f = data_packet::cast<frame_data>(pkt);
-                int               w = f.width;
-                int               h = f.height;
-                const int         sr = ensure_session_locked(w, h);
+                int w = input_caps_.width;
+                int h = input_caps_.height;
+                const int sr = ensure_session_locked(w, h);
                 if (sr >= 0 && recording)
                 {
                     (void)write_frame_locked(pkt);
@@ -467,6 +449,10 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
         caps_reject_ = false;
         input_caps_ = caps;
         have_input_caps_ = true;
+        if (!output_template.empty())
+        {
+            (void)ensure_session_locked(caps.width, caps.height);
+        }
         return 0;
     }
     if (in.sdu_type != sdu_type_e::MJPEG)
@@ -481,9 +467,8 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
     {
         return 0;
     }
-    data_packet pkt = packet_from_pdu(in);
     std::lock_guard<std::mutex> lock(q_mu);
-    const int                   r = try_enqueue_locked(std::move(pkt));
+    const int                   r = try_enqueue_locked(std::move(in));
     if (0 == r)
     {
         q_cv.notify_one();
@@ -524,65 +509,6 @@ void mkv_sink::close()
     caps_reject_ = false;
 }
 
-int mkv_sink::input(uint8_t /*port*/, const data_packet &in)
-{
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::MJPEG)
-    {
-        return -EINVAL;
-    }
-
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened)
-    {
-        return 0;
-    }
-
-    video_coded_caps caps {};
-    caps.width = f.width > 0 ? f.width : input_caps_.width;
-    caps.height = f.height > 0 ? f.height : input_caps_.height;
-    if (caps.width <= 0 || caps.height <= 0)
-    {
-        return -EINVAL;
-    }
-    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, 0, 0);
-    const int     cr = input_pdu_locked(std::move(caps_pdu));
-    if (cr < 0)
-    {
-        return cr;
-    }
-    if (output_template.empty())
-    {
-        return 0;
-    }
-
-    component_pdu pdu;
-    pdu.ts_us = f.pts > 0 ? static_cast<uint64_t>(f.pts) : 0ULL;
-    pdu.sdu_type = sdu_type_e::MJPEG;
-    pdu.port = 0;
-    pdu.sdu = f.buf;
-    if (f.key)
-    {
-        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-    }
-    data_packet pkt = packet_from_pdu(pdu);
-
-    bool dropped_oldest = false;
-    int  r = 0;
-    {
-        std::lock_guard<std::mutex> qlock(q_mu);
-        r = enqueue_drop_locked(std::move(pkt), &dropped_oldest);
-        if (0 == r)
-        {
-            q_cv.notify_one();
-        }
-    }
-    if (dropped_oldest)
-    {
-        dropped++;
-    }
-    return r;
-}
 
 int mkv_sink::configure(std::string_view key, std::string_view value)
 {

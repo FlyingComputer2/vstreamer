@@ -48,10 +48,6 @@ std::string sdl_sink::name() const
     return "sdl_sink";
 }
 
-media_kind_e sdl_sink::input_kind() const
-{
-    return media_kind_e::NV12;
-}
 
 const char *sdl_sink::presenter_video_driver() const
 {
@@ -78,17 +74,14 @@ bool sdl_sink::raw_caps_acceptable(const video_raw_caps &caps) const
     return false;
 }
 
-frame_data sdl_sink::frame_from_pdu(const component_pdu &in) const
+nv12_present_sample sdl_sink::sample_from_pdu(const component_pdu &in) const
 {
-    frame_data f;
-    f.kind = media_kind_e::NV12;
-    f.width = input_caps_.width;
-    f.height = input_caps_.height;
-    f.pts = static_cast<int64_t>(in.ts_us);
-    f.capture_mono_ns = static_cast<int64_t>(in.ts_us) * 1000LL;
-    f.key = has_flag(in, pdu_flag_e::KEY);
-    f.buf = in.sdu;
-    return f;
+    nv12_present_sample s;
+    s.width = input_caps_.width;
+    s.height = input_caps_.height;
+    s.ts_us = in.ts_us;
+    s.buf = in.sdu;
+    return s;
 }
 
 int sdl_sink::open()
@@ -244,7 +237,7 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     {
         return -EBADF;
     }
-    const frame_data f = frame_from_pdu(in);
+    const nv12_present_sample f = sample_from_pdu(in);
     const int enq = present->try_enqueue(f);
     if (0 == enq)
     {
@@ -263,63 +256,6 @@ int sdl_sink::input(component_pdu &&in)
     return input_pdu_locked(std::move(in));
 }
 
-int sdl_sink::input(uint8_t port, const data_packet &in)
-{
-    if (0 != port)
-    {
-        return -EINVAL;
-    }
-
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::NV12)
-    {
-        return -EINVAL;
-    }
-
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened || !present.has_value())
-    {
-        return -EBADF;
-    }
-
-    video_raw_caps caps {};
-    caps.width = f.width > 0 ? f.width : input_caps_.width;
-    caps.height = f.height > 0 ? f.height : input_caps_.height;
-    if (caps.width <= 0 || caps.height <= 0)
-    {
-        return -EINVAL;
-    }
-    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps, 0, 0);
-    const int     cr = input_pdu_locked(std::move(caps_pdu));
-    if (cr < 0)
-    {
-        return cr;
-    }
-
-    component_pdu pdu;
-    pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
-                                      : static_cast<uint64_t>(f.pts);
-    pdu.sdu_type = sdu_type_e::NV12;
-    pdu.port = 0;
-    pdu.sdu = f.buf;
-    if (f.key)
-    {
-        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-    }
-
-    bool dropped_oldest = false;
-    const frame_data ff = frame_from_pdu(pdu);
-    const int enq = present->enqueue_drop(ff, &dropped_oldest);
-    if (dropped_oldest)
-    {
-        dropped++;
-    }
-    if (0 == enq)
-    {
-        present_cv.notify_one();
-    }
-    return enq;
-}
 
 int sdl_sink::configure(std::string_view key, std::string_view value)
 {

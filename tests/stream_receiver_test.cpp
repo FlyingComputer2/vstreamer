@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include "test_pdu_helpers.hpp"
+
 #include <arpa/inet.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -18,23 +20,6 @@
 #include <cstring>
 #include <string>
 #include <thread>
-
-TEST(StreamReceiverTest, OutputUnblocksOnClose)
-{
-    vstreamer::stream_receiver receiver;
-    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:0"));
-
-    std::thread blocked([&receiver]() {
-        vstreamer::data_packet out;
-        const int              rc = receiver.output(0, out, -1);
-        EXPECT_EQ(-EBADF, rc);
-    });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.close();
-
-    blocked.join();
-}
 
 namespace
 {
@@ -67,6 +52,18 @@ int ephemeral_udp_port()
 }
 
 }  // namespace
+
+TEST(StreamReceiverTest, OutputEagainWhenEmpty)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.open());
+    vstreamer::component_pdu out;
+    EXPECT_EQ(-EAGAIN, receiver.output(out));
+    receiver.close();
+}
 
 TEST(StreamReceiverTest, OpenCloseStress)
 {
@@ -111,8 +108,8 @@ TEST(StreamReceiverTest, LoopbackRxTruncatedZero)
 
     for (int attempt = 0; attempt < 50; ++attempt)
     {
-        vstreamer::data_packet out;
-        if (receiver.output(0, out, 20) == 0)
+        vstreamer::component_pdu out;
+        if (receiver.output(out) == 0)
         {
             break;
         }

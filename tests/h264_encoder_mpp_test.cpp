@@ -1,10 +1,10 @@
 #include "components/h264_encoder_mpp.hpp"
 
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -21,21 +21,6 @@ int cfg(vstreamer::component &c, const char *key, const char *val)
     std::string_view k = key;
     std::string_view v = val;
     return c.configure(k, v);
-}
-
-vstreamer::data_packet make_nv12(int w, int h, int64_t pts)
-{
-    const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 3U / 2U;
-    std::vector<uint8_t> storage(bytes, 0x10);
-    auto                 fd = std::make_unique<vstreamer::frame_data>();
-    fd->kind = vstreamer::media_kind_e::NV12;
-    fd->width = w;
-    fd->height = h;
-    fd->pts = pts;
-    fd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
-    vstreamer::data_packet pkt;
-    pkt.reset(std::move(fd));
-    return pkt;
 }
 
 }  // namespace
@@ -56,13 +41,14 @@ TEST(H264EncoderMppTest, ConcurrentInputOutputConfigure)
     std::atomic<bool> run {true};
     constexpr int     k_w = 320;
     constexpr int     k_h = 240;
+    ASSERT_EQ(0, enc.input(vstreamer::test_pdu::make_nv12_caps(k_w, k_h, 30)));
 
     std::thread input_thr([&] {
-        int64_t pts = 0;
+        uint64_t ts_us = 0;
         while (run.load(std::memory_order_relaxed))
         {
-            const vstreamer::data_packet pkt = make_nv12(k_w, k_h, pts++);
-            const int                    ir = enc.input(0, pkt);
+            vstreamer::component_pdu pkt = vstreamer::test_pdu::make_nv12(k_w, k_h, ts_us++);
+            const int                ir = enc.input(std::move(pkt));
             if (ir < 0 && ir != -EAGAIN)
             {
                 break;
@@ -74,8 +60,8 @@ TEST(H264EncoderMppTest, ConcurrentInputOutputConfigure)
     std::thread output_thr([&] {
         while (run.load(std::memory_order_relaxed))
         {
-            vstreamer::data_packet out;
-            (void)enc.output(0, out, 5);
+            vstreamer::component_pdu out;
+            (void)enc.output(out);
         }
     });
 

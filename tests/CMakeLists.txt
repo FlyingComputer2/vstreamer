@@ -11,7 +11,6 @@ set(VSTREAMER_TEST_SOURCES
     component_pdu_test.cpp
     port_caps_test.cpp
     pdu_wakeup_test.cpp
-    legacy_pdu_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
     stream_header_test.cpp
@@ -54,7 +53,7 @@ add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/bench_console.cpp)
 target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source apps_common)
-target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 include(GoogleTest)
@@ -81,7 +80,8 @@ endif()
 if(ENABLE_H264_ENCODER_MPP AND ENABLE_H264_DECODER_MPP)
     add_executable(h264_decoder_mpp_hw_test h264_decoder_mpp_test.cpp)
     target_link_libraries(h264_decoder_mpp_hw_test PRIVATE GTest::gtest_main vstreamer_source)
-    target_include_directories(h264_decoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(h264_decoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                                 ${CMAKE_SOURCE_DIR}/tests)
     target_compile_options(h264_decoder_mpp_hw_test PRIVATE -Wall -Wextra -Wpedantic)
     get_filename_component(_tsan_mpp_supp_dec "${CMAKE_CURRENT_SOURCE_DIR}/tsan_mpp.supp" ABSOLUTE)
     gtest_discover_tests(
@@ -98,7 +98,8 @@ endif()
 if(ENABLE_H264_ENCODER_MPP)
     add_executable(h264_encoder_mpp_hw_test h264_encoder_mpp_test.cpp)
     target_link_libraries(h264_encoder_mpp_hw_test PRIVATE GTest::gtest_main vstreamer_source)
-    target_include_directories(h264_encoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(h264_encoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                                 ${CMAKE_SOURCE_DIR}/tests)
     target_compile_options(h264_encoder_mpp_hw_test PRIVATE -Wall -Wextra -Wpedantic)
     get_filename_component(_tsan_mpp_supp "${CMAKE_CURRENT_SOURCE_DIR}/tsan_mpp.supp" ABSOLUTE)
     gtest_discover_tests(

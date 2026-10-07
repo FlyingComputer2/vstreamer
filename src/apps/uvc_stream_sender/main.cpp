@@ -302,8 +302,7 @@ int main(int argc, char **argv)
     };
 
     selector = std::make_unique<source_selector>(
-        camera, noise, k_noise_fallback_w, k_noise_fallback_h, k_noise_fallback_fps, on_switch,
-        source_selector::push_packet_fn {}, source_selector::push_packet_fn {});
+        camera, noise, k_noise_fallback_w, k_noise_fallback_h, k_noise_fallback_fps, on_switch);
     metrics_src = std::make_unique<source_selector_query_source>(*selector);
     g_tx.metrics_source = metrics_src.get();
 

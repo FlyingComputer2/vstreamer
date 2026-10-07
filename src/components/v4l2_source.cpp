@@ -246,10 +246,6 @@ std::string v4l2_source::name() const
     return "v4l2";
 }
 
-media_kind_e v4l2_source::output_kind() const
-{
-    return media_kind_e::MJPEG;
-}
 
 void v4l2_source::capture_close_locked()
 {
@@ -742,7 +738,7 @@ int v4l2_source::wait_capture_fd(int local_fd, int timeout_ms)
     return 0;
 }
 
-int v4l2_source::dequeue_capture_locked(frame &out)
+int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
 {
     if (!capture_open || fd < 0)
     {
@@ -791,8 +787,12 @@ int v4l2_source::dequeue_capture_locked(frame &out)
                 reinterpret_cast<std::byte *>(tmp), size, size, [](std::byte *p) {
                     std::free(reinterpret_cast<uint8_t *>(p));
                 });
-            out.reset(media_kind_e::MJPEG, live_w, live_h, pts++, true, std::move(payload),
-                      cap_ns);
+            out.ts_us = cap_ns > 0 ? static_cast<uint64_t>(cap_ns / 1000LL) : 0ULL;
+            out.seq = out_seq_++;
+            out.sdu_type = sdu_type_e::MJPEG;
+            out.port = 0;
+            out.flags = static_cast<uint8_t>(pdu_flag_e::KEY);
+            out.sdu = std::move(payload);
             ret = 0;
         }
     }
@@ -803,29 +803,6 @@ int v4l2_source::dequeue_capture_locked(frame &out)
 
     xioctl(fd, VIDIOC_QBUF, &buf);
     return ret;
-}
-
-int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
-{
-    frame fr;
-    const int r = dequeue_capture_locked(fr);
-    if (r < 0)
-    {
-        return r;
-    }
-    out.ts_us = fr.capture_mono_ns() > 0
-                    ? static_cast<uint64_t>(fr.capture_mono_ns() / 1000LL)
-                    : 0ULL;
-    out.seq = out_seq_++;
-    out.sdu_type = sdu_type_e::MJPEG;
-    out.port = 0;
-    out.flags = 0;
-    if (fr.key())
-    {
-        out.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-    }
-    out.sdu = fr.payload_buffer();
-    return 0;
 }
 
 int v4l2_source::output(component_pdu &out)
@@ -850,68 +827,6 @@ int v4l2_source::output(component_pdu &out)
     return dequeue_capture_pdu_locked(out);
 }
 
-int v4l2_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
-{
-    std::unique_lock<std::mutex> lock(mu);
-    if (!source_open)
-    {
-        return -EBADF;
-    }
-
-    if (!capture_open)
-    {
-        maybe_retry_capture_locked();
-    }
-
-    if (capture_open)
-    {
-        const int local_fd = fd;
-        lock.unlock();
-        const int wait_r = wait_capture_fd(local_fd, timeout_ms);
-        lock.lock();
-        if (!source_open)
-        {
-            return -EBADF;
-        }
-        if (!capture_open || fd != local_fd)
-        {
-            /* Device closed during select — retry below. */
-        }
-        else if (wait_r < 0)
-        {
-            if (wait_r != -EAGAIN && capture_lost_errno(-wait_r))
-            {
-                std::fprintf(stderr, "v4l2_source: select lost: %s\n",
-                             std::strerror(-wait_r));
-                capture_close_locked();
-            }
-            else if (capture_open)
-            {
-                return wait_r;
-            }
-        }
-        else if (wait_r == 0)
-        {
-            frame fr;
-            const int r = dequeue_capture_locked(fr);
-            if (r == 0)
-            {
-                out.adopt_frame(std::move(fr));
-                return 0;
-            }
-            if (capture_open)
-            {
-                return r;
-            }
-        }
-        else if (capture_open)
-        {
-            return wait_r;
-        }
-    }
-
-    return -ENODEV;
-}
 
 int v4l2_source::configure(std::string_view key, std::string_view value)
 {

@@ -14,8 +14,8 @@
 #include <thread>
 
 #include "components/components.hpp"
-#include "core/pdu_input.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
 #include "core/thread_affinity.hpp"
 
 namespace vstreamer::test_app
@@ -48,7 +48,7 @@ void drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, ben
     {
         return;
     }
-    auto *dec_out = dynamic_cast<pdu_output *>(dec);
+    auto *dec_out = dynamic_cast<component_output *>(dec);
     if (nullptr == dec_out)
     {
         return;
@@ -73,7 +73,7 @@ int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queu
     {
         return -EINVAL;
     }
-    auto *dec_in = dynamic_cast<pdu_input *>(dec);
+    auto *dec_in = dynamic_cast<component_input *>(dec);
     if (nullptr == dec_in)
     {
         return -ENOTSUP;
@@ -134,7 +134,7 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
     }
     std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
     present_queue->bind_wakeup(wake);
-    auto *sink_pdu = dynamic_cast<pdu_input *>(display);
+    auto *sink_pdu = dynamic_cast<component_input *>(display);
     component &deadline_owner = *display;
     while (g_run.load(std::memory_order_relaxed))
     {
@@ -163,9 +163,9 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
 void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_queue *au_in_queue,
                         bench_diag *diag)
 {
-    auto *rcv_out = dynamic_cast<pdu_output *>(rcv);
-    auto *depay_in = dynamic_cast<pdu_input *>(depay);
-    auto *depay_out = dynamic_cast<pdu_output *>(depay);
+    auto *rcv_out = dynamic_cast<component_output *>(rcv);
+    auto *depay_in = dynamic_cast<component_input *>(depay);
+    auto *depay_out = dynamic_cast<component_output *>(depay);
     auto *rcv_owner = dynamic_cast<component *>(rcv);
     if (nullptr == rcv || nullptr == depay || nullptr == rcv_out || nullptr == depay_in ||
         nullptr == depay_out || nullptr == rcv_owner)
@@ -247,7 +247,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
             if (is_caps(pdu.sdu_type))
             {
-                auto *dec_pdu_in = dynamic_cast<pdu_input *>(dec);
+                auto *dec_pdu_in = dynamic_cast<component_input *>(dec);
                 if (nullptr != dec_pdu_in)
                 {
                     (void)dec_pdu_in->input(std::move(pdu));

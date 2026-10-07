@@ -11,8 +11,6 @@
 #include <cmath>
 #include <ctime>
 
-#include "core/data_packet.hpp"
-
 namespace vstreamer::test_app
 {
 

@@ -1,10 +1,11 @@
 #include "components/h264_encoder_intel.hpp"
 
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
+#include "core/key_util.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -42,7 +43,7 @@ int cfg(vstreamer::component &c, const char *key, const char *val)
     return c.configure(key, val);
 }
 
-vstreamer::data_packet make_nv12_gradient(int w, int h, int64_t pts, int frame_idx)
+vstreamer::component_pdu make_nv12_gradient(int w, int h, uint64_t ts_us, int frame_idx)
 {
     const size_t y_sz = static_cast<size_t>(w) * static_cast<size_t>(h);
     const size_t uv_sz = y_sz / 2U;
@@ -61,32 +62,26 @@ vstreamer::data_packet make_nv12_gradient(int w, int h, int64_t pts, int frame_i
         storage[y_sz + i] = static_cast<uint8_t>((i + frame_idx * 7) & 0xff);
     }
 
-    auto fd = std::make_unique<vstreamer::frame_data>();
-    fd->kind = vstreamer::media_kind_e::NV12;
-    fd->width = w;
-    fd->height = h;
-    fd->pts = pts;
-    fd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
-    vstreamer::data_packet pkt;
-    pkt.reset(std::move(fd));
+    vstreamer::component_pdu pkt = vstreamer::test_pdu::make_nv12(w, h, ts_us);
+    pkt.sdu = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
     return pkt;
 }
 
 double encode_window_bps(vstreamer::h264_encoder_intel &enc, int w, int h, int frames, int fps)
 {
-    int64_t bits = 0;
-    std::vector<int64_t> out_pts;
+    int64_t              bits = 0;
+    std::vector<uint64_t> out_ts;
     for (int i = 0; i < frames; ++i)
     {
-        const vstreamer::data_packet in = make_nv12_gradient(w, h, i, i);
-        if (enc.input(0, in) < 0)
+        vstreamer::component_pdu in = make_nv12_gradient(w, h, static_cast<uint64_t>(i), i);
+        if (enc.input(std::move(in)) < 0)
         {
             return -1.0;
         }
         for (;;)
         {
-            vstreamer::data_packet out;
-            const int orv = enc.output(0, out, 0);
+            vstreamer::component_pdu out;
+            const int              orv = enc.output(out);
             if (orv == -EAGAIN)
             {
                 break;
@@ -95,30 +90,36 @@ double encode_window_bps(vstreamer::h264_encoder_intel &enc, int w, int h, int f
             {
                 return -1.0;
             }
-            const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-            bits += static_cast<int64_t>(f.buf.size()) * 8;
-            out_pts.push_back(f.pts);
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            bits += static_cast<int64_t>(out.sdu.size()) * 8;
+            out_ts.push_back(out.ts_us);
         }
     }
     for (int spin = 0; spin < 50; ++spin)
     {
-        vstreamer::data_packet out;
-        const int orv = enc.output(0, out, 20);
+        vstreamer::component_pdu out;
+        const int              orv = enc.output(out);
         if (orv < 0)
         {
             break;
         }
-        const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-        bits += static_cast<int64_t>(f.buf.size()) * 8;
-        out_pts.push_back(f.pts);
+        if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+        {
+            continue;
+        }
+        bits += static_cast<int64_t>(out.sdu.size()) * 8;
+        out_ts.push_back(out.ts_us);
     }
-    if (out_pts.size() < 2)
+    if (out_ts.size() < 2)
     {
         return -1.0;
     }
-    for (size_t i = 1; i < out_pts.size(); ++i)
+    for (size_t i = 1; i < out_ts.size(); ++i)
     {
-        EXPECT_GE(out_pts[i], out_pts[i - 1]);
+        EXPECT_GE(out_ts[i], out_ts[i - 1]);
     }
     const double seconds = static_cast<double>(frames) / static_cast<double>(fps);
     return static_cast<double>(bits) / seconds;
@@ -142,32 +143,36 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
     constexpr int k_w = 1920;
     constexpr int k_h = 1080;
     constexpr int k_gop = 120;
-    int key_count = 0;
-    int frames_since_key = 0;
+    int           key_count = 0;
+    int           frames_since_key = 0;
+
+    ASSERT_EQ(0, enc.input(vstreamer::test_pdu::make_nv12_caps(k_w, k_h, 30)));
 
     for (int i = 0; i < 300; ++i)
     {
-        const vstreamer::data_packet in = make_nv12_gradient(k_w, k_h, i, i);
-        ASSERT_EQ(enc.input(0, in), 0);
+        vstreamer::component_pdu in = make_nv12_gradient(k_w, k_h, static_cast<uint64_t>(i), i);
+        ASSERT_EQ(enc.input(std::move(in)), 0);
         for (;;)
         {
-            vstreamer::data_packet out;
-            const int orv = enc.output(0, out, 0);
+            vstreamer::component_pdu out;
+            const int              orv = enc.output(out);
             if (orv == -EAGAIN)
             {
                 break;
             }
             ASSERT_EQ(orv, 0);
-            const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-            // The key flag must match the bitstream: a decoder joining mid-stream needs
-            // in-band SPS/PPS and an IDR slice to start.
-            const nal_mask m = scan_nals(f.buf.u8(), f.buf.size());
-            EXPECT_EQ(f.key, m.idr) << "AU " << i;
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            const bool key = (out.flags & static_cast<uint8_t>(vstreamer::pdu_flag_e::KEY)) != 0;
+            const nal_mask m = scan_nals(out.sdu.u8(), out.sdu.size());
+            EXPECT_EQ(key, m.idr) << "AU " << i;
             if (m.idr)
             {
                 EXPECT_TRUE(m.sps && m.pps) << "IDR AU " << i << " lacks SPS/PPS";
             }
-            if (f.key)
+            if (key)
             {
                 if (key_count > 0)
                 {
@@ -193,13 +198,12 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
     bool saw_key_after = false;
     for (int i = 300; i < 310; ++i)
     {
-        const vstreamer::data_packet in = make_nv12_gradient(k_w, k_h, i, i);
-        ASSERT_EQ(enc.input(0, in), 0);
-        vstreamer::data_packet out;
-        if (enc.output(0, out, 50) == 0)
+        vstreamer::component_pdu in = make_nv12_gradient(k_w, k_h, static_cast<uint64_t>(i), i);
+        ASSERT_EQ(enc.input(std::move(in)), 0);
+        vstreamer::component_pdu out;
+        if (enc.output(out) == 0 && out.sdu_type == vstreamer::sdu_type_e::H264_AU)
         {
-            const auto &f = vstreamer::data_packet::cast<vstreamer::frame_data>(out);
-            if (f.key)
+            if ((out.flags & static_cast<uint8_t>(vstreamer::pdu_flag_e::KEY)) != 0)
             {
                 saw_key_after = true;
             }

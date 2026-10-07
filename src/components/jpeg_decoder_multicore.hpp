@@ -19,8 +19,8 @@
 #include "core/component_coder.hpp"
 #include "core/component_pdu.hpp"
 #include "core/output_opts.hpp"
-#include "core/pdu_input.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
 
@@ -29,7 +29,7 @@
 namespace vstreamer
 {
 
-class jpeg_decoder_multicore : public component_coder, public pdu_input, public pdu_output
+class jpeg_decoder_multicore : public component_coder
 {
 public:
     jpeg_decoder_multicore();
@@ -39,15 +39,8 @@ public:
     jpeg_decoder_multicore &operator=(const jpeg_decoder_multicore &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
     int  open() override;
     void close() override;
-
-    int input(uint8_t port, const data_packet &in) override;
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
-
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 
@@ -95,7 +88,7 @@ private:
     int                worker_cpu = -1;
     std::vector<int>   worker_cpus;
     output_mode_e      output_mode = output_mode_e::filter;
-    media_kind_e       output_format = media_kind_e::NV12;
+    sdu_type_e         output_format = sdu_type_e::NV12;
     mutable std::string decoded_pix_fmt = "unknown";
 
     mutable std::mutex       life_mu;

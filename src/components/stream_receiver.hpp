@@ -17,9 +17,8 @@
 #include <vector>
 
 #include "core/component_source.hpp"
-#include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_output.hpp"
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
@@ -30,7 +29,7 @@ namespace vstreamer
 {
 
 /* Pad 0 (source): STREAM_DGRAM out. */
-class stream_receiver : public component_source, public pdu_output
+class stream_receiver : public component_source
 {
 public:
     stream_receiver();
@@ -40,14 +39,8 @@ public:
     stream_receiver &operator=(const stream_receiver &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
-    [[nodiscard]] packet_kind_e output_packet_kind(uint8_t port) const override;
-
     int  open() override;
     void close() override;
-
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
     int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;

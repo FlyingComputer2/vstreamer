@@ -1,24 +1,23 @@
-# Decoder
+# Component decoder (coder)
 
-Decoders are `component_coder`s ([component_coder.hpp](../src/core/component_coder.hpp)), the
-inverse of [encoders](component-encoder.md): push compressed frames with `input`, pull packed NV12
-frames with `output`. Keys: [vstreamer.md § Keys](vstreamer.md#keys).
+Decoders implement `component_coder`:
 
-| Class | `input_kind` | `output_kind` | Notes |
-|-------|--------------|---------------|-------|
-| `jpeg_decoder_multicore` | `MJPEG` | `NV12` | libav worker pool (`workers` 1..8, default 2), results in submit order |
-| `h264_decoder_mpp` | `H264` | `NV12` | Rockchip MPP; `cancel_pending_io()` for shutdown |
+```cpp
+virtual int input(component_pdu &&in) = 0;
+virtual int output(component_pdu &out) = 0;
+```
 
-Rules:
+## Caps and media
 
-- `input` takes one JPEG or one Annex-B access unit; `output` returns frames in order, `-EAGAIN`
-  when none is ready. `pts` and `capture_mono_ns` carry through.
-- Output is always **packed** NV12 (no stride padding). Helpers: `src/core/pix_convert.hpp`.
-- `output_mode`:
-  - `filter` — accept only 4:2:0 sources (MPP `YUV420SP`/`VU`, libav `YUV420P`); other chroma →
-    `-ENOTSUP`.
-  - `convert` — also accept 4:2:2 (MPP `YUV422SP`/`VU`, libav `YUV422P`) and convert. 8-bit only.
-- `output_format` (`format` on query): `nv12` only. Parsers live in `src/core/output_opts.hpp`.
-- `h264_decoder_mpp` `output_size_mode`: `stream` sizes output from the SPS, `config` from `size`.
-- `jpeg_decoder_multicore` pins workers with `worker_cpu` / `worker_cpus`; `workers` is fixed once
-  open (`-EBUSY`).
+For H.264, send `CAPS_VIDEO_CODED` before each `H264_AU` (or rely on in-band SPS when the
+decoder accepts it). Decoders emit `CAPS_VIDEO_RAW` when the raster size changes, then `NV12`
+frames. `ts_us` on coded input is carried through to raw output when possible; `-EAGAIN` when no
+frame is ready.
+
+## Built-in decoders
+
+| Component | In | Out |
+|-----------|----|-----|
+| `h264_decoder_mpp` | `H264_AU` | `NV12` |
+| `h264_decoder_intel` | `H264_AU` | `NV12` |
+| `jpeg_decoder` | `MJPEG` | `NV12` |

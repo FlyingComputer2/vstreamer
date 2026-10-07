@@ -2,7 +2,6 @@
 
 #include "apps/common/tx/tx_stages.hpp"
 
-#include "apps/common/legacy_pdu.hpp"
 #include "apps/common/pdu_stage.hpp"
 #include "apps/common/pipeline_state.hpp"
 #include "apps/common/stage_latency.hpp"
@@ -19,9 +18,8 @@
 #include <vector>
 
 #include "components/components.hpp"
-#include "core/data_packet.hpp"
-#include "core/pdu_input.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
 #include "core/thread_affinity.hpp"
@@ -109,18 +107,10 @@ bool handle_source_poll_error(int got)
 
 void drain_pay_pdus_to_sender(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag)
 {
-    auto *pay_out = dynamic_cast<pdu_output *>(&pay);
-    auto *snd_in = dynamic_cast<pdu_input *>(&sender);
+    auto *pay_out = dynamic_cast<component_output *>(&pay);
+    auto *snd_in = dynamic_cast<component_input *>(&sender);
     if (nullptr == pay_out || nullptr == snd_in)
     {
-        data_packet sock_pkt;
-        while (g_run.load(std::memory_order_relaxed) && pay.output(0, sock_pkt, 0) == 0)
-        {
-            if (sender.input(0, sock_pkt) == 0)
-            {
-                diag.tx_rtp_sock++;
-            }
-        }
         return;
     }
     component_pdu dgram;
@@ -139,7 +129,7 @@ bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag
 {
     log_pdu_stage_latency("enc_out", au);
     diag.tx_enc_out_bytes.fetch_add(pdu_bytes(au), std::memory_order_relaxed);
-    auto *pay_in = dynamic_cast<pdu_input *>(&pay);
+    auto *pay_in = dynamic_cast<component_input *>(&pay);
     if (nullptr == pay_in || pay_in->input(std::move(au)) < 0)
     {
         return false;
@@ -151,29 +141,9 @@ bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag
 void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
                    bench_diag &diag)
 {
-    auto *enc_out = dynamic_cast<pdu_output *>(&enc);
+    auto *enc_out = dynamic_cast<component_output *>(&enc);
     if (nullptr == enc_out)
     {
-        data_packet pkt;
-        while (g_run.load(std::memory_order_relaxed) && enc.output(0, pkt, 0) == 0)
-        {
-            const frame_data &f = data_packet::cast<frame_data>(pkt);
-            diag.tx_enc_out_bytes.fetch_add(f.buf.size(), std::memory_order_relaxed);
-            auto *pay_in = dynamic_cast<pdu_input *>(&pay);
-            if (nullptr != pay_in)
-            {
-                component_pdu pdu;
-                pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
-                                                  : static_cast<uint64_t>(f.pts);
-                pdu.sdu_type = sdu_type_e::H264_AU;
-                pdu.sdu = f.buf;
-                if (f.key)
-                {
-                    pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-                }
-                (void)forward_encoded_au_pdu(pay, sender, diag, std::move(pdu));
-            }
-        }
         return;
     }
     component_pdu pdu;
@@ -190,7 +160,7 @@ bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_
     {
         *accepted = false;
     }
-    auto *enc_in = dynamic_cast<pdu_input *>(enc);
+    auto *enc_in = dynamic_cast<component_input *>(enc);
     if (nullptr == enc_in)
     {
         return false;
@@ -260,30 +230,10 @@ void source_stage_main(component_source *source, pipeline_pdu_queue *mjpeg_pipe,
                        bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.source);
-    auto *po = dynamic_cast<pdu_output *>(source);
+    auto *po = dynamic_cast<component_output *>(source);
     auto *owner = dynamic_cast<component *>(source);
     if (nullptr == po || nullptr == owner)
     {
-        apps::legacy_to_pdu to_pdu;
-        while (g_run.load(std::memory_order_relaxed))
-        {
-            data_packet raw;
-            const int got = source->output(0, raw, g_run.load() ? -1 : 0);
-            if (got < 0)
-            {
-                if (!handle_source_poll_error(got))
-                {
-                    break;
-                }
-                continue;
-            }
-            std::vector<component_pdu> pdus;
-            to_pdu.convert(raw, &pdus);
-            for (component_pdu &pdu : pdus)
-            {
-                (void)enqueue_source_pdu(std::move(pdu), mjpeg_pipe, nv12_pipe, diag);
-            }
-        }
         return;
     }
     std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
@@ -331,8 +281,8 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     {
         max_inflight = 1;
     }
-    auto *jdec_in = dynamic_cast<pdu_input *>(jdec);
-    auto *jdec_out = dynamic_cast<pdu_output *>(jdec);
+    auto *jdec_in = dynamic_cast<component_input *>(jdec);
+    auto *jdec_out = dynamic_cast<component_output *>(jdec);
     auto *owner = dynamic_cast<component *>(jdec);
     if (nullptr == jdec_in || nullptr == jdec_out || nullptr == owner)
     {
@@ -403,7 +353,7 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
                        pipeline_pdu_queue *nv12_pipe, bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.encode);
-    auto *enc_pdu_in = dynamic_cast<pdu_input *>(enc);
+    auto *enc_pdu_in = dynamic_cast<component_input *>(enc);
     auto *owner = dynamic_cast<component *>(enc);
     if (nullptr == owner)
     {

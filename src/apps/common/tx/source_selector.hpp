@@ -3,14 +3,12 @@
 
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
-#include "core/data_packet.hpp"
-#include "core/pdu_output.hpp"
 #include "core/pdu_wakeup.hpp"
 
 #include <chrono>
-#include <memory>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace vstreamer::apps::tx
@@ -27,14 +25,11 @@ class source_selector
 {
 public:
     using on_switch_fn = std::function<void(source_kind kind, int width, int height, int fps)>;
-    using push_packet_fn = std::function<void(data_packet &&)>;
     using push_pdu_fn = std::function<void(component_pdu &&)>;
 
     source_selector(component_source &camera, component_source &noise, int noise_width,
-                    int noise_height, int noise_fps, on_switch_fn on_switch,
-                    push_packet_fn push_mjpeg, push_packet_fn push_nv12);
+                    int noise_height, int noise_fps, on_switch_fn on_switch);
 
-    void set_push_handlers(push_packet_fn push_mjpeg_in, push_packet_fn push_nv12_in);
     void set_push_pdu_handler(push_pdu_fn push_pdu_in);
     void bind_source_wakeups(std::shared_ptr<pdu_wakeup> w);
 
@@ -67,8 +62,6 @@ private:
     int               noise_height;
     int               noise_fps;
     on_switch_fn      on_switch;
-    push_packet_fn    push_mjpeg;
-    push_packet_fn    push_nv12;
     push_pdu_fn       push_pdu;
 
     source_kind kind = source_kind::camera;

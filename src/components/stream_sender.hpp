@@ -19,9 +19,8 @@
 #include <netinet/in.h>
 
 #include "core/component_sink.hpp"
-#include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
-#include "core/pdu_input.hpp"
+#include "core/component_input.hpp"
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
@@ -36,7 +35,7 @@ enum class fec_mode_e
 };
 
 /* Pad 0 (sink): STREAM_DGRAM in → UDP egress. */
-class stream_sender : public component_sink, public pdu_input
+class stream_sender : public component_sink
 {
 public:
     stream_sender();
@@ -46,16 +45,8 @@ public:
     stream_sender &operator=(const stream_sender &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-
-    [[nodiscard]] uint8_t input_pad_count() const override { return 1; }
-
-    [[nodiscard]] packet_kind_e input_packet_kind(uint8_t port) const override;
-
     int  open() override;
     void close() override;
-
-    int input(uint8_t port, const data_packet &in) override;
     int input(component_pdu &&in) override;
 
     int set_enabled(bool on, int timeout_ms) override;
@@ -126,7 +117,7 @@ private:
     /* A wire datagram and the earliest time the send thread may send it. */
     struct queued_wire
     {
-        data_packet                           pkt;
+        shared_sized_buffer                   buf;
         std::chrono::steady_clock::time_point release {};
     };
 

@@ -14,9 +14,8 @@
 #include <vector>
 
 #include "core/component_coder.hpp"
-#include "core/data_packet.hpp"
-#include "core/pdu_input.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
 #include "core/port_caps.hpp"
 #include "core/rtp_h264.hpp"
 #include "core/sdu_caps.hpp"
@@ -24,7 +23,7 @@
 namespace vstreamer
 {
 
-class rtp_h264_depay : public component_coder, public pdu_input, public pdu_output
+class rtp_h264_depay : public component_coder
 {
 public:
     rtp_h264_depay();
@@ -34,18 +33,8 @@ public:
     rtp_h264_depay &operator=(const rtp_h264_depay &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
-    [[nodiscard]] packet_kind_e input_packet_kind() const override;
-    [[nodiscard]] packet_kind_e output_packet_kind() const override;
-
     int  open() override;
     void close() override;
-
-    int input(uint8_t port, const data_packet &in) override;
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
-
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 

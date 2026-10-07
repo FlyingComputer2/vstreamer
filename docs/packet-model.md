@@ -1,17 +1,19 @@
 # Packet model
 
-Pipeline wires carry `data_packet` (`core/data_packet.hpp`): owned
-`packet_body` subclasses (`frame_data`, `audio_data`, `sock_data`).
+Pipeline stages exchange **`component_pdu`** (`core/component_pdu.hpp`): a typed SDU in
+`shared_sized_buffer`, plus `sdu_type`, timestamps, flags, and port index. Caps PDUs
+(`CAPS_VIDEO_RAW`, `CAPS_VIDEO_CODED`, …) describe geometry and codec parameters via
+`sdu_caps.hpp`.
 
-Receiver RX/gap counters are not carried in `data_packet`; they are sent on the reverse UDP
+Receiver RX/gap counters are not carried in PDUs; they are sent on the reverse UDP
 link-report path and surfaced as `stream_sender.peer_*` metrics (see [pipeline-flow.md](pipeline-flow.md)).
 
 ### RTP capture timestamp extension
 
 `rtp_h264_pay` stamps a one-byte RFC 5285 extension (id **2**, 8 bytes big-endian) with the
 capture instant as **CLOCK_REALTIME** nanoseconds since the Unix epoch. `rtp_h264_depay` maps
-that value to local monotonic time when emitting each access unit so downstream stages keep using
-`frame_data.capture_mono_ns` for latency.
+that value to local monotonic time and stores it in each output AU’s `ts_us` (microseconds) for
+latency accounting downstream.
 
 **Clock requirements:** sender and receiver hosts must be time-synchronized (chrony, NTP, or
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
@@ -38,7 +40,10 @@ add a 2-byte big-endian `orig_len` before the RTP datagram inside the shard body
 
 `fec none` sends raw SDUs (`is_fec=0`) with only the 4-byte stream header prefix.
 
-`stream_receiver` strips the stream header and FEC, then passes **`sock_data`** to `rtp_h264_depay`.
+`stream_receiver` strips the stream header and FEC, then emits **`STREAM_DGRAM`** PDUs.
+`rtp_h264_depay` accepts `RTP` or `STREAM_DGRAM` and outputs `H264_AU` (and `CAPS_VIDEO_CODED`
+when SPS dimensions change).
+
 The depayloader orders RTP using the sequence inside the RTP header, not a separate sock sequence.
 
 Peer loss metrics on `stream_sender` (`peer_loss_*`, `peer_*_gap_count`) are fed from
@@ -67,7 +72,7 @@ is the header `sequence_number`. Payload only:
 ## Stream path
 
 ```text
-TX: … → rtp_h264_pay → stream_sender.0
+TX: … → rtp_h264_pay → stream_sender
 
-RX: stream_receiver.0 → rtp_h264_depay → h264_decoder → sdl_sink
+RX: stream_receiver → rtp_h264_depay → h264_decoder → sdl_sink
 ```

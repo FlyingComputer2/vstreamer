@@ -1,12 +1,12 @@
 #include "components/mkv_sink.hpp"
 
 #include "core/component_pdu.hpp"
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <cerrno>
 
@@ -22,9 +22,7 @@ extern "C"
 #include <string>
 #include <vector>
 
-using vstreamer::data_packet;
-using vstreamer::frame_data;
-using vstreamer::media_kind_e;
+using vstreamer::component_pdu;
 using vstreamer::mkv_sink;
 using vstreamer::shared_sized_buffer;
 
@@ -57,24 +55,6 @@ constexpr uint8_t k_minimal_jpeg[] = {
     0xf8, 0xf9, 0xfa, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xfb, 0xd5,
     0xdb, 0x20, 0xa8, 0xa8, 0xa8, 0xff, 0xd9,
 };
-
-data_packet make_mjpeg_packet(int w, int h, int64_t pts)
-{
-    auto body = std::make_shared<frame_data>();
-    body->kind = media_kind_e::MJPEG;
-    body->width = w;
-    body->height = h;
-    body->pts = pts;
-    body->key = true;
-    const size_t sz = sizeof(k_minimal_jpeg);
-    auto        *copy = static_cast<uint8_t *>(std::malloc(sz));
-    std::memcpy(copy, k_minimal_jpeg, sz);
-    body->buf = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(copy), sz, sz,
-                                           [](std::byte *p) {
-                                               std::free(reinterpret_cast<uint8_t *>(p));
-                                           });
-    return data_packet(std::move(body));
-}
 
 bool probe_video_span(const std::string &path, int *frame_count, double *duration_sec)
 {
@@ -145,14 +125,13 @@ vstreamer::component_pdu make_mjpeg_caps(int w, int h)
     return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_CODED, caps, 0, 0);
 }
 
-vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t pts)
+vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t frame_index)
 {
     vstreamer::component_pdu pdu;
-    pdu.ts_us = static_cast<uint64_t>(pts);
+    pdu.ts_us = static_cast<uint64_t>(frame_index);
     pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
     pdu.port = 0;
-    const data_packet legacy = make_mjpeg_packet(w, h, pts);
-    pdu.sdu = data_packet::cast<frame_data>(legacy).buf;
+    pdu.sdu = shared_sized_buffer::copy_from(k_minimal_jpeg, sizeof(k_minimal_jpeg));
     return pdu;
 }
 
@@ -219,8 +198,11 @@ TEST(MkvSinkTest, DurationAndResizeSegments)
     {
         const int w = (i < 30) ? 320 : 640;
         const int h = (i < 30) ? 240 : 480;
-        data_packet pkt = make_mjpeg_packet(w, h, i);
-        ASSERT_EQ(sink.input(0, pkt), 0);
+        if (0 == i || i == 30)
+        {
+            ASSERT_EQ(sink.input(make_mjpeg_caps(w, h)), 0);
+        }
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(w, h, i)), 0);
     }
     sink.close();
 

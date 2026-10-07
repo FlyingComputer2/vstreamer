@@ -1,8 +1,6 @@
 #include "components/h264_decoder_mpp.hpp"
 
-#include "core/data_packet.hpp"
 #include "core/key_util.hpp"
-#include "core/packet_types.hpp"
 #include "core/sdu_type.hpp"
 #include "core/output_opts.hpp"
 #include "core/pix_convert.hpp"
@@ -175,15 +173,7 @@ std::string h264_decoder_mpp::name() const
     return "h264_decoder_mpp";
 }
 
-media_kind_e h264_decoder_mpp::input_kind() const
-{
-    return media_kind_e::H264;
-}
 
-media_kind_e h264_decoder_mpp::output_kind() const
-{
-    return output_format;
-}
 
 int h264_decoder_mpp::ensure_decoder_locked()
 {
@@ -353,7 +343,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         return -EIO;
     }
 
-    if (output_format != media_kind_e::NV12)
+    if (output_format != sdu_type_e::NV12)
     {
         return -ENOTSUP;
     }
@@ -692,34 +682,6 @@ int h264_decoder_mpp::input(component_pdu &&in)
     return input_pdu_locked(std::move(in));
 }
 
-int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
-{
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::H264 || f.buf.size() > k_max_au)
-    {
-        return -EINVAL;
-    }
-    component_pdu pdu;
-    pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
-                                      : static_cast<uint64_t>(f.pts);
-    pdu.sdu_type = sdu_type_e::H264_AU;
-    pdu.port = 0;
-    pdu.sdu = f.buf;
-    if (f.key)
-    {
-        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
-    }
-    video_coded_caps caps {};
-    caps.width = f.width > 0 ? f.width : width;
-    caps.height = f.height > 0 ? f.height : height;
-    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, pdu.ts_us, 0);
-    const int     cr = input(std::move(caps_pdu));
-    if (cr < 0)
-    {
-        return cr;
-    }
-    return input(std::move(pdu));
-}
 
 int h264_decoder_mpp::output(component_pdu &out)
 {
@@ -740,45 +702,6 @@ int h264_decoder_mpp::output(component_pdu &out)
     return 0;
 }
 
-int h264_decoder_mpp::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
-{
-    using clock = std::chrono::steady_clock;
-    auto deadline = clock::now();
-    if (timeout_ms > 0)
-    {
-        deadline += std::chrono::milliseconds(timeout_ms);
-    }
-    for (;;)
-    {
-        component_pdu pdu;
-        const int     r = output(pdu);
-        if (0 == r)
-        {
-            if (is_caps(pdu.sdu_type))
-            {
-                continue;
-            }
-            auto fd = std::make_unique<frame_data>();
-            fd->kind = media_kind_e::NV12;
-            fd->width = output_caps_.width;
-            fd->height = output_caps_.height;
-            fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL;
-            fd->pts = fd->capture_mono_ns;
-            fd->buf = std::move(pdu.sdu);
-            out.reset(std::move(fd));
-            return 0;
-        }
-        if (timeout_ms == 0)
-        {
-            return r;
-        }
-        if (timeout_ms > 0 && clock::now() >= deadline)
-        {
-            return -EAGAIN;
-        }
-        drain_mpp_to_ready(timeout_ms > 0 ? 5 : 10);
-    }
-}
 
 int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
 {
@@ -823,8 +746,8 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
     }
     if (key == "output_format")
     {
-        media_kind_e kind = media_kind_e::UNKNOWN;
-        int          r = parse_output_format(v, &kind);
+        sdu_type_e kind = sdu_type_e::UNKNOWN;
+        int        r = parse_output_format(v, &kind);
         if (r < 0)
         {
             return r;

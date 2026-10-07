@@ -1,8 +1,7 @@
 #include "components/noise_source.hpp"
 
 #include "core/component_pdu.hpp"
-#include "core/data_packet.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_output.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/noise_fft2.hpp"
 
@@ -116,15 +115,10 @@ int main()
                      [&]
                      {
                          vstreamer::component_pdu pdu;
-                         auto *po = dynamic_cast<vstreamer::pdu_output *>(&src);
+                         auto *po = dynamic_cast<vstreamer::component_output *>(&src);
                          if (nullptr != po && po->output(pdu) == 0 && !vstreamer::is_caps(pdu.sdu_type))
                          {
                              return;
-                         }
-                         vstreamer::data_packet pkt;
-                         if (src.output(0, pkt, 0) == 0)
-                         {
-                             pkt.release();
                          }
                      });
         std::printf("%4dx%-4d %4d %8.3f  (%6.1f fps)\n", c.w, c.h, c.bw, ms, 1000.0 / ms);

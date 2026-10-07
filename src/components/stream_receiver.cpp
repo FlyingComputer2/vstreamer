@@ -113,19 +113,7 @@ std::string stream_receiver::name() const
     return "stream_receiver";
 }
 
-media_kind_e stream_receiver::output_kind() const
-{
-    return media_kind_e::UNKNOWN;
-}
 
-packet_kind_e stream_receiver::output_packet_kind(uint8_t port) const
-{
-    if (0 != port)
-    {
-        return packet_kind_e::UNKNOWN;
-    }
-    return packet_kind_e::SOCK;
-}
 
 void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
                                              size_t max_app_bytes, bool discont)
@@ -635,50 +623,6 @@ int stream_receiver::output(component_pdu &out)
     return 0;
 }
 
-int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
-{
-    if (0 != port)
-    {
-        return -EINVAL;
-    }
-
-    std::unique_lock<std::mutex> lock(q_mu);
-    if (pdu_queue.empty() && 0 != timeout_ms)
-    {
-        if (timeout_ms < 0)
-        {
-            q_cv.wait(lock, [this] { return stopping || !pdu_queue.empty(); });
-        }
-        else
-        {
-            q_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                          [this] { return stopping || !pdu_queue.empty(); });
-        }
-    }
-
-    if (pdu_queue.empty())
-    {
-        if (stopping)
-        {
-            return -EBADF;
-        }
-        return -EAGAIN;
-    }
-
-    component_pdu pdu = std::move(pdu_queue.front());
-    pdu_queue.pop_front();
-    const size_t egress_bytes = pdu.sdu.size();
-    lock.unlock();
-    {
-        std::lock_guard<std::mutex> slock(mu);
-        update_kbps_window(egress_rate_t0, egress_rate_bytes, egress_kbps, egress_bytes);
-    }
-    auto sd = std::make_unique<sock_data>();
-    sd->pts = static_cast<int64_t>(pdu.ts_us);
-    sd->buf = std::move(pdu.sdu);
-    out.reset(std::move(sd));
-    return 0;
-}
 
 namespace
 {

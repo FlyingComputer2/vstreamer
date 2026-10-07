@@ -78,8 +78,7 @@ TEST(SdlNv12PresenterTest, TryEnqueueEagainWhenQueueFull)
 {
     vstreamer::sdl_nv12_presenter present("sdl_sink_test", "dummy");
     present.set_queue_capacity(1);
-    vstreamer::frame_data f;
-    f.kind = vstreamer::media_kind_e::NV12;
+    vstreamer::nv12_present_sample f;
     f.width = 4;
     f.height = 4;
     const size_t sz = 4 * 4 + 8;
@@ -92,8 +91,7 @@ TEST(SdlNv12PresenterTest, EnqueueDropOldestWhenQueueFull)
 {
     vstreamer::sdl_nv12_presenter present("sdl_sink_test", "dummy");
     present.set_queue_capacity(1);
-    vstreamer::frame_data f;
-    f.kind = vstreamer::media_kind_e::NV12;
+    vstreamer::nv12_present_sample f;
     f.width = 4;
     f.height = 4;
     const size_t sz = 4 * 4 + 8;

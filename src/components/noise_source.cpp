@@ -237,10 +237,6 @@ std::string noise_source::name() const
     return "noise";
 }
 
-media_kind_e noise_source::output_kind() const
-{
-    return media_kind_e::NV12;
-}
 
 int noise_source::open()
 {
@@ -560,65 +556,6 @@ int noise_source::output(component_pdu &out)
     return 0;
 }
 
-int noise_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
-{
-    join_pregenerate_worker();
-
-    for (;;)
-    {
-        component_pdu pdu;
-        const int     r = output(pdu);
-        if (-EAGAIN == r)
-        {
-            if (0 == timeout_ms)
-            {
-                return -EAGAIN;
-            }
-            int fps_val = 30;
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                if (!opened)
-                {
-                    return -EBADF;
-                }
-                fps_val = fps;
-            }
-            pace_unlocked(fps_val, timeout_ms);
-            continue;
-        }
-        if (r < 0)
-        {
-            return r;
-        }
-        if (pdu.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
-        {
-            continue;
-        }
-        if (pdu.sdu_type != sdu_type_e::NV12)
-        {
-            return -EINVAL;
-        }
-
-        int w = 0;
-        int h = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            w = width;
-            h = height;
-        }
-
-        auto fd = std::make_unique<frame_data>();
-        fd->kind = media_kind_e::NV12;
-        fd->width = w;
-        fd->height = h;
-        fd->pts = static_cast<int64_t>(pdu.seq);
-        fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL;
-        fd->key = true;
-        fd->buf = std::move(pdu.sdu);
-        out.reset(std::move(fd));
-        return 0;
-    }
-}
 
 int noise_source::configure(std::string_view key, std::string_view value)
 {

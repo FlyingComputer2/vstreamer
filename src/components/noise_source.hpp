@@ -17,14 +17,14 @@
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
 #include "core/noise_fft2.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_output.hpp"
 #include "core/port_caps.hpp"
 
 namespace vstreamer
 {
 
 /* Synthetic NV12: bandwidth-shaped spectrum → SIMD IFFT (PFFFT). Default 416x240@30. */
-class noise_source : public component_source, public pdu_output
+class noise_source : public component_source
 {
 public:
     noise_source();
@@ -34,14 +34,10 @@ public:
     noise_source &operator=(const noise_source &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
     int  open() override;
     void close() override;
 
     void stop_pregenerate();
-
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
     int output(component_pdu &out) override;
 
     [[nodiscard]] int64_t next_deadline_ns() const override;

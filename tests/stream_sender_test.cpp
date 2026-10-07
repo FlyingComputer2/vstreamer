@@ -3,13 +3,14 @@
 
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
-#include "core/data_packet.hpp"
 #include "core/shared_sized_buffer.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -100,22 +101,6 @@ int ephemeral_udp_port()
     return port;
 }
 
-vstreamer::data_packet make_sock_packet(uint32_t counter, size_t payload_bytes)
-{
-    std::vector<uint8_t> storage(payload_bytes);
-    storage[0] = static_cast<uint8_t>((counter >> 24) & 0xFF);
-    storage[1] = static_cast<uint8_t>((counter >> 16) & 0xFF);
-    storage[2] = static_cast<uint8_t>((counter >> 8) & 0xFF);
-    storage[3] = static_cast<uint8_t>(counter & 0xFF);
-
-    auto sd = std::make_unique<vstreamer::sock_data>();
-    sd->pts = static_cast<int64_t>(counter);
-    sd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
-
-    vstreamer::data_packet pkt;
-    pkt.reset(std::move(sd));
-    return pkt;
-}
 
 size_t query_size_t(const vstreamer::stream_sender &sender, const char *key)
 {
@@ -177,8 +162,8 @@ TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
     constexpr size_t k_payload = 1400;
     for (int i = 0; i < k_packets; ++i)
     {
-        const auto pkt = make_sock_packet(static_cast<uint32_t>(i), k_payload);
-        ASSERT_EQ(0, sender.input(0, pkt));
+        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
+        ASSERT_EQ(0, sender.input(std::move(pkt)));
     }
 
     std::string dropped_s;
@@ -188,7 +173,7 @@ TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
     sender.close();
 }
 
-TEST(StreamSenderTest, QueueByteCapEvictsOldestUnderPacing)
+TEST(StreamSenderTest, QueueByteCapReturnsEagainUnderPacing)
 {
     const int port = ephemeral_udp_port();
     ASSERT_GT(port, 0);
@@ -204,24 +189,27 @@ TEST(StreamSenderTest, QueueByteCapEvictsOldestUnderPacing)
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
     const size_t limit = query_size_t(sender, "queue_byte_limit");
-    constexpr int k_packets = 6000;
     constexpr size_t k_payload = 128;
 
-    for (int i = 0; i < k_packets; ++i)
+    bool saw_eagain = false;
+    for (int i = 0; i < 6000; ++i)
     {
-        const auto pkt = make_sock_packet(static_cast<uint32_t>(i), k_payload);
-        ASSERT_EQ(0, sender.input(0, pkt));
+        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
+        const int rc = sender.input(std::move(pkt));
+        if (-EAGAIN == rc)
+        {
+            saw_eagain = true;
+            break;
+        }
+        ASSERT_EQ(0, rc);
         const size_t qb = query_size_t(sender, "queue_bytes");
         EXPECT_LE(qb, limit);
     }
+    EXPECT_TRUE(saw_eagain);
 
     std::string dropped_s;
     ASSERT_EQ(0, sender.query("dropped", &dropped_s));
-    const uint64_t dropped = std::strtoull(dropped_s.c_str(), nullptr, 10);
-    EXPECT_GT(dropped, 0ULL);
-
-    const uint64_t sent = sender.wire_pkts_sent_counter().load();
-    EXPECT_GE(sent + dropped, static_cast<uint64_t>(k_packets - 500));
+    EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
 
     sender.close();
 }
@@ -254,8 +242,8 @@ TEST(StreamSenderTest, MaxKbpsReconfigureWhileSending)
 
     for (int i = 0; i < 500; ++i)
     {
-        const auto pkt = make_sock_packet(static_cast<uint32_t>(i), 128);
-        (void)sender.input(0, pkt);
+        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 128);
+        (void)sender.input(std::move(pkt));
     }
     stop = true;
     hammer.join();
@@ -364,8 +352,8 @@ TEST(StreamSenderTest, LocalBindFixesSourcePort)
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
-    const auto pkt = make_sock_packet(0, 64);
-    ASSERT_EQ(0, sender.input(0, pkt));
+    auto pkt = vstreamer::test_pdu::make_stream_dgram(0, 64);
+    ASSERT_EQ(0, sender.input(std::move(pkt)));
 
     std::string qlocal;
     ASSERT_EQ(0, sender.query("local", &qlocal));
@@ -659,17 +647,17 @@ TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
 
     ASSERT_EQ(0, receiver.open());
-    ASSERT_EQ(0, sender.input(0, make_sock_packet(0, 64)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0, 64))));
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
-    ASSERT_EQ(0, sender.input(0, make_sock_packet(1, 64)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1, 64))));
 
-    vstreamer::data_packet out;
+    vstreamer::component_pdu out;
     const auto             deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     int                    got = 0;
     while (std::chrono::steady_clock::now() < deadline)
     {
-        const int rc = receiver.output(0, out, 100);
+        const int rc = receiver.output(out);
         if (0 == rc)
         {
             ++got;
@@ -743,8 +731,8 @@ TEST(StreamSenderTest, WireSequenceStampedOnFecAndRaw)
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
-    const auto pkt = make_sock_packet(0, 32);
-    ASSERT_EQ(0, sender.input(0, pkt));
+    auto pkt = vstreamer::test_pdu::make_stream_dgram(0, 32);
+    ASSERT_EQ(0, sender.input(std::move(pkt)));
 
     uint8_t wire[2048];
     size_t  wire_len = 0;
@@ -755,7 +743,7 @@ TEST(StreamSenderTest, WireSequenceStampedOnFecAndRaw)
 
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, sender.set_enabled(true, 0));
-    ASSERT_EQ(0, sender.input(0, make_sock_packet(1, 32)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1, 32))));
     bool saw_raw = false;
     for (int attempt = 0; attempt < 8 && !saw_raw; ++attempt)
     {
@@ -796,7 +784,7 @@ TEST(StreamSenderTest, RawPathDoesNotAdvanceSduBase)
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
-    ASSERT_EQ(0, sender.input(0, make_sock_packet(0, 32)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0, 32))));
     uint8_t wire[2048];
     size_t  wire_len = 0;
     ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
@@ -813,12 +801,12 @@ TEST(StreamSenderTest, RawPathDoesNotAdvanceSduBase)
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     for (int i = 0; i < 5; ++i)
     {
-        ASSERT_EQ(0, sender.input(0, make_sock_packet(static_cast<uint32_t>(i + 1), 32)));
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i + 1), 32)));
         ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 200));
     }
 
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, sender.input(0, make_sock_packet(99, 32)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(99, 32))));
     ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
     uint16_t base1 = 0;
     ASSERT_TRUE(vstreamer::rs_block_erasure::unpack_header(
@@ -873,11 +861,11 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
     std::string dropped_before;
     ASSERT_EQ(0, sender.query("dropped", &dropped_before));
     const uint64_t dropped0 = std::strtoull(dropped_before.c_str(), nullptr, 10);
-    const auto     legacy_pkt = make_sock_packet(9999, 64);
-    ASSERT_EQ(0, sender.input(0, legacy_pkt));
+    auto overflow_pkt = vstreamer::test_pdu::make_stream_dgram(9999, 64);
+    EXPECT_EQ(-EAGAIN, sender.input(std::move(overflow_pkt)));
     std::string dropped_after;
     ASSERT_EQ(0, sender.query("dropped", &dropped_after));
-    EXPECT_GE(std::strtoull(dropped_after.c_str(), nullptr, 10), dropped0);
+    EXPECT_EQ(dropped0, std::strtoull(dropped_after.c_str(), nullptr, 10));
 
     sender.close();
 }

@@ -35,7 +35,7 @@ bool key_is_noise_query(std::string_view key)
 
 int pdu_output_from_source(component_source &src, component_pdu &out)
 {
-    auto *po = dynamic_cast<pdu_output *>(&src);
+    auto *po = dynamic_cast<component_output *>(&src);
     if (nullptr == po)
     {
         return -ENOTSUP;
@@ -47,23 +47,14 @@ int pdu_output_from_source(component_source &src, component_pdu &out)
 
 source_selector::source_selector(component_source &camera_in, component_source &noise_in,
                                int noise_width_in, int noise_height_in, int noise_fps_in,
-                               on_switch_fn on_switch_in, push_packet_fn push_mjpeg_in,
-                               push_packet_fn push_nv12_in)
+                               on_switch_fn on_switch_in)
     : camera(camera_in),
       noise(noise_in),
       noise_width(noise_width_in),
       noise_height(noise_height_in),
       noise_fps(noise_fps_in),
-      on_switch(std::move(on_switch_in)),
-      push_mjpeg(std::move(push_mjpeg_in)),
-      push_nv12(std::move(push_nv12_in))
+      on_switch(std::move(on_switch_in))
 {
-}
-
-void source_selector::set_push_handlers(push_packet_fn push_mjpeg_in, push_packet_fn push_nv12_in)
-{
-    push_mjpeg = std::move(push_mjpeg_in);
-    push_nv12 = std::move(push_nv12_in);
 }
 
 void source_selector::set_push_pdu_handler(push_pdu_fn push_pdu_in)
@@ -330,77 +321,23 @@ int source_selector::poll_once_pdu(pdu_wakeup &w)
 
 int source_selector::poll_once(int timeout_ms)
 {
-    if (push_pdu)
+    pdu_wakeup local_wake;
+    if (timeout_ms < 0)
     {
-        pdu_wakeup local_wake;
         return poll_once_pdu(local_wake);
     }
-
-    data_packet out;
-    if (source_kind::camera == kind)
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
+    while (std::chrono::steady_clock::now() < deadline)
     {
-        const int cam = camera.output(0, out, timeout_ms);
-        if (0 == cam)
+        const int r = poll_once_pdu(local_wake);
+        if (0 == r || -EAGAIN != r)
         {
-            if (push_mjpeg)
-            {
-                push_mjpeg(std::move(out));
-            }
-            return 0;
+            return r;
         }
-        if (-ENODEV != cam)
-        {
-            return cam;
-        }
-        switch_to_noise();
-        if (source_kind::camera == kind)
-        {
-            return -EAGAIN;
-        }
-        const int nr = noise.output(0, out, timeout_ms);
-        if (0 == nr && push_nv12)
-        {
-            push_nv12(std::move(out));
-        }
-        return nr;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
-    const auto now = std::chrono::steady_clock::now();
-    const auto since_probe =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_camera_probe).count();
-    if (since_probe >= k_camera_probe_interval_ms)
-    {
-        last_camera_probe = now;
-        data_packet probe;
-        const int   cam = camera.output(0, probe, 0);
-        if (0 == cam)
-        {
-            int w = noise_width;
-            int h = noise_height;
-            int f = noise_fps;
-            (void)read_camera_geometry(&w, &h, &f);
-            switch_to_camera(w, h, f);
-            if (source_kind::camera == kind && push_mjpeg)
-            {
-                push_mjpeg(std::move(probe));
-                return 0;
-            }
-        }
-        else if (-ENODEV != cam && -EAGAIN != cam)
-        {
-            if (-cam > 0 && -cam < 4096)
-            {
-                camera_error = std::strerror(-cam);
-            }
-        }
-    }
-
-    const int nr = noise.output(0, out, timeout_ms);
-    if (0 == nr && push_nv12)
-    {
-        push_nv12(std::move(out));
-    }
-    return nr;
+    return -EAGAIN;
 }
 
 int source_selector::configure(std::string_view key, std::string_view value)

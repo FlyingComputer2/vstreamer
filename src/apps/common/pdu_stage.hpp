@@ -8,7 +8,7 @@
 #include "apps/common/stage_latency.hpp"
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
-#include "core/pdu_output.hpp"
+#include "core/component_output.hpp"
 #include "core/pdu_wakeup.hpp"
 #include "core/time_util.hpp"
 
@@ -31,7 +31,7 @@ void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
 void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &stop_flag);
 
 template <typename SinkFn>
-void pump_pdu_output(pdu_output &src, component &owner, pdu_wakeup &w, std::atomic<bool> &stop_flag,
+void pump_pdu_output(component_output &src, component &owner, pdu_wakeup &w, std::atomic<bool> &stop_flag,
                      const char *latency_stage, SinkFn &&sink,
                      std::unordered_map<uint64_t, int64_t> *input_mono_by_ts_us)
 {
@@ -59,7 +59,7 @@ void pump_pdu_output(pdu_output &src, component &owner, pdu_wakeup &w, std::atom
                         const int64_t now_ns = steady_mono_ns();
                         const double  node_ms =
                             static_cast<double>(now_ns - it->second) / 1e6;
-                        record_stage_latency_ms(latency_stage, data_packet(), node_ms);
+                        record_stage_latency_ms(latency_stage, node_ms);
                         input_mono_by_ts_us->erase(it);
                     }
                 }

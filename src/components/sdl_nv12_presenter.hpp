@@ -12,10 +12,18 @@
 #include <string>
 #include <thread>
 
-#include "core/packet_types.hpp"
+#include "core/shared_sized_buffer.hpp"
 
 namespace vstreamer
 {
+
+struct nv12_present_sample
+{
+    shared_sized_buffer buf;
+    int                 width = 0;
+    int                 height = 0;
+    uint64_t            ts_us = 0;
+};
 
 /* Shared SDL NV12 window/texture path for sdl_sink. */
 class sdl_nv12_presenter
@@ -29,16 +37,16 @@ public:
     /* Create window/texture before first frame (black until present). */
     int prepare(int w, int h, bool &session_open);
 
-    int present(const frame_data &f, bool &session_open);
+    int present(const nv12_present_sample &f, bool &session_open);
 
     void set_queue_capacity(size_t cap);
     [[nodiscard]] size_t queue_capacity() const;
     [[nodiscard]] size_t queue_size() const;
 
     /* Non-blocking enqueue; -EAGAIN when the pending queue is full. */
-    int try_enqueue(const frame_data &f);
+    int try_enqueue(const nv12_present_sample &f);
     /* Drop oldest pending frame when full (live preview policy). */
-    int enqueue_drop(const frame_data &f, bool *dropped_oldest);
+    int enqueue_drop(const nv12_present_sample &f, bool *dropped_oldest);
     /* Present all pending frames on the calling thread. */
     int drain_pending(bool &session_open);
 
@@ -53,7 +61,7 @@ private:
     void destroy_texture_locked();
     void pump_events_locked(bool &session_open);
     int  ensure_video_locked(int w, int h);
-    int  present_nv12_locked(const frame_data &f, bool &session_open);
+    int  present_nv12_locked(const nv12_present_sample &f, bool &session_open);
 
     const char *log_tag;
     const char *video_driver;
@@ -86,8 +94,8 @@ private:
     mutable std::string last_err;
 
     static constexpr size_t k_default_queue_depth = 1;
-    size_t                  queue_cap = k_default_queue_depth;
-    std::deque<frame_data>  pending;
+    size_t                         queue_cap = k_default_queue_depth;
+    std::deque<nv12_present_sample> pending;
 
     void note_present_failure(const char *op);
     void clear_sdl_error();

@@ -34,7 +34,7 @@
  * hosts via CLOCK_REALTIME on the wire; sender and receiver clocks must be synchronized).
  *
  * Per-stage latency lines (stderr): --diag or VSTREAMER_LOG_STAGE_LATENCY=1
- * Optional: VSTREAMER_STAGE_LATENCY_EVERY=N (log every Nth frame by pts, default 1).
+ * Optional: VSTREAMER_STAGE_LATENCY_EVERY=N (log every Nth frame by ts_us, default 1).
  */
 #include "components/components.hpp"
 
@@ -664,8 +664,7 @@ int main(int argc, char **argv)
             (void)enc.configure("idr", std::string_view("1"));
         };
         uvc_selector = std::make_unique<apps::tx::source_selector>(
-            camera, noise, width, height, fps, on_switch, apps::tx::source_selector::push_packet_fn {},
-            apps::tx::source_selector::push_packet_fn {});
+            camera, noise, width, height, fps, on_switch);
         uvc_metrics_source =
             std::make_unique<apps::tx::source_selector_query_source>(*uvc_selector);
     }

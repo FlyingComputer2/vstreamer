@@ -17,8 +17,7 @@
 
 #include "components/sdl_nv12_presenter.hpp"
 #include "core/component_sink.hpp"
-#include "core/data_packet.hpp"
-#include "core/pdu_input.hpp"
+#include "core/component_input.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
 
@@ -26,7 +25,7 @@ namespace vstreamer
 {
 
 /* Packed NV12 preview sink. */
-class sdl_sink : public component_sink, public pdu_input
+class sdl_sink : public component_sink
 {
 public:
     sdl_sink();
@@ -36,14 +35,10 @@ public:
     sdl_sink &operator=(const sdl_sink &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-
     int  open() override;
     void close() override;
 
     int prepare(int width, int height);
-
-    int input(uint8_t port, const data_packet &in) override;
     int input(component_pdu &&in) override;
 
     int configure(std::string_view key, std::string_view value) override;
@@ -54,7 +49,7 @@ private:
 
     [[nodiscard]] int input_pdu_locked(component_pdu &&in);
     [[nodiscard]] bool raw_caps_acceptable(const video_raw_caps &caps) const;
-    [[nodiscard]] frame_data frame_from_pdu(const component_pdu &in) const;
+    [[nodiscard]] nv12_present_sample sample_from_pdu(const component_pdu &in) const;
 
     void present_thread_main();
     void stop_present_thread();

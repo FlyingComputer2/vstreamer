@@ -36,9 +36,7 @@ if(ENABLE_H264_DECODER_MPP OR ENABLE_H264_ENCODER_MPP)
 endif()
 
 set(VSTREAMER_SOURCES
-    src/core/frame.cpp
     src/core/metrics.cpp
-    src/core/data_packet.cpp
     src/core/sdu_type.cpp
     src/core/sdu_caps.cpp
     src/core/port_caps.cpp
