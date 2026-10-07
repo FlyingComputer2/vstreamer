@@ -183,15 +183,16 @@ void v4l2_source::stop_poll_watcher()
     poll_stop_.store(false, std::memory_order_release);
 }
 
-void v4l2_source::stop_poll_watcher_locked()
+void v4l2_source::start_poll_watcher()
 {
     stop_poll_watcher();
-}
-
-void v4l2_source::start_poll_watcher_locked()
-{
-    stop_poll_watcher();
-    if (!source_open)
+    bool should_start = false;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        should_start = source_open;
+        poll_edge_notified_ = false;
+    }
+    if (!should_start)
     {
         return;
     }
@@ -218,10 +219,15 @@ void v4l2_source::poll_watcher_main()
         struct pollfd pfd {};
         pfd.fd = local_fd;
         pfd.events = POLLIN;
-        const int pr = ::poll(&pfd, 1, 100);
+        const int pr = ::poll(&pfd, 1, 200);
         if (pr > 0 && (pfd.revents & (POLLIN | POLLERR | POLLHUP)) != 0)
         {
-            notify_wakeup();
+            std::lock_guard<std::mutex> lock(mu);
+            if (!poll_edge_notified_)
+            {
+                poll_edge_notified_ = true;
+                notify_wakeup();
+            }
         }
     }
 }
@@ -646,22 +652,24 @@ int v4l2_source::list_ctrls_locked(std::string *out) const
 
 int v4l2_source::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (source_open)
     {
-        return 0;
-    }
+        std::lock_guard<std::mutex> lock(mu);
+        if (source_open)
+        {
+            return 0;
+        }
 
-    const int r = capture_open_locked(true);
-    if (r < 0)
-    {
-        cap_retry_due = now_sec() + 1.0;
-        std::fprintf(stderr,
-                     "v4l2_source: capture unavailable on %s; waiting for device (%dx%d@%d)\n",
-                     device.c_str(), width, height, fps);
+        const int r = capture_open_locked(true);
+        if (r < 0)
+        {
+            cap_retry_due = now_sec() + 1.0;
+            std::fprintf(stderr,
+                         "v4l2_source: capture unavailable on %s; waiting for device (%dx%d@%d)\n",
+                         device.c_str(), width, height, fps);
+        }
+        source_open = true;
     }
-    source_open = true;
-    start_poll_watcher_locked();
+    start_poll_watcher();
     return 0;
 }
 
@@ -797,6 +805,7 @@ int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
             out.flags = static_cast<uint8_t>(pdu_flag_e::KEY);
             out.sdu = std::move(payload);
             ret = 0;
+            poll_edge_notified_ = false;
         }
     }
     else

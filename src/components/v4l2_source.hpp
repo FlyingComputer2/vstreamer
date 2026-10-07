@@ -60,8 +60,7 @@ class v4l2_source : public component_source
     int        emit_coded_caps_locked(component_pdu &out);
     bool       coded_caps_match_locked() const;
     void       poll_watcher_main();
-    void       start_poll_watcher_locked();
-    void       stop_poll_watcher_locked();
+    void       start_poll_watcher();
     void       stop_poll_watcher();
     bool       maybe_retry_capture_locked();
 
@@ -92,6 +91,7 @@ class v4l2_source : public component_source
 
     std::thread       poll_thread_;
     std::atomic<bool> poll_stop_ {false};
+    bool              poll_edge_notified_ = false;
 
     double cap_retry_due = 0;
 
