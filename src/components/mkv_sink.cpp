@@ -186,7 +186,7 @@ int mkv_sink::start_locked(int w, int h)
     }
 
     const int use_fps = fps > 0 ? fps : 30;
-    st->time_base = AVRational{1, use_fps};
+    st->time_base = AVRational{1, 1000000};
     st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id = AV_CODEC_ID_MJPEG;
     st->codecpar->width = w;
@@ -222,6 +222,7 @@ int mkv_sink::start_locked(int w, int h)
     live_h = h;
     last_mux_pts = -1;
     segment_pts_base = -1;
+    last_frame_ts_us = -1;
     t0 = now_sec();
     recording = true;
     return 0;
@@ -280,16 +281,26 @@ int mkv_sink::write_frame_locked(const component_pdu &in)
     pkt->size = static_cast<int>(in.sdu.size());
 
     const int use_fps = fps > 0 ? fps : 30;
-    const int64_t frame_pts = static_cast<int64_t>(in.ts_us);
+    const int64_t frame_ts_us = static_cast<int64_t>(in.ts_us);
     if (segment_pts_base < 0)
     {
-        segment_pts_base = frame_pts;
+        segment_pts_base = frame_ts_us;
     }
-    int64_t mux_pts = frame_pts - segment_pts_base;
+    int64_t mux_pts = frame_ts_us - segment_pts_base;
     if (mux_pts < 0)
     {
         mux_pts = 0;
     }
+    int64_t duration_us = 1000000 / use_fps;
+    if (last_frame_ts_us >= 0)
+    {
+        const int64_t delta = frame_ts_us - last_frame_ts_us;
+        if (delta > 0)
+        {
+            duration_us = delta;
+        }
+    }
+    last_frame_ts_us = frame_ts_us;
     if (last_mux_pts >= 0 && mux_pts <= last_mux_pts)
     {
         mux_pts = last_mux_pts + 1;
@@ -297,7 +308,7 @@ int mkv_sink::write_frame_locked(const component_pdu &in)
     last_mux_pts = mux_pts;
     pkt->pts = mux_pts;
     pkt->dts = mux_pts;
-    pkt->duration = 1;
+    pkt->duration = duration_us;
     pkt->stream_index = st->index;
     pkt->flags |= AV_PKT_FLAG_KEY;
     pkt->buf = av_buffer_create(buf, in.sdu.size(), av_buffer_default_free, nullptr, 0);
@@ -308,7 +319,7 @@ int mkv_sink::write_frame_locked(const component_pdu &in)
         return -ENOMEM;
     }
 
-    av_packet_rescale_ts(pkt, AVRational{1, use_fps}, st->time_base);
+    av_packet_rescale_ts(pkt, AVRational{1, 1000000}, st->time_base);
 
     int ret = av_interleaved_write_frame(oc, pkt);
     av_packet_free(&pkt);

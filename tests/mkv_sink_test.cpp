@@ -128,7 +128,7 @@ vstreamer::component_pdu make_mjpeg_caps(int w, int h)
 vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t frame_index)
 {
     vstreamer::component_pdu pdu;
-    pdu.ts_us = static_cast<uint64_t>(frame_index);
+    pdu.ts_us = static_cast<uint64_t>(frame_index * 33333);
     pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
     pdu.port = 0;
     pdu.sdu = shared_sized_buffer::copy_from(k_minimal_jpeg, sizeof(k_minimal_jpeg));
@@ -174,6 +174,38 @@ TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
     EXPECT_TRUE(saw_eagain);
 
     sink.close();
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvSinkTest, MicrosecondTimestampsDuration)
+{
+    const auto base = std::filesystem::temp_directory_path() / "mkv_sink_ts_us";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+
+    const std::string out_template = (base / "clip.mkv").string();
+    const std::string seg_path = (base / "clip-001.mkv").string();
+    mkv_sink sink;
+    ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+    ASSERT_EQ(sink.configure("fps", "30"), 0);
+    ASSERT_EQ(sink.input(make_mjpeg_caps(320, 240)), 0);
+
+    for (int i = 0; i < 30; ++i)
+    {
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(320, 240, i)), 0);
+    }
+    sink.close();
+
+    int    frames = 0;
+    double dur = 0.0;
+    ASSERT_TRUE(std::filesystem::exists(seg_path));
+    ASSERT_TRUE(probe_video_span(seg_path, &frames, &dur));
+    EXPECT_EQ(frames, 30);
+    EXPECT_NEAR(dur, 1.0, 0.1);
+
     std::filesystem::remove_all(base, ec);
 }
 

@@ -26,8 +26,12 @@ public:
 
     void reset();
 
-    /* Clears pending and enqueues new datagrams. */
+    /* Clears pending and enqueues new datagrams. pts is a frame index (legacy). */
     int pack_annexb(const uint8_t *data, size_t size, int64_t pts, int64_t capture_rt_ns = 0);
+
+    /* Like pack_annexb but rtp_ts is already in 90 kHz units (from capture ts_us). */
+    int pack_annexb_rtp_ts(const uint8_t *data, size_t size, uint32_t rtp_ts,
+                           int64_t capture_rt_ns = 0);
 
     bool pending() const { return !queue.empty(); }
 

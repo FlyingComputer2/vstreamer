@@ -207,8 +207,15 @@ void rtp_h264_packer::cache_param(const uint8_t *nal, int len)
 int rtp_h264_packer::pack_annexb(const uint8_t *data, size_t size, int64_t pts,
                                  int64_t capture_rt_ns)
 {
-    queue.clear();
     const uint32_t ts = pts_to_rtp_ts(pts, cfg.fps);
+    return pack_annexb_rtp_ts(data, size, ts, capture_rt_ns);
+}
+
+int rtp_h264_packer::pack_annexb_rtp_ts(const uint8_t *data, size_t size, uint32_t rtp_ts,
+                                       int64_t capture_rt_ns)
+{
+    queue.clear();
+    const uint32_t ts = rtp_ts;
 
     std::vector<std::pair<const uint8_t *, int>> nals;
     parse_annexb_nals(data, size, &nals);

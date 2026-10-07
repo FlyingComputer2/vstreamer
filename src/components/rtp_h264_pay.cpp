@@ -136,8 +136,9 @@ int rtp_h264_pay::input_pdu_locked(component_pdu &&in)
     }
 
     const int64_t capture_rt = mono_to_realtime_ns(static_cast<int64_t>(in.ts_us) * 1000LL);
-    const int64_t pts = static_cast<int64_t>(in.ts_us);
-    if (packer.pack_annexb(in.sdu.u8(), in.sdu.size(), pts, capture_rt) < 0)
+    const uint32_t rtp_ts =
+        static_cast<uint32_t>((static_cast<uint64_t>(in.ts_us) * 90ULL) / 1000ULL);
+    if (packer.pack_annexb_rtp_ts(in.sdu.u8(), in.sdu.size(), rtp_ts, capture_rt) < 0)
     {
         return -EINVAL;
     }

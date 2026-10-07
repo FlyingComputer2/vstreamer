@@ -705,3 +705,37 @@ TEST(RtpH264Test, DepayAcceptsSmallClockAheadSkew)
     EXPECT_GT(lag_ns, -35'000'000LL);
     depay.close();
 }
+
+TEST(RtpH264Test, CaptureTsUsToRtpTimestampDelta)
+{
+    const uint8_t idr[] = {0x65, 0x01};
+    std::vector<uint8_t> au;
+    append_nal(&au, idr, sizeof(idr));
+
+    rtp_h264_config cfg;
+    cfg.mtu = 1400;
+    cfg.fps = 30;
+    rtp_h264_packer packer(cfg);
+    uint8_t buf[2048];
+
+    const uint32_t rtp0 = static_cast<uint32_t>((33333ULL * 90ULL) / 1000ULL);
+    const uint32_t rtp1 = static_cast<uint32_t>((66666ULL * 90ULL) / 1000ULL);
+    ASSERT_EQ(0, packer.pack_annexb_rtp_ts(au.data(), au.size(), rtp0, 0));
+    ASSERT_GT(packer.pop_datagram(buf, sizeof(buf)), 0);
+    const uint32_t read0 = (static_cast<uint32_t>(buf[4]) << 24) |
+                           (static_cast<uint32_t>(buf[5]) << 16) |
+                           (static_cast<uint32_t>(buf[6]) << 8) |
+                           static_cast<uint32_t>(buf[7]);
+
+    packer.reset();
+    ASSERT_EQ(0, packer.pack_annexb_rtp_ts(au.data(), au.size(), rtp1, 0));
+    ASSERT_GT(packer.pop_datagram(buf, sizeof(buf)), 0);
+    const uint32_t read1 = (static_cast<uint32_t>(buf[4]) << 24) |
+                           (static_cast<uint32_t>(buf[5]) << 16) |
+                           (static_cast<uint32_t>(buf[6]) << 8) |
+                           static_cast<uint32_t>(buf[7]);
+
+    EXPECT_EQ(rtp0, read0);
+    EXPECT_EQ(rtp1, read1);
+    EXPECT_NEAR(static_cast<int>(read1 - read0), 3000, 1);
+}

@@ -80,6 +80,7 @@ private:
     int  live_h = 0;
     int64_t last_mux_pts = -1;
     int64_t segment_pts_base = -1;
+    int64_t last_frame_ts_us = -1;
     double  t0 = 0.0;
     uint64_t frames_out = 0;
     uint64_t dropped = 0;
