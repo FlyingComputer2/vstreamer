@@ -406,14 +406,17 @@ void mkv_sink::mux_thread_main()
     }
 }
 
+void mkv_sink::wait_mux_idle()
+{
+    std::unique_lock<std::mutex> lock(q_mu);
+    q_cv.wait(lock, [this] {
+        return queue.empty() && mux_in_flight.load(std::memory_order_relaxed) == 0;
+    });
+}
+
 void mkv_sink::stop_mux_thread()
 {
-    {
-        std::unique_lock<std::mutex> lock(q_mu);
-        q_cv.wait(lock, [this] {
-            return queue.empty() && mux_in_flight.load(std::memory_order_relaxed) == 0;
-        });
-    }
+    wait_mux_idle();
     mux_stop.store(true, std::memory_order_relaxed);
     q_cv.notify_all();
     if (mux_thread.joinable())
@@ -478,6 +481,44 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
 
 int mkv_sink::input(component_pdu &&in)
 {
+    if (0 == in.port && in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED)
+    {
+        video_coded_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        bool resize = false;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!opened)
+            {
+                return -EBADF;
+            }
+            if (!coded_caps_acceptable(caps))
+            {
+                caps_reject_ = true;
+                have_input_caps_ = false;
+                return -ENOTSUP;
+            }
+            resize = have_input_caps_ && (input_caps_.width != caps.width || input_caps_.height != caps.height);
+        }
+        if (resize)
+        {
+            wait_mux_idle();
+            std::lock_guard<std::mutex> lock(mu);
+            if (!opened)
+            {
+                return -EBADF;
+            }
+            stop_locked();
+            caps_reject_ = false;
+            input_caps_ = caps;
+            have_input_caps_ = true;
+            return 0;
+        }
+    }
+
     std::lock_guard<std::mutex> lock(mu);
     if (!opened)
     {

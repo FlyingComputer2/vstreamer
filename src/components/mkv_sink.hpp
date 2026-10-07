@@ -52,6 +52,7 @@ private:
 
     void mux_thread_main();
     void stop_mux_thread();
+    void wait_mux_idle();
 
     [[nodiscard]] int input_pdu_locked(component_pdu &&in);
     [[nodiscard]] bool coded_caps_acceptable(const video_coded_caps &caps) const;
