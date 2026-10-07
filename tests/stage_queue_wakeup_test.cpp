@@ -62,3 +62,29 @@ TEST(StageQueueWakeTest, PopWaitsOnQueueWakeupNotFixedDelay)
 
     EXPECT_LT(blocked_ms, 10.0) << "queue pop should wake on push, not a fixed 50ms stage wait";
 }
+
+TEST(StageQueueWakeTest, EnqueueMonoSurvivesOverflowDrops)
+{
+    std::atomic<bool> run {true};
+    vstreamer::apps::pipeline_pdu_queue q(2, run);
+    stub_component owner;
+    vstreamer::pdu_wakeup wake;
+
+    for (int i = 0; i < 10'000; ++i)
+    {
+        vstreamer::component_pdu pdu;
+        pdu.seq = static_cast<uint64_t>(i);
+        pdu.sdu_type = vstreamer::sdu_type_e::NV12;
+        ASSERT_TRUE(q.push(std::move(pdu)));
+    }
+
+    int64_t mono = 0;
+    for (int i = 0; i < 2; ++i)
+    {
+        vstreamer::component_pdu pdu;
+        ASSERT_TRUE(q.pop(pdu, wake, owner, &mono));
+        EXPECT_GT(mono, 0);
+    }
+    run = false;
+    q.wake_shutdown();
+}

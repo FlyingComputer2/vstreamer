@@ -35,11 +35,6 @@ public:
 
     [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
 
-    void bind_enqueue_mono_tracker(std::unordered_map<uint64_t, int64_t> *tracker)
-    {
-        enqueue_mono_by_ts_us_ = tracker;
-    }
-
     bool push(component_pdu pkt, std::atomic<uint64_t> *drops = nullptr)
     {
         std::unique_lock<std::mutex> lock(mu);
@@ -47,9 +42,11 @@ public:
         {
             return false;
         }
-        if (nullptr != enqueue_mono_by_ts_us_ && !is_caps(pkt.sdu_type) && pkt.ts_us > 0)
+        queued_pdu entry;
+        entry.pdu = std::move(pkt);
+        if (!is_caps(entry.pdu.sdu_type))
         {
-            note_pdu_input_ts(pkt.ts_us, steady_mono_ns(), enqueue_mono_by_ts_us_);
+            entry.enqueue_mono_ns = steady_mono_ns();
         }
         if (q.size() >= capacity)
         {
@@ -59,7 +56,7 @@ public:
                 drops->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        q.push_back(std::move(pkt));
+        q.push_back(std::move(entry));
         cv_pop.notify_one();
         if (wake_)
         {
@@ -74,7 +71,8 @@ public:
         return q.size();
     }
 
-    bool pop(component_pdu &out, pdu_wakeup &w, component &deadline_owner)
+    bool pop(component_pdu &out, pdu_wakeup &w, component &deadline_owner,
+             int64_t *enqueue_mono_ns = nullptr)
     {
         while (run_.load(std::memory_order_relaxed))
         {
@@ -82,8 +80,13 @@ public:
                 std::unique_lock<std::mutex> lock(mu);
                 if (!q.empty())
                 {
-                    out = std::move(q.front());
+                    queued_pdu entry = std::move(q.front());
                     q.pop_front();
+                    out = std::move(entry.pdu);
+                    if (nullptr != enqueue_mono_ns)
+                    {
+                        *enqueue_mono_ns = entry.enqueue_mono_ns;
+                    }
                     return true;
                 }
             }
@@ -102,13 +105,18 @@ public:
     }
 
 private:
+    struct queued_pdu
+    {
+        component_pdu pdu;
+        int64_t       enqueue_mono_ns = 0;
+    };
+
     size_t                       capacity;
     std::atomic<bool>           &run_;
     std::mutex                   mu;
     std::condition_variable      cv_pop;
-    std::deque<component_pdu>    q;
+    std::deque<queued_pdu>       q;
     std::shared_ptr<pdu_wakeup>  wake_;
-    std::unordered_map<uint64_t, int64_t> *enqueue_mono_by_ts_us_ = nullptr;
 };
 
 class present_pdu_queue

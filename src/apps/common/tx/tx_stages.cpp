@@ -383,9 +383,8 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     owner->set_wakeup(enc_wake);
     pay->set_wakeup(enc_wake);
     sender->set_wakeup(enc_wake);
-    std::unordered_map<uint64_t, int64_t> queue_in_mono_ns;
-    nv12_pipe->bind_enqueue_mono_tracker(&queue_in_mono_ns);
     component_pdu nv12_pdu;
+    int64_t       nv12_enqueue_mono_ns = 0;
     bool          holding = false;
     uint64_t                              last_seq = 0;
     bool                                  have_seq = false;
@@ -394,7 +393,7 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
         apply_pending_console_encoder_cfg(*enc);
         if (!holding)
         {
-            if (!nv12_pipe->pop(nv12_pdu, *nv12_wake, *owner))
+            if (!nv12_pipe->pop(nv12_pdu, *nv12_wake, *owner, &nv12_enqueue_mono_ns))
             {
                 drain_encoder(*enc, *pay, *sender, *diag);
                 continue;
@@ -410,7 +409,15 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
                 drain_encoder(*enc, *pay, *sender, *diag);
                 continue;
             }
-            record_pdu_edge_latency_ms("enc_in", nv12_pdu, &queue_in_mono_ns);
+            if (nv12_enqueue_mono_ns > 0)
+            {
+                const double ms =
+                    static_cast<double>(steady_mono_ns() - nv12_enqueue_mono_ns) / 1e6;
+                if (ms >= 0.0)
+                {
+                    apps::record_stage_latency_ms("enc_in", ms);
+                }
+            }
             holding = true;
         }
         bool accepted = false;
