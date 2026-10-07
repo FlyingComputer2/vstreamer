@@ -115,13 +115,9 @@ void sdl_sink::close()
 {
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (present.has_value() && opened)
+        if (present.has_value())
         {
-            const int tail = present->drain_pending(opened);
-            if (tail > 0)
-            {
-                frames_in += static_cast<uint64_t>(tail);
-            }
+            present->clear_pending();
         }
     }
     std::lock_guard<std::mutex> lock(mu);
@@ -169,14 +165,21 @@ std::thread::id sdl_sink::bound_render_thread() const
 
 int sdl_sink::present_pending()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened || !present.has_value())
+    if (!present.has_value())
     {
         return -EBADF;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened)
+        {
+            return -EBADF;
+        }
     }
     const int r = present->drain_pending(opened);
     if (r > 0)
     {
+        std::lock_guard<std::mutex> lock(mu);
         frames_in += static_cast<uint64_t>(r);
         return 0;
     }

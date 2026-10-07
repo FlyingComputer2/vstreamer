@@ -49,6 +49,7 @@ public:
     int enqueue_drop(const nv12_present_sample &f, bool *dropped_oldest);
     /* Present all pending frames on the calling thread. */
     int drain_pending(bool &session_open);
+    void clear_pending();
 
     void set_title(std::string_view title);
     void stats_string(char *buf, size_t buflen, uint64_t frames_in) const;
@@ -62,7 +63,8 @@ private:
     void destroy_texture_locked();
     void pump_events_locked(bool &session_open);
     int  ensure_video_locked(int w, int h);
-    int  present_nv12_locked(const nv12_present_sample &f, bool &session_open);
+    int  present_nv12_locked(const nv12_present_sample &f, bool &session_open,
+                             std::unique_lock<std::mutex> &lock);
 
     const char *log_tag;
     const char *video_driver;
