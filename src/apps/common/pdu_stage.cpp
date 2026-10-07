@@ -2,6 +2,10 @@
 
 #include <atomic>
 #include <cmath>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #include "core/sequence_gap.hpp"
 #include "core/sdu_caps.hpp"
@@ -22,6 +26,17 @@ void log_pdu_stage_latency(const char *stage, const component_pdu &pdu)
     {
         record_stage_latency_ms(stage, ms);
     }
+    if (!stage_latency_stderr_enabled())
+    {
+        return;
+    }
+    const int stride = stage_latency_stderr_stride();
+    if (stride > 1 && (pdu.ts_us % static_cast<uint64_t>(stride)) != 0)
+    {
+        return;
+    }
+    std::fprintf(stderr, "stage_latency: %-10s %7.2f ms ts_us=%" PRIu64 "\n", stage, ms,
+                 pdu.ts_us);
 }
 
 void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns,

@@ -28,11 +28,40 @@ namespace
 
 std::atomic<bool> g_stage_latency_diag {false};
 
+[[nodiscard]] bool stage_latency_log_env_enabled()
+{
+    static const bool env_on = [] {
+        const char *v = std::getenv("VSTREAMER_LOG_STAGE_LATENCY");
+        return nullptr != v && v[0] != '\0' && 0 != std::strcmp(v, "0");
+    }();
+    return env_on;
+}
+
 }  // namespace
 
 void stage_latency_set_diag_enabled(bool enabled)
 {
     g_stage_latency_diag.store(enabled, std::memory_order_relaxed);
+}
+
+bool stage_latency_stderr_enabled()
+{
+    return g_stage_latency_diag.load(std::memory_order_relaxed) || stage_latency_log_env_enabled();
+}
+
+int stage_latency_stderr_stride()
+{
+    static const int every = [] {
+        const char *v = std::getenv("VSTREAMER_STAGE_LATENCY_EVERY");
+        if (nullptr == v || v[0] == '\0')
+        {
+            return 1;
+        }
+        char       *end = nullptr;
+        const long n = std::strtol(v, &end, 10);
+        return (end != v && n > 0) ? static_cast<int>(n) : 1;
+    }();
+    return every;
 }
 
 void note_source_pdu(const component_pdu &pdu)
