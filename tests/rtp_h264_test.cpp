@@ -344,6 +344,34 @@ TEST(RtpH264Test, PackAuWith100Nals)
     EXPECT_EQ(au, out);
 }
 
+TEST(RtpH264Test, PayLargeIdrThenAcceptsNextAu)
+{
+    vstreamer::rtp_h264_pay pay;
+    ASSERT_EQ(0, pay.open());
+    ASSERT_EQ(0, pay.input(vstreamer::test_pdu::make_h264_coded_caps(64, 64)));
+
+    std::vector<uint8_t> idr_nal;
+    idr_nal.push_back(0x65);
+    idr_nal.insert(idr_nal.end(), 1024 * 1024, 0xAB);
+    std::vector<uint8_t> au;
+    append_nal(&au, idr_nal.data(), idr_nal.size());
+    ASSERT_EQ(0, pay.input(vstreamer::test_pdu::make_h264_au(au.data(), au.size(), 1)));
+
+    size_t drained = 0;
+    vstreamer::component_pdu out;
+    while (pay.output(out) == 0)
+    {
+        ++drained;
+    }
+    EXPECT_GT(drained, 512U);
+
+    const uint8_t p[] = {0x41, 0x04};
+    std::vector<uint8_t> au2;
+    append_nal(&au2, p, sizeof(p));
+    EXPECT_EQ(0, pay.input(vstreamer::test_pdu::make_h264_au(au2.data(), au2.size(), 2, false)));
+    pay.close();
+}
+
 TEST(RtpH264Test, PayRetainsUnpulledDatagrams)
 {
     vstreamer::rtp_h264_pay pay;

@@ -130,24 +130,26 @@ int rtp_h264_pay::input_pdu_locked(component_pdu &&in)
     {
         return -ENOTSUP;
     }
-    if (pending.size() >= k_pending_cap)
+    const int64_t capture_rt = mono_to_realtime_ns(static_cast<int64_t>(in.ts_us) * 1000LL);
+    const uint32_t rtp_ts =
+        static_cast<uint32_t>((static_cast<uint64_t>(in.ts_us) * 90ULL) / 1000ULL);
+    const size_t need_dgrams =
+        packer.count_annexb_rtp_datagrams(in.sdu.u8(), in.sdu.size(), rtp_ts, capture_rt);
+    if (0 == need_dgrams)
+    {
+        return -EINVAL;
+    }
+    if (pending.size() + need_dgrams > k_pending_cap)
     {
         return -EAGAIN;
     }
 
-    const int64_t capture_rt = mono_to_realtime_ns(static_cast<int64_t>(in.ts_us) * 1000LL);
-    const uint32_t rtp_ts =
-        static_cast<uint32_t>((static_cast<uint64_t>(in.ts_us) * 90ULL) / 1000ULL);
     if (packer.pack_annexb_rtp_ts(in.sdu.u8(), in.sdu.size(), rtp_ts, capture_rt) < 0)
     {
         return -EINVAL;
     }
     while (packer.pending())
     {
-        if (pending.size() >= k_pending_cap)
-        {
-            return -EAGAIN;
-        }
         std::vector<uint8_t> buf(static_cast<size_t>(mtu));
         const int            n = packer.pop_datagram(buf.data(), buf.size());
         if (n < 0)

@@ -71,7 +71,7 @@ private:
     };
 
     std::deque<pending_datagram> pending;
-    static constexpr size_t      k_pending_cap = 512;
+    static constexpr size_t      k_pending_cap = 2048;
     uint64_t                     datagrams_dropped = 0;
     uint64_t                     out_seq_ = 0;
 
