@@ -274,40 +274,6 @@ double sender_peer_fec_loss_pct(stream_sender &sender)
     return g_sender_peer_loss.loss_fec_pct;
 }
 
-void adapt_encoder_qp_for_peer_loss(component_coder &enc, stream_sender &sender)
-{
-    sync_sender_peer_link_metrics_live(sender);
-    double loss_udp = 0.;
-    double loss_fec = 0.;
-    {
-        std::lock_guard<std::mutex> lock(g_sender_peer_loss_mu);
-        loss_udp = g_sender_peer_loss.loss_udp_pct;
-        loss_fec = g_sender_peer_loss.loss_fec_pct;
-    }
-    const double loss = std::max(loss_udp, loss_fec);
-    if (loss < 10.0)
-    {
-        return;
-    }
-    const int qp = query_encoder_qp(enc);
-    if (qp < 0 || qp >= 51)
-    {
-        return;
-    }
-    static int64_t last_bump_mono_ns = 0;
-    const int64_t  now_ns = steady_mono_ns();
-    if (now_ns - last_bump_mono_ns < 400'000'000LL)
-    {
-        return;
-    }
-    char buf[16];
-    std::snprintf(buf, sizeof(buf), "%d", qp + 1);
-    if (enc.configure("qp", std::string_view(buf)) == 0)
-    {
-        last_bump_mono_ns = now_ns;
-    }
-}
-
 int query_encoder_qp(component_coder &enc)
 {
     std::string val;

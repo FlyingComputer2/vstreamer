@@ -380,7 +380,6 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     while (g_run.load(std::memory_order_relaxed))
     {
         apply_pending_console_encoder_cfg(*enc);
-        apps::tx::adapt_encoder_qp_for_peer_loss(*enc, *sender);
         if (!holding)
         {
             if (!nv12_pipe->pop(nv12_pdu, *wake, *owner))
