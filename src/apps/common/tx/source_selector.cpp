@@ -322,24 +322,32 @@ int source_selector::poll_once_pdu(pdu_wakeup &w)
 
 int source_selector::poll_once(int timeout_ms)
 {
-    pdu_wakeup fallback_wake;
-    pdu_wakeup &w = source_wake_ ? *source_wake_ : fallback_wake;
+    if (!source_wake_)
+    {
+        return -EINVAL;
+    }
+    pdu_wakeup &w = *source_wake_;
     if (timeout_ms < 0)
     {
         return poll_once_pdu(w);
     }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
-    while (std::chrono::steady_clock::now() < deadline)
+    const int64_t end_ns =
+        steady_mono_ns() + static_cast<int64_t>(timeout_ms > 0 ? timeout_ms : 0) * 1'000'000LL;
+    while (apps::g_run.load(std::memory_order_relaxed))
     {
         const int r = poll_once_pdu(w);
         if (0 == r || -EAGAIN != r)
         {
             return r;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const int64_t now_ns = steady_mono_ns();
+        if (now_ns >= end_ns)
+        {
+            return -EAGAIN;
+        }
+        w.wait_until(end_ns);
     }
-    return -EAGAIN;
+    return -ECANCELED;
 }
 
 int source_selector::configure(std::string_view key, std::string_view value)

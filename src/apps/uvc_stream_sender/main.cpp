@@ -320,6 +320,8 @@ int main(int argc, char **argv)
     apps::pipeline_pdu_queue mjpeg_pipe(pipe_q, g_run);
     apps::pipeline_pdu_queue nv12_pipe(pipe_q, g_run);
     g_tx.metrics_nv12_pipe = &nv12_pipe;
+    const std::shared_ptr<vstreamer::pdu_wakeup> source_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
     const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
         std::make_shared<vstreamer::pdu_wakeup>();
     const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
@@ -327,7 +329,7 @@ int main(int argc, char **argv)
     mjpeg_pipe.bind_wakeup(mjpeg_wake);
     nv12_pipe.bind_wakeup(nv12_wake);
 
-    selector->bind_source_wakeups(mjpeg_wake);
+    selector->bind_source_wakeups(source_wake);
     selector->set_push_pdu_handler([&](component_pdu &&pkt) {
         (void)enqueue_source_pdu(std::move(pkt), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
     });

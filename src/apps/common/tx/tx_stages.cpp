@@ -240,18 +240,6 @@ void source_stage_main(component_source *source, pipeline_pdu_queue *mjpeg_pipe,
     }
     std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
     owner->set_wakeup(wake);
-    if (nullptr != mjpeg_pipe)
-    {
-        if (auto existing = mjpeg_pipe->shared_wakeup())
-        {
-            wake = existing;
-            owner->set_wakeup(wake);
-        }
-        else
-        {
-            mjpeg_pipe->bind_wakeup(wake);
-        }
-    }
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
@@ -396,13 +384,12 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> nv12_wake = nv12_pipe->shared_wakeup();
-    if (!nv12_wake)
+    std::shared_ptr<pdu_wakeup> enc_wake = nv12_pipe->shared_wakeup();
+    if (!enc_wake)
     {
-        nv12_wake = std::make_shared<pdu_wakeup>();
-        nv12_pipe->bind_wakeup(nv12_wake);
+        enc_wake = std::make_shared<pdu_wakeup>();
+        nv12_pipe->bind_wakeup(enc_wake);
     }
-    std::shared_ptr<pdu_wakeup> enc_wake = std::make_shared<pdu_wakeup>();
     owner->set_wakeup(enc_wake);
     pay->set_wakeup(enc_wake);
     sender->set_wakeup(enc_wake);
@@ -416,7 +403,7 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
         apply_pending_console_encoder_cfg(*enc);
         if (!holding)
         {
-            if (!nv12_pipe->pop(nv12_pdu, *nv12_wake, *owner, &nv12_enqueue_mono_ns))
+            if (!nv12_pipe->pop(nv12_pdu, *enc_wake, *owner, &nv12_enqueue_mono_ns))
             {
                 drain_encoder(*enc, *pay, *sender, *diag);
                 continue;
