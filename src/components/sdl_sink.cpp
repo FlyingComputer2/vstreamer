@@ -108,68 +108,22 @@ int sdl_sink::open()
         return r;
     }
     opened = true;
-    present_stop.store(false, std::memory_order_relaxed);
-    present_thread = std::thread([this] { present_thread_main(); });
     return 0;
-}
-
-void sdl_sink::stop_present_thread()
-{
-    present_stop.store(true, std::memory_order_relaxed);
-    present_cv.notify_all();
-    if (present_thread.joinable())
-    {
-        present_thread.join();
-    }
-    present_stop.store(false, std::memory_order_relaxed);
-}
-
-void sdl_sink::present_thread_main()
-{
-    while (!present_stop.load(std::memory_order_relaxed))
-    {
-        {
-            std::unique_lock<std::mutex> lock(mu);
-            present_cv.wait_for(lock, std::chrono::milliseconds(50), [this] {
-                return present_stop.load(std::memory_order_relaxed) ||
-                       (present.has_value() && present->queue_size() > 0);
-            });
-            if (present_stop.load(std::memory_order_relaxed))
-            {
-                break;
-            }
-            if (!present.has_value() || !opened)
-            {
-                continue;
-            }
-            const int r = present->drain_pending(opened);
-            if (r > 0)
-            {
-                frames_in += static_cast<uint64_t>(r);
-            }
-        }
-    }
-    if (present.has_value())
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        while (present->queue_size() > 0 && opened)
-        {
-            const int tail_r = present->drain_pending(opened);
-            if (tail_r > 0)
-            {
-                frames_in += static_cast<uint64_t>(tail_r);
-            }
-            else
-            {
-                break;
-            }
-        }
-    }
 }
 
 void sdl_sink::close()
 {
-    stop_present_thread();
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (present.has_value() && opened)
+        {
+            const int tail = present->drain_pending(opened);
+            if (tail > 0)
+            {
+                frames_in += static_cast<uint64_t>(tail);
+            }
+        }
+    }
     std::lock_guard<std::mutex> lock(mu);
     if (present.has_value())
     {
@@ -201,6 +155,36 @@ int sdl_sink::prepare(int width, int height)
         std::fprintf(stderr, ")\n");
     }
     return r;
+}
+
+std::thread::id sdl_sink::bound_render_thread() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!present.has_value())
+    {
+        return {};
+    }
+    return present->bound_render_thread();
+}
+
+int sdl_sink::present_pending()
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!opened || !present.has_value())
+    {
+        return -EBADF;
+    }
+    const int r = present->drain_pending(opened);
+    if (r > 0)
+    {
+        frames_in += static_cast<uint64_t>(r);
+        return 0;
+    }
+    if (r < 0)
+    {
+        return r;
+    }
+    return -EAGAIN;
 }
 
 int sdl_sink::input_pdu_locked(component_pdu &&in)
@@ -250,9 +234,9 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     }
     const nv12_present_sample f = sample_from_pdu(in);
     const int enq = present->try_enqueue(f);
-    if (0 == enq)
+    if (-EAGAIN == enq)
     {
-        present_cv.notify_one();
+        dropped++;
     }
     return enq;
 }

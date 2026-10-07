@@ -39,6 +39,9 @@ public:
     void close() override;
 
     int prepare(int width, int height);
+    /* Present queued NV12 on the calling thread (must match prepare/open thread). */
+    int present_pending();
+    [[nodiscard]] std::thread::id bound_render_thread() const;
     int input(component_pdu &&in) override;
 
     int configure(std::string_view key, std::string_view value) override;
@@ -51,15 +54,9 @@ private:
     [[nodiscard]] bool raw_caps_acceptable(const video_raw_caps &caps) const;
     [[nodiscard]] nv12_present_sample sample_from_pdu(const component_pdu &in) const;
 
-    void present_thread_main();
-    void stop_present_thread();
-
     static const std::vector<port_desc> &input_ports();
 
     mutable std::mutex mu;
-    std::condition_variable present_cv;
-    std::thread             present_thread;
-    std::atomic<bool>       present_stop {false};
 
     bool opened = false;
     uint64_t frames_in = 0;

@@ -389,11 +389,8 @@ int sdl_nv12_presenter::ensure_video_locked(int w, int h)
 
         window = win;
         renderer = ren;
-        if (kmsdrm)
-        {
-            render_thread_id = here;
-            render_thread_bound = true;
-        }
+        render_thread_id = here;
+        render_thread_bound = true;
     }
 
     auto *ren = static_cast<SDL_Renderer *>(renderer);
@@ -745,6 +742,12 @@ int sdl_nv12_presenter::drain_pending(bool &session_open)
         return presented;
     }
     return last_err;
+}
+
+std::thread::id sdl_nv12_presenter::bound_render_thread() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return render_thread_bound ? render_thread_id : std::thread::id {};
 }
 
 int sdl_nv12_presenter::present(const nv12_present_sample &f, bool &session_open)

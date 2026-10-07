@@ -55,6 +55,7 @@ public:
 
     [[nodiscard]] int live_width() const { return live_w; }
     [[nodiscard]] int live_height() const { return live_h; }
+    [[nodiscard]] std::thread::id bound_render_thread() const;
 
 private:
     void destroy_video_locked();

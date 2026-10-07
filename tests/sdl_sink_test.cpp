@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace
@@ -72,6 +73,21 @@ TEST(SdlSinkTest, PduInputRequiresOpen)
 {
     vstreamer::sdl_sink sink;
     ASSERT_EQ(-EBADF, sink.input(make_nv12_caps(64, 64)));
+}
+
+TEST(SdlSinkTest, PresentPendingOnPrepareThread)
+{
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    vstreamer::sdl_sink sink;
+    ASSERT_EQ(0, sink.configure("video_driver", "dummy"));
+    ASSERT_EQ(0, sink.open());
+    const std::thread::id prep_thread = std::this_thread::get_id();
+    ASSERT_EQ(0, sink.prepare(64, 64));
+    EXPECT_EQ(prep_thread, sink.bound_render_thread());
+    ASSERT_EQ(0, sink.input(make_nv12_caps(64, 64)));
+    ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 1'000'000)));
+    EXPECT_EQ(0, sink.present_pending());
+    sink.close();
 }
 
 TEST(SdlNv12PresenterTest, TryEnqueueEagainWhenQueueFull)
