@@ -1,6 +1,14 @@
+#include "components/components_config.hpp"
+
+#if defined(ENABLE_H264_DECODER_MPP)
 #include "components/h264_decoder_mpp.hpp"
+#endif
+#if defined(ENABLE_H264_ENCODER_MPP)
 #include "components/h264_encoder_mpp.hpp"
+#endif
+#if defined(ENABLE_JPEG_DECODER_MULTICORE)
 #include "components/jpeg_decoder_multicore.hpp"
+#endif
 #if defined(ENABLE_H264_ENCODER_INTEL)
 #include "components/h264_encoder_intel.hpp"
 #endif
@@ -21,7 +29,7 @@
 namespace
 {
 
-vstreamer::component_pdu make_raw_caps(int w, int h)
+[[maybe_unused]] vstreamer::component_pdu make_raw_caps(int w, int h)
 {
     vstreamer::video_raw_caps caps {};
     caps.width = w;
@@ -31,7 +39,7 @@ vstreamer::component_pdu make_raw_caps(int w, int h)
     return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps, 1, 0);
 }
 
-vstreamer::component_pdu make_coded_caps(int w, int h)
+[[maybe_unused]] vstreamer::component_pdu make_coded_caps(int w, int h)
 {
     vstreamer::video_coded_caps caps {};
     caps.width = w;
@@ -39,7 +47,7 @@ vstreamer::component_pdu make_coded_caps(int w, int h)
     return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_CODED, caps, 1, 0);
 }
 
-vstreamer::component_pdu make_nv12_pdu(int w, int h)
+[[maybe_unused]] vstreamer::component_pdu make_nv12_pdu(int w, int h)
 {
     const size_t bytes = static_cast<size_t>(w) * static_cast<size_t>(h) * 3U / 2U;
     std::vector<uint8_t> storage(bytes, 0x10);
@@ -50,7 +58,7 @@ vstreamer::component_pdu make_nv12_pdu(int w, int h)
     return pdu;
 }
 
-vstreamer::component_pdu make_mjpeg_pdu()
+[[maybe_unused]] vstreamer::component_pdu make_mjpeg_pdu()
 {
     const uint8_t byte = 0xff;
     vstreamer::component_pdu pdu;
@@ -62,6 +70,7 @@ vstreamer::component_pdu make_mjpeg_pdu()
 
 }  // namespace
 
+#if defined(ENABLE_H264_ENCODER_MPP)
 TEST(H264EncoderMppTest, CapsRejectionPdu)
 {
     vstreamer::h264_encoder_mpp enc;
@@ -77,7 +86,9 @@ TEST(H264EncoderMppTest, CapsRejectionPdu)
     EXPECT_EQ(0, enc.input(make_nv12_pdu(320, 240)));
     enc.close();
 }
+#endif
 
+#if defined(ENABLE_H264_DECODER_MPP)
 TEST(H264DecoderMppTest, CapsRejectionPdu)
 {
     vstreamer::h264_decoder_mpp dec;
@@ -98,7 +109,9 @@ TEST(H264DecoderMppTest, CapsRejectionPdu)
     EXPECT_EQ(0, dec.input(std::move(au)));
     dec.close();
 }
+#endif
 
+#if defined(ENABLE_JPEG_DECODER_MULTICORE)
 TEST(JpegDecoderMulticoreTest, CapsRejectionPdu)
 {
     vstreamer::jpeg_decoder_multicore dec;
@@ -112,6 +125,7 @@ TEST(JpegDecoderMulticoreTest, CapsRejectionPdu)
     EXPECT_EQ(0, dec.input(make_mjpeg_pdu()));
     dec.close();
 }
+#endif
 
 #if defined(ENABLE_H264_ENCODER_INTEL)
 TEST(H264EncoderIntelTest, CapsRejectionPdu)
