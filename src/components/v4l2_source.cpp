@@ -173,7 +173,7 @@ v4l2_source::~v4l2_source()
     close();
 }
 
-void v4l2_source::stop_poll_watcher_locked()
+void v4l2_source::stop_poll_watcher()
 {
     poll_stop_.store(true, std::memory_order_release);
     if (poll_thread_.joinable())
@@ -183,9 +183,14 @@ void v4l2_source::stop_poll_watcher_locked()
     poll_stop_.store(false, std::memory_order_release);
 }
 
+void v4l2_source::stop_poll_watcher_locked()
+{
+    stop_poll_watcher();
+}
+
 void v4l2_source::start_poll_watcher_locked()
 {
-    stop_poll_watcher_locked();
+    stop_poll_watcher();
     if (!source_open)
     {
         return;
@@ -662,20 +667,18 @@ int v4l2_source::open()
 
 void v4l2_source::interrupt_shutdown()
 {
+    stop_poll_watcher();
     std::lock_guard<std::mutex> lock(mu);
-    stop_poll_watcher_locked();
     capture_close_locked();
 }
 
 void v4l2_source::close()
 {
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        stop_poll_watcher_locked();
-        capture_close_locked();
-        source_open = false;
-        cap_retry_due = 0;
-    }
+    stop_poll_watcher();
+    std::lock_guard<std::mutex> lock(mu);
+    capture_close_locked();
+    source_open = false;
+    cap_retry_due = 0;
 }
 
 bool v4l2_source::maybe_retry_capture_locked()

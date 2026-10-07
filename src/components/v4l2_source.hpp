@@ -62,6 +62,7 @@ class v4l2_source : public component_source
     void       poll_watcher_main();
     void       start_poll_watcher_locked();
     void       stop_poll_watcher_locked();
+    void       stop_poll_watcher();
     bool       maybe_retry_capture_locked();
 
     static const std::vector<port_desc> &output_ports();

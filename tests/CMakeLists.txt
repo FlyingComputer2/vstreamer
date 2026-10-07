@@ -21,6 +21,10 @@ set(VSTREAMER_TEST_SOURCES
     shared_sized_buffer_test.cpp
 )
 
+if(ENABLE_V4L2_SOURCE)
+    list(APPEND VSTREAMER_TEST_SOURCES v4l2_source_lifecycle_test.cpp)
+endif()
+
 if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
     list(APPEND VSTREAMER_TEST_SOURCES source_selector_test.cpp)
 endif()
