@@ -33,7 +33,6 @@ using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
 using apps::log_pdu_stage_latency;
-using apps::log_stage_latency;
 using apps::note_pdu_sequence_gap;
 using apps::note_source_pdu;
 using apps::pipeline_pdu_queue;
@@ -108,33 +107,79 @@ bool handle_source_poll_error(int got)
     return false;
 }
 
-bool forward_encoded_au(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag, data_packet &pkt)
+void drain_pay_pdus_to_sender(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag)
 {
-    log_stage_latency("enc_out", pkt);
-    if (pay.input(0, pkt) < 0)
+    auto *pay_out = dynamic_cast<pdu_output *>(&pay);
+    auto *snd_in = dynamic_cast<pdu_input *>(&sender);
+    if (nullptr == pay_out || nullptr == snd_in)
     {
-        return false;
+        data_packet sock_pkt;
+        while (g_run.load(std::memory_order_relaxed) && pay.output(0, sock_pkt, 0) == 0)
+        {
+            if (sender.input(0, sock_pkt) == 0)
+            {
+                diag.tx_rtp_sock++;
+            }
+        }
+        return;
     }
-    data_packet sock_pkt;
-    while (g_run.load(std::memory_order_relaxed) && pay.output(0, sock_pkt, 0) == 0)
+    component_pdu dgram;
+    while (g_run.load(std::memory_order_relaxed) && pay_out->output(dgram) == 0)
     {
-        if (sender.input(0, sock_pkt) == 0)
+        dgram.sdu_type = sdu_type_e::STREAM_DGRAM;
+        if (snd_in->input(std::move(dgram)) == 0)
         {
             diag.tx_rtp_sock++;
         }
     }
+}
+
+bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag,
+                            component_pdu &&au)
+{
+    log_pdu_stage_latency("enc_out", au);
+    diag.tx_enc_out_bytes.fetch_add(pdu_bytes(au), std::memory_order_relaxed);
+    auto *pay_in = dynamic_cast<pdu_input *>(&pay);
+    if (nullptr == pay_in || pay_in->input(std::move(au)) < 0)
+    {
+        return false;
+    }
+    drain_pay_pdus_to_sender(pay, sender, diag);
     return true;
 }
 
 void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
                    bench_diag &diag)
 {
-    data_packet pkt;
-    while (g_run.load(std::memory_order_relaxed) && enc.output(0, pkt, 0) == 0)
+    auto *enc_out = dynamic_cast<pdu_output *>(&enc);
+    if (nullptr == enc_out)
     {
-        const frame_data &f = data_packet::cast<frame_data>(pkt);
-        diag.tx_enc_out_bytes.fetch_add(f.buf.size(), std::memory_order_relaxed);
-        (void)forward_encoded_au(pay, sender, diag, pkt);
+        data_packet pkt;
+        while (g_run.load(std::memory_order_relaxed) && enc.output(0, pkt, 0) == 0)
+        {
+            const frame_data &f = data_packet::cast<frame_data>(pkt);
+            diag.tx_enc_out_bytes.fetch_add(f.buf.size(), std::memory_order_relaxed);
+            auto *pay_in = dynamic_cast<pdu_input *>(&pay);
+            if (nullptr != pay_in)
+            {
+                component_pdu pdu;
+                pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
+                                                  : static_cast<uint64_t>(f.pts);
+                pdu.sdu_type = sdu_type_e::H264_AU;
+                pdu.sdu = f.buf;
+                if (f.key)
+                {
+                    pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+                }
+                (void)forward_encoded_au_pdu(pay, sender, diag, std::move(pdu));
+            }
+        }
+        return;
+    }
+    component_pdu pdu;
+    while (g_run.load(std::memory_order_relaxed) && enc_out->output(pdu) == 0)
+    {
+        (void)forward_encoded_au_pdu(pay, sender, diag, std::move(pdu));
     }
 }
 

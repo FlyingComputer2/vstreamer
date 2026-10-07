@@ -1,5 +1,4 @@
 #include "apps/common/cpu_map.hpp"
-#include "apps/common/legacy_pdu.hpp"
 #include "apps/common/pipeline_controller.hpp"
 #include "apps/common/queues.hpp"
 #include "apps/common/stage_latency.hpp"
@@ -327,16 +326,10 @@ int main(int argc, char **argv)
     mjpeg_pipe.bind_wakeup(pipe_wake);
     nv12_pipe.bind_wakeup(pipe_wake);
 
-    const auto push_legacy_source = [&](data_packet &&pkt) {
-        apps::legacy_to_pdu to_pdu;
-        std::vector<component_pdu> pdus;
-        to_pdu.convert(pkt, &pdus);
-        for (component_pdu &pdu : pdus)
-        {
-            (void)enqueue_source_pdu(std::move(pdu), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
-        }
-    };
-    selector->set_push_handlers(push_legacy_source, push_legacy_source);
+    selector->bind_source_wakeups(pipe_wake);
+    selector->set_push_pdu_handler([&](component_pdu &&pkt) {
+        (void)enqueue_source_pdu(std::move(pkt), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
+    });
 
     pipeline_rate_state       rate;
     apps::pipeline_controller ctrl;
