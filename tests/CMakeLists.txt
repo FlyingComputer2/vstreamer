@@ -11,6 +11,7 @@ set(VSTREAMER_TEST_SOURCES
     component_pdu_test.cpp
     port_caps_test.cpp
     pdu_wakeup_test.cpp
+    legacy_pdu_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
     stream_header_test.cpp

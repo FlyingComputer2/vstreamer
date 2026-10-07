@@ -9,6 +9,8 @@ set(_apps_common_sources
     pipeline_stage_util.cpp
     queues.cpp
     stage_latency.cpp
+    legacy_pdu.cpp
+    pdu_stage.cpp
 )
 
 if(VSTREAMER_APP_TX_OK)
