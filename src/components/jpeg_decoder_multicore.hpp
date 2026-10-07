@@ -8,6 +8,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -16,19 +17,19 @@
 
 #include "core/buffer_pool.hpp"
 #include "core/component_coder.hpp"
+#include "core/component_pdu.hpp"
 #include "core/output_opts.hpp"
+#include "core/pdu_input.hpp"
+#include "core/pdu_output.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
 
 #include <memory>
 
 namespace vstreamer
 {
 
-/*
- * libav MJPEG → packed NV12 on CPU (H3 rover).
- * N worker threads, each with its own AVCodecContext (thread_count=1),
- * job queue + in-order result slots — same model as camera.c (not Cedar/VPU).
- */
-class jpeg_decoder_multicore : public component_coder
+class jpeg_decoder_multicore : public component_coder, public pdu_input, public pdu_output
 {
 public:
     jpeg_decoder_multicore();
@@ -47,10 +48,20 @@ public:
     int input(uint8_t port, const data_packet &in) override;
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
 
+    int input(component_pdu &&in) override;
+    int output(component_pdu &out) override;
+
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    [[nodiscard]] int input_pdu_locked(component_pdu &&in);
+    [[nodiscard]] bool caps_acceptable(const video_coded_caps &caps) const;
+    void maybe_emit_output_caps_locked(uint64_t ts_us);
+
+    static const std::vector<port_desc> &input_ports();
+    static const std::vector<port_desc> &output_ports();
+
     static constexpr int k_max_workers = 8;
     static constexpr int k_queue_depth = 32;
     static constexpr size_t k_max_jpeg = 8ULL * 1024ULL * 1024ULL;
@@ -60,20 +71,19 @@ private:
         uint64_t seq = 0;
         uint8_t *data = nullptr;
         size_t   size = 0;
-        int64_t  pts = 0;
-        int64_t  capture_mono_ns = 0;
+        uint64_t ts_us = 0;
     };
 
     struct result_slot
     {
-        uint64_t seq = 0;
-        int      status = 0;
-        bool     ready = false;
-        frame    out;
+        uint64_t      seq = 0;
+        int           status = 0;
+        bool          ready = false;
+        component_pdu pdu;
     };
 
     void worker_main(int worker_index);
-    int  decode_one(void *dec, void *avframe, void *pkt, const job &j, frame *out) const;
+    int  decode_one(void *dec, void *avframe, void *pkt, const job &j, component_pdu *out);
     int  start_workers();
     void stop_workers();
 
@@ -88,9 +98,9 @@ private:
     media_kind_e       output_format = media_kind_e::NV12;
     mutable std::string decoded_pix_fmt = "unknown";
 
-    mutable std::mutex      life_mu;
-    bool                    opened = false;
-    bool                    stop = false;
+    mutable std::mutex       life_mu;
+    bool                     opened = false;
+    bool                     stop = false;
     std::vector<std::thread> threads;
 
     std::mutex              job_mu;
@@ -108,9 +118,17 @@ private:
 
     mutable bool unsupported_pix_fmt_log_done = false;
 
-    mutable std::mutex              nv12_pool_mu;
+    mutable std::mutex                   nv12_pool_mu;
     mutable std::unique_ptr<buffer_pool> nv12_pool;
-    mutable size_t                  nv12_pool_bytes = 0;
+    mutable size_t                       nv12_pool_bytes = 0;
+
+    bool                      have_input_caps_ = false;
+    video_coded_caps          input_caps_ {};
+    bool                      caps_reject_ = false;
+    bool                      have_output_caps_ = false;
+    video_raw_caps            output_caps_ {};
+    uint64_t                  out_seq_ = 0;
+    std::deque<component_pdu> pending_caps_out_;
 };
 
 }  // namespace vstreamer

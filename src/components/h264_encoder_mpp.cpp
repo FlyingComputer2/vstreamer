@@ -1,6 +1,10 @@
 #include "components/h264_encoder_mpp.hpp"
 
+#include "core/data_packet.hpp"
 #include "core/h264_level.hpp"
+#include "core/key_util.hpp"
+#include "core/packet_types.hpp"
+#include "core/sdu_type.hpp"
 #include "core/key_util.hpp"
 #include "core/time_util.hpp"
 
@@ -1111,6 +1115,125 @@ void h264_encoder_mpp::close()
     cv.notify_all();
 }
 
+namespace
+{
+
+const std::vector<port_desc> &enc_input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &enc_output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+}  // namespace
+
+int h264_encoder_mpp::input(component_pdu &&in)
+{
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
+    {
+        video_raw_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        if (caps.width != width || caps.height != height)
+        {
+            caps_reject_ = true;
+            have_input_caps_ = false;
+            return -ENOTSUP;
+        }
+        caps_reject_ = false;
+        have_input_caps_ = true;
+        input_caps_ = caps;
+        if (!have_output_caps_ || caps.width != output_caps_.width || caps.height != output_caps_.height)
+        {
+            video_coded_caps coded {};
+            coded.width = caps.width;
+            coded.height = caps.height;
+            coded.fps_num = fps;
+            coded.fps_den = 1;
+            output_caps_ = coded;
+            have_output_caps_ = true;
+            component_pdu caps_pdu =
+                make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, coded, in.ts_us, 0);
+            caps_pdu.seq = 0;
+            pending_caps_out_.push_back(std::move(caps_pdu));
+        }
+        return 0;
+    }
+    if (in.sdu_type != sdu_type_e::NV12)
+    {
+        return -EINVAL;
+    }
+    if (caps_reject_ || !have_input_caps_)
+    {
+        return -ENOTSUP;
+    }
+    auto fd = std::make_unique<frame_data>();
+    fd->kind = media_kind_e::NV12;
+    fd->width = input_caps_.width;
+    fd->height = input_caps_.height;
+    fd->pts = static_cast<int64_t>(in.ts_us);
+    fd->capture_mono_ns = static_cast<int64_t>(in.ts_us) * 1000LL;
+    fd->buf = std::move(in.sdu);
+    data_packet pkt;
+    pkt.reset(std::move(fd));
+    return input(0, pkt);
+}
+
+int h264_encoder_mpp::output(component_pdu &out)
+{
+    if (!pending_caps_out_.empty())
+    {
+        out = std::move(pending_caps_out_.front());
+        pending_caps_out_.pop_front();
+        return 0;
+    }
+    data_packet pkt;
+    const int   r = output(0, pkt, 0);
+    if (0 != r)
+    {
+        return r;
+    }
+    const frame_data &f = data_packet::cast<frame_data>(pkt);
+    out.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
+                                      : static_cast<uint64_t>(f.pts);
+    out.seq = out_seq_++;
+    out.sdu_type = sdu_type_e::H264_AU;
+    out.port = 0;
+    out.flags = 0;
+    if (f.key)
+    {
+        out.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+    }
+    out.sdu = f.buf;
+    notify_wakeup();
+    return 0;
+}
+
 int h264_encoder_mpp::input(uint8_t /*port*/, const data_packet &in)
 {
     const frame_data &f = data_packet::cast<frame_data>(in);
@@ -1410,6 +1533,16 @@ int h264_encoder_mpp::query(std::string_view key, std::string *value) const
         }
         *value = buf;
         return 0;
+    }
+    int r = port_caps_query(enc_input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
+    r = port_caps_query(enc_output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
     }
     return -ENOTSUP;
 }

@@ -1,6 +1,9 @@
 #include "components/jpeg_decoder_multicore.hpp"
 
+#include "core/data_packet.hpp"
 #include "core/key_util.hpp"
+#include "core/packet_types.hpp"
+#include "core/sdu_type.hpp"
 #include "core/output_opts.hpp"
 #include "core/pix_convert.hpp"
 #include "core/thread_affinity.hpp"
@@ -65,6 +68,72 @@ int parse_size(std::string_view s, int *w, int *h)
 
 }  // namespace
 
+
+const std::vector<port_desc> &jpeg_decoder_multicore::input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::MJPEG;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &jpeg_decoder_multicore::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+bool jpeg_decoder_multicore::caps_acceptable(const video_coded_caps &caps) const
+{
+    if (caps.width <= 0 || caps.height <= 0 || caps.width > width || caps.height > height)
+    {
+        return false;
+    }
+    for (const port_caps_entry &entry : input_ports()[0].caps)
+    {
+        if (entry.sdu_type == sdu_type_e::CAPS_VIDEO_CODED && match(entry, caps))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void jpeg_decoder_multicore::maybe_emit_output_caps_locked(uint64_t ts_us)
+{
+    video_raw_caps raw {};
+    raw.width = input_caps_.width;
+    raw.height = input_caps_.height;
+    raw.hor_stride = input_caps_.width;
+    raw.ver_stride = input_caps_.height;
+    if (have_output_caps_ && raw.width == output_caps_.width && raw.height == output_caps_.height &&
+        raw.hor_stride == output_caps_.hor_stride && raw.ver_stride == output_caps_.ver_stride)
+    {
+        return;
+    }
+    output_caps_ = raw;
+    have_output_caps_ = true;
+    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, raw, ts_us, 0);
+    caps_pdu.seq = 0;
+    pending_caps_out_.push_back(std::move(caps_pdu));
+}
+
 jpeg_decoder_multicore::jpeg_decoder_multicore() = default;
 
 jpeg_decoder_multicore::~jpeg_decoder_multicore()
@@ -89,7 +158,7 @@ media_kind_e jpeg_decoder_multicore::output_kind() const
 }
 
 int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v, const job &j,
-                                       frame *out) const
+                                       component_pdu *out)
 {
     auto *ctx = static_cast<AVCodecContext *>(dec_v);
     auto *avf = static_cast<AVFrame *>(avframe_v);
@@ -100,8 +169,16 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
     media_kind_e fmt = media_kind_e::NV12;
     {
         std::lock_guard<std::mutex> lock(cfg_mu);
-        dw = width;
-        dh = height;
+        if (have_input_caps_ && input_caps_.width > 0 && input_caps_.height > 0)
+        {
+            dw = input_caps_.width;
+            dh = input_caps_.height;
+        }
+        else
+        {
+            dw = width;
+            dh = height;
+        }
         fmt = output_format;
     }
     if (fmt != media_kind_e::NV12)
@@ -112,7 +189,7 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
     av_packet_unref(packet);
     packet->data = j.data;
     packet->size = static_cast<int>(j.size);
-    packet->pts = j.pts;
+    packet->pts = static_cast<int64_t>(j.ts_us);
 
     if (avcodec_send_packet(ctx, packet) < 0)
     {
@@ -185,8 +262,9 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
         return r;
     }
 
-    out->reset(media_kind_e::NV12, dw, dh, j.pts, true, std::move(buf), j.capture_mono_ns);
-    return 0;
+    if (nullptr == out) { return -EINVAL; }
+    out->ts_us = j.ts_us; out->seq = 0; out->sdu_type = sdu_type_e::NV12; out->port = 0; out->flags = 0;
+    out->sdu = std::move(buf); return 0;
 }
 
 namespace
@@ -312,8 +390,8 @@ void jpeg_decoder_multicore::worker_main(int worker_index)
             job_cv.notify_all();
         }
 
-        frame out;
-        int   status = decode_one(dec, avf, pkt, j, &out);
+        component_pdu out;
+        int status = decode_one(dec, avf, pkt, j, &out);
         std::free(j.data);
         j.data = nullptr;
 
@@ -323,15 +401,16 @@ void jpeg_decoder_multicore::worker_main(int worker_index)
             res_cv.wait(lock, [this, slot] { return stop || !results[slot].ready; });
             if (stop)
             {
-                out.release();
+                out.sdu = {};
                 break;
             }
             results[slot].seq = j.seq;
             results[slot].status = status;
-            results[slot].out = std::move(out);
+            results[slot].pdu = std::move(out);
             results[slot].ready = true;
             res_cv.notify_all();
         }
+        notify_wakeup();
     }
 
     av_frame_free(&avf);
@@ -352,7 +431,7 @@ int jpeg_decoder_multicore::start_workers()
         results[i].ready = false;
         results[i].status = 0;
         results[i].seq = 0;
-        results[i].out.release();
+        results[i].pdu.sdu = {};
     }
 
     int n = 0;
@@ -418,7 +497,7 @@ void jpeg_decoder_multicore::stop_workers()
         std::lock_guard<std::mutex> lock(res_mu);
         for (int i = 0; i < k_queue_depth; i++)
         {
-            results[i].out.release();
+            results[i].pdu.sdu = {};
             results[i].ready = false;
         }
     }
@@ -452,105 +531,82 @@ void jpeg_decoder_multicore::close()
     opened = false;
 }
 
+int jpeg_decoder_multicore::input_pdu_locked(component_pdu &&in)
+{
+    if (0 != in.port) { return -EINVAL; }
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED) {
+        video_coded_caps caps {};
+        if (read_caps(in, &caps) != 0) { return -EINVAL; }
+        if (!caps_acceptable(caps)) { caps_reject_ = true; have_input_caps_ = false; return -ENOTSUP; }
+        caps_reject_ = false; input_caps_ = caps; have_input_caps_ = true;
+        maybe_emit_output_caps_locked(in.ts_us); return 0;
+    }
+    if (in.sdu_type != sdu_type_e::MJPEG) { return -EINVAL; }
+    if (caps_reject_ || !have_input_caps_) { return -ENOTSUP; }
+    if (in.sdu.size() > k_max_jpeg) { return -EINVAL; }
+    auto *copy = static_cast<uint8_t *>(std::malloc(in.sdu.size()));
+    if (nullptr == copy) { return -ENOMEM; }
+    std::memcpy(copy, in.sdu.u8(), in.sdu.size());
+    std::unique_lock<std::mutex> lock(job_mu);
+    if (job_count == k_queue_depth) { lock.unlock(); std::free(copy); return -EAGAIN; }
+    jobs[job_tail].seq = next_in_seq++; jobs[job_tail].data = copy; jobs[job_tail].size = in.sdu.size();
+    jobs[job_tail].ts_us = in.ts_us;
+    job_tail = (job_tail + 1) % k_queue_depth; job_count++; job_cv.notify_one(); return 0;
+}
+int jpeg_decoder_multicore::input(component_pdu &&in)
+{
+    std::lock_guard<std::mutex> life(life_mu);
+    if (!opened) { return -EBADF; }
+    return input_pdu_locked(std::move(in));
+}
 int jpeg_decoder_multicore::input(uint8_t /*port*/, const data_packet &in)
 {
     const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::MJPEG || f.buf.size() > k_max_jpeg)
-    {
-        return -EINVAL;
-    }
-
+    if (f.kind != media_kind_e::MJPEG || f.buf.size() > k_max_jpeg) { return -EINVAL; }
+    component_pdu pdu;
+    pdu.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL) : static_cast<uint64_t>(f.pts);
+    pdu.sdu_type = sdu_type_e::MJPEG; pdu.port = 0; pdu.sdu = f.buf;
+    video_coded_caps caps {}; caps.width = f.width > 0 ? f.width : width; caps.height = f.height > 0 ? f.height : height;
+    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, pdu.ts_us, 0);
     std::lock_guard<std::mutex> life(life_mu);
-    if (!opened)
-    {
-        return -EBADF;
-    }
-
-    auto *copy = static_cast<uint8_t *>(std::malloc(f.buf.size()));
-    if (nullptr == copy)
-    {
-        return -ENOMEM;
-    }
-    std::memcpy(copy, f.buf.u8(), f.buf.size());
-
-    std::unique_lock<std::mutex> lock(job_mu);
-    if (job_count == k_queue_depth)
-    {
-        lock.unlock();
-        std::free(copy);
-        return -EAGAIN;
-    }
-
-    jobs[job_tail].seq = next_in_seq++;
-    jobs[job_tail].data = copy;
-    jobs[job_tail].size = f.buf.size();
-    jobs[job_tail].pts = f.pts;
-    jobs[job_tail].capture_mono_ns = f.capture_mono_ns;
-    job_tail = (job_tail + 1) % k_queue_depth;
-    job_count++;
-    job_cv.notify_one();
-    return 0;
+    if (!opened) { return -EBADF; }
+    const int cr = input_pdu_locked(std::move(caps_pdu));
+    if (cr < 0) { return cr; }
+    return input_pdu_locked(std::move(pdu));
 }
 
-int jpeg_decoder_multicore::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
+
+int jpeg_decoder_multicore::output(component_pdu &out)
 {
+    if (!pending_caps_out_.empty()) { out = std::move(pending_caps_out_.front()); pending_caps_out_.pop_front(); return 0; }
     std::unique_lock<std::mutex> life(life_mu);
-    if (!opened)
-    {
-        return -EBADF;
-    }
+    if (!opened) { return -EBADF; }
     life.unlock();
-
     std::unique_lock<std::mutex> lock(res_mu);
-    auto                         ready = [this] {
-        int slot = static_cast<int>(next_out_seq % k_queue_depth);
-        return results[slot].ready && results[slot].seq == next_out_seq;
-    };
-
-    if (timeout_ms == 0)
-    {
-        if (!ready())
-        {
-            return -EAGAIN;
-        }
-    }
-    else if (timeout_ms < 0)
-    {
-        res_cv.wait(lock, [&] { return stop || ready(); });
-        if (!ready())
-        {
-            return -EAGAIN;
-        }
-    }
-    else
-    {
-        if (!res_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                             [&] { return stop || ready(); }))
-        {
-            return -EAGAIN;
-        }
-        if (!ready())
-        {
-            return -EAGAIN;
-        }
-    }
-
+    auto ready = [this] { int slot = static_cast<int>(next_out_seq % k_queue_depth);
+        return results[slot].ready && results[slot].seq == next_out_seq; };
+    if (!ready()) { return -EAGAIN; }
     int slot = static_cast<int>(next_out_seq % k_queue_depth);
     int status = results[slot].status;
-    if (status == 0)
-    {
-        out.adopt_frame(std::move(results[slot].out));
-    }
-    else
-    {
-        results[slot].out.release();
-    }
-    results[slot].ready = false;
-    results[slot].status = 0;
-    next_out_seq++;
-    res_cv.notify_all();
+    if (status == 0) { out = std::move(results[slot].pdu); out.seq = out_seq_++; }
+    else { results[slot].pdu.sdu = {}; }
+    results[slot].ready = false; results[slot].status = 0; next_out_seq++; res_cv.notify_all();
     return status == 0 ? 0 : status;
 }
+int jpeg_decoder_multicore::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
+{
+    (void)timeout_ms;
+    for (;;) {
+        component_pdu pdu; const int r = output(pdu);
+        if (0 != r) { return r; }
+        if (is_caps(pdu.sdu_type)) { continue; }
+        auto fd = std::make_unique<frame_data>();
+        fd->kind = media_kind_e::NV12; fd->width = output_caps_.width; fd->height = output_caps_.height;
+        fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL; fd->pts = fd->capture_mono_ns;
+        fd->buf = std::move(pdu.sdu); out.reset(std::move(fd)); return 0;
+    }
+}
+
 
 int jpeg_decoder_multicore::configure(std::string_view key, std::string_view value)
 {
@@ -727,6 +783,10 @@ int jpeg_decoder_multicore::query(std::string_view key, std::string *value) cons
         *value = decoded_pix_fmt;
         return 0;
     }
+    int r = port_caps_query(input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r) { return r; }
+    r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r) { return r; }
     return -ENOTSUP;
 }
 

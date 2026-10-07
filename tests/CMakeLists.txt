@@ -46,6 +46,10 @@ if(ENABLE_MKV_SINK)
     list(APPEND VSTREAMER_TEST_SOURCES mkv_sink_test.cpp)
 endif()
 
+if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_MPP OR ENABLE_H264_DECODER_MPP)
+    list(APPEND VSTREAMER_TEST_SOURCES codec_caps_rejection_test.cpp)
+endif()
+
 add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/bench_console.cpp)
