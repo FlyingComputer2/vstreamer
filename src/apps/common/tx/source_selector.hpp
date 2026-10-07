@@ -63,6 +63,7 @@ private:
     int               noise_fps;
     on_switch_fn      on_switch;
     push_pdu_fn       push_pdu;
+    std::shared_ptr<pdu_wakeup> source_wake_;
 
     source_kind kind = source_kind::camera;
     std::string camera_error;

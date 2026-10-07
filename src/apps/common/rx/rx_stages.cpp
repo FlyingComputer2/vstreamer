@@ -229,7 +229,6 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
     std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
     owner->set_wakeup(wake);
     au_in_queue->bind_wakeup(wake);
-    present_queue->bind_wakeup(wake);
     component_pdu pdu;
     bool          holding = false;
     uint64_t            last_seq = 0;

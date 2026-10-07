@@ -865,6 +865,12 @@ int main(int argc, char **argv)
     }
     apps::pipeline_pdu_queue  mjpeg_pipe(pipe_q_depth, g_run);
     apps::pipeline_pdu_queue  nv12_pipe(pipe_q_depth, g_run);
+    const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
+    mjpeg_pipe.bind_wakeup(mjpeg_wake);
+    nv12_pipe.bind_wakeup(nv12_wake);
     g_tx.metrics_nv12_pipe = &nv12_pipe;
     apps::present_pdu_queue present_queue(present_queue_depth, g_run);
     apps::pdu_rx_au_queue     au_in_pipe(rx_au_q_depth, g_run);
@@ -877,6 +883,7 @@ int main(int argc, char **argv)
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
     if (use_uvc_selector)
     {
+        uvc_selector->bind_source_wakeups(mjpeg_wake);
         uvc_selector->set_push_pdu_handler([&](component_pdu &&pkt) {
             (void)enqueue_source_pdu(std::move(pkt), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
         });

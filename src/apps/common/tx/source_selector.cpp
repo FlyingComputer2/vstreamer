@@ -237,6 +237,7 @@ void source_selector::close()
 
 void source_selector::bind_source_wakeups(std::shared_ptr<pdu_wakeup> w)
 {
+    source_wake_ = w;
     dynamic_cast<component &>(camera).set_wakeup(w);
     dynamic_cast<component &>(noise).set_wakeup(w);
 }
@@ -321,16 +322,17 @@ int source_selector::poll_once_pdu(pdu_wakeup &w)
 
 int source_selector::poll_once(int timeout_ms)
 {
-    pdu_wakeup local_wake;
+    pdu_wakeup fallback_wake;
+    pdu_wakeup &w = source_wake_ ? *source_wake_ : fallback_wake;
     if (timeout_ms < 0)
     {
-        return poll_once_pdu(local_wake);
+        return poll_once_pdu(w);
     }
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
     while (std::chrono::steady_clock::now() < deadline)
     {
-        const int r = poll_once_pdu(local_wake);
+        const int r = poll_once_pdu(w);
         if (0 == r || -EAGAIN != r)
         {
             return r;
