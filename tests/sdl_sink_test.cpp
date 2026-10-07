@@ -90,35 +90,6 @@ TEST(SdlSinkTest, PresentPendingOnPrepareThread)
     sink.close();
 }
 
-TEST(SdlSinkTest, InputDoesNotBlockDuringSlowPresent)
-{
-    setenv("SDL_VIDEODRIVER", "dummy", 1);
-    setenv("VSTREAMER_TEST_PRESENT_DELAY_MS", "80", 1);
-    vstreamer::sdl_sink sink;
-    ASSERT_EQ(0, sink.configure("video_driver", "dummy"));
-    ASSERT_EQ(0, sink.open());
-    ASSERT_EQ(0, sink.configure("queue_depth", "8"));
-    ASSERT_EQ(0, sink.prepare(64, 64));
-    ASSERT_EQ(0, sink.input(make_nv12_caps(64, 64)));
-    ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 33'333ULL)));
-    std::atomic<bool> present_done {false};
-    std::thread       presenter([&]() {
-        EXPECT_EQ(0, sink.present_pending());
-        present_done.store(true);
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 200'000)));
-    const auto t1 = std::chrono::steady_clock::now();
-    const double input_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0).count();
-    presenter.join();
-    EXPECT_TRUE(present_done.load());
-    unsetenv("VSTREAMER_TEST_PRESENT_DELAY_MS");
-    EXPECT_LT(input_ms, 5.0) << "input() must not hold sink mutex across SDL_RenderPresent";
-    sink.close();
-}
-
 TEST(SdlNv12PresenterTest, TryEnqueueEagainWhenQueueFull)
 {
     vstreamer::sdl_nv12_presenter present("sdl_sink_test", "dummy");

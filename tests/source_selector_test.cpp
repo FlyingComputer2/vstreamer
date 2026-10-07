@@ -2,6 +2,7 @@
 
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
+#include "core/pdu_wakeup.hpp"
 #include "core/sdu_type.hpp"
 
 #include <gtest/gtest.h>
@@ -115,6 +116,7 @@ TEST(SourceSelectorTest, CameraEnodevFallsBackToNoiseOnce)
                                                 EXPECT_EQ(25, f);
                                             });
     sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) { pdu_count++; });
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
     EXPECT_EQ(vstreamer::apps::tx::source_kind::camera, sel.active_kind());
@@ -145,6 +147,7 @@ TEST(SourceSelectorTest, CameraRecoversAfterNoise)
             }
         });
     sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) {});
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
     EXPECT_EQ(0, sel.poll_once(-1));
@@ -169,6 +172,7 @@ TEST(SourceSelectorTest, CameraAbsentAtStartUsesNoise)
     int pdu_count = 0;
     vstreamer::apps::tx::source_selector sel(camera, noise, 320, 240, 25, {});
     sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) { pdu_count++; });
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
     EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, sel.active_kind());
