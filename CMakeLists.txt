@@ -39,6 +39,10 @@ set(VSTREAMER_SOURCES
     src/core/frame.cpp
     src/core/metrics.cpp
     src/core/data_packet.cpp
+    src/core/sdu_type.cpp
+    src/core/sdu_caps.cpp
+    src/core/port_caps.cpp
+    src/core/pdu_wakeup.cpp
     src/core/buffer_pool.cpp
     src/core/component_sink.cpp
     src/core/rtp_h264.cpp
