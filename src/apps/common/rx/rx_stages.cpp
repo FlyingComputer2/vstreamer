@@ -1,4 +1,4 @@
-/* rx_stages.cpp — PDU-native RX stages (SDL sink uses PDU input from step 7). */
+/* rx_stages.cpp — PDU-native RX decode, depay, and present stage loops. */
 
 #include "apps/common/rx/rx_stages.hpp"
 
