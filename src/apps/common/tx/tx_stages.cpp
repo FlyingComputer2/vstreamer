@@ -317,14 +317,33 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu out;
-        while (jdec_out->output(out) == 0)
+        for (;;)
         {
+            const int or_out = jdec_out->output(out);
+            if (0 == or_out)
+            {
+                if (is_caps(out.sdu_type))
+                {
+                    (void)nv12_pipe->push(std::move(out), &diag->tx_nv12_q_drop);
+                    continue;
+                }
+                inflight--;
+                note_pdu_sequence_gap(out.seq, last_seq, have_seq, nullptr);
+                log_pdu_stage_latency("jpeg_nv12", out);
+                diag->tx_jpeg_nv12++;
+                diag->tx_jpeg_nv12_bytes += pdu_bytes(out);
+                (void)nv12_pipe->push(std::move(out), &diag->tx_nv12_q_drop);
+                continue;
+            }
+            if (-EBADF == or_out || -ECANCELED == or_out)
+            {
+                return;
+            }
+            if (-EAGAIN == or_out)
+            {
+                break;
+            }
             inflight--;
-            note_pdu_sequence_gap(out.seq, last_seq, have_seq, nullptr);
-            log_pdu_stage_latency("jpeg_nv12", out);
-            diag->tx_jpeg_nv12++;
-            diag->tx_jpeg_nv12_bytes += pdu_bytes(out);
-            (void)nv12_pipe->push(std::move(out), &diag->tx_nv12_q_drop);
         }
         while (inflight < max_inflight)
         {
@@ -348,6 +367,10 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
                 holding = false;
                 inflight++;
                 continue;
+            }
+            if (-EBADF == ir || -ECANCELED == ir)
+            {
+                return;
             }
             if (-EAGAIN == ir)
             {

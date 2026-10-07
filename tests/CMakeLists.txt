@@ -25,6 +25,12 @@ if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
     list(APPEND VSTREAMER_TEST_SOURCES source_selector_test.cpp)
 endif()
 
+if(ENABLE_JPEG_DECODER_MULTICORE)
+    list(APPEND VSTREAMER_TEST_SOURCES
+        jpeg_decoder_multicore_test.cpp
+        jpeg_stage_inflight_test.cpp)
+endif()
+
 if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
     list(APPEND VSTREAMER_TEST_SOURCES
         fec_spread_test.cpp
