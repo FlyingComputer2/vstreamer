@@ -1,5 +1,6 @@
 #include "components/rtp_h264_depay.hpp"
 
+#include "core/h264_sps.hpp"
 #include "core/key_util.hpp"
 #include "core/time_util.hpp"
 
@@ -17,6 +18,30 @@ constexpr int64_t k_capture_skew_min_ns = -50'000'000LL;
 constexpr int64_t k_capture_skew_max_ns = 60'000'000'000LL;
 
 }  // namespace
+
+const std::vector<port_desc> &rtp_h264_depay::input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::RTP;
+        p.caps.push_back(caps);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &rtp_h264_depay::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry coded {};
+        coded.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(coded);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
 
 rtp_h264_depay::rtp_h264_depay() = default;
 
@@ -54,10 +79,13 @@ int rtp_h264_depay::open()
 {
     std::lock_guard<std::mutex> lock(mu);
     depay = rtp_h264_depacketizer(fps);
-    au_queue.clear();
+    out_queue.clear();
     au_dropped = 0;
     capture_ts_rejected = 0;
     capture_skew_ms = 0.0;
+    last_caps_w_ = 0;
+    last_caps_h_ = 0;
+    out_seq_ = 0;
     opened = true;
     return 0;
 }
@@ -66,7 +94,7 @@ void rtp_h264_depay::close()
 {
     std::lock_guard<std::mutex> lock(mu);
     depay.reset();
-    au_queue.clear();
+    out_queue.clear();
     opened = false;
 }
 
@@ -88,25 +116,66 @@ int64_t rtp_h264_depay::accept_capture_rt_ns(int64_t capture_rt_ns)
     return now_mono - skew_ns;
 }
 
-void rtp_h264_depay::push_au(au_item &&item)
+void rtp_h264_depay::maybe_queue_caps_for_au(const au_item &item)
 {
-    if (au_queue.size() >= k_au_queue_depth)
+    int32_t w = 0;
+    int32_t h = 0;
+    if (!h264_annexb_sps_dimensions(item.buf.data(), item.buf.size(), &w, &h))
     {
-        au_queue.pop_front();
-        au_dropped++;
+        w = 0;
+        h = 0;
     }
-    au_queue.push_back(std::move(item));
+    if (w == last_caps_w_ && h == last_caps_h_)
+    {
+        return;
+    }
+    last_caps_w_ = w;
+    last_caps_h_ = h;
+    video_coded_caps caps {};
+    caps.width = w;
+    caps.height = h;
+    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, item.ts_us, 0);
+    caps_pdu.seq = 0;
+    out_queue.push_back(std::move(caps_pdu));
 }
 
-int rtp_h264_depay::input(uint8_t port, const data_packet &in)
+void rtp_h264_depay::push_au(au_item &&item)
 {
-    if (0 != port)
+    if (out_queue.size() >= k_au_queue_depth * 2)
+    {
+        au_dropped++;
+        return;
+    }
+    maybe_queue_caps_for_au(item);
+    component_pdu pdu;
+    pdu.ts_us = item.ts_us;
+    pdu.seq = out_seq_++;
+    pdu.sdu_type = sdu_type_e::H264_AU;
+    pdu.port = 0;
+    pdu.flags = 0;
+    if (item.key)
+    {
+        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+    }
+    pdu.sdu = shared_sized_buffer::copy_from(item.buf.data(), item.buf.size());
+    if (pdu.sdu.empty() && !item.buf.empty())
+    {
+        au_dropped++;
+        return;
+    }
+    out_queue.push_back(std::move(pdu));
+    notify_wakeup();
+}
+
+int rtp_h264_depay::input(component_pdu &&in)
+{
+    if (0 != in.port || in.sdu_type != sdu_type_e::RTP)
     {
         return -EINVAL;
     }
-    const sock_data &s = data_packet::cast<sock_data>(in);
     std::lock_guard<std::mutex> lock(mu);
-    const shared_sized_buffer &feed = s.buf;
+    const shared_sized_buffer &feed = in.sdu;
+    const uint64_t             rx_ts_us = in.ts_us;
     for (;;)
     {
         std::vector<uint8_t> au;
@@ -121,44 +190,78 @@ int rtp_h264_depay::input(uint8_t port, const data_packet &in)
         }
         au_item item;
         item.buf = std::move(au);
-        item.pts = depay.au_pts();
-        item.capture_mono_ns = accept_capture_rt_ns(depay.au_capture_rt_ns());
+        const int64_t cap_mono = accept_capture_rt_ns(depay.au_capture_rt_ns());
+        if (cap_mono > 0)
+        {
+            item.ts_us = static_cast<uint64_t>(cap_mono / 1000LL);
+        }
+        else
+        {
+            item.ts_us = rx_ts_us;
+        }
         item.key = depay.au_key();
         push_au(std::move(item));
     }
     return 0;
 }
 
-int rtp_h264_depay::output(uint8_t port, data_packet &out, int /*timeout_ms*/)
+int rtp_h264_depay::input(uint8_t port, const data_packet &in)
 {
+    if (0 != port || in.get_type() != packet_kind_e::SOCK)
+    {
+        return -EINVAL;
+    }
+    const sock_data &s = data_packet::cast<sock_data>(in);
+    component_pdu pdu;
+    pdu.ts_us = s.pts > 0 ? static_cast<uint64_t>(s.pts) : 0ULL;
+    pdu.sdu_type = sdu_type_e::RTP;
+    pdu.port = 0;
+    pdu.sdu = s.buf;
+    return input(std::move(pdu));
+}
+
+int rtp_h264_depay::output(component_pdu &out)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (out_queue.empty())
+    {
+        return -EAGAIN;
+    }
+    out = std::move(out_queue.front());
+    out_queue.pop_front();
+    return 0;
+}
+
+int rtp_h264_depay::output(uint8_t port, data_packet &out, int timeout_ms)
+{
+    (void)timeout_ms;
     if (0 != port)
     {
         return -EINVAL;
     }
-
-    std::lock_guard<std::mutex> lock(mu);
-    if (au_queue.empty())
+    for (;;)
     {
-        return -EAGAIN;
+        component_pdu pdu;
+        const int     r = rtp_h264_depay::output(pdu);
+        if (0 != r)
+        {
+            return r;
+        }
+        if (is_caps(pdu.sdu_type))
+        {
+            continue;
+        }
+        auto fd = std::make_unique<frame_data>();
+        fd->kind = media_kind_e::H264;
+        fd->width = last_caps_w_;
+        fd->height = last_caps_h_;
+        fd->capture_mono_ns = static_cast<int64_t>(pdu.ts_us) * 1000LL;
+        fd->pts = fd->capture_mono_ns;
+        fd->key = has_flag(pdu, pdu_flag_e::KEY);
+        fd->buf = std::move(pdu.sdu);
+        out.reset(std::move(fd));
+        return 0;
     }
-
-    au_item item = std::move(au_queue.front());
-    au_queue.pop_front();
-
-    auto fd = std::make_unique<frame_data>();
-    fd->kind = media_kind_e::H264;
-    fd->width = 0;
-    fd->height = 0;
-    fd->pts = item.pts;
-    fd->capture_mono_ns = item.capture_mono_ns;
-    fd->key = item.key;
-    fd->buf = shared_sized_buffer::copy_from(item.buf.data(), item.buf.size());
-    if (fd->buf.empty() && !item.buf.empty())
-    {
-        return -ENOMEM;
-    }
-    out.reset(std::move(fd));
-    return 0;
 }
 
 int rtp_h264_depay::configure(std::string_view key, std::string_view value)
@@ -186,6 +289,16 @@ int rtp_h264_depay::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    int r = port_caps_query(input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
+    r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
     }
 
     if ("loss" == key)

@@ -48,6 +48,7 @@ set(VSTREAMER_SOURCES
     src/core/rtp_h264.cpp
     src/core/pix_convert.cpp
     src/core/h264_level.cpp
+    src/core/h264_sps.cpp
     src/core/component_factory.cpp
 )
 
