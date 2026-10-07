@@ -140,19 +140,22 @@ bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag
     return true;
 }
 
-void drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
+bool drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
                    bench_diag &diag)
 {
     auto *enc_out = dynamic_cast<component_output *>(&enc);
     if (nullptr == enc_out)
     {
-        return;
+        return false;
     }
+    bool          drained = false;
     component_pdu pdu;
     while (g_run.load(std::memory_order_relaxed) && enc_out->output(pdu) == 0)
     {
+        drained = true;
         (void)forward_encoded_au_pdu(pay, sender, diag, std::move(pdu));
     }
+    return drained;
 }
 
 bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
@@ -304,12 +307,14 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     bool          holding = false;
     while (g_run.load(std::memory_order_relaxed))
     {
+        bool progressed = false;
         component_pdu out;
         for (;;)
         {
             const int or_out = jdec_out->output(out);
             if (0 == or_out)
             {
+                progressed = true;
                 if (is_caps(out.sdu_type))
                 {
                     (void)nv12_pipe->push(std::move(out), &diag->tx_nv12_q_drop);
@@ -337,11 +342,12 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
         {
             if (!holding)
             {
-                if (!mjpeg_pipe->pop(raw, *wake, *owner))
+                if (!mjpeg_pipe->try_pop(raw))
                 {
                     break;
                 }
                 holding = true;
+                progressed = true;
             }
             if (is_caps(raw.sdu_type))
             {
@@ -367,7 +373,7 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
             holding = false;
             break;
         }
-        if (!holding && inflight < max_inflight)
+        if (!progressed)
         {
             wait_for_pdu(*wake, *owner, g_run);
         }
@@ -401,47 +407,57 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     while (g_run.load(std::memory_order_relaxed))
     {
         apply_pending_console_encoder_cfg(*enc);
+        bool progressed = drain_encoder(*enc, *pay, *sender, *diag);
         if (!holding)
         {
-            if (!nv12_pipe->pop(nv12_pdu, *enc_wake, *owner, &nv12_enqueue_mono_ns))
+            if (nv12_pipe->try_pop(nv12_pdu, &nv12_enqueue_mono_ns))
             {
-                drain_encoder(*enc, *pay, *sender, *diag);
+                progressed = true;
+                diag->tx_enc_nv12_popped++;
+                note_pdu_sequence_gap(nv12_pdu.seq, last_seq, have_seq, nullptr);
+                if (is_caps(nv12_pdu.sdu_type))
+                {
+                    if (nullptr != enc_pdu_in)
+                    {
+                        (void)enc_pdu_in->input(std::move(nv12_pdu));
+                    }
+                    (void)drain_encoder(*enc, *pay, *sender, *diag);
+                    continue;
+                }
+                if (nv12_enqueue_mono_ns > 0)
+                {
+                    const double ms =
+                        static_cast<double>(steady_mono_ns() - nv12_enqueue_mono_ns) / 1e6;
+                    if (ms >= 0.0)
+                    {
+                        apps::record_stage_latency_ms("enc_in", ms);
+                    }
+                }
+                holding = true;
+            }
+        }
+        if (holding)
+        {
+            bool accepted = false;
+            if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12_pdu, &accepted))
+            {
+                break;
+            }
+            if (accepted)
+            {
+                holding = false;
+                progressed = true;
                 continue;
             }
-            diag->tx_enc_nv12_popped++;
-            note_pdu_sequence_gap(nv12_pdu.seq, last_seq, have_seq, nullptr);
-            if (is_caps(nv12_pdu.sdu_type))
+            if (drain_encoder(*enc, *pay, *sender, *diag))
             {
-                if (nullptr != enc_pdu_in)
-                {
-                    (void)enc_pdu_in->input(std::move(nv12_pdu));
-                }
-                drain_encoder(*enc, *pay, *sender, *diag);
-                continue;
+                progressed = true;
             }
-            if (nv12_enqueue_mono_ns > 0)
-            {
-                const double ms =
-                    static_cast<double>(steady_mono_ns() - nv12_enqueue_mono_ns) / 1e6;
-                if (ms >= 0.0)
-                {
-                    apps::record_stage_latency_ms("enc_in", ms);
-                }
-            }
-            holding = true;
         }
-        bool accepted = false;
-        if (!submit_nv12_to_encoder(enc, pay, sender, diag, nv12_pdu, &accepted))
+        if (!progressed)
         {
-            break;
+            wait_for_pdu(*enc_wake, *owner, g_run);
         }
-        if (accepted)
-        {
-            holding = false;
-            continue;
-        }
-        drain_encoder(*enc, *pay, *sender, *diag);
-        wait_for_pdu(*enc_wake, *owner, g_run);
     }
 }
 

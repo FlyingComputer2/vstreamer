@@ -10,7 +10,6 @@
 #include <memory>
 #include <unordered_map>
 
-#include "apps/common/pdu_stage.hpp"
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
 #include "core/pdu_wakeup.hpp"
@@ -71,28 +70,21 @@ public:
         return q.size();
     }
 
-    bool pop(component_pdu &out, pdu_wakeup &w, component &deadline_owner,
-             int64_t *enqueue_mono_ns = nullptr)
+    [[nodiscard]] bool try_pop(component_pdu &out, int64_t *enqueue_mono_ns = nullptr)
     {
-        while (run_.load(std::memory_order_relaxed))
+        std::lock_guard<std::mutex> lock(mu);
+        if (q.empty())
         {
-            {
-                std::unique_lock<std::mutex> lock(mu);
-                if (!q.empty())
-                {
-                    queued_pdu entry = std::move(q.front());
-                    q.pop_front();
-                    out = std::move(entry.pdu);
-                    if (nullptr != enqueue_mono_ns)
-                    {
-                        *enqueue_mono_ns = entry.enqueue_mono_ns;
-                    }
-                    return true;
-                }
-            }
-            wait_for_pdu(w, deadline_owner, run_);
+            return false;
         }
-        return false;
+        queued_pdu entry = std::move(q.front());
+        q.pop_front();
+        out = std::move(entry.pdu);
+        if (nullptr != enqueue_mono_ns)
+        {
+            *enqueue_mono_ns = entry.enqueue_mono_ns;
+        }
+        return true;
     }
 
     void wake_shutdown()
@@ -152,22 +144,16 @@ public:
         return true;
     }
 
-    bool pop(component_pdu &out, pdu_wakeup &w, component &deadline_owner)
+    [[nodiscard]] bool try_pop(component_pdu &out)
     {
-        while (run_.load(std::memory_order_relaxed))
+        std::lock_guard<std::mutex> lock(mu);
+        if (q.empty())
         {
-            {
-                std::unique_lock<std::mutex> lock(mu);
-                if (!q.empty())
-                {
-                    out = std::move(q.front());
-                    q.pop_front();
-                    return true;
-                }
-            }
-            wait_for_pdu(w, deadline_owner, run_);
+            return false;
         }
-        return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
     }
 
     void wake()
@@ -221,22 +207,16 @@ struct pdu_rx_au_queue
         }
     }
 
-    bool pop(component_pdu &out, pdu_wakeup &w, component &deadline_owner)
+    [[nodiscard]] bool try_pop(component_pdu &out)
     {
-        while (run_.load(std::memory_order_relaxed))
+        std::lock_guard<std::mutex> lock(mu);
+        if (q.empty())
         {
-            {
-                std::unique_lock<std::mutex> lock(mu);
-                if (!q.empty())
-                {
-                    out = std::move(q.front());
-                    q.pop_front();
-                    return true;
-                }
-            }
-            wait_for_pdu(w, deadline_owner, run_);
+            return false;
         }
-        return false;
+        out = std::move(q.front());
+        q.pop_front();
+        return true;
     }
 
     void wake()

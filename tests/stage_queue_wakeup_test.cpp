@@ -1,3 +1,4 @@
+#include "apps/common/pdu_stage.hpp"
 #include "apps/common/queues.hpp"
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
@@ -42,7 +43,11 @@ TEST(StageQueueWakeTest, PopWaitsOnQueueWakeupNotFixedDelay)
         }
         cv.notify_one();
         const auto t0 = std::chrono::steady_clock::now();
-        ASSERT_TRUE(q.pop(pdu, *wake, owner));
+        while (run.load(std::memory_order_relaxed) && !q.try_pop(pdu))
+        {
+            vstreamer::apps::wait_for_pdu(*wake, owner, run);
+        }
+        ASSERT_TRUE(run.load(std::memory_order_relaxed));
         const auto t1 = std::chrono::steady_clock::now();
         blocked_ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -82,7 +87,7 @@ TEST(StageQueueWakeTest, EnqueueMonoSurvivesOverflowDrops)
     for (int i = 0; i < 2; ++i)
     {
         vstreamer::component_pdu pdu;
-        ASSERT_TRUE(q.pop(pdu, wake, owner, &mono));
+        ASSERT_TRUE(q.try_pop(pdu, &mono));
         EXPECT_GT(mono, 0);
     }
     run = false;

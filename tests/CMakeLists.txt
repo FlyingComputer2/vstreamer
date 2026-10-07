@@ -12,6 +12,7 @@ set(VSTREAMER_TEST_SOURCES
     port_caps_test.cpp
     pdu_wakeup_test.cpp
     stage_queue_wakeup_test.cpp
+    stage_loop_output_drain_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
     stream_header_test.cpp

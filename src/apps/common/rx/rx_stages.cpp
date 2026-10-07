@@ -42,28 +42,31 @@ namespace
     return is_caps(pdu.sdu_type) ? 0U : pdu.sdu.size();
 }
 
-void drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, bench_diag &diag)
+bool drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, bench_diag &diag)
 {
     if (ensure_decoder_open(dec) < 0)
     {
-        return;
+        return false;
     }
     auto *dec_out = dynamic_cast<component_output *>(dec);
     if (nullptr == dec_out)
     {
-        return;
+        return false;
     }
-    uint64_t last_seq = 0;
-    bool     have_seq = false;
+    bool          drained = false;
+    uint64_t      last_seq = 0;
+    bool          have_seq = false;
     component_pdu frame;
     while (g_run.load(std::memory_order_relaxed) && dec_out->output(frame) == 0)
     {
+        drained = true;
         note_pdu_sequence_gap(frame.seq, last_seq, have_seq, nullptr);
         diag.rx_nv12_out++;
         diag.rx_nv12_out_bytes += pdu_bytes(frame);
         log_pdu_stage_latency("dec_out", frame);
         (void)present_queue->push(std::move(frame), &diag.rx_present_q_drop);
     }
+    return drained;
 }
 
 int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queue *present_queue,
@@ -139,8 +142,9 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
-        if (!present_queue->pop(pdu, *wake, deadline_owner))
+        if (!present_queue->try_pop(pdu))
         {
+            wait_for_pdu(*wake, deadline_owner, g_run);
             continue;
         }
         if (nullptr == sink_pdu)
@@ -240,57 +244,69 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
+        bool progressed = drain_dec_pdus(dec, present_queue, *diag);
         if (!holding)
         {
-            if (!au_in_queue->pop(pdu, *wake, *owner))
+            if (au_in_queue->try_pop(pdu))
             {
-                drain_dec_pdus(dec, present_queue, *diag);
-                continue;
-            }
-            note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
-            if (is_caps(pdu.sdu_type))
-            {
-                if (ensure_decoder_open(dec) < 0)
+                progressed = true;
+                note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
+                if (is_caps(pdu.sdu_type))
                 {
-                    holding = false;
+                    if (ensure_decoder_open(dec) < 0)
+                    {
+                        holding = false;
+                        continue;
+                    }
+                    auto *dec_pdu_in = dynamic_cast<component_input *>(dec);
+                    if (nullptr != dec_pdu_in)
+                    {
+                        const int cr = dec_pdu_in->input(std::move(pdu));
+                        if (0 == cr)
+                        {
+                            diag->rx_dec_in_ok++;
+                        }
+                        else if (-EAGAIN != cr && -ECANCELED != cr)
+                        {
+                            diag->rx_dec_in_err++;
+                        }
+                    }
                     continue;
                 }
-                auto *dec_pdu_in = dynamic_cast<component_input *>(dec);
-                if (nullptr != dec_pdu_in)
+                log_pdu_stage_latency("dec_in", pdu);
+                holding = true;
+            }
+        }
+        if (holding)
+        {
+            const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag);
+            if (0 == r)
+            {
+                holding = false;
+                if (drain_dec_pdus(dec, present_queue, *diag))
                 {
-                    const int cr = dec_pdu_in->input(std::move(pdu));
-                    if (0 == cr)
-                    {
-                        diag->rx_dec_in_ok++;
-                    }
-                    else if (-EAGAIN != cr && -ECANCELED != cr)
-                    {
-                        diag->rx_dec_in_err++;
-                    }
+                    progressed = true;
                 }
-                drain_dec_pdus(dec, present_queue, *diag);
                 continue;
             }
-            log_pdu_stage_latency("dec_in", pdu);
-            holding = true;
-        }
-        const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag);
-        if (0 == r)
-        {
+            if (-EAGAIN == r)
+            {
+                if (drain_dec_pdus(dec, present_queue, *diag))
+                {
+                    progressed = true;
+                }
+                continue;
+            }
+            if (-ECANCELED == r)
+            {
+                break;
+            }
             holding = false;
-            drain_dec_pdus(dec, present_queue, *diag);
-            continue;
         }
-        if (-EAGAIN == r)
+        if (!progressed)
         {
-            drain_dec_pdus(dec, present_queue, *diag);
-            continue;
+            wait_for_pdu(*wake, *owner, g_run);
         }
-        if (-ECANCELED == r)
-        {
-            break;
-        }
-        holding = false;
     }
     drain_dec_pdus(dec, present_queue, *diag);
 }
