@@ -45,6 +45,11 @@ if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
     )
 endif()
 
+include(${CMAKE_SOURCE_DIR}/src/apps/common/app_capabilities.cmake)
+if(VSTREAMER_APP_TX_OK AND VSTREAMER_APP_RX_OK)
+    list(APPEND VSTREAMER_TEST_SOURCES stage_latency_metrics_test.cpp)
+endif()
+
 if(ENABLE_RTP_H264_PAY AND ENABLE_RTP_H264_DEPAY)
     list(APPEND VSTREAMER_TEST_SOURCES rtp_h264_test.cpp)
 endif()
