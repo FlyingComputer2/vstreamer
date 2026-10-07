@@ -2,7 +2,6 @@
 
 #include "apps/common/rx/rx_stages.hpp"
 
-#include "apps/common/legacy_pdu.hpp"
 #include "apps/common/pdu_stage.hpp"
 #include "apps/common/pipeline_state.hpp"
 #include "apps/common/rx/rx_state.hpp"
@@ -15,7 +14,6 @@
 #include <thread>
 
 #include "components/components.hpp"
-#include "core/data_packet.hpp"
 #include "core/pdu_input.hpp"
 #include "core/pdu_output.hpp"
 #include "core/thread_affinity.hpp"
@@ -27,8 +25,6 @@ using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
 using apps::log_pdu_stage_latency;
-using apps::log_stage_latency;
-using apps::packet_frame_bytes;
 using apps::note_pdu_sequence_gap;
 using apps::pdu_rx_au_queue;
 using apps::present_pdu_queue;
@@ -147,25 +143,15 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
         {
             continue;
         }
-        if (nullptr != sink_pdu)
+        if (nullptr == sink_pdu)
         {
-            log_pdu_stage_latency("present", pdu);
-            if (sink_pdu->input(std::move(pdu)) == 0)
-            {
-                diag->rx_present_ok++;
-            }
-            else
-            {
-                diag->rx_present_err++;
-            }
+            diag->rx_present_err++;
             continue;
         }
-        apps::pdu_to_legacy to_legacy;
-        data_packet         legacy;
-        if (to_legacy.convert(pdu, &legacy) == 0 && display->input(0, legacy) == 0)
+        log_pdu_stage_latency("present", pdu);
+        if (sink_pdu->input(std::move(pdu)) == 0)
         {
             diag->rx_present_ok++;
-            log_stage_latency("present", legacy);
         }
         else
         {
@@ -177,27 +163,37 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
 void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_queue *au_in_queue,
                         bench_diag *diag)
 {
+    auto *rcv_out = dynamic_cast<pdu_output *>(rcv);
+    auto *depay_in = dynamic_cast<pdu_input *>(depay);
     auto *depay_out = dynamic_cast<pdu_output *>(depay);
-    if (nullptr == rcv || nullptr == depay || nullptr == depay_out)
+    auto *rcv_owner = dynamic_cast<component *>(rcv);
+    if (nullptr == rcv || nullptr == depay || nullptr == rcv_out || nullptr == depay_in ||
+        nullptr == depay_out || nullptr == rcv_owner)
     {
         return;
     }
+    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    rcv_owner->set_wakeup(wake);
     uint64_t au_seq = 0;
     bool     have_au = false;
     while (g_run.load(std::memory_order_relaxed))
     {
-        data_packet sock_pkt;
-        const int   got = rcv->output(0, sock_pkt, 50);
+        component_pdu sock_pdu;
+        const int     got = rcv_out->output(sock_pdu);
         if (0 != got)
         {
             if (got < 0 && -EAGAIN != got)
             {
                 break;
             }
+            if (-EAGAIN == got)
+            {
+                wait_for_pdu(*wake, *rcv_owner, g_run);
+            }
             continue;
         }
         diag->rx_udp++;
-        if (depay->input(0, sock_pkt) < 0)
+        if (depay_in->input(std::move(sock_pdu)) < 0)
         {
             diag->rx_depay_err++;
             continue;
