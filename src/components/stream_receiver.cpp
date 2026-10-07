@@ -2,6 +2,7 @@
 
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
 #include "core/sequence_gap.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
@@ -88,6 +89,18 @@ uint64_t monotonic_timestamp_us()
 
 }  // namespace
 
+const std::vector<port_desc> &stream_receiver::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::STREAM_DGRAM;
+        p.caps.push_back(caps);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
 stream_receiver::stream_receiver() : pool(static_cast<size_t>(1500), k_queue_depth) {}
 
 stream_receiver::~stream_receiver()
@@ -115,7 +128,7 @@ packet_kind_e stream_receiver::output_packet_kind(uint8_t port) const
 }
 
 void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
-                                             size_t max_app_bytes)
+                                             size_t max_app_bytes, bool discont)
 {
     if (payload.empty() || 0 == max_app_bytes || payload.size() > max_app_bytes)
     {
@@ -125,21 +138,26 @@ void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
     }
 
     const size_t payload_len = payload.size();
-    data_packet  pkt;
-    auto         sd = std::make_unique<sock_data>();
-    sd->pts = 0;
-    sd->buf = std::move(payload);
-    pkt.reset(std::move(sd));
+    component_pdu pdu;
+    pdu.ts_us = monotonic_timestamp_us();
+    pdu.sdu_type = sdu_type_e::STREAM_DGRAM;
+    pdu.port = 0;
+    pdu.flags = 0;
+    if (discont)
+    {
+        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::DISCONT);
+    }
+    pdu.sdu = std::move(payload);
 
     bool evicted = false;
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        if (payload_queue.size() >= k_queue_depth)
+        if (pdu_queue.size() >= k_queue_depth)
         {
-            payload_queue.pop_front();
+            pdu_queue.pop_front();
             evicted = true;
         }
-        payload_queue.push_back(std::move(pkt));
+        pdu_queue.push_back(std::move(pdu));
     }
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -150,6 +168,7 @@ void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
             recv_dropped++;
         }
     }
+    notify_wakeup();
     q_cv.notify_all();
 }
 
@@ -161,7 +180,16 @@ void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads, size_t max
     }
     for (auto &payload : *payloads)
     {
-        enqueue_payload_buffer(std::move(payload), max_app_bytes);
+        bool discont = false;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (discont_next_)
+            {
+                discont = true;
+                discont_next_ = false;
+            }
+        }
+        enqueue_payload_buffer(std::move(payload), max_app_bytes, discont);
     }
     payloads->clear();
 }
@@ -201,6 +229,7 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
         if (dg > 0)
         {
             udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+            discont_next_ = true;
         }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
@@ -546,6 +575,7 @@ int stream_receiver::open()
         fec_gap_count.store(0, std::memory_order_relaxed);
         last_udp_seq = 0;
         have_udp_seq = false;
+        discont_next_ = false;
         rx_bad_header = 0;
         cached_max_fec_shard = stream_max_fec_shard(static_cast<size_t>(max_datagram));
         cached_max_decoded_app = max_decoded_app_bytes_from_shard(cached_max_fec_shard);
@@ -585,12 +615,24 @@ void stream_receiver::close()
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);
-        while (!payload_queue.empty())
+        while (!pdu_queue.empty())
         {
-            payload_queue.pop_front();
+            pdu_queue.pop_front();
         }
     }
     q_cv.notify_all();
+}
+
+int stream_receiver::output(component_pdu &out)
+{
+    std::lock_guard<std::mutex> lock(q_mu);
+    if (pdu_queue.empty())
+    {
+        return -EAGAIN;
+    }
+    out = std::move(pdu_queue.front());
+    pdu_queue.pop_front();
+    return 0;
 }
 
 int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
@@ -601,20 +643,20 @@ int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
     }
 
     std::unique_lock<std::mutex> lock(q_mu);
-    if (payload_queue.empty() && timeout_ms != 0)
+    if (pdu_queue.empty() && 0 != timeout_ms)
     {
         if (timeout_ms < 0)
         {
-            q_cv.wait(lock, [this] { return stopping || !payload_queue.empty(); });
+            q_cv.wait(lock, [this] { return stopping || !pdu_queue.empty(); });
         }
         else
         {
             q_cv.wait_for(lock, std::chrono::milliseconds(timeout_ms),
-                          [this] { return stopping || !payload_queue.empty(); });
+                          [this] { return stopping || !pdu_queue.empty(); });
         }
     }
 
-    if (payload_queue.empty())
+    if (pdu_queue.empty())
     {
         if (stopping)
         {
@@ -623,15 +665,18 @@ int stream_receiver::output(uint8_t port, data_packet &out, int timeout_ms)
         return -EAGAIN;
     }
 
-    const size_t egress_bytes =
-        data_packet::cast<sock_data>(payload_queue.front()).buf.size();
-    out = std::move(payload_queue.front());
-    payload_queue.pop_front();
+    component_pdu pdu = std::move(pdu_queue.front());
+    pdu_queue.pop_front();
+    const size_t egress_bytes = pdu.sdu.size();
     lock.unlock();
     {
         std::lock_guard<std::mutex> slock(mu);
         update_kbps_window(egress_rate_t0, egress_rate_bytes, egress_kbps, egress_bytes);
     }
+    auto sd = std::make_unique<sock_data>();
+    sd->pts = static_cast<int64_t>(pdu.ts_us);
+    sd->buf = std::move(pdu.sdu);
+    out.reset(std::move(sd));
     return 0;
 }
 
@@ -707,6 +752,15 @@ int stream_receiver::configure(std::string_view key, std::string_view value)
 
 int stream_receiver::query(std::string_view key, std::string *value) const
 {
+    if (nullptr == value)
+    {
+        return -EINVAL;
+    }
+    int r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
     if ("listen" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

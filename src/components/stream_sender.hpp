@@ -21,6 +21,8 @@
 #include "core/component_sink.hpp"
 #include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
+#include "core/pdu_input.hpp"
+#include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
 
@@ -33,8 +35,8 @@ enum class fec_mode_e
     block,
 };
 
-/* Pad 0 (sink): SOCK in → UDP egress. */
-class stream_sender : public component_sink
+/* Pad 0 (sink): STREAM_DGRAM in → UDP egress. */
+class stream_sender : public component_sink, public pdu_input
 {
 public:
     stream_sender();
@@ -54,6 +56,7 @@ public:
     void close() override;
 
     int input(uint8_t port, const data_packet &in) override;
+    int input(component_pdu &&in) override;
 
     int set_enabled(bool on, int timeout_ms) override;
     [[nodiscard]] bool enabled() const override;
@@ -81,7 +84,14 @@ private:
     void pace_wire_send(size_t bytes);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                            std::chrono::steady_clock::time_point release);
+    [[nodiscard]] int try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                                            std::chrono::steady_clock::time_point release);
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
+
+    [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, size_t ingress_bytes,
+                                     bool pdu_no_evict);
+
+    static const std::vector<port_desc> &input_ports();
 
     [[nodiscard]] size_t queue_byte_limit() const;
 

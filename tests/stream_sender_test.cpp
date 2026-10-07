@@ -2,6 +2,7 @@
 #include "components/stream_sender.hpp"
 
 #include "core/component.hpp"
+#include "core/component_pdu.hpp"
 #include "core/data_packet.hpp"
 #include "core/shared_sized_buffer.hpp"
 #include "core/rs_block_erasure.hpp"
@@ -826,5 +827,57 @@ TEST(StreamSenderTest, RawPathDoesNotAdvanceSduBase)
     EXPECT_EQ(static_cast<uint16_t>(base0 + static_cast<uint16_t>(first_sdu_n)), base1);
 
     close(sniff);
+    sender.close();
+}
+
+TEST(StreamSenderTest, PortCapsAdvertisesStreamDgram)
+{
+    vstreamer::stream_sender sender;
+    std::string              val;
+    ASSERT_EQ(0, sender.query("inport-0.caps-0.sdu_type", &val));
+    EXPECT_EQ("STREAM_DGRAM", val);
+}
+
+TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec", "none"));
+    ASSERT_EQ(0, cfg(sender, "max_kbps", "10"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "200"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    std::vector<uint8_t> payload(256, 0x5A);
+    bool                 saw_eagain = false;
+    for (int i = 0; i < 800; ++i)
+    {
+        vstreamer::component_pdu pdu;
+        pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
+        pdu.port = 0;
+        pdu.sdu = vstreamer::shared_sized_buffer::copy_from(payload.data(), payload.size());
+        const int rc = sender.input(std::move(pdu));
+        if (-EAGAIN == rc)
+        {
+            saw_eagain = true;
+            break;
+        }
+        ASSERT_EQ(0, rc);
+    }
+    EXPECT_TRUE(saw_eagain);
+
+    std::string dropped_before;
+    ASSERT_EQ(0, sender.query("dropped", &dropped_before));
+    const uint64_t dropped0 = std::strtoull(dropped_before.c_str(), nullptr, 10);
+    const auto     legacy_pkt = make_sock_packet(9999, 64);
+    ASSERT_EQ(0, sender.input(0, legacy_pkt));
+    std::string dropped_after;
+    ASSERT_EQ(0, sender.query("dropped", &dropped_after));
+    EXPECT_GE(std::strtoull(dropped_after.c_str(), nullptr, 10), dropped0);
+
     sender.close();
 }

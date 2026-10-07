@@ -19,6 +19,8 @@
 #include "core/component_source.hpp"
 #include "core/data_packet.hpp"
 #include "core/buffer_pool.hpp"
+#include "core/pdu_output.hpp"
+#include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
 
@@ -27,8 +29,8 @@
 namespace vstreamer
 {
 
-/* Pad 0 (source): SOCK out. */
-class stream_receiver : public component_source
+/* Pad 0 (source): STREAM_DGRAM out. */
+class stream_receiver : public component_source, public pdu_output
 {
 public:
     stream_receiver();
@@ -46,6 +48,7 @@ public:
     void close() override;
 
     int output(uint8_t port, data_packet &out, int timeout_ms) override;
+    int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -79,7 +82,10 @@ private:
     /* Returns true when the datagram is valid stream media (telemetry peer update). */
     bool ingest_datagram(const uint8_t *data, size_t len);
     void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
-    void enqueue_payload_buffer(shared_sized_buffer &&payload, size_t max_app_bytes);
+    void enqueue_payload_buffer(shared_sized_buffer &&payload, size_t max_app_bytes,
+                                bool discont);
+
+    static const std::vector<port_desc> &output_ports();
 
     mutable std::mutex mu;
     bool               opened = false;
@@ -93,8 +99,9 @@ private:
     std::mutex              q_mu;
     std::condition_variable q_cv;
     bool                    stopping = false;
-    std::deque<data_packet> payload_queue;
+    std::deque<component_pdu> pdu_queue;
     static constexpr size_t k_queue_depth = 4096;
+    bool                    discont_next_ = false;
 
     std::atomic<uint64_t> udp_packet_received {0};
     std::atomic<uint64_t> fec_packet_received {0};
