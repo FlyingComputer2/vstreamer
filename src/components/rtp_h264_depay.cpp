@@ -109,6 +109,10 @@ void rtp_h264_depay::maybe_queue_caps_for_au(const au_item &item)
         w = 0;
         h = 0;
     }
+    if (w <= 0 || h <= 0)
+    {
+        return;
+    }
     if (w == last_caps_w_ && h == last_caps_h_)
     {
         return;

@@ -247,10 +247,23 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
             if (is_caps(pdu.sdu_type))
             {
+                if (ensure_decoder_open(dec) < 0)
+                {
+                    holding = false;
+                    continue;
+                }
                 auto *dec_pdu_in = dynamic_cast<component_input *>(dec);
                 if (nullptr != dec_pdu_in)
                 {
-                    (void)dec_pdu_in->input(std::move(pdu));
+                    const int cr = dec_pdu_in->input(std::move(pdu));
+                    if (0 == cr)
+                    {
+                        diag->rx_dec_in_ok++;
+                    }
+                    else if (-EAGAIN != cr && -ECANCELED != cr)
+                    {
+                        diag->rx_dec_in_err++;
+                    }
                 }
                 drain_dec_pdus(dec, present_queue, *diag);
                 continue;

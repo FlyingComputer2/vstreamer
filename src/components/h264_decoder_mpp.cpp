@@ -114,7 +114,7 @@ bool h264_decoder_mpp::coded_caps_acceptable(const video_coded_caps &caps) const
     }
     else if (caps.width <= 0 || caps.height <= 0)
     {
-        return false;
+        return width > 0 && height > 0;
     }
     for (const port_caps_entry &entry : input_ports()[0].caps)
     {
@@ -594,25 +594,46 @@ int h264_decoder_mpp::input_pdu_locked(component_pdu &&in)
         {
             return -EINVAL;
         }
-        if (!coded_caps_acceptable(caps))
+        video_coded_caps use_caps = caps;
+        if (output_size_stream && (use_caps.width <= 0 || use_caps.height <= 0))
+        {
+            if (width <= 0 || height <= 0)
+            {
+                caps_reject_ = true;
+                have_input_caps_ = false;
+                return -ENOTSUP;
+            }
+            use_caps.width = width;
+            use_caps.height = height;
+        }
+        if (!coded_caps_acceptable(use_caps))
         {
             caps_reject_ = true;
             have_input_caps_ = false;
             return -ENOTSUP;
         }
         caps_reject_ = false;
-        input_caps_ = caps;
+        input_caps_ = use_caps;
         have_input_caps_ = true;
         if (!output_size_stream)
         {
-            width = caps.width;
-            height = caps.height;
+            width = use_caps.width;
+            height = use_caps.height;
         }
         return 0;
     }
     if (in.sdu_type != sdu_type_e::H264_AU)
     {
         return -EINVAL;
+    }
+    if (!have_input_caps_ && output_size_stream && width > 0 && height > 0)
+    {
+        video_coded_caps implied {};
+        implied.width = width;
+        implied.height = height;
+        input_caps_ = implied;
+        have_input_caps_ = true;
+        caps_reject_ = false;
     }
     if (caps_reject_ || !have_input_caps_)
     {

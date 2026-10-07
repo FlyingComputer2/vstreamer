@@ -188,6 +188,8 @@ int sdl_sink::prepare(int width, int height)
     {
         return -EBADF;
     }
+    prepared_w_ = width;
+    prepared_h_ = height;
     const int r = present->prepare(width, height, opened);
     if (r < 0)
     {
@@ -228,6 +230,15 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     if (in.sdu_type != sdu_type_e::NV12)
     {
         return -EINVAL;
+    }
+    if (!have_input_caps_ && prepared_w_ > 0 && prepared_h_ > 0)
+    {
+        input_caps_.width = prepared_w_;
+        input_caps_.height = prepared_h_;
+        input_caps_.hor_stride = prepared_w_;
+        input_caps_.ver_stride = prepared_h_;
+        have_input_caps_ = true;
+        caps_reject_ = false;
     }
     if (caps_reject_ || !have_input_caps_)
     {

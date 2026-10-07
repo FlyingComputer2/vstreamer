@@ -677,8 +677,8 @@ int main(int argc, char **argv)
                            (nullptr != source ? source->open() : -EINVAL);
     if (open_stage(source_open_label, source_open_rc) < 0 ||
         (use_jpeg_decode && open_stage("jpeg_decoder", jdec.open()) < 0) ||
-        open_stage("h264_encoder", enc.open()) < 0 || open_stage("stream_sender", sender.open()) < 0 ||
-        open_stage("stream_receiver", rcv.open()) < 0)
+        open_stage("h264_encoder", enc.open()) < 0 || open_stage("h264_decoder", dec.open()) < 0 ||
+        open_stage("stream_sender", sender.open()) < 0 || open_stage("stream_receiver", rcv.open()) < 0)
     {
         return 1;
     }

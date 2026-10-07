@@ -69,6 +69,8 @@ private:
     bool           have_input_caps_ = false;
     bool           caps_reject_ = false;
     video_raw_caps input_caps_ {};
+    int            prepared_w_ = 0;
+    int            prepared_h_ = 0;
 
     std::optional<sdl_nv12_presenter> present;
 };

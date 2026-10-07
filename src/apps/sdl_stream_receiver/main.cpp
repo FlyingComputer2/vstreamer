@@ -134,6 +134,7 @@ int main(int argc, char **argv)
     std::snprintf(fps_buf, sizeof(fps_buf), "%d", fps);
     cfg(dec, "size", size_buf);
     cfg(dec, "fps", fps_buf);
+    cfg(dec, "output_size_mode", "stream");
     cfg(depay, "fps", fps_buf);
     cfg(*preview, "title", "sdl_stream_receiver");
     if (kmsdrm && cfg(*preview, "video_driver", "kmsdrm") < 0)
@@ -142,7 +143,8 @@ int main(int argc, char **argv)
     }
 
     const bool defer_sdl = !kmsdrm;
-    if (rcv.open() < 0 || depay.open() < 0 || (defer_sdl ? 0 : preview->open()) < 0)
+    if (rcv.open() < 0 || depay.open() < 0 || dec.open() < 0 ||
+        (defer_sdl ? 0 : preview->open()) < 0)
     {
         return 1;
     }
