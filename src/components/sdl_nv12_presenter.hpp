@@ -58,6 +58,12 @@ public:
     [[nodiscard]] int live_height() const { return live_h; }
     [[nodiscard]] std::thread::id bound_render_thread() const;
 
+    using test_present_delay_hook_fn = void (*)(int delay_ms);
+    static void set_test_present_delay_hook(test_present_delay_hook_fn hook);
+    static void clear_test_present_delay_hook();
+
+    static test_present_delay_hook_fn s_test_present_delay_hook;
+
 private:
     void destroy_video_locked();
     void destroy_texture_locked();

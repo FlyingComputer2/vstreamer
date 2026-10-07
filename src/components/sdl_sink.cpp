@@ -87,7 +87,7 @@ nv12_present_sample sdl_sink::sample_from_pdu(const component_pdu &in) const
 int sdl_sink::open()
 {
     std::lock_guard<std::mutex> lock(mu);
-    if (opened)
+    if (opened.load(std::memory_order_relaxed))
     {
         return 0;
     }
@@ -107,12 +107,13 @@ int sdl_sink::open()
         present.reset();
         return r;
     }
-    opened = true;
+    opened.store(true, std::memory_order_release);
     return 0;
 }
 
 void sdl_sink::close()
 {
+    close_requested.store(true, std::memory_order_release);
     {
         std::lock_guard<std::mutex> lock(mu);
         if (present.has_value())
@@ -126,7 +127,8 @@ void sdl_sink::close()
         present->close();
         present.reset();
     }
-    opened = false;
+    opened.store(false, std::memory_order_release);
+    close_requested.store(false, std::memory_order_release);
     have_input_caps_ = false;
     caps_reject_ = false;
 }
@@ -134,13 +136,14 @@ void sdl_sink::close()
 int sdl_sink::prepare(int width, int height)
 {
     std::lock_guard<std::mutex> lock(mu);
-    if (!opened || !present.has_value())
+    if (!opened.load(std::memory_order_acquire) || !present.has_value())
     {
         return -EBADF;
     }
     prepared_w_ = width;
     prepared_h_ = height;
-    const int r = present->prepare(width, height, opened);
+    bool session_open = opened.load(std::memory_order_relaxed);
+    const int r = present->prepare(width, height, session_open);
     if (r < 0)
     {
         std::fprintf(stderr, "sdl_sink: prepare(%d,%d) failed (%d", width, height, r);
@@ -165,22 +168,26 @@ std::thread::id sdl_sink::bound_render_thread() const
 
 int sdl_sink::present_pending()
 {
-    if (!present.has_value())
-    {
-        return -EBADF;
-    }
+    bool session_open = false;
+    sdl_nv12_presenter *presenter = nullptr;
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (!opened)
+        if (close_requested.load(std::memory_order_acquire) ||
+            !opened.load(std::memory_order_acquire) || !present.has_value())
         {
             return -EBADF;
         }
+        session_open = true;
+        presenter = &(*present);
     }
-    const int r = present->drain_pending(opened);
+    const int r = presenter->drain_pending(session_open);
     if (r > 0)
     {
         std::lock_guard<std::mutex> lock(mu);
-        frames_in += static_cast<uint64_t>(r);
+        if (opened.load(std::memory_order_relaxed))
+        {
+            frames_in += static_cast<uint64_t>(r);
+        }
         return 0;
     }
     if (r < 0)
@@ -247,7 +254,7 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
 int sdl_sink::input(component_pdu &&in)
 {
     std::lock_guard<std::mutex> lock(mu);
-    if (!opened)
+    if (!opened.load(std::memory_order_acquire))
     {
         return -EBADF;
     }
@@ -283,7 +290,7 @@ int sdl_sink::configure(std::string_view key, std::string_view value)
     if ("video_driver" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (opened)
+        if (opened.load(std::memory_order_acquire))
         {
             return -EBUSY;
         }

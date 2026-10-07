@@ -58,7 +58,8 @@ private:
 
     mutable std::mutex mu;
 
-    bool opened = false;
+    std::atomic<bool> opened {false};
+    std::atomic<bool> close_requested {false};
     uint64_t frames_in = 0;
     uint64_t dropped = 0;
     std::string video_driver = "auto";

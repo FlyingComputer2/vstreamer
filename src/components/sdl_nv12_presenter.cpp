@@ -21,6 +21,20 @@
 
 namespace vstreamer
 {
+
+sdl_nv12_presenter::test_present_delay_hook_fn sdl_nv12_presenter::s_test_present_delay_hook =
+    nullptr;
+
+void sdl_nv12_presenter::set_test_present_delay_hook(test_present_delay_hook_fn hook)
+{
+    s_test_present_delay_hook = hook;
+}
+
+void sdl_nv12_presenter::clear_test_present_delay_hook()
+{
+    s_test_present_delay_hook = nullptr;
+}
+
 namespace
 {
 
@@ -488,15 +502,9 @@ int sdl_nv12_presenter::present_nv12_locked(const nv12_present_sample &f, bool &
     clear_sdl_error();
     lock.unlock();
     SDL_RenderPresent(ren);
-    if (const char *delay_ms = std::getenv("VSTREAMER_TEST_PRESENT_DELAY_MS");
-        nullptr != delay_ms && delay_ms[0] != '\0')
+    if (nullptr != sdl_nv12_presenter::s_test_present_delay_hook)
     {
-        char *end = nullptr;
-        const long ms = std::strtol(delay_ms, &end, 10);
-        if (end != delay_ms && ms > 0)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        }
+        sdl_nv12_presenter::s_test_present_delay_hook(0);
     }
     lock.lock();
     if (check_sdl_error_after("SDL_RenderPresent"))
