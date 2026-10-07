@@ -7,6 +7,7 @@
 #endif
 
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -29,6 +30,17 @@ public:
     int prepare(int w, int h, bool &session_open);
 
     int present(const frame_data &f, bool &session_open);
+
+    void set_queue_capacity(size_t cap);
+    [[nodiscard]] size_t queue_capacity() const;
+    [[nodiscard]] size_t queue_size() const;
+
+    /* Non-blocking enqueue; -EAGAIN when the pending queue is full. */
+    int try_enqueue(const frame_data &f);
+    /* Drop oldest pending frame when full (live preview policy). */
+    int enqueue_drop(const frame_data &f, bool *dropped_oldest);
+    /* Present all pending frames on the calling thread. */
+    int drain_pending(bool &session_open);
 
     void set_title(std::string_view title);
     void stats_string(char *buf, size_t buflen, uint64_t frames_in) const;
@@ -72,6 +84,10 @@ private:
     uint64_t present_fail_count = 0;
     double   last_latency_ms = 0.0;
     mutable std::string last_err;
+
+    static constexpr size_t k_default_queue_depth = 1;
+    size_t                  queue_cap = k_default_queue_depth;
+    std::deque<frame_data>  pending;
 
     void note_present_failure(const char *op);
     void clear_sdl_error();

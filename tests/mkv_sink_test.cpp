@@ -1,10 +1,14 @@
 #include "components/mkv_sink.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/data_packet.hpp"
 #include "core/packet_types.hpp"
+#include "core/sdu_caps.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
+#include <cerrno>
 
 extern "C"
 {
@@ -133,7 +137,66 @@ bool probe_video_span(const std::string &path, int *frame_count, double *duratio
     return true;
 }
 
+vstreamer::component_pdu make_mjpeg_caps(int w, int h)
+{
+    vstreamer::video_coded_caps caps {};
+    caps.width = w;
+    caps.height = h;
+    return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_CODED, caps, 0, 0);
+}
+
+vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t pts)
+{
+    vstreamer::component_pdu pdu;
+    pdu.ts_us = static_cast<uint64_t>(pts);
+    pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
+    pdu.port = 0;
+    const data_packet legacy = make_mjpeg_packet(w, h, pts);
+    pdu.sdu = data_packet::cast<frame_data>(legacy).buf;
+    return pdu;
+}
+
 }  // namespace
+
+TEST(MkvSinkTest, PortCapsAdvertisesMjpeg)
+{
+    mkv_sink    sink;
+    std::string val;
+    ASSERT_EQ(0, sink.query("inport-0.caps-0.sdu_type", &val));
+    EXPECT_EQ("CAPS_VIDEO_CODED", val);
+    ASSERT_EQ(0, sink.query("inport-0.caps-1.sdu_type", &val));
+    EXPECT_EQ("MJPEG", val);
+}
+
+TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
+{
+    mkv_sink sink;
+    ASSERT_EQ(0, sink.configure("queue_depth", "1"));
+    ASSERT_EQ(sink.open(), 0);
+    const auto base = std::filesystem::temp_directory_path() / "mkv_sink_pdu_eagain";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+    const std::string out_template = (base / "clip.mkv").string();
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+
+    ASSERT_EQ(0, sink.input(make_mjpeg_caps(320, 240)));
+    bool saw_eagain = false;
+    for (int i = 0; i < 512; ++i)
+    {
+        const int rc = sink.input(make_mjpeg_pdu(320, 240, i));
+        if (-EAGAIN == rc)
+        {
+            saw_eagain = true;
+            break;
+        }
+        ASSERT_EQ(0, rc);
+    }
+    EXPECT_TRUE(saw_eagain);
+
+    sink.close();
+    std::filesystem::remove_all(base, ec);
+}
 
 TEST(MkvSinkTest, DurationAndResizeSegments)
 {
@@ -148,6 +211,7 @@ TEST(MkvSinkTest, DurationAndResizeSegments)
 
     mkv_sink sink;
     ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
     ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
     ASSERT_EQ(sink.configure("fps", "30"), 0);
 

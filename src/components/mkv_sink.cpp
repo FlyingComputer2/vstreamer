@@ -1,6 +1,7 @@
 #include "components/mkv_sink.hpp"
 
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
 
 #include <cerrno>
 #include <cinttypes>
@@ -62,7 +63,27 @@ int parse_size(std::string_view s, int *w, int *h)
     return 0;
 }
 
+const std::vector<port_desc> &mkv_input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::MJPEG;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
 }  // namespace
+
+const std::vector<port_desc> &mkv_sink::input_ports()
+{
+    return mkv_input_ports();
+}
 
 mkv_sink::mkv_sink() = default;
 
@@ -305,18 +326,202 @@ int mkv_sink::write_frame_locked(const data_packet &in)
     return 0;
 }
 
+bool mkv_sink::coded_caps_acceptable(const video_coded_caps &caps) const
+{
+    if (caps.width <= 0 || caps.height <= 0)
+    {
+        return false;
+    }
+    for (const port_caps_entry &entry : input_ports()[0].caps)
+    {
+        if (entry.sdu_type == sdu_type_e::CAPS_VIDEO_CODED && match(entry, caps))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+data_packet mkv_sink::packet_from_pdu(const component_pdu &in) const
+{
+    auto body = std::make_shared<frame_data>();
+    body->kind = media_kind_e::MJPEG;
+    body->width = input_caps_.width;
+    body->height = input_caps_.height;
+    body->pts = static_cast<int64_t>(in.ts_us);
+    body->key = has_flag(in, pdu_flag_e::KEY);
+    body->buf = in.sdu;
+    return data_packet(std::move(body));
+}
+
+int mkv_sink::try_enqueue_locked(data_packet &&pkt)
+{
+    if (queue.size() >= queue_cap)
+    {
+        return -EAGAIN;
+    }
+    queue.push_back(std::move(pkt));
+    return 0;
+}
+
+int mkv_sink::enqueue_drop_locked(data_packet &&pkt, bool *dropped_oldest)
+{
+    if (nullptr != dropped_oldest)
+    {
+        *dropped_oldest = false;
+    }
+    if (queue.size() >= queue_cap && !queue.empty())
+    {
+        queue.pop_front();
+        if (nullptr != dropped_oldest)
+        {
+            *dropped_oldest = true;
+        }
+    }
+    queue.push_back(std::move(pkt));
+    return 0;
+}
+
+void mkv_sink::mux_thread_main()
+{
+    while (true)
+    {
+        data_packet pkt;
+        {
+            std::unique_lock<std::mutex> lock(q_mu);
+            q_cv.wait(lock, [this] {
+                return !queue.empty() || mux_stop.load(std::memory_order_relaxed);
+            });
+            if (queue.empty())
+            {
+                if (mux_stop.load(std::memory_order_relaxed))
+                {
+                    break;
+                }
+                continue;
+            }
+            pkt = std::move(queue.front());
+            queue.pop_front();
+        }
+
+        mux_in_flight.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (opened)
+            {
+                const frame_data &f = data_packet::cast<frame_data>(pkt);
+                int               w = f.width;
+                int               h = f.height;
+                const int         sr = ensure_session_locked(w, h);
+                if (sr >= 0 && recording)
+                {
+                    (void)write_frame_locked(pkt);
+                }
+            }
+        }
+        mux_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        q_cv.notify_all();
+    }
+}
+
+void mkv_sink::stop_mux_thread()
+{
+    {
+        std::unique_lock<std::mutex> lock(q_mu);
+        q_cv.wait(lock, [this] {
+            return queue.empty() && mux_in_flight.load(std::memory_order_relaxed) == 0;
+        });
+    }
+    mux_stop.store(true, std::memory_order_relaxed);
+    q_cv.notify_all();
+    if (mux_thread.joinable())
+    {
+        mux_thread.join();
+    }
+    mux_stop.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        queue.clear();
+    }
+}
+
+int mkv_sink::input_pdu_locked(component_pdu &&in)
+{
+    if (0 != in.port)
+    {
+        return -EINVAL;
+    }
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED)
+    {
+        video_coded_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        if (!coded_caps_acceptable(caps))
+        {
+            caps_reject_ = true;
+            have_input_caps_ = false;
+            return -ENOTSUP;
+        }
+        caps_reject_ = false;
+        input_caps_ = caps;
+        have_input_caps_ = true;
+        return 0;
+    }
+    if (in.sdu_type != sdu_type_e::MJPEG)
+    {
+        return -EINVAL;
+    }
+    if (caps_reject_ || !have_input_caps_)
+    {
+        return -ENOTSUP;
+    }
+    if (output_template.empty())
+    {
+        return 0;
+    }
+    data_packet pkt = packet_from_pdu(in);
+    std::lock_guard<std::mutex> lock(q_mu);
+    const int                   r = try_enqueue_locked(std::move(pkt));
+    if (0 == r)
+    {
+        q_cv.notify_one();
+    }
+    return r;
+}
+
+int mkv_sink::input(component_pdu &&in)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!opened)
+    {
+        return -EBADF;
+    }
+    return input_pdu_locked(std::move(in));
+}
+
 int mkv_sink::open()
 {
     std::lock_guard<std::mutex> lock(mu);
+    if (opened)
+    {
+        return 0;
+    }
     opened = true;
+    mux_stop.store(false, std::memory_order_relaxed);
+    mux_thread = std::thread([this] { mux_thread_main(); });
     return 0;
 }
 
 void mkv_sink::close()
 {
+    stop_mux_thread();
     std::lock_guard<std::mutex> lock(mu);
     stop_locked();
     opened = false;
+    have_input_caps_ = false;
+    caps_reject_ = false;
 }
 
 int mkv_sink::input(uint8_t /*port*/, const data_packet &in)
@@ -333,19 +538,50 @@ int mkv_sink::input(uint8_t /*port*/, const data_packet &in)
         return 0;
     }
 
-    int w = f.width;
-    int h = f.height;
-    int r = ensure_session_locked(w, h);
-    if (r < 0)
+    video_coded_caps caps {};
+    caps.width = f.width > 0 ? f.width : input_caps_.width;
+    caps.height = f.height > 0 ? f.height : input_caps_.height;
+    if (caps.width <= 0 || caps.height <= 0)
     {
-        return r;
+        return -EINVAL;
     }
-    if (!recording)
+    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, 0, 0);
+    const int     cr = input_pdu_locked(std::move(caps_pdu));
+    if (cr < 0)
+    {
+        return cr;
+    }
+    if (output_template.empty())
     {
         return 0;
     }
 
-    return write_frame_locked(in);
+    component_pdu pdu;
+    pdu.ts_us = f.pts > 0 ? static_cast<uint64_t>(f.pts) : 0ULL;
+    pdu.sdu_type = sdu_type_e::MJPEG;
+    pdu.port = 0;
+    pdu.sdu = f.buf;
+    if (f.key)
+    {
+        pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+    }
+    data_packet pkt = packet_from_pdu(pdu);
+
+    bool dropped_oldest = false;
+    int  r = 0;
+    {
+        std::lock_guard<std::mutex> qlock(q_mu);
+        r = enqueue_drop_locked(std::move(pkt), &dropped_oldest);
+        if (0 == r)
+        {
+            q_cv.notify_one();
+        }
+    }
+    if (dropped_oldest)
+    {
+        dropped++;
+    }
+    return r;
 }
 
 int mkv_sink::configure(std::string_view key, std::string_view value)
@@ -414,11 +650,34 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         return 0;
     }
 
+    if (key == "queue_depth")
+    {
+        int64_t n = 0;
+        std::string tmp(v);
+        if (key_parse_i64(tmp.c_str(), &n) < 0 || n <= 0 || n > 4096)
+        {
+            return -EINVAL;
+        }
+        queue_cap = static_cast<size_t>(n);
+        return 0;
+    }
+
     return -ENOTSUP;
 }
 
 int mkv_sink::query(std::string_view key, std::string *value) const
 {
+    if (nullptr == value)
+    {
+        return -EINVAL;
+    }
+
+    int r = port_caps_query(input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "output")
@@ -453,6 +712,14 @@ int mkv_sink::query(std::string_view key, std::string *value) const
         {
             *value = "idle";
         }
+        return 0;
+    }
+
+    if (key == "dropped")
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, dropped);
+        *value = buf;
         return 0;
     }
 

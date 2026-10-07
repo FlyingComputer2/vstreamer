@@ -625,6 +625,7 @@ int sdl_nv12_presenter::open()
 void sdl_nv12_presenter::close()
 {
     std::lock_guard<std::mutex> lock(mu);
+    pending.clear();
     destroy_video_locked();
     if (sdl_ready)
     {
@@ -653,6 +654,97 @@ int sdl_nv12_presenter::prepare(int w, int h, bool &session_open)
         return 0;
     }
     return ensure_video_locked(w, h);
+}
+
+void sdl_nv12_presenter::set_queue_capacity(size_t cap)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (0 == cap)
+    {
+        cap = k_default_queue_depth;
+    }
+    queue_cap = cap;
+    while (pending.size() > queue_cap)
+    {
+        pending.pop_front();
+    }
+}
+
+size_t sdl_nv12_presenter::queue_capacity() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return queue_cap;
+}
+
+size_t sdl_nv12_presenter::queue_size() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return pending.size();
+}
+
+int sdl_nv12_presenter::try_enqueue(const frame_data &f)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (pending.size() >= queue_cap)
+    {
+        return -EAGAIN;
+    }
+    pending.push_back(f);
+    return 0;
+}
+
+int sdl_nv12_presenter::enqueue_drop(const frame_data &f, bool *dropped_oldest)
+{
+    if (nullptr != dropped_oldest)
+    {
+        *dropped_oldest = false;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    if (pending.size() >= queue_cap && !pending.empty())
+    {
+        pending.pop_front();
+        if (nullptr != dropped_oldest)
+        {
+            *dropped_oldest = true;
+        }
+    }
+    pending.push_back(f);
+    return 0;
+}
+
+int sdl_nv12_presenter::drain_pending(bool &session_open)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!sdl_ready || !session_open)
+    {
+        return -EBADF;
+    }
+    int presented = 0;
+    int last_err = 0;
+    while (!pending.empty())
+    {
+        frame_data f = std::move(pending.front());
+        pending.pop_front();
+        const int r = present_nv12_locked(f, session_open);
+        if (0 == r)
+        {
+            presented++;
+        }
+        else if (0 == presented)
+        {
+            last_err = r;
+        }
+        if (!session_open)
+        {
+            pending.clear();
+            break;
+        }
+    }
+    if (presented > 0)
+    {
+        return presented;
+    }
+    return last_err;
 }
 
 int sdl_nv12_presenter::present(const frame_data &f, bool &session_open)
