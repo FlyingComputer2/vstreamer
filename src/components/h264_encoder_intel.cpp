@@ -173,6 +173,7 @@ int h264_encoder_intel::nv12_size_locked() const
 void h264_encoder_intel::clear_out_locked()
 {
     out_q.clear();
+    in_capture_ts_us_.clear();
     pending_caps_out_.clear();
     have_input_caps_ = false;
     caps_reject_ = false;
@@ -232,19 +233,19 @@ int h264_encoder_intel::drain_packets_locked()
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
-        int64_t out_pts = pkt->pts;
-        if (out_pts == AV_NOPTS_VALUE)
+        uint64_t capture_ts = 0;
+        if (!in_capture_ts_us_.empty())
         {
-            out_pts = last_out_pts >= 0 ? last_out_pts + 1 : 0;
+            capture_ts = in_capture_ts_us_.front();
+            in_capture_ts_us_.pop_front();
         }
-        if (last_out_pts >= 0 && out_pts < last_out_pts)
+        else if (pkt->pts != AV_NOPTS_VALUE)
         {
-            out_pts = last_out_pts;
+            capture_ts = static_cast<uint64_t>(pkt->pts);
         }
-        last_out_pts = out_pts;
         const bool key = h264_au_has_idr(buf, sz);
         component_pdu au;
-        au.ts_us = static_cast<uint64_t>(out_pts);
+        au.ts_us = capture_ts;
         au.seq = 0;
         au.sdu_type = sdu_type_e::H264_AU;
         au.port = 0;
@@ -339,7 +340,7 @@ int h264_encoder_intel::codec_open_locked()
         ctx->width = width;
         ctx->height = height;
         ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-        ctx->time_base = AVRational{1, fps};
+        ctx->time_base = AVRational{1, 1000000};
         ctx->framerate = AVRational{fps, 1};
         ctx->gop_size = gop > 0 ? gop : 1;
 
@@ -406,6 +407,7 @@ int h264_encoder_intel::codec_open_locked()
     low_power_live = resolved_lp;
     reopen_req = false;
     last_out_pts = -1;
+    in_capture_ts_us_.clear();
     pending_idr = true;
     return 0;
 }
@@ -830,12 +832,14 @@ int h264_encoder_intel::input(component_pdu &&in)
 #endif
     }
 
+    const uint64_t capture_ts_us = in.ts_us;
     ret = avcodec_send_frame(ctx, hw);
     av_frame_unref(hw);
     if (ret < 0)
     {
         return ret;
     }
+    in_capture_ts_us_.push_back(capture_ts_us);
     return drain_packets_locked();
 }
 

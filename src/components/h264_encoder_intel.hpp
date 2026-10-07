@@ -85,6 +85,9 @@ private:
     bool  pending_idr = false;
     int64_t last_out_pts = -1;
 
+    /* One entry per frame accepted by avcodec_send_frame; AU ts_us comes from here. */
+    std::deque<uint64_t> in_capture_ts_us_;
+
     std::deque<component_pdu> out_q;
 
     bool             have_input_caps_ = false;

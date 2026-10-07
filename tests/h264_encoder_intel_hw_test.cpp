@@ -127,6 +127,49 @@ double encode_window_bps(vstreamer::h264_encoder_intel &enc, int w, int h, int f
 
 }  // namespace
 
+TEST(H264EncoderIntelHwTest, PreservesInputCaptureTsUs)
+{
+    vstreamer::h264_encoder_intel enc;
+    if (cfg(enc, "size", "640x480") < 0 || cfg(enc, "fps", "30") < 0 || cfg(enc, "rc", "cbr") < 0 ||
+        cfg(enc, "cbr", "2000000") < 0 || cfg(enc, "gop", "30") < 0)
+    {
+        GTEST_SKIP() << "configure failed";
+    }
+    if (enc.open() < 0)
+    {
+        GTEST_SKIP() << "VA-API encoder open failed";
+    }
+    ASSERT_EQ(0, enc.input(vstreamer::test_pdu::make_nv12_caps(640, 480, 30)));
+
+    constexpr uint64_t k_base = 1'700'000'000'000ULL;
+    int                aus_out = 0;
+    for (int i = 0; i < 15; ++i)
+    {
+        const uint64_t ts = k_base + static_cast<uint64_t>(i) * 33'333ULL;
+        vstreamer::component_pdu in = make_nv12_gradient(640, 480, ts, i);
+        ASSERT_EQ(enc.input(std::move(in)), 0);
+        for (;;)
+        {
+            vstreamer::component_pdu out;
+            const int              orv = enc.output(out);
+            if (orv == -EAGAIN)
+            {
+                break;
+            }
+            ASSERT_EQ(orv, 0);
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            EXPECT_EQ(out.ts_us, k_base + static_cast<uint64_t>(aus_out) * 33'333ULL)
+                << "AU index " << aus_out;
+            ++aus_out;
+        }
+    }
+    EXPECT_GE(aus_out, 10);
+    enc.close();
+}
+
 TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
 {
     vstreamer::h264_encoder_intel enc;

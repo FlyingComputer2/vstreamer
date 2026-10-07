@@ -72,6 +72,8 @@ private:
     int   live_gop = 0;
     bool  pending_idr = false;
 
+    std::deque<uint64_t> in_capture_ts_us_;
+
     std::deque<component_pdu> out_q;
 
     bool             have_input_caps_ = false;

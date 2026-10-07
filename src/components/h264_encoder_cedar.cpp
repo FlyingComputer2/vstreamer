@@ -97,6 +97,7 @@ int h264_encoder_cedar::nv12_size_locked() const
 void h264_encoder_cedar::clear_out_locked()
 {
     out_q.clear();
+    in_capture_ts_us_.clear();
     pending_caps_out_.clear();
     have_input_caps_ = false;
     caps_reject_ = false;
@@ -148,8 +149,18 @@ int h264_encoder_cedar::drain_packets_locked()
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
+        uint64_t capture_ts = 0;
+        if (!in_capture_ts_us_.empty())
+        {
+            capture_ts = in_capture_ts_us_.front();
+            in_capture_ts_us_.pop_front();
+        }
+        else if (pkt->pts != AV_NOPTS_VALUE)
+        {
+            capture_ts = static_cast<uint64_t>(pkt->pts);
+        }
         component_pdu au;
-        au.ts_us = pkt->pts != AV_NOPTS_VALUE ? static_cast<uint64_t>(pkt->pts) : 0ULL;
+        au.ts_us = capture_ts;
         au.seq = 0;
         au.sdu_type = sdu_type_e::H264_AU;
         au.port = 0;
@@ -185,7 +196,7 @@ int h264_encoder_cedar::codec_open_locked()
     ctx->width = width;
     ctx->height = height;
     ctx->pix_fmt = AV_PIX_FMT_NV12;
-    ctx->time_base = AVRational{1, fps};
+    ctx->time_base = AVRational{1, 1000000};
     ctx->framerate = AVRational{fps, 1};
     ctx->gop_size = gop > 0 ? gop : 1;
     av_opt_set_int(ctx->priv_data, "qp", qp, 0);
@@ -512,12 +523,14 @@ int h264_encoder_cedar::input(component_pdu &&in)
         return AVERROR(ENOMEM);
     }
 
+    const uint64_t capture_ts_us = in.ts_us;
     int ret = avcodec_send_frame(ctx, frame);
     if (ret < 0)
     {
         av_frame_unref(frame);
         return ret;
     }
+    in_capture_ts_us_.push_back(capture_ts_us);
 
     r = drain_packets_locked();
     av_frame_unref(frame);
