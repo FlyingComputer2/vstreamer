@@ -1,6 +1,9 @@
 #include "components/h264_decoder_mpp.hpp"
 #include "components/h264_encoder_mpp.hpp"
 #include "components/jpeg_decoder_multicore.hpp"
+#if defined(ENABLE_H264_ENCODER_INTEL)
+#include "components/h264_encoder_intel.hpp"
+#endif
 
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
@@ -106,3 +109,24 @@ TEST(JpegDecoderMulticoreTest, CapsRejectionPdu)
     EXPECT_EQ(0, dec.input(make_mjpeg_pdu()));
     dec.close();
 }
+
+#if defined(ENABLE_H264_ENCODER_INTEL)
+TEST(H264EncoderIntelTest, CapsRejectionPdu)
+{
+    vstreamer::h264_encoder_intel enc;
+    ASSERT_EQ(0, enc.configure("size", "320x240"));
+    if (enc.open() < 0)
+    {
+        GTEST_SKIP() << "VAAPI encoder unavailable on this host";
+    }
+
+    vstreamer::component_pdu bad_caps = make_raw_caps(640, 480);
+    EXPECT_EQ(-ENOTSUP, enc.input(std::move(bad_caps)));
+    EXPECT_EQ(-ENOTSUP, enc.input(make_nv12_pdu(320, 240)));
+
+    vstreamer::component_pdu good_caps = make_raw_caps(320, 240);
+    EXPECT_EQ(0, enc.input(std::move(good_caps)));
+    EXPECT_EQ(0, enc.input(make_nv12_pdu(320, 240)));
+    enc.close();
+}
+#endif

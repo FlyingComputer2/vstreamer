@@ -176,8 +176,6 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_q
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    au_in_queue->bind_wakeup(wake);
     uint64_t au_seq = 0;
     bool     have_au = false;
     while (g_run.load(std::memory_order_relaxed))

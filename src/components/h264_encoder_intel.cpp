@@ -1,6 +1,10 @@
 #include "components/h264_encoder_intel.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -176,8 +180,11 @@ int h264_encoder_intel::nv12_size_locked() const
 
 void h264_encoder_intel::clear_out_locked()
 {
-    in_pts_q.clear();
     out_q.clear();
+    pending_caps_out_.clear();
+    have_input_caps_ = false;
+    caps_reject_ = false;
+    have_output_caps_ = false;
 }
 
 void h264_encoder_intel::log_opened_locked() const
@@ -234,10 +241,9 @@ int h264_encoder_intel::drain_packets_locked()
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
         int64_t out_pts = pkt->pts;
-        if (!in_pts_q.empty())
+        if (out_pts == AV_NOPTS_VALUE)
         {
-            out_pts = in_pts_q.front();
-            in_pts_q.pop_front();
+            out_pts = last_out_pts >= 0 ? last_out_pts + 1 : 0;
         }
         if (last_out_pts >= 0 && out_pts < last_out_pts)
         {
@@ -249,6 +255,7 @@ int h264_encoder_intel::drain_packets_locked()
         au.reset(media_kind_e::H264, live_w, live_h, out_pts, key, std::move(payload));
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
+        notify_wakeup();
         cv.notify_one();
     }
 }
@@ -408,7 +415,6 @@ int h264_encoder_intel::codec_open_locked()
 
 void h264_encoder_intel::codec_close_locked()
 {
-    in_pts_q.clear();
     if (ctx)
     {
         auto *c = static_cast<AVCodecContext *>(ctx);
@@ -586,8 +592,6 @@ int h264_encoder_intel::input(uint8_t /*port*/, const data_packet &in)
     {
         return ret;
     }
-    in_pts_q.push_back(f.pts);
-
     return drain_packets_locked();
 }
 
@@ -803,8 +807,138 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view value)
     return -ENOTSUP;
 }
 
+namespace
+{
+
+const std::vector<port_desc> &intel_enc_input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &intel_enc_output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+}  // namespace
+
+int h264_encoder_intel::input(component_pdu &&in)
+{
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
+    {
+        video_raw_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        if (caps.width != width || caps.height != height)
+        {
+            caps_reject_ = true;
+            have_input_caps_ = false;
+            return -ENOTSUP;
+        }
+        caps_reject_ = false;
+        have_input_caps_ = true;
+        input_caps_ = caps;
+        if (!have_output_caps_ || caps.width != output_caps_.width || caps.height != output_caps_.height)
+        {
+            video_coded_caps coded {};
+            coded.width = caps.width;
+            coded.height = caps.height;
+            coded.fps_num = fps;
+            coded.fps_den = 1;
+            output_caps_ = coded;
+            have_output_caps_ = true;
+            component_pdu caps_pdu =
+                make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, coded, in.ts_us, 0);
+            caps_pdu.seq = 0;
+            pending_caps_out_.push_back(std::move(caps_pdu));
+        }
+        return 0;
+    }
+    if (in.sdu_type != sdu_type_e::NV12)
+    {
+        return -EINVAL;
+    }
+    if (caps_reject_ || !have_input_caps_)
+    {
+        return -ENOTSUP;
+    }
+    auto fd = std::make_unique<frame_data>();
+    fd->kind = media_kind_e::NV12;
+    fd->width = input_caps_.width;
+    fd->height = input_caps_.height;
+    fd->pts = static_cast<int64_t>(in.ts_us);
+    fd->capture_mono_ns = static_cast<int64_t>(in.ts_us) * 1000LL;
+    fd->buf = std::move(in.sdu);
+    data_packet pkt;
+    pkt.reset(std::move(fd));
+    return input(0, pkt);
+}
+
+int h264_encoder_intel::output(component_pdu &out)
+{
+    if (!pending_caps_out_.empty())
+    {
+        out = std::move(pending_caps_out_.front());
+        pending_caps_out_.pop_front();
+        return 0;
+    }
+    data_packet pkt;
+    const int   r = output(0, pkt, 0);
+    if (0 != r)
+    {
+        return r;
+    }
+    const frame_data &f = data_packet::cast<frame_data>(pkt);
+    out.ts_us = f.capture_mono_ns > 0 ? static_cast<uint64_t>(f.capture_mono_ns / 1000LL)
+                                      : static_cast<uint64_t>(f.pts);
+    out.seq = out_seq_++;
+    out.sdu_type = sdu_type_e::H264_AU;
+    out.port = 0;
+    out.flags = 0;
+    if (f.key)
+    {
+        out.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
+    }
+    out.sdu = f.buf;
+    notify_wakeup();
+    return 0;
+}
+
 int h264_encoder_intel::query(std::string_view key, std::string *value) const
 {
+    int r = port_caps_query(intel_enc_input_ports(), true, key, value);
+    if (0 == r)
+    {
+        return 0;
+    }
+    r = port_caps_query(intel_enc_output_ports(), false, key, value);
+    if (0 == r)
+    {
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "status")
