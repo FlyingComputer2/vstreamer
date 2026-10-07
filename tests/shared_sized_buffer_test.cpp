@@ -3,6 +3,7 @@
 #include <cstring>
 #include <gtest/gtest.h>
 
+
 using vstreamer::shared_sized_buffer;
 
 TEST(SharedSizedBufferTest, CopyFromAndSubviewShareStorage)

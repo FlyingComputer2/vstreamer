@@ -17,7 +17,11 @@
 #include <string_view>
 
 #include "core/component_coder.hpp"
-#include "core/frame.hpp"
+#include "core/component_pdu.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
 
 namespace vstreamer
 {
@@ -33,17 +37,13 @@ public:
     h264_encoder_mpp &operator=(const h264_encoder_mpp &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
     int  open() override;
     void close() override;
 
     /* Wake blocking encode drain / output waits (shutdown without joining a stuck thread). */
     void cancel_pending_io();
-
-    int input(uint8_t port, const data_packet &in) override;
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
+    int input(component_pdu &&in) override;
+    int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -55,15 +55,16 @@ private:
     int  apply_h264_cfg_locked();
     int  apply_rc_cfg_locked();
     int  drain_packets_locked(int timeout_ms);
-    int  put_nv12_frame_unlocked(const frame_data &f);
+    int  put_nv12_frame_unlocked(const component_pdu &in);
     void clear_out_locked();
     void release_enc_slot_after_eoi();
     bool append_enc_packet_bytes(const uint8_t *data, size_t len);
-    bool finalize_enc_au_frame(frame *out);
-    void enqueue_completed_aus_locked(std::vector<frame> &&aus);
+    bool finalize_enc_au_pdu(component_pdu *out);
+    void enqueue_completed_aus_locked(std::vector<component_pdu> &&aus);
     /* mpp_api_mu must already be held; never takes mu. */
-    void ingest_enc_packet(void *mpp_packet_opaque, std::vector<frame> *completed_aus);
-    void drain_enc_packets_nonblock(void *mpp_ctx, void *mpp_mpi, std::vector<frame> *completed_aus);
+    void ingest_enc_packet(void *mpp_packet_opaque, std::vector<component_pdu> *completed_aus);
+    void drain_enc_packets_nonblock(void *mpp_ctx, void *mpp_mpi,
+                                    std::vector<component_pdu> *completed_aus);
 
     /* Lock order: mu → mpp_api_mu only; never take mu while holding mpp_api_mu. */
     mutable std::mutex      mu;
@@ -105,7 +106,7 @@ private:
 
     std::vector<uint8_t> enc_au_accum;
     int64_t              enc_au_pts = 0;
-    int64_t              enc_au_capture_mono_ns = 0;
+    int64_t              enc_au_mono_ns = 0;
     bool                 enc_au_key = false;
 
     static constexpr int enc_slot_count = 8;
@@ -113,15 +114,22 @@ private:
     {
         void   *frm = nullptr;
         void   *pkt = nullptr;
-        int64_t capture_mono_ns = 0;
+        int64_t frame_mono_ns = 0;
     };
     std::array<enc_slot, enc_slot_count> enc_slots {};
     std::deque<int>                      enc_free_slots;
     std::deque<int>                      enc_pending_slots;
 
-    std::deque<frame> out_q;
+    std::deque<component_pdu> out_q;
 
-    /* Capture-to-encoded-AU (ms); updated when output carries capture_mono_ns. */
+    bool             have_input_caps_ = false;
+    bool             caps_reject_ = false;
+    video_raw_caps   input_caps_ {};
+    bool             have_output_caps_ = false;
+    video_coded_caps output_caps_ {};
+    uint64_t         out_seq_ = 0;
+    std::deque<component_pdu> pending_caps_out_;
+
     double last_latency_ms = 0.0;
 };
 

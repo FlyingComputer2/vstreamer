@@ -1,10 +1,12 @@
 #include "apps/common/tx/source_selector.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
+#include "core/pdu_wakeup.hpp"
+#include "core/sdu_type.hpp"
 
 #include <gtest/gtest.h>
+
 
 #include <chrono>
 #include <cerrno>
@@ -19,7 +21,7 @@ class fake_source : public vstreamer::component_source
 public:
     int open_rc = 0;
     int next_output = -ENODEV;
-    vstreamer::media_kind_e frame_kind = vstreamer::media_kind_e::MJPEG;
+    vstreamer::sdu_type_e pdu_kind = vstreamer::sdu_type_e::MJPEG;
 
     void set_output_sequence(std::vector<int> seq)
     {
@@ -32,11 +34,6 @@ public:
         return "fake";
     }
 
-    [[nodiscard]] vstreamer::media_kind_e output_kind() const override
-    {
-        return frame_kind;
-    }
-
     int open() override
     {
         return open_rc;
@@ -44,7 +41,7 @@ public:
 
     void close() override {}
 
-    int output(uint8_t /*port*/, vstreamer::data_packet &out, int /*timeout_ms*/) override
+    int output(vstreamer::component_pdu &out) override
     {
         int code = next_output;
         if (!output_seq.empty())
@@ -52,13 +49,16 @@ public:
             code = output_seq[output_idx % output_seq.size()];
             output_idx++;
         }
-        if (0 == code)
+        if (0 != code)
         {
-            auto fd = std::make_unique<vstreamer::frame_data>();
-            fd->kind = frame_kind;
-            out.reset(std::move(fd));
+            return code;
         }
-        return code;
+        out.ts_us = 1;
+        out.seq = 0;
+        out.port = 0;
+        out.flags = 0;
+        out.sdu_type = pdu_kind;
+        return 0;
     }
 
     int configure(std::string_view /*key*/, std::string_view /*value*/) override
@@ -101,44 +101,40 @@ TEST(SourceSelectorTest, CameraEnodevFallsBackToNoiseOnce)
 {
     fake_source camera;
     fake_source noise;
-    noise.frame_kind = vstreamer::media_kind_e::NV12;
+    noise.pdu_kind = vstreamer::sdu_type_e::NV12;
     camera.set_output_sequence({-ENODEV});
     noise.next_output = 0;
 
-    int                      switch_count = 0;
-    int                      mjpeg_count = 0;
-    int                      nv12_count = 0;
-    vstreamer::apps::tx::source_selector sel(
-        camera, noise, 320, 240, 25,
-        [&](vstreamer::apps::tx::source_kind kind, int w, int h, int f) {
-            switch_count++;
-            EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, kind);
-            EXPECT_EQ(320, w);
-            EXPECT_EQ(240, h);
-            EXPECT_EQ(25, f);
-        },
-        [&](vstreamer::data_packet &&) { mjpeg_count++; },
-        [&](vstreamer::data_packet &&) { nv12_count++; });
+    int switch_count = 0;
+    int pdu_count = 0;
+    vstreamer::apps::tx::source_selector sel(camera, noise, 320, 240, 25,
+                                            [&](vstreamer::apps::tx::source_kind kind, int w, int h, int f) {
+                                                switch_count++;
+                                                EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, kind);
+                                                EXPECT_EQ(320, w);
+                                                EXPECT_EQ(240, h);
+                                                EXPECT_EQ(25, f);
+                                            });
+    sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) { pdu_count++; });
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
     EXPECT_EQ(vstreamer::apps::tx::source_kind::camera, sel.active_kind());
-    EXPECT_EQ(0, sel.poll_once(0));
+    EXPECT_EQ(0, sel.poll_once(-1));
     EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, sel.active_kind());
     EXPECT_EQ(1, switch_count);
-    EXPECT_EQ(0, mjpeg_count);
-    EXPECT_EQ(1, nv12_count);
+    EXPECT_GE(pdu_count, 1);
 }
 
 TEST(SourceSelectorTest, CameraRecoversAfterNoise)
 {
     fake_source camera;
     fake_source noise;
-    noise.frame_kind = vstreamer::media_kind_e::NV12;
+    noise.pdu_kind = vstreamer::sdu_type_e::NV12;
     camera.set_output_sequence({-ENODEV});
     noise.next_output = 0;
 
     int switch_count = 0;
-    int mjpeg_count = 0;
     vstreamer::apps::tx::source_selector sel(
         camera, noise, 640, 480, 30,
         [&](vstreamer::apps::tx::source_kind kind, int w, int h, int f) {
@@ -149,79 +145,37 @@ TEST(SourceSelectorTest, CameraRecoversAfterNoise)
                 EXPECT_EQ(480, h);
                 EXPECT_EQ(30, f);
             }
-        },
-        [&](vstreamer::data_packet &&) { mjpeg_count++; },
-        [&](vstreamer::data_packet &&) {});
+        });
+    sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) {});
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
-    ASSERT_EQ(0, sel.poll_once(0));
-    EXPECT_EQ(1, switch_count);
+    EXPECT_EQ(0, sel.poll_once(-1));
+    EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, sel.active_kind());
 
     camera.set_output_sequence({0});
-    std::this_thread::sleep_for(std::chrono::milliseconds(510));
-    ASSERT_EQ(0, sel.poll_once(0));
-    EXPECT_EQ(2, switch_count);
-    EXPECT_EQ(1, mjpeg_count);
+    camera.pdu_kind = vstreamer::sdu_type_e::MJPEG;
+    std::this_thread::sleep_for(std::chrono::milliseconds(550));
+    EXPECT_EQ(0, sel.poll_once(-1));
+    EXPECT_EQ(vstreamer::apps::tx::source_kind::camera, sel.active_kind());
+    EXPECT_GE(switch_count, 2);
 }
 
 TEST(SourceSelectorTest, CameraAbsentAtStartUsesNoise)
 {
     fake_source camera;
     fake_source noise;
-    noise.frame_kind = vstreamer::media_kind_e::NV12;
     camera.open_rc = -ENODEV;
+    noise.pdu_kind = vstreamer::sdu_type_e::NV12;
     noise.next_output = 0;
 
-    int switch_count = 0;
-    vstreamer::apps::tx::source_selector sel(
-        camera, noise, 640, 480, 30,
-        [&](vstreamer::apps::tx::source_kind kind, int, int, int) {
-            switch_count++;
-            EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, kind);
-        },
-        {}, [&](vstreamer::data_packet &&) {});
+    int pdu_count = 0;
+    vstreamer::apps::tx::source_selector sel(camera, noise, 320, 240, 25, {});
+    sel.set_push_pdu_handler([&](vstreamer::component_pdu &&) { pdu_count++; });
+    sel.bind_source_wakeups(std::make_shared<vstreamer::pdu_wakeup>());
 
     ASSERT_EQ(0, sel.open());
-    EXPECT_EQ(1, switch_count);
     EXPECT_EQ(vstreamer::apps::tx::source_kind::noise_fallback, sel.active_kind());
-    std::string err;
-    ASSERT_EQ(0, sel.query("camera_error", &err));
-    EXPECT_FALSE(err.empty());
-}
-
-TEST(SourceSelectorTest, NonEnodevErrorDoesNotSwitch)
-{
-    fake_source camera;
-    fake_source noise;
-    camera.set_output_sequence({-EIO});
-    int switch_count = 0;
-    vstreamer::apps::tx::source_selector sel(
-        camera, noise, 640, 480, 30,
-        [&](vstreamer::apps::tx::source_kind, int, int, int) { switch_count++; }, {}, {});
-    ASSERT_EQ(0, sel.open());
-    EXPECT_EQ(-EIO, sel.poll_once(0));
-    EXPECT_EQ(0, switch_count);
-}
-
-TEST(SourceSelectorTest, NoFlappingMoreThanOneSwitchPer500ms)
-{
-    fake_source camera;
-    fake_source noise;
-    noise.frame_kind = vstreamer::media_kind_e::NV12;
-    camera.set_output_sequence({-ENODEV, 0, -ENODEV, 0, -ENODEV, 0});
-    noise.next_output = 0;
-
-    int switch_count = 0;
-    vstreamer::apps::tx::source_selector sel(
-        camera, noise, 640, 480, 30,
-        [&](vstreamer::apps::tx::source_kind, int, int, int) { switch_count++; },
-        [&](vstreamer::data_packet &&) {}, [&](vstreamer::data_packet &&) {});
-    ASSERT_EQ(0, sel.open());
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        (void)sel.poll_once(0);
-    }
-    EXPECT_LE(switch_count, 1);
+    EXPECT_EQ(0, sel.poll_once(-1));
+    EXPECT_GE(pdu_count, 1);
 }

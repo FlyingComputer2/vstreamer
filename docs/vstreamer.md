@@ -23,17 +23,16 @@ All interfaces live in `src/core/`.
 | Interface | Header | Data path |
 |-----------|--------|-----------|
 | `component` | [component.hpp](../src/core/component.hpp) | `configure(key, value)` / `query(key, &value)` |
-| `component_source` | [component_source.hpp](../src/core/component_source.hpp) | `output(port, data_packet&, timeout_ms)` |
-| `component_coder` | [component_coder.hpp](../src/core/component_coder.hpp) | `input(port, const data_packet&)` + `output(…)` |
-| `component_sink` | [component_sink.hpp](../src/core/component_sink.hpp) | `input(port, const data_packet&)` + `set_enabled(on, timeout_ms)` |
+| `component_source` | [component_source.hpp](../src/core/component_source.hpp) | `output(component_pdu&)` |
+| `component_coder` | [component_coder.hpp](../src/core/component_coder.hpp) | `input(component_pdu&&)` + `output(component_pdu&)` |
+| `component_sink` | [component_sink.hpp](../src/core/component_sink.hpp) | `input(component_pdu&&)` + `set_enabled(on, timeout_ms)` |
 
-Every component has `name()`, `open()` / `close()`, and declares what it carries:
-`input_kind()` / `output_kind()` (`media_kind_e`: `MJPEG`, `NV12`, `H264`, …) and
-`input_packet_kind()` / `output_packet_kind()` (`packet_kind_e`: `FRAME`, `AUDIO`, `SOCK`).
-Pads are numbered ports; all current components use port 0.
+Concrete components inherit `component_input` / `component_output` (or both via
+`component_coder`). Port indices live on each PDU (`port`); caps are advertised through
+`input_ports()` / `output_ports()` (`port_desc` + `sdu_type_e`).
 
 **Return codes.** `0` on success, negative errno otherwise. `output()` returns `-EAGAIN` when
-nothing is ready within `timeout_ms` (`< 0` blocks, `0` polls, `> 0` waits).
+nothing is ready; apps poll or wait on `pdu_wakeup` from `component::set_wakeup()`.
 
 ### `configure` / `query` contract
 
@@ -51,17 +50,17 @@ virtual int query(std::string_view key, std::string *value) const = 0;
 - `configure` may be called from another thread (e.g. a console) while the pipeline runs;
   each component locks internally. Keys marked *live* below take effect without reopening.
 
-### `data_packet` and buffers
+### `component_pdu` and buffers
 
-Wires carry `data_packet` ([data_packet.hpp](../src/core/data_packet.hpp)): a shared pointer to
-a `packet_body` subclass — `frame_data` (video frame / access unit), `audio_data`, or
-`sock_data` (one datagram). Bytes live in `shared_sized_buffer`
-([shared_sized_buffer.hpp](../src/core/shared_sized_buffer.hpp)), refcounted, with zero-copy
-sub-views.
+Wires carry `component_pdu` ([component_pdu.hpp](../src/core/component_pdu.hpp)): SDU bytes in
+`shared_sized_buffer` ([shared_sized_buffer.hpp](../src/core/shared_sized_buffer.hpp)),
+`sdu_type_e` (e.g. `NV12`, `H264_AU`, `STREAM_DGRAM`, `RTP`), `ts_us`, `seq`, and `flags`
+(`pdu_flag_e::KEY`, `AU_END`, …). Caps PDUs embed `video_raw_caps` / `video_coded_caps` via
+`make_caps_pdu()`.
 
-**Immutability rule:** once a packet is passed to `input()` or returned from `output()`, its body
-and bytes are immutable. Code that modifies bytes must hold the only reference
-(`use_count() == 1`) or copy. Components recycle storage through `buffer_pool`.
+**Immutability rule:** once a PDU is passed to `input()` or returned from `output()`, treat its
+SDU as read-only unless this stage holds the only buffer reference. Components recycle storage
+through `buffer_pool`.
 
 Wire layout of the forward datagram: [packet-model.md](packet-model.md).
 
@@ -215,7 +214,7 @@ FU-A, capture-time header extension).
 `set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
 
 **`stream_receiver`** — UDP ingress, strips stream header, FEC-decodes and re-orders, outputs
-one `sock_data` per original datagram.
+one `STREAM_DGRAM` PDU per original datagram.
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
@@ -445,7 +444,7 @@ component layer exists today; the rest is still design.
 
 | Item | Status | Notes |
 |------|--------|-------|
-| Component layer (`component_*`, `data_packet`, factory) | **done** | this page |
+| Component layer (`component_*`, `component_pdu`, factory) | **done** | this page |
 | `stream_sender` / `stream_receiver` + RS block-erasure FEC | **done** | |
 | `rtp_h264_pay` / `rtp_h264_depay` | **done** | |
 | Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl_test` |

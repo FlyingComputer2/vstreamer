@@ -86,14 +86,6 @@ void telemetry_thread_main(stream_receiver *rcv)
 void publish_latency_metrics(double glass_ms)
 {
     metric_store(*g_pipeline_metrics.get_metric("latency.glass_ms"), glass_ms);
-    metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"),
-                 apps::g_latency_source_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"),
-                 apps::g_latency_jpeg_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"),
-                 apps::g_latency_enc_in_ms.load(std::memory_order_relaxed));
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"),
-                 apps::g_latency_enc_out_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.depay_ms"),
                  apps::g_latency_depay_ms.load(std::memory_order_relaxed));
     metric_store(*g_pipeline_metrics.get_metric("latency.dec_in_ms"),

@@ -1,10 +1,13 @@
 #include "components/noise_source.hpp"
 
+#include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
 #include "core/time_util.hpp"
 
-#include "core/key_util.hpp"
-
 #include <cerrno>
+#include <climits>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -174,6 +177,21 @@ int parse_size(std::string_view s, int *w, int *h)
 
 }  // namespace
 
+const std::vector<port_desc> &noise_source::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry raw {};
+        raw.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(raw);
+        port_caps_entry nv12 {};
+        nv12.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(nv12);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
 noise_source::noise_source() = default;
 
 noise_source::~noise_source()
@@ -219,10 +237,6 @@ std::string noise_source::name() const
     return "noise";
 }
 
-media_kind_e noise_source::output_kind() const
-{
-    return media_kind_e::NV12;
-}
 
 int noise_source::open()
 {
@@ -231,8 +245,9 @@ int noise_source::open()
     {
         return 0;
     }
-    pts = 0;
     due_sec = 0;
+    caps_w = 0;
+    caps_h = 0;
     opened = true;
     kick_pregenerate_async_locked();
     return 0;
@@ -372,6 +387,69 @@ int noise_source::fill_nv12_locked(uint8_t *dst, size_t dst_sz)
     return r_c;
 }
 
+bool noise_source::raw_caps_match_locked() const
+{
+    return caps_w == width && caps_h == height && caps_w > 0 && caps_h > 0;
+}
+
+int noise_source::emit_raw_caps_locked(component_pdu &out)
+{
+    video_raw_caps caps {};
+    caps.width = width;
+    caps.height = height;
+    caps.hor_stride = width;
+    caps.ver_stride = height;
+    caps.fps_num = fps > 0 ? fps : 30;
+    caps.fps_den = 1;
+    const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000LL);
+    out = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps, ts_us, 0);
+    out.seq = out_seq_++;
+    notify_wakeup();
+    caps_w = width;
+    caps_h = height;
+    return 0;
+}
+
+bool noise_source::pace_ready_locked() const
+{
+    if (due_sec <= 0)
+    {
+        return true;
+    }
+    const double now = now_sec();
+    return now + 1e-9 >= due_sec;
+}
+
+void noise_source::advance_pace_locked()
+{
+    const int fps_val = fps > 0 ? fps : 30;
+    const double period = 1.0 / static_cast<double>(fps_val);
+    const double t0 = now_sec();
+    if (due_sec <= 0)
+    {
+        due_sec = t0 + period;
+    }
+    else
+    {
+        due_sec += period;
+    }
+    const double now = now_sec();
+    if (due_sec - now < -1.0)
+    {
+        due_sec = now + period;
+    }
+}
+
+int64_t noise_source::next_deadline_ns() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (due_sec <= 0)
+    {
+        return INT64_MAX;
+    }
+    return static_cast<int64_t>(due_sec * 1'000'000'000.0);
+}
+
 void noise_source::pace_unlocked(int fps_val, int timeout_ms)
 {
     int fps = fps_val > 0 ? fps_val : 30;
@@ -413,79 +491,71 @@ void noise_source::pace_unlocked(int fps_val, int timeout_ms)
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::duration<double>(wait)));
 }
 
-int noise_source::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
+int noise_source::output(component_pdu &out)
 {
     join_pregenerate_worker();
 
-    int     fps_val = 0;
-    int     w = 0;
-    int     h = 0;
-    int64_t frame_pts = 0;
-
+    std::lock_guard<std::mutex> lock(mu);
+    if (!opened)
     {
-        std::lock_guard<std::mutex> lock(mu);
-        if (!opened)
-        {
-            return -EBADF;
-        }
-
-        fps_val = fps;
-        w = width;
-        h = height;
-        frame_pts = pts;
-        pts++;
-
-        const size_t y_sz = static_cast<size_t>(w) * static_cast<size_t>(h);
-        const size_t nv12_sz = y_sz + y_sz / 2ULL;
-
-        int r = ensure_pregenerated_locked();
-        if (r < 0)
-        {
-            pts--;
-            return r;
-        }
-
-        auto *buf = static_cast<uint8_t *>(std::malloc(nv12_sz));
-        if (nullptr == buf)
-        {
-            pts--;
-            return -ENOMEM;
-        }
-
-        if (pregenerate_count > 0 && pregen_ready)
-        {
-            const size_t idx = pregen_cursor % pregenerated.size();
-            pregen_cursor++;
-            std::memcpy(buf, pregenerated[idx].data(), nv12_sz);
-        }
-        else
-        {
-            r = fill_nv12_locked(buf, nv12_sz);
-            if (r < 0)
-            {
-                std::free(buf);
-                pts--;
-                return r;
-            }
-        }
-
-        auto fd = std::make_unique<frame_data>();
-        fd->kind = media_kind_e::NV12;
-        fd->width = w;
-        fd->height = h;
-        fd->pts = frame_pts;
-        fd->capture_mono_ns = steady_mono_ns();
-        fd->key = true;
-        fd->buf = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(buf), nv12_sz, nv12_sz,
-                                             [](std::byte *p) {
-                                                 std::free(reinterpret_cast<uint8_t *>(p));
-                                             });
-        out.reset(std::move(fd));
+        return -EBADF;
+    }
+    if (!pace_ready_locked())
+    {
+        return -EAGAIN;
     }
 
-    pace_unlocked(fps_val, timeout_ms);
+    if (!raw_caps_match_locked())
+    {
+        return emit_raw_caps_locked(out);
+    }
+
+    const size_t y_sz = static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t nv12_sz = y_sz + y_sz / 2ULL;
+
+    const int r = ensure_pregenerated_locked();
+    if (r < 0)
+    {
+        return r;
+    }
+
+    auto *buf = static_cast<uint8_t *>(std::malloc(nv12_sz));
+    if (nullptr == buf)
+    {
+        return -ENOMEM;
+    }
+
+    if (pregenerate_count > 0 && pregen_ready)
+    {
+        const size_t idx = pregen_cursor % pregenerated.size();
+        pregen_cursor++;
+        std::memcpy(buf, pregenerated[idx].data(), nv12_sz);
+    }
+    else
+    {
+        const int fr = fill_nv12_locked(buf, nv12_sz);
+        if (fr < 0)
+        {
+            std::free(buf);
+            return fr;
+        }
+    }
+
+    const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000LL);
+    out.ts_us = ts_us;
+    out.seq = out_seq_++;
+    out.sdu_type = sdu_type_e::NV12;
+    out.port = 0;
+    out.flags = static_cast<uint8_t>(pdu_flag_e::KEY);
+    out.sdu = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(buf), nv12_sz, nv12_sz,
+                                         [](std::byte *p) {
+                                             std::free(reinterpret_cast<uint8_t *>(p));
+                                         });
+    advance_pace_locked();
+    notify_wakeup();
     return 0;
 }
+
 
 int noise_source::configure(std::string_view key, std::string_view value)
 {
@@ -504,6 +574,8 @@ int noise_source::configure(std::string_view key, std::string_view value)
         }
         width = w;
         height = h;
+        caps_w = 0;
+        caps_h = 0;
         invalidate_pregenerated_locked();
         return 0;
     }
@@ -594,6 +666,12 @@ int noise_source::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+
+    int qr = port_caps_query(output_ports(), false, key, value);
+    if (0 == qr || -EINVAL == qr)
+    {
+        return qr;
     }
 
     std::lock_guard<std::mutex> lock(mu);

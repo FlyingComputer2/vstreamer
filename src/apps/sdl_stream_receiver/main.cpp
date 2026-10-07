@@ -134,6 +134,7 @@ int main(int argc, char **argv)
     std::snprintf(fps_buf, sizeof(fps_buf), "%d", fps);
     cfg(dec, "size", size_buf);
     cfg(dec, "fps", fps_buf);
+    cfg(dec, "output_size_mode", "stream");
     cfg(depay, "fps", fps_buf);
     cfg(*preview, "title", "sdl_stream_receiver");
     if (kmsdrm && cfg(*preview, "video_driver", "kmsdrm") < 0)
@@ -142,7 +143,8 @@ int main(int argc, char **argv)
     }
 
     const bool defer_sdl = !kmsdrm;
-    if (rcv.open() < 0 || depay.open() < 0 || (defer_sdl ? 0 : preview->open()) < 0)
+    if (rcv.open() < 0 || depay.open() < 0 || dec.open() < 0 ||
+        (defer_sdl ? 0 : preview->open()) < 0)
     {
         return 1;
     }
@@ -155,14 +157,14 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "sdl_stream_receiver: decode disabled (VSTREAMER_SKIP_DECODE)\n");
     }
 
-    const size_t present_q_depth =
+    const size_t present_queue_depth =
         apps::queue_depth_from_env("VSTREAMER_PRESENT_QUEUE_DEPTH",
                                    apps::k_default_present_queue_depth, 16);
     const size_t rx_au_q_depth =
         apps::queue_depth_from_env("VSTREAMER_RX_AU_QUEUE_DEPTH",
                                    apps::k_default_rx_au_queue_depth, 256);
-    apps::present_frame_queue present_q(present_q_depth, g_run);
-    apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
+    apps::present_pdu_queue present_queue(present_queue_depth, g_run);
+    apps::pdu_rx_au_queue     au_in_pipe(rx_au_q_depth, g_run);
 
     pipeline_rate_state       rate;
     apps::pipeline_controller ctrl;
@@ -181,15 +183,15 @@ int main(int argc, char **argv)
 
     ctrl.add_stage("rx_net", "rx",
                    [&](std::atomic<bool> & /*run*/) {
-                       rx_net_thread_main(&rcv, &depay, &au_q, &g_bench_diag);
+                       rx_net_thread_main(&rcv, &depay, &au_in_pipe, &g_bench_diag);
                    });
     ctrl.add_stage("decode", "rx",
                    [&](std::atomic<bool> & /*run*/) {
-                       decode_thread_main(&dec, &present_q, &au_q, &g_bench_diag);
+                       decode_thread_main(&dec, &present_queue, &au_in_pipe, &g_bench_diag);
                    });
     ctrl.add_stage("present", "",
                    [&](std::atomic<bool> & /*run*/) {
-                       present_thread_main(preview, &present_q, width, height, kmsdrm, defer_sdl,
+                       present_thread_main(preview, &present_queue, width, height, kmsdrm, defer_sdl,
                                            &g_bench_diag);
                    });
     ctrl.add_stage("telemetry", "",
@@ -206,8 +208,8 @@ int main(int argc, char **argv)
     ctrl.run();
 
     rcv.close();
-    au_q.wake();
-    present_q.wake();
+    au_in_pipe.wake();
+    present_queue.wake();
     console.stop();
     depay.close();
     dec.close();

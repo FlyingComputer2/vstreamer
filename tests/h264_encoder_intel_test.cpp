@@ -1,10 +1,9 @@
 #include "components/h264_encoder_intel.hpp"
 
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
 
 #include <cerrno>
 #include <string>

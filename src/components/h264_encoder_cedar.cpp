@@ -1,6 +1,10 @@
 #include "components/h264_encoder_cedar.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -81,15 +85,7 @@ std::string h264_encoder_cedar::name() const
     return "h264_encoder_cedar";
 }
 
-media_kind_e h264_encoder_cedar::input_kind() const
-{
-    return media_kind_e::NV12;
-}
 
-media_kind_e h264_encoder_cedar::output_kind() const
-{
-    return media_kind_e::H264;
-}
 
 int h264_encoder_cedar::nv12_size_locked() const
 {
@@ -101,6 +97,11 @@ int h264_encoder_cedar::nv12_size_locked() const
 void h264_encoder_cedar::clear_out_locked()
 {
     out_q.clear();
+    in_capture_ts_us_.clear();
+    pending_caps_out_.clear();
+    have_input_caps_ = false;
+    caps_reject_ = false;
+    have_output_caps_ = false;
 }
 
 int h264_encoder_cedar::drain_packets_locked()
@@ -148,11 +149,26 @@ int h264_encoder_cedar::drain_packets_locked()
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });
-        frame au;
-        au.reset(media_kind_e::H264, live_w, live_h, pkt->pts, !!(pkt->flags & AV_PKT_FLAG_KEY),
-                 std::move(payload));
+        uint64_t capture_ts = 0;
+        if (!in_capture_ts_us_.empty())
+        {
+            capture_ts = in_capture_ts_us_.front();
+            in_capture_ts_us_.pop_front();
+        }
+        else if (pkt->pts != AV_NOPTS_VALUE)
+        {
+            capture_ts = static_cast<uint64_t>(pkt->pts);
+        }
+        component_pdu au;
+        au.ts_us = capture_ts;
+        au.seq = 0;
+        au.sdu_type = sdu_type_e::H264_AU;
+        au.port = 0;
+        au.flags = (pkt->flags & AV_PKT_FLAG_KEY) ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
+        au.sdu = std::move(payload);
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
+        notify_wakeup();
         cv.notify_one();
     }
 }
@@ -180,7 +196,7 @@ int h264_encoder_cedar::codec_open_locked()
     ctx->width = width;
     ctx->height = height;
     ctx->pix_fmt = AV_PIX_FMT_NV12;
-    ctx->time_base = AVRational{1, fps};
+    ctx->time_base = AVRational{1, 1000000};
     ctx->framerate = AVRational{fps, 1};
     ctx->gop_size = gop > 0 ? gop : 1;
     av_opt_set_int(ctx->priv_data, "qp", qp, 0);
@@ -286,113 +302,7 @@ void h264_encoder_cedar::close()
     cv.notify_all();
 }
 
-int h264_encoder_cedar::input(uint8_t /*port*/, const data_packet &in)
-{
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::NV12)
-    {
-        return -EINVAL;
-    }
 
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened)
-    {
-        return -EBADF;
-    }
-
-    int r = reopen_if_needed_locked();
-    if (r < 0)
-    {
-        return r;
-    }
-
-    if (f.width != live_w || f.height != live_h)
-    {
-        return -EINVAL;
-    }
-    int want = nv12_size_locked();
-    if (want < 0 || static_cast<size_t>(want) != f.buf.size() || nullptr == f.buf.u8())
-    {
-        return -EINVAL;
-    }
-
-    auto *ctx = static_cast<AVCodecContext *>(this->ctx);
-    auto *frame = static_cast<AVFrame *>(this->avframe);
-
-    av_frame_unref(frame);
-    int sz = av_image_fill_arrays(frame->data, frame->linesize, f.buf.u8(), AV_PIX_FMT_NV12,
-                                  live_w, live_h, 1);
-    if (sz < 0)
-    {
-        return sz;
-    }
-    frame->width = live_w;
-    frame->height = live_h;
-    frame->format = AV_PIX_FMT_NV12;
-    frame->pts = f.pts;
-    if (pending_idr)
-    {
-        frame->pict_type = AV_PICTURE_TYPE_I;
-#ifdef AV_FRAME_FLAG_KEY
-        frame->flags |= AV_FRAME_FLAG_KEY;
-#endif
-        pending_idr = false;
-    }
-    frame->buf[0] =
-        av_buffer_create(f.buf.u8(), static_cast<size_t>(sz), nv12_keep, nullptr, 0);
-    if (nullptr == frame->buf[0])
-    {
-        av_frame_unref(frame);
-        return AVERROR(ENOMEM);
-    }
-
-    int ret = avcodec_send_frame(ctx, frame);
-    if (ret < 0)
-    {
-        av_frame_unref(frame);
-        return ret;
-    }
-
-    r = drain_packets_locked();
-    av_frame_unref(frame);
-    return r;
-}
-
-int h264_encoder_cedar::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
-{
-    std::unique_lock<std::mutex> lock(mu);
-    if (!opened && out_q.empty())
-    {
-        return -EBADF;
-    }
-
-    auto ready = [this]() { return !out_q.empty() || !opened; };
-
-    if (out_q.empty())
-    {
-        if (timeout_ms == 0)
-        {
-            return -EAGAIN;
-        }
-        if (timeout_ms < 0)
-        {
-            cv.wait(lock, ready);
-        }
-        else
-        {
-            cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
-        }
-    }
-
-    if (out_q.empty())
-    {
-        return opened ? -EAGAIN : -EBADF;
-    }
-
-    out.adopt_frame(std::move(out_q.front()));
-    out_q.pop_front();
-    return 0;
-}
 
 int h264_encoder_cedar::configure(std::string_view key, std::string_view value)
 {
@@ -483,8 +393,192 @@ int h264_encoder_cedar::configure(std::string_view key, std::string_view value)
     return -ENOTSUP;
 }
 
+namespace
+{
+
+const std::vector<port_desc> &cedar_enc_input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &cedar_enc_output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+}  // namespace
+
+int h264_encoder_cedar::input(component_pdu &&in)
+{
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
+    {
+        video_raw_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        if (caps.width != width || caps.height != height)
+        {
+            caps_reject_ = true;
+            have_input_caps_ = false;
+            return -ENOTSUP;
+        }
+        caps_reject_ = false;
+        have_input_caps_ = true;
+        input_caps_ = caps;
+        if (!have_output_caps_ || caps.width != output_caps_.width || caps.height != output_caps_.height)
+        {
+            video_coded_caps coded {};
+            coded.width = caps.width;
+            coded.height = caps.height;
+            coded.fps_num = fps;
+            coded.fps_den = 1;
+            output_caps_ = coded;
+            have_output_caps_ = true;
+            component_pdu caps_pdu =
+                make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, coded, in.ts_us, 0);
+            caps_pdu.seq = 0;
+            pending_caps_out_.push_back(std::move(caps_pdu));
+        }
+        return 0;
+    }
+    if (in.sdu_type != sdu_type_e::NV12)
+    {
+        return -EINVAL;
+    }
+    if (caps_reject_ || !have_input_caps_)
+    {
+        return -ENOTSUP;
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (!opened)
+    {
+        return -EBADF;
+    }
+
+    int r = reopen_if_needed_locked();
+    if (r < 0)
+    {
+        return r;
+    }
+
+    if (input_caps_.width != live_w || input_caps_.height != live_h)
+    {
+        return -EINVAL;
+    }
+    int want = nv12_size_locked();
+    if (want < 0 || static_cast<size_t>(want) != in.sdu.size() || nullptr == in.sdu.u8())
+    {
+        return -EINVAL;
+    }
+
+    auto *ctx = static_cast<AVCodecContext *>(this->ctx);
+    auto *frame = static_cast<AVFrame *>(this->avframe);
+
+    av_frame_unref(frame);
+    int sz = av_image_fill_arrays(frame->data, frame->linesize, in.sdu.u8(), AV_PIX_FMT_NV12,
+                                  live_w, live_h, 1);
+    if (sz < 0)
+    {
+        return sz;
+    }
+    frame->width = live_w;
+    frame->height = live_h;
+    frame->format = AV_PIX_FMT_NV12;
+    frame->pts = static_cast<int64_t>(in.ts_us);
+    if (pending_idr)
+    {
+        frame->pict_type = AV_PICTURE_TYPE_I;
+#ifdef AV_FRAME_FLAG_KEY
+        frame->flags |= AV_FRAME_FLAG_KEY;
+#endif
+        pending_idr = false;
+    }
+    frame->buf[0] =
+        av_buffer_create(in.sdu.u8(), static_cast<size_t>(sz), nv12_keep, nullptr, 0);
+    if (nullptr == frame->buf[0])
+    {
+        av_frame_unref(frame);
+        return AVERROR(ENOMEM);
+    }
+
+    const uint64_t capture_ts_us = in.ts_us;
+    int ret = avcodec_send_frame(ctx, frame);
+    if (ret < 0)
+    {
+        av_frame_unref(frame);
+        return ret;
+    }
+    in_capture_ts_us_.push_back(capture_ts_us);
+
+    r = drain_packets_locked();
+    av_frame_unref(frame);
+    return r;
+}
+
+int h264_encoder_cedar::output(component_pdu &out)
+{
+    if (!pending_caps_out_.empty())
+    {
+        out = std::move(pending_caps_out_.front());
+        pending_caps_out_.pop_front();
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (!opened && out_q.empty())
+    {
+        return -EBADF;
+    }
+    if (out_q.empty())
+    {
+        return -EAGAIN;
+    }
+
+    out = std::move(out_q.front());
+    out_q.pop_front();
+    if (out.seq == 0)
+    {
+        out.seq = out_seq_++;
+    }
+    notify_wakeup();
+    return 0;
+}
+
 int h264_encoder_cedar::query(std::string_view key, std::string *value) const
 {
+    int r = port_caps_query(cedar_enc_input_ports(), true, key, value);
+    if (0 == r)
+    {
+        return 0;
+    }
+    r = port_caps_query(cedar_enc_output_ports(), false, key, value);
+    if (0 == r)
+    {
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "status")

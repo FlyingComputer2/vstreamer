@@ -16,6 +16,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+
+#include "core/pdu_wakeup.hpp"
 #include <string>
 #include <thread>
 
@@ -300,8 +302,7 @@ int main(int argc, char **argv)
     };
 
     selector = std::make_unique<source_selector>(
-        camera, noise, k_noise_fallback_w, k_noise_fallback_h, k_noise_fallback_fps, on_switch,
-        source_selector::push_packet_fn {}, source_selector::push_packet_fn {});
+        camera, noise, k_noise_fallback_w, k_noise_fallback_h, k_noise_fallback_fps, on_switch);
     metrics_src = std::make_unique<source_selector_query_source>(*selector);
     g_tx.metrics_source = metrics_src.get();
 
@@ -316,17 +317,22 @@ int main(int argc, char **argv)
 
     const size_t pipe_q = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                      apps::k_default_pipe_queue_depth, 64);
-    apps::pipeline_queue mjpeg_q(pipe_q, g_run);
-    apps::pipeline_queue nv12_q(pipe_q, g_run);
-    g_tx.metrics_nv12_q = &nv12_q;
+    apps::pipeline_pdu_queue mjpeg_pipe(pipe_q, g_run);
+    apps::pipeline_pdu_queue nv12_pipe(pipe_q, g_run);
+    g_tx.metrics_nv12_pipe = &nv12_pipe;
+    const std::shared_ptr<vstreamer::pdu_wakeup> source_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
+        std::make_shared<vstreamer::pdu_wakeup>();
+    mjpeg_pipe.bind_wakeup(mjpeg_wake);
+    nv12_pipe.bind_wakeup(nv12_wake);
 
-    selector->set_push_handlers(
-        [&](data_packet &&p) {
-            (void)enqueue_source_frame(std::move(p), &mjpeg_q, &nv12_q, &g_bench_diag);
-        },
-        [&](data_packet &&p) {
-            (void)enqueue_source_frame(std::move(p), &mjpeg_q, &nv12_q, &g_bench_diag);
-        });
+    selector->bind_source_wakeups(source_wake);
+    selector->set_push_pdu_handler([&](component_pdu &&pkt) {
+        (void)enqueue_source_pdu(std::move(pkt), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
+    });
 
     pipeline_rate_state       rate;
     apps::pipeline_controller ctrl;
@@ -374,13 +380,13 @@ int main(int argc, char **argv)
     const int jpeg_workers = static_cast<int>(g_cpu_map.jpeg_workers.size());
     ctrl.add_stage("source", "source",
                    [&, sel = selector.get()](std::atomic<bool> & /*run*/) {
-                       source_stage_selector_main(sel, &mjpeg_q, &nv12_q, &g_bench_diag);
+                       source_stage_selector_main(sel, &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
                    });
     ctrl.add_stage("jpeg", "jpeg", [&, jw = jpeg_workers](std::atomic<bool> & /*run*/) {
-        jpeg_stage_main(&jdec, &mjpeg_q, &nv12_q, &g_bench_diag, jw);
+        jpeg_stage_main(&jdec, &mjpeg_pipe, &nv12_pipe, &g_bench_diag, jw);
     });
     ctrl.add_stage("encode", "encode", [&](std::atomic<bool> & /*run*/) {
-        encode_stage_main(&enc, &pay, &sender, &nv12_q, &g_bench_diag);
+        encode_stage_main(&enc, &pay, &sender, &nv12_pipe, &g_bench_diag);
     });
     ctrl.add_metrics_sync([&]() {
         update_pipeline_metrics(g_bench_diag, &enc, &sender, nullptr, nullptr, false, rate,
@@ -391,8 +397,8 @@ int main(int argc, char **argv)
                  device, size_buf, fps, console_host.c_str(), console_port);
     ctrl.run();
 
-    mjpeg_q.wake_shutdown();
-    nv12_q.wake_shutdown();
+    mjpeg_pipe.wake_shutdown();
+    nv12_pipe.wake_shutdown();
     console.stop();
     selector->close();
     sender.close();

@@ -6,15 +6,20 @@
 #error "sdl_sink requires -DENABLE_SDL_SINK=ON"
 #endif
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "components/sdl_nv12_presenter.hpp"
 #include "core/component_sink.hpp"
-#include "core/data_packet.hpp"
+#include "core/component_input.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
 
 namespace vstreamer
 {
@@ -30,14 +35,14 @@ public:
     sdl_sink &operator=(const sdl_sink &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-
     int  open() override;
     void close() override;
 
     int prepare(int width, int height);
-
-    int input(uint8_t port, const data_packet &in) override;
+    /* Present queued NV12 on the calling thread (must match prepare/open thread). */
+    int present_pending();
+    [[nodiscard]] std::thread::id bound_render_thread() const;
+    int input(component_pdu &&in) override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -45,11 +50,25 @@ public:
 private:
     const char *presenter_video_driver() const;
 
+    [[nodiscard]] int input_pdu_locked(component_pdu &&in);
+    [[nodiscard]] bool raw_caps_acceptable(const video_raw_caps &caps) const;
+    [[nodiscard]] nv12_present_sample sample_from_pdu(const component_pdu &in) const;
+
+    static const std::vector<port_desc> &input_ports();
+
     mutable std::mutex mu;
 
-    bool opened = false;
+    std::atomic<bool> opened {false};
+    std::atomic<bool> close_requested {false};
     uint64_t frames_in = 0;
+    uint64_t dropped = 0;
     std::string video_driver = "auto";
+
+    bool           have_input_caps_ = false;
+    bool           caps_reject_ = false;
+    video_raw_caps input_caps_ {};
+    int            prepared_w_ = 0;
+    int            prepared_h_ = 0;
 
     std::optional<sdl_nv12_presenter> present;
 };

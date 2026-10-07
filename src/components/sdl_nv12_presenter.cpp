@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #include <SDL.h>
 
@@ -20,6 +21,20 @@
 
 namespace vstreamer
 {
+
+sdl_nv12_presenter::test_present_delay_hook_fn sdl_nv12_presenter::s_test_present_delay_hook =
+    nullptr;
+
+void sdl_nv12_presenter::set_test_present_delay_hook(test_present_delay_hook_fn hook)
+{
+    s_test_present_delay_hook = hook;
+}
+
+void sdl_nv12_presenter::clear_test_present_delay_hook()
+{
+    s_test_present_delay_hook = nullptr;
+}
+
 namespace
 {
 
@@ -389,11 +404,8 @@ int sdl_nv12_presenter::ensure_video_locked(int w, int h)
 
         window = win;
         renderer = ren;
-        if (kmsdrm)
-        {
-            render_thread_id = here;
-            render_thread_bound = true;
-        }
+        render_thread_id = here;
+        render_thread_bound = true;
     }
 
     auto *ren = static_cast<SDL_Renderer *>(renderer);
@@ -413,18 +425,19 @@ int sdl_nv12_presenter::ensure_video_locked(int w, int h)
     return 0;
 }
 
-int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_open)
+int sdl_nv12_presenter::present_nv12_locked(const nv12_present_sample &f, bool &session_open,
+                                              std::unique_lock<std::mutex> &lock)
 {
     const int need = nv12_byte_size(f.width, f.height);
     if (need < 0 || static_cast<size_t>(need) != f.buf.size() || nullptr == f.buf.u8())
     {
         return -EINVAL;
     }
-    if (f.capture_mono_ns > 0)
+    if (f.ts_us > 0)
     {
         const int64_t now_ns = steady_mono_ns();
-        last_latency_ms =
-            static_cast<double>(now_ns - f.capture_mono_ns) / 1e6;
+        const int64_t cap_ns = static_cast<int64_t>(f.ts_us) * 1000LL;
+        last_latency_ms = static_cast<double>(now_ns - cap_ns) / 1e6;
         if (last_latency_ms < 0.0)
         {
             last_latency_ms = 0.0;
@@ -487,7 +500,13 @@ int sdl_nv12_presenter::present_nv12_locked(const frame_data &f, bool &session_o
         return -EIO;
     }
     clear_sdl_error();
+    lock.unlock();
     SDL_RenderPresent(ren);
+    if (nullptr != sdl_nv12_presenter::s_test_present_delay_hook)
+    {
+        sdl_nv12_presenter::s_test_present_delay_hook(0);
+    }
+    lock.lock();
     if (check_sdl_error_after("SDL_RenderPresent"))
     {
         return -EIO;
@@ -625,6 +644,7 @@ int sdl_nv12_presenter::open()
 void sdl_nv12_presenter::close()
 {
     std::lock_guard<std::mutex> lock(mu);
+    pending.clear();
     destroy_video_locked();
     if (sdl_ready)
     {
@@ -655,14 +675,137 @@ int sdl_nv12_presenter::prepare(int w, int h, bool &session_open)
     return ensure_video_locked(w, h);
 }
 
-int sdl_nv12_presenter::present(const frame_data &f, bool &session_open)
+void sdl_nv12_presenter::set_queue_capacity(size_t cap)
 {
     std::lock_guard<std::mutex> lock(mu);
+    if (0 == cap)
+    {
+        cap = k_default_queue_depth;
+    }
+    queue_cap = cap;
+    while (pending.size() > queue_cap)
+    {
+        pending.pop_front();
+    }
+}
+
+size_t sdl_nv12_presenter::queue_capacity() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return queue_cap;
+}
+
+size_t sdl_nv12_presenter::queue_size() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return pending.size();
+}
+
+int sdl_nv12_presenter::try_enqueue(const nv12_present_sample &f)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (pending.size() >= queue_cap)
+    {
+        return -EAGAIN;
+    }
+    pending.push_back(f);
+    return 0;
+}
+
+int sdl_nv12_presenter::enqueue_drop(const nv12_present_sample &f, bool *dropped_oldest)
+{
+    if (nullptr != dropped_oldest)
+    {
+        *dropped_oldest = false;
+    }
+    std::lock_guard<std::mutex> lock(mu);
+    if (pending.size() >= queue_cap && !pending.empty())
+    {
+        pending.pop_front();
+        if (nullptr != dropped_oldest)
+        {
+            *dropped_oldest = true;
+        }
+    }
+    pending.push_back(f);
+    return 0;
+}
+
+int sdl_nv12_presenter::drain_pending(bool &session_open)
+{
+    int presented = 0;
+    int last_err = 0;
+    for (;;)
+    {
+        nv12_present_sample f;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (!sdl_ready || !session_open)
+            {
+                if (presented > 0)
+                {
+                    return presented;
+                }
+                return -EBADF;
+            }
+            if (pending.empty())
+            {
+                break;
+            }
+            f = std::move(pending.front());
+            pending.pop_front();
+        }
+        int r = 0;
+        {
+            std::unique_lock<std::mutex> lock(mu);
+            if (!sdl_ready || !session_open)
+            {
+                break;
+            }
+            r = present_nv12_locked(f, session_open, lock);
+        }
+        if (0 == r)
+        {
+            presented++;
+        }
+        else if (0 == presented)
+        {
+            last_err = r;
+        }
+        if (!session_open)
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            pending.clear();
+            break;
+        }
+    }
+    if (presented > 0)
+    {
+        return presented;
+    }
+    return last_err;
+}
+
+void sdl_nv12_presenter::clear_pending()
+{
+    std::lock_guard<std::mutex> lock(mu);
+    pending.clear();
+}
+
+std::thread::id sdl_nv12_presenter::bound_render_thread() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return render_thread_bound ? render_thread_id : std::thread::id {};
+}
+
+int sdl_nv12_presenter::present(const nv12_present_sample &f, bool &session_open)
+{
+    std::unique_lock<std::mutex> lock(mu);
     if (!sdl_ready || !session_open)
     {
         return -EBADF;
     }
-    return present_nv12_locked(f, session_open);
+    return present_nv12_locked(f, session_open, lock);
 }
 
 void sdl_nv12_presenter::stats_string(char *buf, size_t buflen, uint64_t frames_in) const

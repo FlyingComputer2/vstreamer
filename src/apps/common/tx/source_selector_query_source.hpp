@@ -18,11 +18,6 @@ public:
         return "source_selector";
     }
 
-    [[nodiscard]] media_kind_e output_kind() const override
-    {
-        return media_kind_e::UNKNOWN;
-    }
-
     int open() override
     {
         return 0;
@@ -30,7 +25,7 @@ public:
 
     void close() override {}
 
-    int output(uint8_t /*port*/, data_packet & /*out*/, int /*timeout_ms*/) override
+    int output(component_pdu & /*out*/) override
     {
         return -ENOTSUP;
     }

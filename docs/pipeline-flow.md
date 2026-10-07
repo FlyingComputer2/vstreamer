@@ -59,10 +59,10 @@ Build with `-DENABLE_SDL_SINK=ON` (requires SDL2).
 
 ### Latency (capture → present)
 
-Inside each host, stages measure delay with the local monotonic clock
-(`capture_mono_ns` on frames, deltas via `steady_mono_ns()`). On the wire, `rtp_h264_pay` converts
-capture time to **CLOCK_REALTIME** in the RTP extension; `rtp_h264_depay` converts back to local
-monotonic on output. Glass latency (`stream_sdl.glass_latency_ms`, `latency.glass_ms`) is
+Inside each host, stages measure delay with PDU `ts_us` (microseconds on the local monotonic
+clock) and deltas via `steady_mono_ns()`. On the wire, `rtp_h264_pay` converts capture time to
+**CLOCK_REALTIME** in the RTP extension; `rtp_h264_depay` converts back to local monotonic in
+`ts_us` on each `H264_AU`. Glass latency (`stream_sdl.glass_latency_ms`, `latency.glass_ms`) is
 capture → display and is meaningful across hosts when clocks are synchronized.
 
 ## Legacy aliases

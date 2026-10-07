@@ -1,7 +1,9 @@
 #include "apps/common/tx/tx_metrics.hpp"
 
 #include "apps/common/pipeline_state.hpp"
+#include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/tx_state.hpp"
+#include "apps/stream_sdl_test/diag.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 
 #include "core/metrics.hpp"
 #include "core/stream_telemetry.hpp"
+#include "core/time_util.hpp"
 
 namespace vstreamer::apps::tx
 {
@@ -109,6 +112,23 @@ void update_receiver_loss_deltas(const stream_link_counters &cur, uint32_t sessi
     }
     tr.prev = cur;
     tr.have_prev = true;
+}
+
+/* Encoder-reported latency in ms; 0 when the encoder does not report one. */
+double query_encoder_latency_ms(component_coder &enc)
+{
+    std::string v;
+    if (enc.query("latency_ms", &v) != 0 || v.empty())
+    {
+        return 0.0;
+    }
+    char        *end = nullptr;
+    const double ms = std::strtod(v.c_str(), &end);
+    if (end == v.c_str() || ms < 0.0)
+    {
+        return 0.0;
+    }
+    return ms;
 }
 
 }  // namespace
@@ -266,6 +286,13 @@ void sync_tx_cumulative_counters(const test_app::bench_diag &d, stream_sender *s
                  sender->wire_bytes_sent_counter());
 }
 
+double sender_peer_fec_loss_pct(stream_sender &sender)
+{
+    sync_sender_peer_link_metrics_live(sender);
+    std::lock_guard<std::mutex> lock(g_sender_peer_loss_mu);
+    return g_sender_peer_loss.loss_fec_pct;
+}
+
 int query_encoder_qp(component_coder &enc)
 {
     std::string val;
@@ -284,6 +311,29 @@ int query_encoder_cbr_bps(component_coder &enc)
         return -1;
     }
     return std::atoi(val.c_str());
+}
+
+void publish_tx_latency_metrics(component_coder *enc)
+{
+    const double source_ms = apps::g_latency_source_ms.load(std::memory_order_relaxed);
+    const double jpeg_ms = apps::g_latency_jpeg_ms.load(std::memory_order_relaxed);
+    const double enc_in_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    const double enc_out_ms = apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+    metric_store(*g_pipeline_metrics.get_metric("latency.source_ms"), source_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_ms"), jpeg_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_in_ms"), enc_in_ms);
+    metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"), enc_out_ms);
+    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"), jpeg_ms);
+    double enc_lat_ms = enc_out_ms;
+    if (nullptr != enc)
+    {
+        const double queried = query_encoder_latency_ms(*enc);
+        if (queried > 0.0)
+        {
+            enc_lat_ms = queried;
+        }
+    }
+    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"), enc_lat_ms);
 }
 
 }  // namespace vstreamer::apps::tx

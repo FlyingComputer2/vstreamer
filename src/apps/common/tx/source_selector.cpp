@@ -1,8 +1,16 @@
 #include "apps/common/tx/source_selector.hpp"
 
+#include "apps/common/pdu_stage.hpp"
+#include "apps/common/pipeline_state.hpp"
+
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
+#include "core/time_util.hpp"
+
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 namespace vstreamer::apps::tx
 {
@@ -25,27 +33,60 @@ bool key_is_noise_query(std::string_view key)
            key == "noise-fft-grid";
 }
 
+int pdu_output_from_source(component_source &src, component_pdu &out)
+{
+    auto *po = dynamic_cast<component_output *>(&src);
+    if (nullptr == po)
+    {
+        return -ENOTSUP;
+    }
+    return po->output(out);
+}
+
 }  // namespace
 
 source_selector::source_selector(component_source &camera_in, component_source &noise_in,
                                int noise_width_in, int noise_height_in, int noise_fps_in,
-                               on_switch_fn on_switch_in, push_packet_fn push_mjpeg_in,
-                               push_packet_fn push_nv12_in)
+                               on_switch_fn on_switch_in)
     : camera(camera_in),
       noise(noise_in),
       noise_width(noise_width_in),
       noise_height(noise_height_in),
       noise_fps(noise_fps_in),
-      on_switch(std::move(on_switch_in)),
-      push_mjpeg(std::move(push_mjpeg_in)),
-      push_nv12(std::move(push_nv12_in))
+      on_switch(std::move(on_switch_in))
 {
 }
 
-void source_selector::set_push_handlers(push_packet_fn push_mjpeg_in, push_packet_fn push_nv12_in)
+void source_selector::set_push_pdu_handler(push_pdu_fn push_pdu_in)
 {
-    push_mjpeg = std::move(push_mjpeg_in);
-    push_nv12 = std::move(push_nv12_in);
+    push_pdu = std::move(push_pdu_in);
+}
+
+void source_selector::emit_switch_caps(source_kind switch_kind, int width, int height, int fps)
+{
+    if (!push_pdu)
+    {
+        return;
+    }
+    const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000LL);
+    if (source_kind::noise_fallback == switch_kind)
+    {
+        video_raw_caps caps {};
+        caps.width = width;
+        caps.height = height;
+        caps.hor_stride = width;
+        caps.ver_stride = height;
+        caps.fps_num = fps > 0 ? fps : 30;
+        caps.fps_den = 1;
+        push_pdu(make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps, ts_us, 0));
+        return;
+    }
+    video_coded_caps caps {};
+    caps.width = width;
+    caps.height = height;
+    caps.fps_num = fps > 0 ? fps : 30;
+    caps.fps_den = 1;
+    push_pdu(make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, caps, ts_us, 0));
 }
 
 bool source_selector::switch_allowed() const
@@ -83,6 +124,7 @@ void source_selector::switch_to_noise()
         logged_noise = true;
         logged_camera = false;
     }
+    emit_switch_caps(source_kind::noise_fallback, noise_width, noise_height, noise_fps);
 }
 
 void source_selector::switch_to_camera(int width, int height, int fps)
@@ -108,6 +150,7 @@ void source_selector::switch_to_camera(int width, int height, int fps)
         logged_camera = true;
         logged_noise = false;
     }
+    emit_switch_caps(source_kind::camera, width, height, fps);
 }
 
 bool source_selector::read_camera_geometry(int *width, int *height, int *fps) const
@@ -192,22 +235,55 @@ void source_selector::close()
     logged_camera = false;
 }
 
-int source_selector::poll_once(int timeout_ms)
+void source_selector::bind_source_wakeups(std::shared_ptr<pdu_wakeup> w)
 {
-    data_packet out;
+    source_wake_ = w;
+    dynamic_cast<component &>(camera).set_wakeup(w);
+    dynamic_cast<component &>(noise).set_wakeup(w);
+}
+
+int source_selector::poll_active_pdu(component_pdu &out, pdu_wakeup &w)
+{
+    component_source &active = source_kind::camera == kind ? camera : noise;
+    component        &owner = dynamic_cast<component &>(active);
+    while (apps::g_run.load(std::memory_order_relaxed))
+    {
+        const int r = pdu_output_from_source(active, out);
+        if (-EAGAIN != r)
+        {
+            if (0 == r && push_pdu)
+            {
+                push_pdu(std::move(out));
+            }
+            return r;
+        }
+        apps::wait_for_pdu(w, owner, apps::g_run);
+    }
+    return -ECANCELED;
+}
+
+int source_selector::poll_once_pdu(pdu_wakeup &w)
+{
+    if (!push_pdu)
+    {
+        return poll_once(-1);
+    }
     if (source_kind::camera == kind)
     {
-        const int cam = camera.output(0, out, timeout_ms);
+        component_pdu out;
+        const int     cam = pdu_output_from_source(camera, out);
         if (0 == cam)
         {
-            if (push_mjpeg)
-            {
-                push_mjpeg(std::move(out));
-            }
+            push_pdu(std::move(out));
             return 0;
         }
         if (-ENODEV != cam)
         {
+            if (-EAGAIN == cam)
+            {
+                apps::wait_for_pdu(w, dynamic_cast<component &>(camera), apps::g_run);
+                return -EAGAIN;
+            }
             return cam;
         }
         switch_to_noise();
@@ -215,50 +291,63 @@ int source_selector::poll_once(int timeout_ms)
         {
             return -EAGAIN;
         }
-        const int nr = noise.output(0, out, timeout_ms);
-        if (0 == nr && push_nv12)
-        {
-            push_nv12(std::move(out));
-        }
-        return nr;
+        component_pdu noise_out;
+        return poll_active_pdu(noise_out, w);
     }
-
     const auto now = std::chrono::steady_clock::now();
     const auto since_probe =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_camera_probe).count();
     if (since_probe >= k_camera_probe_interval_ms)
     {
         last_camera_probe = now;
-        data_packet probe;
-        const int   cam = camera.output(0, probe, 0);
+        component_pdu probe;
+        const int     cam = pdu_output_from_source(camera, probe);
         if (0 == cam)
         {
-            int w = noise_width;
+            int width = noise_width;
             int h = noise_height;
             int f = noise_fps;
-            (void)read_camera_geometry(&w, &h, &f);
-            switch_to_camera(w, h, f);
-            if (source_kind::camera == kind && push_mjpeg)
+            (void)read_camera_geometry(&width, &h, &f);
+            switch_to_camera(width, h, f);
+            if (source_kind::camera == kind)
             {
-                push_mjpeg(std::move(probe));
+                push_pdu(std::move(probe));
                 return 0;
             }
         }
-        else if (-ENODEV != cam && -EAGAIN != cam)
-        {
-            if (-cam > 0 && -cam < 4096)
-            {
-                camera_error = std::strerror(-cam);
-            }
-        }
     }
+    component_pdu noise_out;
+    return poll_active_pdu(noise_out, w);
+}
 
-    const int nr = noise.output(0, out, timeout_ms);
-    if (0 == nr && push_nv12)
+int source_selector::poll_once(int timeout_ms)
+{
+    if (!source_wake_)
     {
-        push_nv12(std::move(out));
+        return -EINVAL;
     }
-    return nr;
+    pdu_wakeup &w = *source_wake_;
+    if (timeout_ms < 0)
+    {
+        return poll_once_pdu(w);
+    }
+    const int64_t end_ns =
+        steady_mono_ns() + static_cast<int64_t>(timeout_ms > 0 ? timeout_ms : 0) * 1'000'000LL;
+    while (apps::g_run.load(std::memory_order_relaxed))
+    {
+        const int r = poll_once_pdu(w);
+        if (0 == r || -EAGAIN != r)
+        {
+            return r;
+        }
+        const int64_t now_ns = steady_mono_ns();
+        if (now_ns >= end_ns)
+        {
+            return -EAGAIN;
+        }
+        w.wait_until(end_ns);
+    }
+    return -ECANCELED;
 }
 
 int source_selector::configure(std::string_view key, std::string_view value)

@@ -18,7 +18,7 @@ struct tx_state
     std::atomic<bool> pending_console_idr {false};
 
     vstreamer::component_source *metrics_source = nullptr;
-    pipeline_queue              *metrics_nv12_q = nullptr;
+    pipeline_pdu_queue          *metrics_nv12_pipe = nullptr;
 };
 
 extern tx_state g_tx;

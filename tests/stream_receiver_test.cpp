@@ -1,10 +1,13 @@
 #include "components/stream_receiver.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <arpa/inet.h>
 #include <poll.h>
@@ -17,23 +20,6 @@
 #include <cstring>
 #include <string>
 #include <thread>
-
-TEST(StreamReceiverTest, OutputUnblocksOnClose)
-{
-    vstreamer::stream_receiver receiver;
-    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:0"));
-
-    std::thread blocked([&receiver]() {
-        vstreamer::data_packet out;
-        const int              rc = receiver.output(0, out, -1);
-        EXPECT_EQ(-EBADF, rc);
-    });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    receiver.close();
-
-    blocked.join();
-}
 
 namespace
 {
@@ -66,6 +52,18 @@ int ephemeral_udp_port()
 }
 
 }  // namespace
+
+TEST(StreamReceiverTest, OutputEagainWhenEmpty)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.open());
+    vstreamer::component_pdu out;
+    EXPECT_EQ(-EAGAIN, receiver.output(out));
+    receiver.close();
+}
 
 TEST(StreamReceiverTest, OpenCloseStress)
 {
@@ -110,8 +108,8 @@ TEST(StreamReceiverTest, LoopbackRxTruncatedZero)
 
     for (int attempt = 0; attempt < 50; ++attempt)
     {
-        vstreamer::data_packet out;
-        if (receiver.output(0, out, 20) == 0)
+        vstreamer::component_pdu out;
+        if (receiver.output(out) == 0)
         {
             break;
         }
@@ -526,4 +524,88 @@ TEST(StreamReceiverTest, BadHeaderCountedAndDoesNotMoveTelemetryPeer)
     receiver.close();
     close(s);
     close(s_bad);
+}
+
+TEST(StreamReceiverTest, PortCapsAdvertisesStreamDgram)
+{
+    vstreamer::stream_receiver receiver;
+    std::string                val;
+    ASSERT_EQ(0, receiver.query("outport-0.caps-0.sdu_type", &val));
+    EXPECT_EQ("STREAM_DGRAM", val);
+}
+
+TEST(StreamReceiverTest, PduOutputNonBlocking)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.open());
+
+    vstreamer::component_pdu pdu;
+    EXPECT_EQ(-EAGAIN, receiver.output(pdu));
+
+    receiver.close();
+}
+
+TEST(StreamReceiverTest, PduDiscontAfterUdpSequenceGap)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    const int s = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(s, 0);
+
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.open());
+
+    sockaddr_in dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(static_cast<uint16_t>(port));
+    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+
+    const auto d1 = make_valid_media_datagram(1, std::vector<uint8_t>(24, 0x11));
+    const auto d4 = make_valid_media_datagram(4, std::vector<uint8_t>(24, 0x22));
+    sendto(s, d1.data(), d1.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+    sendto(s, d4.data(), d4.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+
+    vstreamer::component_pdu first;
+    vstreamer::component_pdu second;
+    const auto               deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool                     have_first = false;
+    bool                     have_second = false;
+    while (std::chrono::steady_clock::now() < deadline && (!have_first || !have_second))
+    {
+        if (!have_first)
+        {
+            vstreamer::component_pdu pdu;
+            if (0 == receiver.output(pdu))
+            {
+                first = std::move(pdu);
+                have_first = true;
+            }
+        }
+        if (have_first && !have_second)
+        {
+            vstreamer::component_pdu pdu;
+            if (0 == receiver.output(pdu))
+            {
+                second = std::move(pdu);
+                have_second = true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(have_first);
+    ASSERT_TRUE(have_second);
+    EXPECT_EQ(vstreamer::sdu_type_e::STREAM_DGRAM, first.sdu_type);
+    EXPECT_EQ(vstreamer::sdu_type_e::STREAM_DGRAM, second.sdu_type);
+    EXPECT_FALSE(vstreamer::has_flag(first, vstreamer::pdu_flag_e::DISCONT));
+    EXPECT_TRUE(vstreamer::has_flag(second, vstreamer::pdu_flag_e::DISCONT));
+    EXPECT_GT(second.ts_us, 0ULL);
+
+    receiver.close();
+    close(s);
 }

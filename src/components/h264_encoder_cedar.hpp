@@ -14,7 +14,10 @@
 #include <string_view>
 
 #include "core/component_coder.hpp"
-#include "core/frame.hpp"
+#include "core/component_pdu.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
+#include "core/sdu_caps.hpp"
 
 namespace vstreamer
 {
@@ -30,14 +33,10 @@ public:
     h264_encoder_cedar &operator=(const h264_encoder_cedar &) = delete;
 
     [[nodiscard]] std::string name() const override;
-    [[nodiscard]] media_kind_e input_kind() const override;
-    [[nodiscard]] media_kind_e output_kind() const override;
-
     int  open() override;
     void close() override;
-
-    int input(uint8_t port, const data_packet &in) override;
-    int output(uint8_t port, data_packet &out, int timeout_ms) override;
+    int input(component_pdu &&in) override;
+    int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -73,7 +72,17 @@ private:
     int   live_gop = 0;
     bool  pending_idr = false;
 
-    std::deque<frame> out_q;
+    std::deque<uint64_t> in_capture_ts_us_;
+
+    std::deque<component_pdu> out_q;
+
+    bool             have_input_caps_ = false;
+    bool             caps_reject_ = false;
+    video_raw_caps   input_caps_ {};
+    bool             have_output_caps_ = false;
+    video_coded_caps output_caps_ {};
+    uint64_t         out_seq_ = 0;
+    std::deque<component_pdu> pending_caps_out_;
 };
 
 }  // namespace vstreamer

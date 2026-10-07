@@ -1,17 +1,21 @@
-/* rx_stages.cpp — receive-half pipeline stages. */
+/* rx_stages.cpp — PDU-native RX decode, depay, and present stage loops. */
 
 #include "apps/common/rx/rx_stages.hpp"
 
+#include "apps/common/pdu_stage.hpp"
 #include "apps/common/pipeline_state.hpp"
 #include "apps/common/rx/rx_state.hpp"
 #include "apps/common/stage_latency.hpp"
 
 #include <cerrno>
 #include <cstdio>
-#include <cstring>
+#include <chrono>
+#include <memory>
+#include <thread>
 
 #include "components/components.hpp"
-#include "core/data_packet.hpp"
+#include "core/component_input.hpp"
+#include "core/component_output.hpp"
 #include "core/thread_affinity.hpp"
 
 namespace vstreamer::test_app
@@ -20,189 +24,72 @@ namespace vstreamer::test_app
 using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
-using apps::log_stage_latency;
-using apps::packet_frame_bytes;
+using apps::log_pdu_stage_latency;
+using apps::note_pdu_sequence_gap;
+using apps::pdu_rx_au_queue;
+using apps::present_pdu_queue;
 using apps::rx::ensure_decoder_open;
 using apps::rx::g_rx;
+using apps::wait_for_pdu;
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY)
 
-int drain_decoder_one_frame(h264_decoder_mpp *dec, data_packet &frame_pkt, bench_diag &diag,
-                            int timeout_ms)
+namespace
 {
-    const int r = dec->output(0, frame_pkt, timeout_ms);
-    if (0 == r)
-    {
-        diag.rx_nv12_out++;
-        diag.rx_nv12_out_bytes += packet_frame_bytes(frame_pkt);
-        return 0;
-    }
-    if (-EAGAIN == r)
-    {
-        diag.rx_dec_out_eagain++;
-        return r;
-    }
-    diag.rx_dec_out_err++;
-    if (diag.rx_dec_out_err <= 10)
-    {
-        std::fprintf(stderr, "stream_sdl: h264_decoder output failed (%d", r);
-        if (-r > 0 && -r < 4096)
-        {
-            std::fprintf(stderr, "; %s", std::strerror(-r));
-        }
-        std::fprintf(stderr, ")\n");
-    }
-    return r;
+
+[[nodiscard]] size_t pdu_bytes(const component_pdu &pdu)
+{
+    return is_caps(pdu.sdu_type) ? 0U : pdu.sdu.size();
 }
 
-void pull_decoder_frames_locked(h264_decoder_mpp *dec, bench_diag &diag,
-                                std::vector<data_packet> &out)
-{
-    for (int pass = 0; pass < 64; pass++)
-    {
-        data_packet frame_pkt;
-        const int   r = drain_decoder_one_frame(dec, frame_pkt, diag, 0);
-        if (0 != r)
-        {
-            break;
-        }
-        out.push_back(std::move(frame_pkt));
-    }
-}
-
-void enqueue_decoded_frames(apps::present_frame_queue *present_q, bench_diag &diag,
-                            std::vector<data_packet> &frames)
-{
-    for (data_packet &frame_pkt : frames)
-    {
-        if (nullptr == present_q)
-        {
-            continue;
-        }
-        log_stage_latency("dec_out", frame_pkt);
-        (void)present_q->push(std::move(frame_pkt), &diag.rx_present_q_drop);
-    }
-}
-
-void drain_decoder_to_present(h264_decoder_mpp *dec, apps::present_frame_queue *present_q,
-                              bench_diag &diag)
+bool drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, bench_diag &diag)
 {
     if (ensure_decoder_open(dec) < 0)
     {
-        return;
+        return false;
     }
-    std::vector<data_packet> frames;
-    pull_decoder_frames_locked(dec, diag, frames);
-    enqueue_decoded_frames(present_q, diag, frames);
+    auto *dec_out = dynamic_cast<component_output *>(dec);
+    if (nullptr == dec_out)
+    {
+        return false;
+    }
+    bool          drained = false;
+    uint64_t      last_seq = 0;
+    bool          have_seq = false;
+    component_pdu frame;
+    while (g_run.load(std::memory_order_relaxed) && dec_out->output(frame) == 0)
+    {
+        drained = true;
+        note_pdu_sequence_gap(frame.seq, last_seq, have_seq, nullptr);
+        diag.rx_nv12_out++;
+        diag.rx_nv12_out_bytes += pdu_bytes(frame);
+        log_pdu_stage_latency("dec_out", frame);
+        (void)present_queue->push(std::move(frame), &diag.rx_present_q_drop);
+    }
+    return drained;
 }
 
-void present_thread_main(component_sink *display, apps::present_frame_queue *present_q, int width,
-                         int height, bool kmsdrm, bool sdl_open_on_thread, bench_diag *diag)
+int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queue *present_queue,
+                     bench_diag &diag)
 {
-    if (nullptr == display || nullptr == present_q || nullptr == diag)
-    {
-        return;
-    }
-    if (sdl_open_on_thread)
-    {
-        if (display->open() < 0)
-        {
-            std::fprintf(stderr, "stream_sdl: SDL display open on present thread failed\n");
-            return;
-        }
-        if (prepare_preview_sink(display, kmsdrm, width, height) < 0)
-        {
-            std::fprintf(stderr,
-                         "stream_sdl: SDL display prepare on present thread failed "
-                         "(continuing)\n");
-        }
-    }
-    else if (kmsdrm && prepare_preview_sink(display, kmsdrm, width, height) < 0)
-    {
-        std::fprintf(stderr,
-                     "stream_sdl: kmsdrm prepare on present thread failed (continuing)\n");
-    }
-
-    while (g_run.load())
-    {
-        data_packet frame_pkt;
-        if (!present_q->pop(frame_pkt, 50))
-        {
-            continue;
-        }
-        const int pr = display->input(0, frame_pkt);
-        if (0 == pr)
-        {
-            diag->rx_present_ok++;
-            log_stage_latency("present", frame_pkt);
-            if (frame_pkt.get_type() == packet_kind_e::FRAME)
-            {
-                const frame_data &f = data_packet::cast<frame_data>(frame_pkt);
-                if (f.capture_mono_ns <= 0)
-                {
-                    const int64_t latest =
-                        apps::g_latest_source_pts.load(std::memory_order_relaxed);
-                    const int   fps = g_rx.stream_fps.load(std::memory_order_relaxed);
-                    if (fps > 0 && latest >= f.pts)
-                    {
-                        const double lag_ms = static_cast<double>(latest - f.pts) * 1000.0 /
-                                                static_cast<double>(fps);
-                        apps::g_glass_latency_ms.store(lag_ms, std::memory_order_relaxed);
-                        apps::g_latency_present_ms.store(lag_ms, std::memory_order_relaxed);
-                    }
-                }
-            }
-        }
-        else
-        {
-            diag->rx_present_err++;
-            const uint64_t n = diag->rx_present_err.load();
-            if (n <= 12)
-            {
-                std::fprintf(stderr, "stream_sdl: display present failed (%d", pr);
-                if (-pr > 0 && -pr < 4096)
-                {
-                    std::fprintf(stderr, "; %s", std::strerror(-pr));
-                }
-                std::string sink_stats;
-                if (display->query("stats", &sink_stats) == 0)
-                {
-                    std::fprintf(stderr, "; sink{%.*s}", static_cast<int>(sink_stats.size()),
-                                 sink_stats.data());
-                }
-                std::fprintf(stderr, ")\n");
-            }
-        }
-    }
-
-    data_packet tail;
-    while (present_q->pop(tail, 0))
-    {
-        if (display->input(0, tail) == 0)
-        {
-            diag->rx_present_ok++;
-        }
-    }
-}
-
-int feed_decoder_au(h264_decoder_mpp *dec, data_packet &au, apps::present_frame_queue *present_q,
-                    bench_diag &diag)
-{
-    if (!g_run.load())
-    {
-        return -ECANCELED;
-    }
     if (ensure_decoder_open(dec) < 0)
     {
         return -EINVAL;
     }
-    for (int attempt = 0; g_run.load() && attempt < 48; attempt++)
+    auto *dec_in = dynamic_cast<component_input *>(dec);
+    if (nullptr == dec_in)
     {
-        const int r = dec->input(0, au);
+        return -ENOTSUP;
+    }
+    const size_t bytes = pdu.sdu.size();
+    for (int attempt = 0; g_run.load(std::memory_order_relaxed) && attempt < 48; attempt++)
+    {
+        component_pdu attempt_pdu = pdu;
+        const int     r = dec_in->input(std::move(attempt_pdu));
         if (0 == r)
         {
             diag.rx_dec_in_ok++;
-            diag.rx_dec_in_bytes += packet_frame_bytes(au);
+            diag.rx_dec_in_bytes += bytes;
             return 0;
         }
         if (-ECANCELED == r)
@@ -212,124 +99,217 @@ int feed_decoder_au(h264_decoder_mpp *dec, data_packet &au, apps::present_frame_
         if (-EAGAIN == r)
         {
             diag.rx_dec_in_eagain++;
-            if (!g_run.load())
-            {
-                return -ECANCELED;
-            }
-            drain_decoder_to_present(dec, present_q, diag);
+            drain_dec_pdus(dec, present_queue, diag);
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
             continue;
         }
         diag.rx_dec_in_err++;
-        if (diag.rx_dec_in_err <= 5)
-        {
-            const frame_data &f = data_packet::cast<frame_data>(au);
-            std::fprintf(stderr,
-                         "stream_sdl: h264_decoder input failed (%d) au_bytes=%zu\n", r,
-                         f.buf.size());
-        }
         return r;
     }
     return -EAGAIN;
 }
+
+}  // namespace
+
 int prepare_preview_sink(component_sink *preview, bool /*kmsdrm*/, int w, int h)
 {
     return static_cast<sdl_sink *>(preview)->prepare(w, h);
 }
-void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, apps::rx_au_queue *au_q,
-                        bench_diag *diag)
+
+void present_thread_main(component_sink *display, present_pdu_queue *present_queue, int width, int height,
+                         bool kmsdrm, bool sdl_open_on_thread, bench_diag *diag)
 {
-    auto depay_sock = [&](data_packet &sock_pkt) {
-        diag->rx_udp++;
-        const int dep = depay->input(0, sock_pkt);
-        if (dep < 0)
+    if (nullptr == display || nullptr == present_queue || nullptr == diag)
+    {
+        return;
+    }
+    if (sdl_open_on_thread)
+    {
+        if (display->open() < 0)
         {
-            diag->rx_depay_err++;
-            if (diag->rx_depay_err <= 5)
-            {
-                std::fprintf(stderr, "stream_sdl: rtp depay input failed (%d)\n", dep);
-            }
             return;
         }
-        data_packet au;
-        while (g_run.load() && depay->output(0, au, 0) == 0)
+        (void)prepare_preview_sink(display, kmsdrm, width, height);
+    }
+    else if (kmsdrm)
+    {
+        (void)prepare_preview_sink(display, kmsdrm, width, height);
+    }
+    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    present_queue->bind_wakeup(wake);
+    auto *sink_pdu = dynamic_cast<component_input *>(display);
+    component &deadline_owner = *display;
+    while (g_run.load(std::memory_order_relaxed))
+    {
+        component_pdu pdu;
+        if (!present_queue->try_pop(pdu))
+        {
+            wait_for_pdu(*wake, deadline_owner, g_run);
+            continue;
+        }
+        if (nullptr == sink_pdu)
+        {
+            diag->rx_present_err++;
+            continue;
+        }
+        log_pdu_stage_latency("present", pdu);
+        if (sink_pdu->input(std::move(pdu)) == 0)
+        {
+            diag->rx_present_ok++;
+        }
+        else
+        {
+            diag->rx_present_err++;
+        }
+        if (auto *sdl = dynamic_cast<sdl_sink *>(display))
+        {
+            (void)sdl->present_pending();
+        }
+    }
+}
+
+void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_queue *au_in_queue,
+                        bench_diag *diag)
+{
+    auto *rcv_out = dynamic_cast<component_output *>(rcv);
+    auto *depay_in = dynamic_cast<component_input *>(depay);
+    auto *depay_out = dynamic_cast<component_output *>(depay);
+    auto *rcv_owner = dynamic_cast<component *>(rcv);
+    if (nullptr == rcv || nullptr == depay || nullptr == rcv_out || nullptr == depay_in ||
+        nullptr == depay_out || nullptr == rcv_owner)
+    {
+        return;
+    }
+    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    rcv_owner->set_wakeup(wake);
+    uint64_t au_seq = 0;
+    bool     have_au = false;
+    while (g_run.load(std::memory_order_relaxed))
+    {
+        component_pdu sock_pdu;
+        const int     got = rcv_out->output(sock_pdu);
+        if (0 != got)
+        {
+            if (got < 0 && -EAGAIN != got)
+            {
+                break;
+            }
+            if (-EAGAIN == got)
+            {
+                wait_for_pdu(*wake, *rcv_owner, g_run);
+            }
+            continue;
+        }
+        diag->rx_udp++;
+        if (depay_in->input(std::move(sock_pdu)) < 0)
+        {
+            diag->rx_depay_err++;
+            continue;
+        }
+        component_pdu au;
+        while (g_run.load(std::memory_order_relaxed) && depay_out->output(au) == 0)
         {
             diag->rx_depay_au++;
             if (g_rx.skip_decode.load())
             {
                 continue;
             }
-            log_stage_latency("depay", au);
-            au_q->push(std::move(au), &diag->rx_au_q_drop);
-        }
-    };
-
-    while (g_run.load())
-    {
-        data_packet sock_pkt;
-        const int   got = rcv->output(0, sock_pkt, 50);
-        if (0 == got)
-        {
-            depay_sock(sock_pkt);
-            continue;
-        }
-        if (got < 0 && -EAGAIN != got)
-        {
-            break;
+            note_pdu_sequence_gap(au.seq, au_seq, have_au, nullptr);
+            log_pdu_stage_latency("depay", au);
+            au_in_queue->push(std::move(au), &diag->rx_au_q_drop);
         }
     }
 }
 
-void decode_thread_main(h264_decoder_mpp *dec, apps::present_frame_queue *present_q, apps::rx_au_queue *au_q,
+void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue, pdu_rx_au_queue *au_in_queue,
                         bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.rx);
-
-    data_packet holding;
-    bool        have_holding = false;
-    while (g_run.load())
+    auto *owner = dynamic_cast<component *>(dec);
+    if (nullptr == owner)
+    {
+        return;
+    }
+    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    owner->set_wakeup(wake);
+    au_in_queue->bind_wakeup(wake);
+    component_pdu pdu;
+    bool          holding = false;
+    uint64_t            last_seq = 0;
+    bool                have_seq = false;
+    while (g_run.load(std::memory_order_relaxed))
     {
         if (g_rx.skip_decode.load())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-
-        if (!have_holding)
+        bool progressed = drain_dec_pdus(dec, present_queue, *diag);
+        if (!holding)
         {
-            if (!au_q->pop(holding, 50))
+            if (au_in_queue->try_pop(pdu))
             {
-                drain_decoder_to_present(dec, present_q, *diag);
+                progressed = true;
+                note_pdu_sequence_gap(pdu.seq, last_seq, have_seq, nullptr);
+                if (is_caps(pdu.sdu_type))
+                {
+                    if (ensure_decoder_open(dec) < 0)
+                    {
+                        holding = false;
+                        continue;
+                    }
+                    auto *dec_pdu_in = dynamic_cast<component_input *>(dec);
+                    if (nullptr != dec_pdu_in)
+                    {
+                        const int cr = dec_pdu_in->input(std::move(pdu));
+                        if (0 == cr)
+                        {
+                            diag->rx_dec_in_ok++;
+                        }
+                        else if (-EAGAIN != cr && -ECANCELED != cr)
+                        {
+                            diag->rx_dec_in_err++;
+                        }
+                    }
+                    continue;
+                }
+                log_pdu_stage_latency("dec_in", pdu);
+                holding = true;
+            }
+        }
+        if (holding)
+        {
+            const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag);
+            if (0 == r)
+            {
+                holding = false;
+                if (drain_dec_pdus(dec, present_queue, *diag))
+                {
+                    progressed = true;
+                }
                 continue;
             }
-            have_holding = true;
+            if (-EAGAIN == r)
+            {
+                if (drain_dec_pdus(dec, present_queue, *diag))
+                {
+                    progressed = true;
+                }
+                continue;
+            }
+            if (-ECANCELED == r)
+            {
+                break;
+            }
+            holding = false;
         }
-
-        log_stage_latency("dec_in", holding);
-        const int r = feed_decoder_au(dec, holding, present_q, *diag);
-        if (0 == r)
+        if (!progressed)
         {
-            have_holding = false;
-            holding.release();
-            drain_decoder_to_present(dec, present_q, *diag);
-            continue;
+            wait_for_pdu(*wake, *owner, g_run);
         }
-        if (-EAGAIN == r)
-        {
-            drain_decoder_to_present(dec, present_q, *diag);
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
-            continue;
-        }
-        if (-ECANCELED == r)
-        {
-            break;
-        }
-        have_holding = false;
-        holding.release();
     }
-
-    drain_decoder_to_present(dec, present_q, *diag);
+    drain_dec_pdus(dec, present_queue, *diag);
 }
-
 
 #endif
 

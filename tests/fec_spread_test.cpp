@@ -1,13 +1,13 @@
 #include "components/stream_receiver.hpp"
 #include "components/stream_sender.hpp"
-#include "core/data_packet.hpp"
 #include "core/fec_spread.hpp"
-#include "core/packet_types.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/shared_sized_buffer.hpp"
 #include "core/stream_header.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -34,15 +34,6 @@ int cfg(vstreamer::component &c, std::string_view key, std::string_view value)
     return c.configure(key, value);
 }
 
-vstreamer::data_packet app_packet(uint8_t tag, size_t len = 64)
-{
-    std::vector<uint8_t> storage(len, tag);
-    auto sd = std::make_unique<vstreamer::sock_data>();
-    sd->buf = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
-    vstreamer::data_packet pkt;
-    pkt.reset(std::move(sd));
-    return pkt;
-}
 
 /* A loopback UDP socket standing in for the receiver; records arrival time and FEC header. */
 class wire_sniffer
@@ -217,7 +208,7 @@ TEST(FecSpreadTest, ZeroSendsBlockAtOnce)
     open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
     for (uint8_t t = 0; t < 4; t++)
     {
-        ASSERT_EQ(0, sender.input(0, app_packet(t)));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     const auto got = sniff.collect(6, 1000);
     ASSERT_EQ(6u, got.size());
@@ -233,7 +224,7 @@ TEST(FecSpreadTest, BlockSpreadOverWindowInOrder)
     open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
     for (uint8_t t = 0; t < 4; t++)
     {
-        ASSERT_EQ(0, sender.input(0, app_packet(t)));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     const auto got = sniff.collect(6, 1000);
     ASSERT_EQ(6u, got.size());
@@ -252,7 +243,7 @@ TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
     wire_sniffer             sniff;
     vstreamer::stream_sender sender;
     open_fec_sender(sender, sniff.host_port(), 8, 12, 20);
-    ASSERT_EQ(0, sender.input(0, app_packet(1)));  // flushed by the 20 ms timeout
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1))));  // flushed by the 20 ms timeout
     const auto got = sniff.collect(5, 1000);
     ASSERT_EQ(5u, got.size());  // 1 data + 4 parity
     EXPECT_EQ(5, got.front().n_sent);
@@ -269,12 +260,12 @@ TEST(FecSpreadTest, OverlappingBlocksInterleave)
     open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
     for (uint8_t t = 0; t < 4; t++)
     {
-        ASSERT_EQ(0, sender.input(0, app_packet(t)));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     for (uint8_t t = 4; t < 8; t++)
     {
-        ASSERT_EQ(0, sender.input(0, app_packet(t)));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     const auto got = sniff.collect(12, 1000);
     ASSERT_EQ(12u, got.size());
@@ -320,7 +311,7 @@ TEST(FecSpreadTest, RawNotDelayed)
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
     const auto t0 = clock_type::now();
-    ASSERT_EQ(0, sender.input(0, app_packet(7)));
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(7))));
     pollfd pfd {fd, POLLIN, 0};
     ASSERT_EQ(1, poll(&pfd, 1, 500));
     EXPECT_LT(ms_between(t0, clock_type::now()), 10.0);
@@ -429,27 +420,27 @@ TEST(FecSpreadTest, LoopbackInOrderWithSpread)
     constexpr int k_packets = 40;
     for (int i = 0; i < k_packets; i++)
     {
-        ASSERT_EQ(0, sender.input(0, app_packet(static_cast<uint8_t>(i))));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(static_cast<uint8_t>(i)))));
         if (i % 7 == 6)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(3));
         }
     }
     std::vector<uint8_t> tags;
-    vstreamer::data_packet out;
+    vstreamer::component_pdu out;
     const auto deadline = clock_type::now() + std::chrono::seconds(2);
     while (tags.size() < k_packets && clock_type::now() < deadline)
     {
-        if (0 == receiver.output(0, out, 50))
+        if (0 == receiver.output(out))
         {
-            const auto &sd = vstreamer::data_packet::cast<vstreamer::sock_data>(out);
-            tags.push_back(sd.buf.u8()[0]);
+            tags.push_back(static_cast<uint8_t>(
+                vstreamer::test_pdu::stream_dgram_counter_be32(out.sdu.u8(), out.sdu.size())));
         }
     }
     ASSERT_EQ(static_cast<size_t>(k_packets), tags.size());
     for (int i = 0; i < k_packets; i++)
     {
-        EXPECT_EQ(static_cast<uint8_t>(i), tags[static_cast<size_t>(i)]);
+        EXPECT_EQ(static_cast<uint32_t>(i), static_cast<uint32_t>(tags[static_cast<size_t>(i)]));
     }
     sender.close();
     receiver.close();
@@ -468,7 +459,7 @@ TEST(FecSpreadTest, TimeoutFlushOnTimeWhenIdle)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(7 * i % 50 + 60));
         const auto t0 = clock_type::now();
-        ASSERT_EQ(0, sender.input(0, app_packet(static_cast<uint8_t>(i))));
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(static_cast<uint8_t>(i)))));
         const auto got = sniff.collect(5, 500);  // 1 data + 4 parity
         ASSERT_EQ(5u, got.size());
         worst_ms = std::max(worst_ms, ms_between(t0, got.front().at));

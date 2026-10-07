@@ -207,7 +207,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double enc_q_pop_fps =
         apps::rate_per_sec(now.tx_enc_nv12_popped, prev.tx_enc_nv12_popped, dt);
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
-    const size_t enc_q_depth = (nullptr != g_tx.metrics_nv12_q) ? g_tx.metrics_nv12_q->size() : 0;
+    const size_t enc_q_depth =
+        (nullptr != g_tx.metrics_nv12_pipe) ? g_tx.metrics_nv12_pipe->size() : 0;
 #else
     const size_t enc_q_depth = 0;
 #endif
@@ -243,6 +244,12 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 #endif
 #if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)
     apps::rx::publish_latency_metrics(glass_ms);
+#endif
+#if !defined(VSTREAMER_BENCH_RX_ONLY)
+    if (nullptr != sender)
+    {
+        apps::tx::publish_tx_latency_metrics(enc);
+    }
 #endif
 
 #if defined(ENABLE_STREAM_RECEIVER)
@@ -315,8 +322,14 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      static_cast<int64_t>(qp_val));
         if (nullptr != enc)
         {
-            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"),
-                         query_component_latency_ms(*enc));
+            double enc_lat_ms =
+                apps::g_latency_enc_out_ms.load(std::memory_order_relaxed);
+            const double queried = query_component_latency_ms(*enc);
+            if (queried > 0.0)
+            {
+                enc_lat_ms = queried;
+            }
+            metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"), enc_lat_ms);
         }
 
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
@@ -526,6 +539,7 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
     if (nullptr != sender)
     {
         apps::tx::sync_sender_peer_link_metrics_live(*sender);
+        apps::tx::publish_tx_latency_metrics(enc);
     }
 #endif
 #if defined(ENABLE_STREAM_RECEIVER) && !defined(VSTREAMER_BENCH_TX_ONLY)

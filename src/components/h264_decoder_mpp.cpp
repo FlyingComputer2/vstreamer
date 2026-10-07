@@ -1,6 +1,7 @@
 #include "components/h264_decoder_mpp.hpp"
 
 #include "core/key_util.hpp"
+#include "core/sdu_type.hpp"
 #include "core/output_opts.hpp"
 #include "core/pix_convert.hpp"
 #include "core/time_util.hpp"
@@ -72,6 +73,94 @@ int parse_size(std::string_view s, int *w, int *h)
 
 }  // namespace
 
+const std::vector<port_desc> &h264_decoder_mpp::input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_CODED;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+const std::vector<port_desc> &h264_decoder_mpp::output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::NV12;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+bool h264_decoder_mpp::coded_caps_acceptable(const video_coded_caps &caps) const
+{
+    if (!output_size_stream)
+    {
+        if (caps.width != width || caps.height != height)
+        {
+            return false;
+        }
+    }
+    else if (caps.width <= 0 || caps.height <= 0)
+    {
+        return width > 0 && height > 0;
+    }
+    for (const port_caps_entry &entry : input_ports()[0].caps)
+    {
+        if (entry.sdu_type == sdu_type_e::CAPS_VIDEO_CODED && match(entry, caps))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void h264_decoder_mpp::maybe_emit_output_caps_locked(int32_t w, int32_t h, int32_t hor,
+                                                     int32_t ver, uint64_t ts_us)
+{
+    video_raw_caps raw {};
+    raw.width = w;
+    raw.height = h;
+    raw.hor_stride = hor;
+    raw.ver_stride = ver;
+    if (have_output_caps_ && raw.width == output_caps_.width && raw.height == output_caps_.height &&
+        raw.hor_stride == output_caps_.hor_stride && raw.ver_stride == output_caps_.ver_stride)
+    {
+        return;
+    }
+    output_caps_ = raw;
+    have_output_caps_ = true;
+    component_pdu caps_pdu = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, raw, ts_us, 0);
+    caps_pdu.seq = 0;
+    pending_caps_out_.push_back(std::move(caps_pdu));
+}
+
+void h264_decoder_mpp::drain_thread_main()
+{
+    while (!drain_stop_.load(std::memory_order_relaxed))
+    {
+        if (!opened)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        drain_mpp_to_ready(10);
+        notify_wakeup();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 h264_decoder_mpp::h264_decoder_mpp() = default;
 
 h264_decoder_mpp::~h264_decoder_mpp()
@@ -84,15 +173,7 @@ std::string h264_decoder_mpp::name() const
     return "h264_decoder_mpp";
 }
 
-media_kind_e h264_decoder_mpp::input_kind() const
-{
-    return media_kind_e::H264;
-}
 
-media_kind_e h264_decoder_mpp::output_kind() const
-{
-    return output_format;
-}
 
 int h264_decoder_mpp::ensure_decoder_locked()
 {
@@ -190,17 +271,8 @@ void h264_decoder_mpp::free_decoder_locked()
 
 void h264_decoder_mpp::clear_pending_locked()
 {
-    for (vstreamer::frame &f : ready_frames)
-    {
-        f.release();
-    }
     ready_frames.clear();
-    pts_ring_head = 0;
-    for (pts_capture_entry &e : pts_ring)
-    {
-        e.pts = 0;
-        e.capture_mono_ns = 0;
-    }
+    pending_caps_out_.clear();
 }
 
 int h264_decoder_mpp::handle_info_change_locked(void *mpp_frame)
@@ -271,7 +343,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         return -EIO;
     }
 
-    if (output_format != media_kind_e::NV12)
+    if (output_format != sdu_type_e::NV12)
     {
         return -ENOTSUP;
     }
@@ -344,38 +416,27 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         return r;
     }
 
-    const int64_t pts = mpp_frame_get_pts(frame);
-    const int64_t cap_ns = lookup_capture_pts(pts);
-    vstreamer::frame packed;
-    packed.reset(media_kind_e::NV12, out_w, out_h, pts, false, std::move(out_buf), cap_ns);
-    if (cap_ns > 0)
+    const uint64_t ts_us = static_cast<uint64_t>(mpp_frame_get_pts(frame));
+    maybe_emit_output_caps_locked(out_w, out_h, hor, ver, ts_us);
+    component_pdu pdu;
+    pdu.ts_us = ts_us;
+    pdu.seq = 0;
+    pdu.sdu_type = sdu_type_e::NV12;
+    pdu.port = 0;
+    pdu.flags = 0;
+    pdu.sdu = std::move(out_buf);
+    if (ts_us > 0)
     {
         const int64_t now_ns = steady_mono_ns();
+        const int64_t cap_ns = static_cast<int64_t>(ts_us) * 1000LL;
         const double  ms = static_cast<double>(now_ns - cap_ns) / 1e6;
         if (ms >= 0.0)
         {
             last_latency_ms = ms;
         }
     }
-    ready_frames.push_back(std::move(packed));
-    return 0;
-}
-
-void h264_decoder_mpp::remember_capture_pts(int64_t pts, int64_t capture_mono_ns)
-{
-    pts_ring[pts_ring_head % k_pts_ring] = {pts, capture_mono_ns};
-    pts_ring_head++;
-}
-
-int64_t h264_decoder_mpp::lookup_capture_pts(int64_t pts) const
-{
-    for (const pts_capture_entry &e : pts_ring)
-    {
-        if (e.pts == pts && e.capture_mono_ns > 0)
-        {
-            return e.capture_mono_ns;
-        }
-    }
+    ready_frames.push_back(std::move(pdu));
+    notify_wakeup();
     return 0;
 }
 
@@ -486,18 +547,25 @@ int h264_decoder_mpp::fetch_one_mpp_frame(int timeout_ms)
 
 int h264_decoder_mpp::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
     {
-        return 0;
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return 0;
+        }
+        const int r = ensure_decoder_locked();
+        if (r < 0)
+        {
+            return r;
+        }
+        opened = true;
+        cancel_io = false;
     }
-    int r = ensure_decoder_locked();
-    if (r < 0)
+    drain_stop_.store(false, std::memory_order_relaxed);
+    if (!drain_thread_.joinable())
     {
-        return r;
+        drain_thread_ = std::thread([this]() { drain_thread_main(); });
     }
-    opened = true;
-    cancel_io = false;
     return 0;
 }
 
@@ -509,21 +577,85 @@ void h264_decoder_mpp::cancel_pending_io()
 void h264_decoder_mpp::close()
 {
     cancel_pending_io();
+    drain_stop_.store(true, std::memory_order_relaxed);
+    notify_wakeup();
+    if (drain_thread_.joinable())
+    {
+        drain_thread_.join();
+    }
     std::lock_guard<std::mutex> lock(mu);
     clear_pending_locked();
     free_decoder_locked();
     opened = false;
     cancel_io = false;
+    have_input_caps_ = false;
+    caps_reject_ = false;
+    have_output_caps_ = false;
+    pending_caps_out_.clear();
 }
 
-int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
+int h264_decoder_mpp::input_pdu_locked(component_pdu &&in)
 {
-    const frame_data &f = data_packet::cast<frame_data>(in);
-    if (f.kind != media_kind_e::H264 || f.buf.size() > k_max_au)
+    if (0 != in.port)
     {
         return -EINVAL;
     }
-
+    if (in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED)
+    {
+        video_coded_caps caps {};
+        if (read_caps(in, &caps) != 0)
+        {
+            return -EINVAL;
+        }
+        video_coded_caps use_caps = caps;
+        if (output_size_stream && (use_caps.width <= 0 || use_caps.height <= 0))
+        {
+            if (width <= 0 || height <= 0)
+            {
+                caps_reject_ = true;
+                have_input_caps_ = false;
+                return -ENOTSUP;
+            }
+            use_caps.width = width;
+            use_caps.height = height;
+        }
+        if (!coded_caps_acceptable(use_caps))
+        {
+            caps_reject_ = true;
+            have_input_caps_ = false;
+            return -ENOTSUP;
+        }
+        caps_reject_ = false;
+        input_caps_ = use_caps;
+        have_input_caps_ = true;
+        if (!output_size_stream)
+        {
+            width = use_caps.width;
+            height = use_caps.height;
+        }
+        return 0;
+    }
+    if (in.sdu_type != sdu_type_e::H264_AU)
+    {
+        return -EINVAL;
+    }
+    if (!have_input_caps_ && output_size_stream && width > 0 && height > 0)
+    {
+        video_coded_caps implied {};
+        implied.width = width;
+        implied.height = height;
+        input_caps_ = implied;
+        have_input_caps_ = true;
+        caps_reject_ = false;
+    }
+    if (caps_reject_ || !have_input_caps_)
+    {
+        return -ENOTSUP;
+    }
+    if (in.sdu.size() > k_max_au)
+    {
+        return -EINVAL;
+    }
     {
         std::lock_guard<std::mutex> lock(mu);
         if (!opened || nullptr == ctx || nullptr == mpi)
@@ -534,26 +666,16 @@ int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
         {
             return -EAGAIN;
         }
-        remember_capture_pts(f.pts, f.capture_mono_ns);
-    }
-
-    drain_mpp_to_ready(0);
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        if (ready_frames.size() >= k_max_ready_frames)
-        {
-            return -EAGAIN;
-        }
     }
 
     MppPacket packet = nullptr;
-    MPP_RET   ret = mpp_packet_init(&packet, const_cast<uint8_t *>(f.buf.u8()), f.buf.size());
+    MPP_RET   ret = mpp_packet_init(&packet, const_cast<uint8_t *>(in.sdu.u8()), in.sdu.size());
     if (ret != MPP_OK || nullptr == packet)
     {
         return -ENOMEM;
     }
-    mpp_packet_set_pts(packet, f.pts);
-    mpp_packet_set_length(packet, f.buf.size());
+    mpp_packet_set_pts(packet, static_cast<int64_t>(in.ts_us));
+    mpp_packet_set_length(packet, in.sdu.size());
 
     void *mpp_ctx = nullptr;
     void *mpp_mpi = nullptr;
@@ -572,46 +694,47 @@ int h264_decoder_mpp::input(uint8_t /*port*/, const data_packet &in)
 
     if (ret == MPP_ERR_BUFFER_FULL)
     {
-        drain_mpp_to_ready(0);
         return -EAGAIN;
     }
     if (ret != MPP_OK)
     {
         return -EIO;
     }
-
-    drain_mpp_to_ready(0);
     return 0;
 }
 
-int h264_decoder_mpp::output(uint8_t /*port*/, data_packet &out, int timeout_ms)
+int h264_decoder_mpp::input(component_pdu &&in)
 {
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (!opened || nullptr == ctx || nullptr == mpi)
+        if (!opened)
         {
             return -EBADF;
         }
-        if (!ready_frames.empty())
-        {
-            out.adopt_frame(std::move(ready_frames.front()));
-            ready_frames.pop_front();
-            return 0;
-        }
     }
+    return input_pdu_locked(std::move(in));
+}
 
-    drain_mpp_to_ready(timeout_ms);
+
+int h264_decoder_mpp::output(component_pdu &out)
+{
+    if (!pending_caps_out_.empty())
     {
-        std::lock_guard<std::mutex> lock(mu);
-        if (ready_frames.empty())
-        {
-            return -EAGAIN;
-        }
-        out.adopt_frame(std::move(ready_frames.front()));
-        ready_frames.pop_front();
+        out = std::move(pending_caps_out_.front());
+        pending_caps_out_.pop_front();
         return 0;
     }
+    std::lock_guard<std::mutex> lock(mu);
+    if (ready_frames.empty())
+    {
+        return -EAGAIN;
+    }
+    out = std::move(ready_frames.front());
+    out.seq = out_seq_++;
+    ready_frames.pop_front();
+    return 0;
 }
+
 
 int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
 {
@@ -656,8 +779,8 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
     }
     if (key == "output_format")
     {
-        media_kind_e kind = media_kind_e::UNKNOWN;
-        int          r = parse_output_format(v, &kind);
+        sdu_type_e kind = sdu_type_e::UNKNOWN;
+        int        r = parse_output_format(v, &kind);
         if (r < 0)
         {
             return r;
@@ -734,6 +857,16 @@ int h264_decoder_mpp::query(std::string_view key, std::string *value) const
         }
         *value = buf;
         return 0;
+    }
+    int r = port_caps_query(input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
+    r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
     }
     return -ENOTSUP;
 }

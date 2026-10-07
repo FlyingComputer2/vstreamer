@@ -8,6 +8,11 @@ set(VSTREAMER_TEST_SOURCES
     h264_level_test.cpp
     key_util_test.cpp
     time_util_test.cpp
+    component_pdu_test.cpp
+    port_caps_test.cpp
+    pdu_wakeup_test.cpp
+    stage_queue_wakeup_test.cpp
+    stage_loop_output_drain_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
     stream_header_test.cpp
@@ -17,8 +22,18 @@ set(VSTREAMER_TEST_SOURCES
     shared_sized_buffer_test.cpp
 )
 
+if(ENABLE_V4L2_SOURCE)
+    list(APPEND VSTREAMER_TEST_SOURCES v4l2_source_lifecycle_test.cpp)
+endif()
+
 if(ENABLE_V4L2_SOURCE AND ENABLE_NOISE_SOURCE)
     list(APPEND VSTREAMER_TEST_SOURCES source_selector_test.cpp)
+endif()
+
+if(ENABLE_JPEG_DECODER_MULTICORE)
+    list(APPEND VSTREAMER_TEST_SOURCES
+        jpeg_decoder_multicore_test.cpp
+        jpeg_stage_inflight_test.cpp)
 endif()
 
 if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
@@ -28,6 +43,11 @@ if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
         stream_sender_test.cpp
         stream_receiver_test.cpp
     )
+endif()
+
+include(${CMAKE_SOURCE_DIR}/src/apps/common/app_capabilities.cmake)
+if(VSTREAMER_APP_TX_OK AND VSTREAMER_APP_RX_OK)
+    list(APPEND VSTREAMER_TEST_SOURCES stage_latency_metrics_test.cpp)
 endif()
 
 if(ENABLE_RTP_H264_PAY AND ENABLE_RTP_H264_DEPAY)
@@ -42,11 +62,15 @@ if(ENABLE_MKV_SINK)
     list(APPEND VSTREAMER_TEST_SOURCES mkv_sink_test.cpp)
 endif()
 
+if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_MPP OR ENABLE_H264_DECODER_MPP)
+    list(APPEND VSTREAMER_TEST_SOURCES codec_caps_rejection_test.cpp)
+endif()
+
 add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/bench_console.cpp)
 target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source apps_common)
-target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 include(GoogleTest)
@@ -73,7 +97,8 @@ endif()
 if(ENABLE_H264_ENCODER_MPP AND ENABLE_H264_DECODER_MPP)
     add_executable(h264_decoder_mpp_hw_test h264_decoder_mpp_test.cpp)
     target_link_libraries(h264_decoder_mpp_hw_test PRIVATE GTest::gtest_main vstreamer_source)
-    target_include_directories(h264_decoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(h264_decoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                                 ${CMAKE_SOURCE_DIR}/tests)
     target_compile_options(h264_decoder_mpp_hw_test PRIVATE -Wall -Wextra -Wpedantic)
     get_filename_component(_tsan_mpp_supp_dec "${CMAKE_CURRENT_SOURCE_DIR}/tsan_mpp.supp" ABSOLUTE)
     gtest_discover_tests(
@@ -90,7 +115,8 @@ endif()
 if(ENABLE_H264_ENCODER_MPP)
     add_executable(h264_encoder_mpp_hw_test h264_encoder_mpp_test.cpp)
     target_link_libraries(h264_encoder_mpp_hw_test PRIVATE GTest::gtest_main vstreamer_source)
-    target_include_directories(h264_encoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_include_directories(h264_encoder_mpp_hw_test PRIVATE ${CMAKE_SOURCE_DIR}/src
+                                                                 ${CMAKE_SOURCE_DIR}/tests)
     target_compile_options(h264_encoder_mpp_hw_test PRIVATE -Wall -Wextra -Wpedantic)
     get_filename_component(_tsan_mpp_supp "${CMAKE_CURRENT_SOURCE_DIR}/tsan_mpp.supp" ABSOLUTE)
     gtest_discover_tests(

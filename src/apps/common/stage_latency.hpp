@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "core/data_packet.hpp"
+#include "core/component_pdu.hpp"
 
 namespace vstreamer::apps
 {
@@ -23,11 +23,12 @@ extern std::atomic<double>  g_latency_present_ms;
 
 void stage_latency_set_diag_enabled(bool enabled);
 
-void note_source_pts(const vstreamer::data_packet &pkt);
-[[nodiscard]] size_t packet_frame_bytes(const vstreamer::data_packet &pkt);
-[[nodiscard]] vstreamer::media_kind_e packet_media_kind(const vstreamer::data_packet &pkt);
-void record_stage_latency_ms(const char *stage, const vstreamer::data_packet &, double ms);
-void log_stage_latency(const char *stage, const vstreamer::data_packet &pkt);
+[[nodiscard]] bool stage_latency_stderr_enabled();
+
+[[nodiscard]] int stage_latency_stderr_stride();
+
+void note_source_pdu(const vstreamer::component_pdu &pdu);
+void record_stage_latency_ms(const char *stage, double ms);
 
 }  // namespace vstreamer::apps
 

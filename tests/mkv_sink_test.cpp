@@ -1,10 +1,14 @@
 #include "components/mkv_sink.hpp"
 
-#include "core/data_packet.hpp"
-#include "core/packet_types.hpp"
+#include "core/component_pdu.hpp"
+#include "core/sdu_caps.hpp"
 #include "core/shared_sized_buffer.hpp"
 
 #include <gtest/gtest.h>
+
+#include "test_pdu_helpers.hpp"
+
+#include <cerrno>
 
 extern "C"
 {
@@ -18,9 +22,7 @@ extern "C"
 #include <string>
 #include <vector>
 
-using vstreamer::data_packet;
-using vstreamer::frame_data;
-using vstreamer::media_kind_e;
+using vstreamer::component_pdu;
 using vstreamer::mkv_sink;
 using vstreamer::shared_sized_buffer;
 
@@ -53,24 +55,6 @@ constexpr uint8_t k_minimal_jpeg[] = {
     0xf8, 0xf9, 0xfa, 0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00, 0xfb, 0xd5,
     0xdb, 0x20, 0xa8, 0xa8, 0xa8, 0xff, 0xd9,
 };
-
-data_packet make_mjpeg_packet(int w, int h, int64_t pts)
-{
-    auto body = std::make_shared<frame_data>();
-    body->kind = media_kind_e::MJPEG;
-    body->width = w;
-    body->height = h;
-    body->pts = pts;
-    body->key = true;
-    const size_t sz = sizeof(k_minimal_jpeg);
-    auto        *copy = static_cast<uint8_t *>(std::malloc(sz));
-    std::memcpy(copy, k_minimal_jpeg, sz);
-    body->buf = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(copy), sz, sz,
-                                           [](std::byte *p) {
-                                               std::free(reinterpret_cast<uint8_t *>(p));
-                                           });
-    return data_packet(std::move(body));
-}
 
 bool probe_video_span(const std::string &path, int *frame_count, double *duration_sec)
 {
@@ -133,7 +117,97 @@ bool probe_video_span(const std::string &path, int *frame_count, double *duratio
     return true;
 }
 
+vstreamer::component_pdu make_mjpeg_caps(int w, int h)
+{
+    vstreamer::video_coded_caps caps {};
+    caps.width = w;
+    caps.height = h;
+    return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_CODED, caps, 0, 0);
+}
+
+vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t frame_index)
+{
+    vstreamer::component_pdu pdu;
+    pdu.ts_us = static_cast<uint64_t>(frame_index * 33333);
+    pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
+    pdu.port = 0;
+    pdu.sdu = shared_sized_buffer::copy_from(k_minimal_jpeg, sizeof(k_minimal_jpeg));
+    return pdu;
+}
+
 }  // namespace
+
+TEST(MkvSinkTest, PortCapsAdvertisesMjpeg)
+{
+    mkv_sink    sink;
+    std::string val;
+    ASSERT_EQ(0, sink.query("inport-0.caps-0.sdu_type", &val));
+    EXPECT_EQ("CAPS_VIDEO_CODED", val);
+    ASSERT_EQ(0, sink.query("inport-0.caps-1.sdu_type", &val));
+    EXPECT_EQ("MJPEG", val);
+}
+
+TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
+{
+    mkv_sink sink;
+    ASSERT_EQ(0, sink.configure("queue_depth", "1"));
+    ASSERT_EQ(sink.open(), 0);
+    const auto base = std::filesystem::temp_directory_path() / "mkv_sink_pdu_eagain";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+    const std::string out_template = (base / "clip.mkv").string();
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+
+    ASSERT_EQ(0, sink.input(make_mjpeg_caps(320, 240)));
+    bool saw_eagain = false;
+    for (int i = 0; i < 512; ++i)
+    {
+        const int rc = sink.input(make_mjpeg_pdu(320, 240, i));
+        if (-EAGAIN == rc)
+        {
+            saw_eagain = true;
+            break;
+        }
+        ASSERT_EQ(0, rc);
+    }
+    EXPECT_TRUE(saw_eagain);
+
+    sink.close();
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvSinkTest, MicrosecondTimestampsDuration)
+{
+    const auto base = std::filesystem::temp_directory_path() / "mkv_sink_ts_us";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+
+    const std::string out_template = (base / "clip.mkv").string();
+    const std::string seg_path = (base / "clip-001.mkv").string();
+    mkv_sink sink;
+    ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+    ASSERT_EQ(sink.configure("fps", "30"), 0);
+    ASSERT_EQ(sink.input(make_mjpeg_caps(320, 240)), 0);
+
+    for (int i = 0; i < 30; ++i)
+    {
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(320, 240, i)), 0);
+    }
+    sink.close();
+
+    int    frames = 0;
+    double dur = 0.0;
+    ASSERT_TRUE(std::filesystem::exists(seg_path));
+    ASSERT_TRUE(probe_video_span(seg_path, &frames, &dur));
+    EXPECT_EQ(frames, 30);
+    EXPECT_NEAR(dur, 1.0, 0.1);
+
+    std::filesystem::remove_all(base, ec);
+}
 
 TEST(MkvSinkTest, DurationAndResizeSegments)
 {
@@ -148,6 +222,7 @@ TEST(MkvSinkTest, DurationAndResizeSegments)
 
     mkv_sink sink;
     ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
     ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
     ASSERT_EQ(sink.configure("fps", "30"), 0);
 
@@ -155,8 +230,11 @@ TEST(MkvSinkTest, DurationAndResizeSegments)
     {
         const int w = (i < 30) ? 320 : 640;
         const int h = (i < 30) ? 240 : 480;
-        data_packet pkt = make_mjpeg_packet(w, h, i);
-        ASSERT_EQ(sink.input(0, pkt), 0);
+        if (0 == i || i == 30)
+        {
+            ASSERT_EQ(sink.input(make_mjpeg_caps(w, h)), 0);
+        }
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(w, h, i)), 0);
     }
     sink.close();
 

@@ -7,13 +7,17 @@
 #include <cstddef>
 #include <deque>
 #include <mutex>
+#include <memory>
+#include <unordered_map>
 
-#include "core/data_packet.hpp"
+#include "core/component.hpp"
+#include "core/component_pdu.hpp"
+#include "core/pdu_wakeup.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/time_util.hpp"
 
 namespace vstreamer::apps
 {
-
-using vstreamer::data_packet;
 
 constexpr size_t k_default_pipe_queue_depth = 8;
 constexpr size_t k_default_present_queue_depth = 1;
@@ -21,56 +25,42 @@ constexpr size_t k_default_rx_au_queue_depth = 4;
 
 [[nodiscard]] size_t queue_depth_from_env(const char *name, size_t default_val, size_t max_val);
 
-class pipeline_queue
+class pipeline_pdu_queue
 {
 public:
-    pipeline_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
+    pipeline_pdu_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
 
-    bool push(data_packet pkt, std::atomic<uint64_t> *drops = nullptr)
+    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+
+    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+
+    bool push(component_pdu pkt, std::atomic<uint64_t> *drops = nullptr)
     {
         std::unique_lock<std::mutex> lock(mu);
         if (!run_.load())
         {
             return false;
+        }
+        queued_pdu entry;
+        entry.pdu = std::move(pkt);
+        if (!is_caps(entry.pdu.sdu_type))
+        {
+            entry.enqueue_mono_ns = steady_mono_ns();
         }
         if (q.size() >= capacity)
         {
             q.pop_front();
             if (nullptr != drops)
             {
-                drops->fetch_add(1);
+                drops->fetch_add(1, std::memory_order_relaxed);
             }
         }
-        q.push_back(std::move(pkt));
+        q.push_back(std::move(entry));
         cv_pop.notify_one();
-        return true;
-    }
-
-    bool push_wait(data_packet pkt, int timeout_ms)
-    {
-        std::unique_lock<std::mutex> lock(mu);
-        const auto room = [this] { return !run_.load() || q.size() < capacity; };
-        if (timeout_ms < 0)
+        if (wake_)
         {
-            cv_push.wait(lock, room);
+            wake_->notify();
         }
-        else if (timeout_ms > 0)
-        {
-            if (!cv_push.wait_for(lock, std::chrono::milliseconds(timeout_ms), room))
-            {
-                return false;
-            }
-        }
-        else if (!room())
-        {
-            return false;
-        }
-        if (!run_.load())
-        {
-            return false;
-        }
-        q.push_back(std::move(pkt));
-        cv_pop.notify_one();
         return true;
     }
 
@@ -80,53 +70,57 @@ public:
         return q.size();
     }
 
-    bool pop(data_packet &out, int timeout_ms)
+    [[nodiscard]] bool try_pop(component_pdu &out, int64_t *enqueue_mono_ns = nullptr)
     {
-        std::unique_lock<std::mutex> lock(mu);
-        const auto ready = [this] { return !run_.load() || !q.empty(); };
-        if (timeout_ms < 0)
-        {
-            cv_pop.wait(lock, ready);
-        }
-        else if (timeout_ms > 0)
-        {
-            cv_pop.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
-        }
-        else if (!ready())
-        {
-            return false;
-        }
+        std::lock_guard<std::mutex> lock(mu);
         if (q.empty())
         {
             return false;
         }
-        out = std::move(q.front());
+        queued_pdu entry = std::move(q.front());
         q.pop_front();
-        cv_push.notify_all();
+        out = std::move(entry.pdu);
+        if (nullptr != enqueue_mono_ns)
+        {
+            *enqueue_mono_ns = entry.enqueue_mono_ns;
+        }
         return true;
     }
 
     void wake_shutdown()
     {
-        cv_push.notify_all();
         cv_pop.notify_all();
+        if (wake_)
+        {
+            wake_->notify();
+        }
     }
 
 private:
-    size_t                  capacity;
-    std::atomic<bool>      &run_;
-    std::mutex              mu;
-    std::condition_variable cv_push;
-    std::condition_variable cv_pop;
-    std::deque<data_packet> q;
+    struct queued_pdu
+    {
+        component_pdu pdu;
+        int64_t       enqueue_mono_ns = 0;
+    };
+
+    size_t                       capacity;
+    std::atomic<bool>           &run_;
+    std::mutex                   mu;
+    std::condition_variable      cv_pop;
+    std::deque<queued_pdu>       q;
+    std::shared_ptr<pdu_wakeup>  wake_;
 };
 
-class present_frame_queue
+class present_pdu_queue
 {
 public:
-    present_frame_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
+    present_pdu_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
 
-    bool push(data_packet pkt, std::atomic<uint64_t> *drops = nullptr)
+    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+
+    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+
+    bool push(component_pdu pkt, std::atomic<uint64_t> *drops = nullptr)
     {
         std::lock_guard<std::mutex> lock(mu);
         if (!run_.load())
@@ -143,25 +137,16 @@ public:
         }
         q.push_back(std::move(pkt));
         cv_pop.notify_one();
+        if (wake_)
+        {
+            wake_->notify();
+        }
         return true;
     }
 
-    bool pop(data_packet &out, int timeout_ms)
+    [[nodiscard]] bool try_pop(component_pdu &out)
     {
-        std::unique_lock<std::mutex> lock(mu);
-        const auto ready = [this] { return !run_.load() || !q.empty(); };
-        if (timeout_ms < 0)
-        {
-            cv_pop.wait(lock, ready);
-        }
-        else if (timeout_ms > 0)
-        {
-            cv_pop.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
-        }
-        else if (!ready())
-        {
-            return false;
-        }
+        std::lock_guard<std::mutex> lock(mu);
         if (q.empty())
         {
             return false;
@@ -174,23 +159,32 @@ public:
     void wake()
     {
         cv_pop.notify_all();
+        if (wake_)
+        {
+            wake_->notify();
+        }
     }
 
 private:
-    size_t                  capacity;
-    std::atomic<bool>      &run_;
-    std::mutex              mu;
-    std::condition_variable cv_pop;
-    std::deque<data_packet> q;
+    size_t                       capacity;
+    std::atomic<bool>           &run_;
+    std::mutex                   mu;
+    std::condition_variable      cv_pop;
+    std::deque<component_pdu>    q;
+    std::shared_ptr<pdu_wakeup>  wake_;
 };
 
-struct rx_au_queue
+struct pdu_rx_au_queue
 {
-    rx_au_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
+    pdu_rx_au_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
 
     size_t capacity = k_default_rx_au_queue_depth;
 
-    void push(data_packet pkt, std::atomic<uint64_t> *au_q_drop_counter = nullptr)
+    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+
+    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+
+    void push(component_pdu pkt, std::atomic<uint64_t> *au_q_drop_counter = nullptr)
     {
         std::lock_guard<std::mutex> lock(mu);
         if (!run_.load())
@@ -207,24 +201,15 @@ struct rx_au_queue
         }
         q.push_back(std::move(pkt));
         cv.notify_one();
+        if (wake_)
+        {
+            wake_->notify();
+        }
     }
 
-    bool pop(data_packet &out, int timeout_ms)
+    [[nodiscard]] bool try_pop(component_pdu &out)
     {
-        std::unique_lock<std::mutex> lock(mu);
-        const auto                   ready = [this] { return !run_.load() || !q.empty(); };
-        if (timeout_ms < 0)
-        {
-            cv.wait(lock, ready);
-        }
-        else if (timeout_ms > 0)
-        {
-            cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), ready);
-        }
-        else if (!ready())
-        {
-            return false;
-        }
+        std::lock_guard<std::mutex> lock(mu);
         if (q.empty())
         {
             return false;
@@ -237,12 +222,17 @@ struct rx_au_queue
     void wake()
     {
         cv.notify_all();
+        if (wake_)
+        {
+            wake_->notify();
+        }
     }
 
-    std::mutex              mu;
-    std::condition_variable cv;
-    std::deque<data_packet> q;
-    std::atomic<bool>      &run_;
+    std::mutex                   mu;
+    std::condition_variable      cv;
+    std::deque<component_pdu>    q;
+    std::atomic<bool>           &run_;
+    std::shared_ptr<pdu_wakeup>  wake_;
 };
 
 }  // namespace vstreamer::apps

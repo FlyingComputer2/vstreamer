@@ -6,8 +6,8 @@
 #include <cstdlib>
 #include <cstring>
 
-#include "core/data_packet.hpp"
-#include "core/time_util.hpp"
+#include "core/component_pdu.hpp"
+#include "core/sdu_caps.hpp"
 
 namespace vstreamer::apps
 {
@@ -28,16 +28,28 @@ namespace
 
 std::atomic<bool> g_stage_latency_diag {false};
 
-[[nodiscard]] bool stage_latency_log_enabled()
+[[nodiscard]] bool stage_latency_log_env_enabled()
 {
     static const bool env_on = [] {
         const char *v = std::getenv("VSTREAMER_LOG_STAGE_LATENCY");
         return nullptr != v && v[0] != '\0' && 0 != std::strcmp(v, "0");
     }();
-    return g_stage_latency_diag.load(std::memory_order_relaxed) || env_on;
+    return env_on;
 }
 
-[[nodiscard]] int stage_latency_log_stride()
+}  // namespace
+
+void stage_latency_set_diag_enabled(bool enabled)
+{
+    g_stage_latency_diag.store(enabled, std::memory_order_relaxed);
+}
+
+bool stage_latency_stderr_enabled()
+{
+    return g_stage_latency_diag.load(std::memory_order_relaxed) || stage_latency_log_env_enabled();
+}
+
+int stage_latency_stderr_stride()
 {
     static const int every = [] {
         const char *v = std::getenv("VSTREAMER_STAGE_LATENCY_EVERY");
@@ -52,42 +64,16 @@ std::atomic<bool> g_stage_latency_diag {false};
     return every;
 }
 
-}  // namespace
-
-void stage_latency_set_diag_enabled(bool enabled)
+void note_source_pdu(const component_pdu &pdu)
 {
-    g_stage_latency_diag.store(enabled, std::memory_order_relaxed);
-}
-
-void note_source_pts(const data_packet &pkt)
-{
-    if (pkt.get_type() != packet_kind_e::FRAME)
+    if (is_caps(pdu.sdu_type) || pdu.ts_us == 0)
     {
         return;
     }
-    const frame_data &f = data_packet::cast<frame_data>(pkt);
-    g_latest_source_pts.store(f.pts, std::memory_order_relaxed);
+    g_latest_source_pts.store(static_cast<int64_t>(pdu.ts_us), std::memory_order_relaxed);
 }
 
-[[nodiscard]] size_t packet_frame_bytes(const data_packet &pkt)
-{
-    if (pkt.get_type() != packet_kind_e::FRAME)
-    {
-        return 0;
-    }
-    return data_packet::cast<frame_data>(pkt).buf.size();
-}
-
-[[nodiscard]] media_kind_e packet_media_kind(const data_packet &pkt)
-{
-    if (pkt.get_type() != packet_kind_e::FRAME)
-    {
-        return media_kind_e::UNKNOWN;
-    }
-    return data_packet::cast<frame_data>(pkt).kind;
-}
-
-void record_stage_latency_ms(const char *stage, const data_packet &, double ms)
+void record_stage_latency_ms(const char *stage, double ms)
 {
     if (nullptr == stage)
     {
@@ -126,36 +112,6 @@ void record_stage_latency_ms(const char *stage, const data_packet &, double ms)
         g_latency_present_ms.store(ms, std::memory_order_relaxed);
         g_glass_latency_ms.store(ms, std::memory_order_relaxed);
     }
-}
-
-void log_stage_latency(const char *stage, const data_packet &pkt)
-{
-    if (nullptr == stage || pkt.get_type() != packet_kind_e::FRAME)
-    {
-        return;
-    }
-    const frame_data &f = data_packet::cast<frame_data>(pkt);
-    if (f.capture_mono_ns <= 0)
-    {
-        return;
-    }
-    const int64_t now_ns = steady_mono_ns();
-    const double  ms = static_cast<double>(now_ns - f.capture_mono_ns) / 1e6;
-    if (ms >= 0.0)
-    {
-        record_stage_latency_ms(stage, pkt, ms);
-    }
-
-    if (!stage_latency_log_enabled())
-    {
-        return;
-    }
-    const int stride = stage_latency_log_stride();
-    if (stride > 1 && (f.pts % stride) != 0)
-    {
-        return;
-    }
-    std::fprintf(stderr, "stage_latency: %-10s %7.2f ms pts=%" PRId64 "\n", stage, ms, f.pts);
 }
 
 }  // namespace vstreamer::apps

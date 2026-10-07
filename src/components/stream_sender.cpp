@@ -3,6 +3,7 @@
 #include "core/fec_spread.hpp"
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
+#include "core/port_caps.hpp"
 #include "core/stream_header.hpp"
 
 #include <cerrno>
@@ -51,10 +52,9 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
     }
 }
 
-size_t wire_packet_bytes(const data_packet &pkt)
+size_t wire_packet_bytes(const shared_sized_buffer &buf)
 {
-    const sock_data &sd = data_packet::cast<sock_data>(pkt);
-    return sd.buf.size();
+    return buf.size();
 }
 
 /* `local` = [host:]port, port 0..65535 (0 = ephemeral). Empty = 0.0.0.0:0. */
@@ -83,6 +83,18 @@ int parse_local_spec(std::string_view spec, std::string *host, int *port)
 }
 
 }  // namespace
+
+const std::vector<port_desc> &stream_sender::input_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::STREAM_DGRAM;
+        p.caps.push_back(caps);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
 
 stream_sender::stream_sender()
     : pool(static_cast<size_t>(1500), k_queue_packet_cap)
@@ -163,18 +175,68 @@ std::string stream_sender::name() const
     return "stream_sender";
 }
 
-media_kind_e stream_sender::input_kind() const
-{
-    return media_kind_e::UNKNOWN;
-}
 
-packet_kind_e stream_sender::input_packet_kind(uint8_t port) const
+
+int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                                         std::chrono::steady_clock::time_point release)
 {
-    if (0 != port)
+    if (nullptr == data || 0 == len)
     {
-        return packet_kind_e::UNKNOWN;
+        return 0;
     }
-    return packet_kind_e::SOCK;
+    size_t payload_max = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        payload_max =
+            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(max_datagram))
+                         : stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+    }
+    if (0 == payload_max || len > payload_max)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return -EINVAL;
+    }
+    const size_t wire_len = k_stream_header_len + len;
+    const size_t limit = queue_byte_limit();
+
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        if (!queue.empty() &&
+            (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
+        {
+            return -EAGAIN;
+        }
+    }
+
+    shared_sized_buffer buf = pool.acquire(wire_len);
+    if (0 == buf.capacity() || buf.size() != wire_len)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return -ENOMEM;
+    }
+    /* sequence_number is stamped in send_thread_main() on every datagram. */
+    stream_header hdr {};
+    hdr.sequence_number = 0;
+    hdr.is_fec = is_fec_shard;
+    hdr.is_stream_data = true;
+    hdr.ext_len = 0;
+    stream_header_write(buf.u8(), hdr);
+    std::memcpy(buf.u8() + k_stream_header_len, data, len);
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        queue_bytes += wire_len;
+        /* Usually the newest release time, so the search ends at the back. */
+        auto pos = queue.end();
+        while (pos != queue.begin() && std::prev(pos)->release > release)
+        {
+            --pos;
+        }
+        queue.insert(pos, queued_wire {std::move(buf), release});
+    }
+    q_cv.notify_one();
+    return 0;
 }
 
 void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
@@ -206,13 +268,12 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         while (!queue.empty() &&
                (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
         {
-            queue_bytes -= wire_packet_bytes(queue.front().pkt);
+            queue_bytes -= wire_packet_bytes(queue.front().buf);
             queue.pop_front();
             evicted = true;
         }
     }
 
-    data_packet copy;
     shared_sized_buffer buf = pool.acquire(wire_len);
     if (0 == buf.capacity() || buf.size() != wire_len)
     {
@@ -228,11 +289,6 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     hdr.ext_len = 0;
     stream_header_write(buf.u8(), hdr);
     std::memcpy(buf.u8() + k_stream_header_len, data, len);
-    auto sd = std::make_unique<sock_data>();
-    sd->pts = 0;
-    sd->buf = std::move(buf);
-    copy.reset(std::move(sd));
-
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
@@ -242,7 +298,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         {
             --pos;
         }
-        queue.insert(pos, queued_wire {std::move(copy), release});
+        queue.insert(pos, queued_wire {std::move(buf), release});
     }
     if (evicted)
     {
@@ -503,7 +559,7 @@ void stream_sender::send_thread_main()
             }
         }
 
-        data_packet pkt;
+        shared_sized_buffer wire_buf;
         {
             /* Wake for the earliest release, a new enqueue, or the next FEC tick. */
             std::unique_lock<std::mutex> lock(q_mu);
@@ -544,9 +600,14 @@ void stream_sender::send_thread_main()
             {
                 continue;
             }
-            pkt = std::move(queue.front().pkt);
-            queue_bytes -= wire_packet_bytes(pkt);
+            wire_buf = std::move(queue.front().buf);
+            queue_bytes -= wire_packet_bytes(wire_buf);
             queue.pop_front();
+        }
+
+        if (wire_buf.empty())
+        {
+            continue;
         }
 
         if (!dst_ok || send_fd < 0)
@@ -568,14 +629,13 @@ void stream_sender::send_thread_main()
             }
         }
 
-        const sock_data &sd = data_packet::cast<sock_data>(pkt);
-        if (sd.buf.size() >= k_stream_header_len)
+        if (wire_buf.size() >= k_stream_header_len)
         {
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
-            stream_header_stamp_sequence(sd.buf.u8(), seq);
+            stream_header_stamp_sequence(wire_buf.u8(), seq);
         }
-        pace_wire_send(sd.buf.size());
-        const ssize_t n = sendto(send_fd, sd.buf.u8(), sd.buf.size(), 0,
+        pace_wire_send(wire_buf.size());
+        const ssize_t n = sendto(send_fd, wire_buf.u8(), wire_buf.size(), 0,
                                     reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
         if (n < 0)
         {
@@ -757,15 +817,9 @@ void stream_sender::close()
     q_cv.notify_all();
 }
 
-int stream_sender::input(uint8_t port, const data_packet &in)
+int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingress_bytes,
+                                  bool pdu_no_evict)
 {
-    if (0 != port)
-    {
-        return -EINVAL;
-    }
-    const sock_data &src = data_packet::cast<sock_data>(in);
-    const size_t     ingress_bytes = src.buf.size();
-
     bool oversized = false;
     bool opened_block = false;
     fec_mode_e mode = fec_mode_e::block;
@@ -783,8 +837,19 @@ int stream_sender::input(uint8_t port, const data_packet &in)
                 return 0;
             }
         }
-        enqueue_wire_copy(src.buf.u8(), src.buf.size(), false,
-                          std::chrono::steady_clock::now());
+        const auto release = std::chrono::steady_clock::now();
+        if (pdu_no_evict)
+        {
+            const int er = try_enqueue_wire_copy(data, len, false, release);
+            if (0 != er)
+            {
+                return er;
+            }
+        }
+        else
+        {
+            enqueue_wire_copy(data, len, false, release);
+        }
     }
     else
     {
@@ -800,13 +865,32 @@ int stream_sender::input(uint8_t port, const data_packet &in)
             const uint64_t                        before = fec.oversized();
             std::chrono::steady_clock::time_point dl;
             const bool had_deadline = fec.next_deadline(&dl);
-            fec.push_app(src.buf.u8(), src.buf.size(), &air);
+            fec.push_app(data, len, &air);
             oversized = fec.oversized() != before;
             opened_block = !had_deadline && fec.next_deadline(&dl);
         }
         if (!air.empty())
         {
-            enqueue_fec_air(&air);
+            if (pdu_no_evict)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
+                for (size_t j = 0; j < air.size(); j++)
+                {
+                    auto &pkt = air[j];
+                    const int er = try_enqueue_wire_copy(
+                        pkt.data(), pkt.size(), true,
+                        t0 + fec_spread_offset(j, air.size(), spread));
+                    if (0 != er)
+                    {
+                        return er;
+                    }
+                }
+            }
+            else
+            {
+                enqueue_fec_air(&air);
+            }
         }
         if (opened_block)
         {
@@ -830,6 +914,20 @@ int stream_sender::input(uint8_t port, const data_packet &in)
     }
     return 0;
 }
+
+int stream_sender::input(component_pdu &&in)
+{
+    if (0 != in.port || in.sdu_type != sdu_type_e::STREAM_DGRAM)
+    {
+        return -EINVAL;
+    }
+    if (in.sdu.empty())
+    {
+        return -EINVAL;
+    }
+    return ingest_app_sdu(in.sdu.u8(), in.sdu.size(), in.sdu.size(), true);
+}
+
 
 int stream_sender::set_enabled(bool on, int timeout_ms)
 {
@@ -1166,6 +1264,12 @@ int stream_sender::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+
+    int r = port_caps_query(input_ports(), true, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
     }
 
     if ("stream" == key)

@@ -23,13 +23,25 @@ class rtp_h264_packer
 {
 public:
     explicit rtp_h264_packer(rtp_h264_config cfg);
+    rtp_h264_packer(const rtp_h264_packer &) = default;
 
     void reset();
 
-    /* Clears pending and enqueues new datagrams. */
+    /* Clears pending and enqueues new datagrams. pts is a frame index (legacy). */
     int pack_annexb(const uint8_t *data, size_t size, int64_t pts, int64_t capture_rt_ns = 0);
 
+    /* Like pack_annexb but rtp_ts is already in 90 kHz units (from capture ts_us). */
+    int pack_annexb_rtp_ts(const uint8_t *data, size_t size, uint32_t rtp_ts,
+                           int64_t capture_rt_ns = 0);
+
     bool pending() const { return !queue.empty(); }
+
+    [[nodiscard]] size_t pending_datagram_count() const { return queue.size(); }
+
+    /* Datagrams pack_annexb_rtp_ts would emit; does not advance this packer's seq. */
+    [[nodiscard]] size_t count_annexb_rtp_datagrams(const uint8_t *data, size_t size,
+                                                    uint32_t rtp_ts,
+                                                    int64_t capture_rt_ns = 0) const;
 
     /* Copies one datagram into dst; returns size or negative errno. */
     int pop_datagram(uint8_t *dst, size_t cap);

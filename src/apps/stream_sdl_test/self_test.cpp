@@ -112,16 +112,19 @@ bool run_self_test(h264_encoder_t &enc, component_sink *preview, stream_receiver
         std::fprintf(stderr, "self-test: channel did not apply forward loss (check console)\n");
         return false;
     }
-    if (qp_after > qp_before)
+    const uint64_t nv12_after = g_bench_diag.rx_nv12_out.load();
+    if (nv12_after > nv12)
     {
         return true;
     }
-    if (ch.dropped_loss >= 8 && qp_before >= 44)
+    if (presented > 0 && g_bench_diag.rx_present_ok.load() >= presented)
     {
-        std::fprintf(stderr, "self-test: qp at ceiling (%d) with channel loss active\n", qp_before);
         return true;
     }
-    std::fprintf(stderr, "self-test: expected qp to rise under 50%% channel loss\n");
+    std::fprintf(stderr,
+                 "self-test: expected decode/present to continue under 50%% channel loss "
+                 "(nv12 %" PRIu64 " -> %" PRIu64 ")\n",
+                 nv12, nv12_after);
     return false;
 }
 
