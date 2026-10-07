@@ -5,8 +5,10 @@
 #include "core/component_source.hpp"
 #include "core/data_packet.hpp"
 #include "core/pdu_output.hpp"
+#include "core/pdu_wakeup.hpp"
 
 #include <chrono>
+#include <memory>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -34,12 +36,14 @@ public:
 
     void set_push_handlers(push_packet_fn push_mjpeg_in, push_packet_fn push_nv12_in);
     void set_push_pdu_handler(push_pdu_fn push_pdu_in);
+    void bind_source_wakeups(std::shared_ptr<pdu_wakeup> w);
 
     int  open();
     void close();
 
     /* One source-thread iteration: may block up to timeout_ms on the active source. */
     int poll_once(int timeout_ms);
+    int poll_once_pdu(pdu_wakeup &w);
 
     [[nodiscard]] source_kind active_kind() const
     {
@@ -54,7 +58,7 @@ private:
     void switch_to_noise();
     void switch_to_camera(int width, int height, int fps);
     void emit_switch_caps(source_kind kind, int width, int height, int fps);
-    int  poll_active_pdu(component_pdu &out, int timeout_ms);
+    int  poll_active_pdu(component_pdu &out, pdu_wakeup &w);
     bool read_camera_geometry(int *width, int *height, int *fps) const;
 
     component_source &camera;

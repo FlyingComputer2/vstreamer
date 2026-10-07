@@ -1,6 +1,9 @@
 #include "components/noise_source.hpp"
 
+#include "core/component_pdu.hpp"
 #include "core/data_packet.hpp"
+#include "core/pdu_output.hpp"
+#include "core/sdu_caps.hpp"
 #include "core/noise_fft2.hpp"
 
 #include <pffft/pffft.h>
@@ -93,7 +96,7 @@ int main()
         {1920, 1080, 15},
     };
 
-    std::printf("\n[noise_source::output] full NV12 (Y+UV IFFT or fast path), ms/frame:\n");
+    std::printf("\n[noise_source::output PDU] full NV12 (Y+UV IFFT or fast path), ms/frame:\n");
     std::printf("%10s %4s %8s\n", "size", "bw", "ms");
     for (const case_s &c : nv12_cases)
     {
@@ -112,6 +115,12 @@ int main()
             bench_ms(reps,
                      [&]
                      {
+                         vstreamer::component_pdu pdu;
+                         auto *po = dynamic_cast<vstreamer::pdu_output *>(&src);
+                         if (nullptr != po && po->output(pdu) == 0 && !vstreamer::is_caps(pdu.sdu_type))
+                         {
+                             return;
+                         }
                          vstreamer::data_packet pkt;
                          if (src.output(0, pkt, 0) == 0)
                          {

@@ -169,7 +169,8 @@ void rtp_h264_depay::push_au(au_item &&item)
 
 int rtp_h264_depay::input(component_pdu &&in)
 {
-    if (0 != in.port || in.sdu_type != sdu_type_e::RTP)
+    if (0 != in.port ||
+        (in.sdu_type != sdu_type_e::RTP && in.sdu_type != sdu_type_e::STREAM_DGRAM))
     {
         return -EINVAL;
     }

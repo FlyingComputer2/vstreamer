@@ -47,6 +47,7 @@
 #include "apps/common/cpu_map.hpp"
 #include "apps/common/pipeline_controller.hpp"
 #include "apps/common/queues.hpp"
+#include "core/component_pdu.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "apps/stream_sdl_test/diag.hpp"
 #include "apps/stream_sdl_test/encoder_types.hpp"
@@ -84,7 +85,7 @@ void on_signal(int /*sig*/)
 
 void shutdown_pipeline(h264_encoder_t &enc, h264_decoder_mpp &dec, stream_sender &sender,
                        stream_receiver &rcv, jpeg_decoder_multicore *jdec, v4l2_source *v4l2,
-                       apps::pipeline_queue *mjpeg_q, apps::pipeline_queue *nv12_q)
+                       apps::pipeline_pdu_queue *mjpeg_pipe, apps::pipeline_pdu_queue *nv12_pipe)
 {
     g_run = false;
 #if defined(ENABLE_H264_ENCODER_MPP)
@@ -103,13 +104,13 @@ void shutdown_pipeline(h264_encoder_t &enc, h264_decoder_mpp &dec, stream_sender
     {
         jdec->close();
     }
-    if (nullptr != mjpeg_q)
+    if (nullptr != mjpeg_pipe)
     {
-        mjpeg_q->wake_shutdown();
+        mjpeg_pipe->wake_shutdown();
     }
-    if (nullptr != nv12_q)
+    if (nullptr != nv12_pipe)
     {
-        nv12_q->wake_shutdown();
+        nv12_pipe->wake_shutdown();
     }
 }
 void print_usage(const char *prog)
@@ -617,6 +618,7 @@ int main(int argc, char **argv)
     }
     cfg_str(dec, "size", size_buf);
     cfg_str(dec, "fps", fps_buf);
+    cfg_str(dec, "output_size_mode", "stream");
     cfg_str(*preview, "title", app_label);
 
     if (nullptr != std::getenv("VSTREAMER_SKIP_DECODE"))
@@ -845,7 +847,7 @@ int main(int argc, char **argv)
     g_rx.stream_fps.store(fps, std::memory_order_relaxed);
     const size_t pipe_q_depth = apps::queue_depth_from_env("VSTREAMER_PIPE_QUEUE_DEPTH",
                                                            apps::k_default_pipe_queue_depth, 64);
-    const size_t present_q_depth =
+    const size_t present_queue_depth =
         apps::queue_depth_from_env("VSTREAMER_PRESENT_QUEUE_DEPTH",
                                    apps::k_default_present_queue_depth, 16);
     const size_t rx_au_q_depth =
@@ -854,7 +856,7 @@ int main(int argc, char **argv)
     std::fprintf(stderr,
                  "stream_sdl: queue depths pipe=%zu present=%zu rx_au=%zu "
                  "(override: VSTREAMER_*_QUEUE_DEPTH env)\n",
-                 pipe_q_depth, present_q_depth, rx_au_q_depth);
+                 pipe_q_depth, present_queue_depth, rx_au_q_depth);
     if (const char *adm = std::getenv("VSTREAMER_ENC_ADMISSION");
         nullptr != adm && adm[0] != '\0' && 0 != std::strcmp(adm, "0"))
     {
@@ -862,11 +864,11 @@ int main(int argc, char **argv)
                      "stream_sdl: encode admission pacing ON (VSTREAMER_ENC_ADMISSION); "
                      "MPP CBR only, 1080p+\n");
     }
-    apps::pipeline_queue      mjpeg_q(pipe_q_depth, g_run);
-    apps::pipeline_queue      nv12_q(pipe_q_depth, g_run);
-    g_tx.metrics_nv12_q = &nv12_q;
-    apps::present_frame_queue present_q(present_q_depth, g_run);
-    apps::rx_au_queue         au_q(rx_au_q_depth, g_run);
+    apps::pipeline_pdu_queue  mjpeg_pipe(pipe_q_depth, g_run);
+    apps::pipeline_pdu_queue  nv12_pipe(pipe_q_depth, g_run);
+    g_tx.metrics_nv12_pipe = &nv12_pipe;
+    apps::present_pdu_queue present_queue(present_queue_depth, g_run);
+    apps::pdu_rx_au_queue     au_in_pipe(rx_au_q_depth, g_run);
 
     apps::pipeline_controller ctrl;
     ctrl.bind_legacy_run(&g_run);
@@ -876,16 +878,12 @@ int main(int argc, char **argv)
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
     if (use_uvc_selector)
     {
-        uvc_selector->set_push_handlers(
-            [&](data_packet &&pkt) {
-                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
-            },
-            [&](data_packet &&pkt) {
-                (void)enqueue_source_frame(std::move(pkt), &mjpeg_q, &nv12_q, &g_bench_diag);
-            });
+        uvc_selector->set_push_pdu_handler([&](component_pdu &&pkt) {
+            (void)enqueue_source_pdu(std::move(pkt), &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
+        });
         ctrl.add_stage("source", "source",
                        [&, sel = uvc_selector.get()](std::atomic<bool> & /*run*/) {
-                           source_stage_selector_main(sel, &mjpeg_q, &nv12_q, &g_bench_diag);
+                           source_stage_selector_main(sel, &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
                        });
     }
     else
@@ -893,17 +891,17 @@ int main(int argc, char **argv)
     {
         ctrl.add_stage("source", "source",
                        [&, src = source](std::atomic<bool> & /*run*/) {
-                           source_stage_main(src, &mjpeg_q, &nv12_q, &g_bench_diag);
+                           source_stage_main(src, &mjpeg_pipe, &nv12_pipe, &g_bench_diag);
                        });
     }
     if (use_jpeg_decode)
     {
         ctrl.add_stage("jpeg", "jpeg", [&, jw = jpeg_workers](std::atomic<bool> & /*run*/) {
-            jpeg_stage_main(&jdec, &mjpeg_q, &nv12_q, &g_bench_diag, jw);
+            jpeg_stage_main(&jdec, &mjpeg_pipe, &nv12_pipe, &g_bench_diag, jw);
         });
     }
     ctrl.add_stage("encode", "encode", [&](std::atomic<bool> & /*run*/) {
-        encode_stage_main(&enc, &pay, &sender, &nv12_q, &g_bench_diag);
+        encode_stage_main(&enc, &pay, &sender, &nv12_pipe, &g_bench_diag);
     });
     ctrl.add_stage("telemetry", "",
                    [&](std::atomic<bool> & /*run*/) { apps::tx::telemetry_thread_main(&sender); });
@@ -922,14 +920,14 @@ int main(int argc, char **argv)
     });
     ctrl.add_stage("present", "",
                    [&](std::atomic<bool> & /*run*/) {
-                       present_thread_main(preview, &present_q, width, height, kmsdrm,
+                       present_thread_main(preview, &present_queue, width, height, kmsdrm,
                                            defer_sdl_to_present, &g_bench_diag);
                    });
     ctrl.add_stage("rx_net", "rx", [&](std::atomic<bool> & /*run*/) {
-        rx_net_thread_main(&rcv, &depay, &au_q, &g_bench_diag);
+        rx_net_thread_main(&rcv, &depay, &au_in_pipe, &g_bench_diag);
     });
     ctrl.add_stage("decode", "rx", [&](std::atomic<bool> & /*run*/) {
-        decode_thread_main(&dec, &present_q, &au_q, &g_bench_diag);
+        decode_thread_main(&dec, &present_queue, &au_in_pipe, &g_bench_diag);
     });
     if (!self_test && diag_log)
     {
@@ -960,12 +958,12 @@ int main(int argc, char **argv)
     }
 
     shutdown_pipeline(enc, dec, sender, rcv, use_jpeg_decode ? &jdec : nullptr,
-                      use_v4l2 ? &camera : nullptr, use_jpeg_decode ? &mjpeg_q : nullptr,
-                      &nv12_q);
-    present_q.wake();
-    au_q.wake();
-    mjpeg_q.wake_shutdown();
-    nv12_q.wake_shutdown();
+                      use_v4l2 ? &camera : nullptr, use_jpeg_decode ? &mjpeg_pipe : nullptr,
+                      &nv12_pipe);
+    present_queue.wake();
+    au_in_pipe.wake();
+    mjpeg_pipe.wake_shutdown();
+    nv12_pipe.wake_shutdown();
     channel.stop();
     source->close();
     if (use_jpeg_decode)

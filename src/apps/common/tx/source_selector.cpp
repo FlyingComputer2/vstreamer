@@ -1,5 +1,8 @@
 #include "apps/common/tx/source_selector.hpp"
 
+#include "apps/common/pdu_stage.hpp"
+#include "apps/common/pipeline_state.hpp"
+
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
 #include "core/time_util.hpp"
@@ -241,80 +244,96 @@ void source_selector::close()
     logged_camera = false;
 }
 
-int source_selector::poll_active_pdu(component_pdu &out, int timeout_ms)
+void source_selector::bind_source_wakeups(std::shared_ptr<pdu_wakeup> w)
+{
+    dynamic_cast<component &>(camera).set_wakeup(w);
+    dynamic_cast<component &>(noise).set_wakeup(w);
+}
+
+int source_selector::poll_active_pdu(component_pdu &out, pdu_wakeup &w)
 {
     component_source &active = source_kind::camera == kind ? camera : noise;
-    int               r = pdu_output_from_source(active, out);
-    if (-EAGAIN == r && timeout_ms != 0)
+    component        &owner = dynamic_cast<component &>(active);
+    while (apps::g_run.load(std::memory_order_relaxed))
     {
-        const int wait_ms = timeout_ms > 0 ? timeout_ms : 50;
-        std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-        r = pdu_output_from_source(active, out);
+        const int r = pdu_output_from_source(active, out);
+        if (-EAGAIN != r)
+        {
+            if (0 == r && push_pdu)
+            {
+                push_pdu(std::move(out));
+            }
+            return r;
+        }
+        apps::wait_for_pdu(w, owner, apps::g_run);
     }
-    if (0 == r && push_pdu)
+    return -ECANCELED;
+}
+
+int source_selector::poll_once_pdu(pdu_wakeup &w)
+{
+    if (!push_pdu)
     {
-        push_pdu(std::move(out));
+        return poll_once(-1);
     }
-    return r;
+    if (source_kind::camera == kind)
+    {
+        component_pdu out;
+        const int     cam = pdu_output_from_source(camera, out);
+        if (0 == cam)
+        {
+            push_pdu(std::move(out));
+            return 0;
+        }
+        if (-ENODEV != cam)
+        {
+            if (-EAGAIN == cam)
+            {
+                apps::wait_for_pdu(w, dynamic_cast<component &>(camera), apps::g_run);
+                return -EAGAIN;
+            }
+            return cam;
+        }
+        switch_to_noise();
+        if (source_kind::camera == kind)
+        {
+            return -EAGAIN;
+        }
+        component_pdu noise_out;
+        return poll_active_pdu(noise_out, w);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto since_probe =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_camera_probe).count();
+    if (since_probe >= k_camera_probe_interval_ms)
+    {
+        last_camera_probe = now;
+        component_pdu probe;
+        const int     cam = pdu_output_from_source(camera, probe);
+        if (0 == cam)
+        {
+            int width = noise_width;
+            int h = noise_height;
+            int f = noise_fps;
+            (void)read_camera_geometry(&width, &h, &f);
+            switch_to_camera(width, h, f);
+            if (source_kind::camera == kind)
+            {
+                push_pdu(std::move(probe));
+                return 0;
+            }
+        }
+    }
+    component_pdu noise_out;
+    return poll_active_pdu(noise_out, w);
 }
 
 int source_selector::poll_once(int timeout_ms)
 {
     if (push_pdu)
     {
-        if (source_kind::camera == kind)
-        {
-            component_pdu out;
-            const int     cam = pdu_output_from_source(camera, out);
-            if (0 == cam)
-            {
-                push_pdu(std::move(out));
-                return 0;
-            }
-            if (-ENODEV != cam)
-            {
-                return cam;
-            }
-            switch_to_noise();
-            if (source_kind::camera == kind)
-            {
-                return -EAGAIN;
-            }
-            component_pdu noise_out;
-            return poll_active_pdu(noise_out, timeout_ms);
-        }
-
-        const auto now = std::chrono::steady_clock::now();
-        const auto since_probe =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - last_camera_probe).count();
-        if (since_probe >= k_camera_probe_interval_ms)
-        {
-            last_camera_probe = now;
-            component_pdu probe;
-            const int     cam = pdu_output_from_source(camera, probe);
-            if (0 == cam)
-            {
-                int w = noise_width;
-                int h = noise_height;
-                int f = noise_fps;
-                (void)read_camera_geometry(&w, &h, &f);
-                switch_to_camera(w, h, f);
-                if (source_kind::camera == kind)
-                {
-                    push_pdu(std::move(probe));
-                    return 0;
-                }
-            }
-            else if (-ENODEV != cam && -EAGAIN != cam)
-            {
-                if (-cam > 0 && -cam < 4096)
-                {
-                    camera_error = std::strerror(-cam);
-                }
-            }
-        }
-        component_pdu noise_out;
-        return poll_active_pdu(noise_out, timeout_ms);
+        pdu_wakeup local_wake;
+        return poll_once_pdu(local_wake);
     }
 
     data_packet out;

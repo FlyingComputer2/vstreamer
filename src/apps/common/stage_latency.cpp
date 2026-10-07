@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "core/component_pdu.hpp"
 #include "core/data_packet.hpp"
+#include "core/sdu_caps.hpp"
 #include "core/time_util.hpp"
 
 namespace vstreamer::apps
@@ -57,6 +59,15 @@ std::atomic<bool> g_stage_latency_diag {false};
 void stage_latency_set_diag_enabled(bool enabled)
 {
     g_stage_latency_diag.store(enabled, std::memory_order_relaxed);
+}
+
+void note_source_pdu(const component_pdu &pdu)
+{
+    if (is_caps(pdu.sdu_type) || pdu.ts_us == 0)
+    {
+        return;
+    }
+    g_latest_source_pts.store(static_cast<int64_t>(pdu.ts_us), std::memory_order_relaxed);
 }
 
 void note_source_pts(const data_packet &pkt)
