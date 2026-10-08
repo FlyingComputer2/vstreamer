@@ -148,6 +148,7 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     fail_lost_app_pkts_seen = 0;
     late_blocks_count = 0;
     late_blocks_seen = 0;
+    given_up_blocks_count = 0;
     oversized_count = 0;
     active = true;
     return true;
@@ -532,7 +533,7 @@ void vstreamer::rs_block_erasure::try_stream_head_systematic(
     }
 }
 
-void vstreamer::rs_block_erasure::abandon_partial_block(
+int vstreamer::rs_block_erasure::abandon_partial_block(
     const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out)
 {
     account_missing_shards(block);
@@ -560,6 +561,7 @@ void vstreamer::rs_block_erasure::abandon_partial_block(
         emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(sn));
         later_block_waiting = false;
     }
+    return std::max(0, sn - (block.released + emitted));
 }
 
 void vstreamer::rs_block_erasure::on_block_decoded(uint16_t sdu_base, int released_before,
@@ -626,7 +628,10 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
         {
             const rx_block_s snap = block;
             rx_blocks.erase(rxit);
-            abandon_partial_block(snap, emit_next, out);
+            if (abandon_partial_block(snap, emit_next, out) > 0)
+            {
+                given_up_blocks_count++;
+            }
             run_emit_engine(out);
         }
         return;

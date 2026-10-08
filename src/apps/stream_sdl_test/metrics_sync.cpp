@@ -347,6 +347,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
         /* Packets evicted from the send queue (or rejected) before reaching the wire. */
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.dropped"),
                      query_u64(*sender, "dropped"));
+        /* App SDUs refused whole because the send queue had no room for all their packets. */
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.queue_full_rejects"),
+                     query_u64(*sender, "queue_full_rejects"));
     }
 #endif  // !VSTREAMER_BENCH_RX_ONLY
 
@@ -395,6 +398,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      query_u64(*rcv, "fec_missing_shards"));
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
                      query_u64(*rcv, "fec_late_blocks"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_given_up_blocks"),
+                     query_u64(*rcv, "fec_given_up_blocks"));
     }
 #endif
 

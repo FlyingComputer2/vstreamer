@@ -869,3 +869,46 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
 
     sender.close();
 }
+
+/* With FEC on, an SDU that closes a block produces its data shard plus all of the block's parity.
+ * A full queue must refuse the whole SDU before it enters the FEC block; queueing some shards and
+ * then returning -EAGAIN sends a block without part of its data or parity while the caller drops
+ * the datagram as not taken. */
+TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
+    ASSERT_EQ(0, cfg(sender, "max_kbps", "10"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    int  rejects = 0;
+    for (int i = 0; i < 400 && rejects < 20; ++i)
+    {
+        const size_t before = query_size_t(sender, "queue_bytes");
+        auto         pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 1000);
+        const int    rc = sender.input(std::move(pkt));
+        const size_t after = query_size_t(sender, "queue_bytes");
+        if (-EAGAIN == rc)
+        {
+            rejects++;
+            EXPECT_LE(after, before) << "refused SDU " << i << " still queued packets";
+            continue;
+        }
+        ASSERT_EQ(0, rc);
+    }
+    EXPECT_GT(rejects, 0);
+
+    std::string rejects_s;
+    ASSERT_EQ(0, sender.query("queue_full_rejects", &rejects_s));
+    EXPECT_EQ(static_cast<uint64_t>(rejects), std::strtoull(rejects_s.c_str(), nullptr, 10));
+
+    sender.close();
+}
