@@ -398,6 +398,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                      query_u64(*rcv, "fec_missing_shards"));
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
                      query_u64(*rcv, "fec_late_blocks"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_given_up_blocks"),
+                     query_u64(*rcv, "fec_given_up_blocks"));
     }
 #endif
 

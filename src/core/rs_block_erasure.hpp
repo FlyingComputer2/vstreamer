@@ -107,7 +107,7 @@ public:
     }
     uint64_t decode_fail() const
     {
-        return evicted_blocks_count + rs_failures_count;
+        return evicted_blocks_count + rs_failures_count + given_up_blocks_count;
     }
     uint64_t hdr_errors() const
     {
@@ -132,6 +132,11 @@ public:
     uint64_t late_blocks() const
     {
         return late_blocks_count;
+    }
+    /* Head-of-line blocks released after the emit hold with SDUs still missing. */
+    uint64_t given_up_blocks() const
+    {
+        return given_up_blocks_count;
     }
     uint64_t oversized() const
     {
@@ -213,7 +218,8 @@ private:
     void emit_payload(fec_rx_payload_list* out, shared_sized_buffer&& app);
     static bool frag_to_app(const shared_sized_buffer& shard, shared_sized_buffer* app);
 
-    void abandon_partial_block(const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out);
+    /* Emits what the block has and returns how many of its SDUs could not be delivered. */
+    int abandon_partial_block(const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out);
     void expire_rx(fec_rx_payload_list* out);
     void expire_done();
     void mark_done(uint16_t sdu_base);
@@ -288,6 +294,7 @@ private:
     uint64_t fail_lost_app_pkts_seen = 0;
     uint64_t late_blocks_count = 0;
     uint64_t late_blocks_seen = 0;
+    uint64_t given_up_blocks_count = 0;
     uint64_t oversized_count = 0;
 
     size_t max_shard_bytes = 1470;

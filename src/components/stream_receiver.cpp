@@ -746,7 +746,8 @@ int stream_receiver::query(std::string_view key, std::string *value) const
     }
     if ("fec_recovered" == key || "fec_failures" == key || "fec_hdr_errors" == key ||
         "fec_kn_mismatch" == key || "fec_evicted_blocks" == key || "fec_rs_failures" == key ||
-        "fec_missing_shards" == key || "fec_late_blocks" == key)
+        "fec_missing_shards" == key || "fec_late_blocks" == key ||
+        "fec_given_up_blocks" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         char           buf[32];
@@ -778,6 +779,10 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         else if ("fec_missing_shards" == key)
         {
             n = fec.missing_shards();
+        }
+        else if ("fec_given_up_blocks" == key)
+        {
+            n = fec.given_up_blocks();
         }
         else
         {

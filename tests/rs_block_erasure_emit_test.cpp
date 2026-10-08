@@ -812,3 +812,63 @@ TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncIgnored)
     EXPECT_EQ(app_tags(out), want);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
+
+/* A head block given up with an SDU still missing is a failed block: the depayloader sees the
+ * hole, so the failure counters must show it as well. */
+TEST(RsBlockErasureEmitTest, HeadGiveUpWithMissingSduCountsAsFailure)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    const auto       air = encode_block_apps(enc, 10, {10, 11, 12, 13});
+    vstreamer::fec_rx_payload_list out;
+    for (size_t i = 0; i < air.size(); i++)
+    {
+        /* Lose data shard 2 and all parity: the block cannot be rebuilt. */
+        if (i == 2 || fec_shard_index(air[i]) >= 4)
+        {
+            continue;
+        }
+        feed_append(dec, air[i], &out);
+    }
+    const auto later = encode_block_apps(enc, 14, {14, 15, 16, 17});
+    feed_append(dec, later[0], &out);
+
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    out.insert(out.end(), tick.begin(), tick.end());
+    ASSERT_TRUE(out_has_app_tag(out, 13));
+    ASSERT_FALSE(out_has_app_tag(out, 12));
+
+    EXPECT_EQ(1u, dec.decode_fail());
+    EXPECT_EQ(1u, dec.given_up_blocks());
+}
+
+/* Giving up a head block that was delivered in full is not a failure. */
+TEST(RsBlockErasureEmitTest, LosslessStreamHasNoFailures)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    for (uint16_t b = 0; b < 8; b++)
+    {
+        const uint16_t base = static_cast<uint16_t>(b * 4);
+        const auto     air = encode_block_apps(
+            enc, base,
+            {static_cast<uint8_t>(base), static_cast<uint8_t>(base + 1),
+             static_cast<uint8_t>(base + 2), static_cast<uint8_t>(base + 3)});
+        for (const auto &shard : air)
+        {
+            feed_append(dec, shard, &out);
+        }
+    }
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    EXPECT_EQ(32u, out.size() + tick.size());
+    EXPECT_EQ(0u, dec.decode_fail());
+}
