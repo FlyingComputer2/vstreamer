@@ -3,7 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <arpa/inet.h>
-#include <deque>
+#include <list>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -60,16 +61,20 @@ struct kn_encode_tables
     std::vector<uint8_t> g_tbls;
 };
 
-const kn_encode_tables& kn_encode_tables_for(int k, int n)
+/* Shared so an entry evicted from the cache stays alive while a caller still uses it. */
+std::shared_ptr<const kn_encode_tables> kn_encode_tables_for(int k, int n)
 {
-    static std::mutex                                      mu;
-    static std::unordered_map<uint32_t, kn_encode_tables>  cache;
-    static std::deque<uint32_t>                            order;
-    const uint32_t                                         key = kn_cache_key(k, n);
-    std::lock_guard<std::mutex>                            lock(mu);
-    auto                                                   it = cache.find(key);
+    static std::mutex                                                         mu;
+    static std::unordered_map<uint32_t, std::shared_ptr<const kn_encode_tables>> cache;
+    /* Least recently used first. */
+    static std::list<uint32_t> order;
+    const uint32_t             key = kn_cache_key(k, n);
+    std::lock_guard<std::mutex> lock(mu);
+    auto                        it = cache.find(key);
     if (it != cache.end())
     {
+        order.remove(key);
+        order.push_back(key);
         return it->second;
     }
     if (cache.size() >= k_kn_cache_max && !order.empty())
@@ -77,15 +82,15 @@ const kn_encode_tables& kn_encode_tables_for(int k, int n)
         cache.erase(order.front());
         order.pop_front();
     }
-    kn_encode_tables built;
-    const int        p = n - k;
-    built.encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
-    built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
-    gf_gen_cauchy1_matrix(built.encode_matrix.data(), n, k);
-    ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+    auto      built = std::make_shared<kn_encode_tables>();
+    const int p = n - k;
+    built->encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
+    built->g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
+    gf_gen_cauchy1_matrix(built->encode_matrix.data(), n, k);
+    ec_init_tables_base(k, p, built->encode_matrix.data() + k * k, built->g_tbls.data());
     order.push_back(key);
-    const auto ins = cache.emplace(key, std::move(built));
-    return ins.first->second;
+    cache.emplace(key, built);
+    return built;
 }
 }  // namespace
 
@@ -129,9 +134,9 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     p = n - k;
     this->timeout_ms = timeout_ms;
     max_shard_bytes = max_shard_bytes_in;
-    const kn_encode_tables& tables = kn_encode_tables_for(cfg_k, cfg_n);
-    encode_matrix = tables.encode_matrix;
-    g_tbls = tables.g_tbls;
+    const auto tables = kn_encode_tables_for(cfg_k, cfg_n);
+    encode_matrix = tables->encode_matrix;
+    g_tbls = tables->g_tbls;
     pending.clear();
     deadline_set = false;
     rx_blocks.clear();
@@ -1019,8 +1024,8 @@ bool vstreamer::rs_block_erasure::decode_block(
         return false;
     }
     const int               parity = n - k;
-    const kn_encode_tables& tables = kn_encode_tables_for(k, n);
-    const uint8_t*          encode_matrix = tables.encode_matrix.data();
+    const auto     tables = kn_encode_tables_for(k, n);
+    const uint8_t* encode_matrix = tables->encode_matrix.data();
 
     size_t shard_len = k_len_prefix;
     for (const auto& kv : frags)

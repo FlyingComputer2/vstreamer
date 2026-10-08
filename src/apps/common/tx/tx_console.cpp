@@ -211,7 +211,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     return true;
                 }
                 long ms = 0;
-                char buf[16];
+                char buf[24];
                 if (!parse_long(work + 15, &ms) || ms < 0)
                 {
                     reply = "err bad fec spread ms (>= 0)\n";
@@ -239,7 +239,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     reply = "err bad fec timeout ms (0..60000)\n";
                     return true;
                 }
-                char buf[16];
+                char buf[24];
                 std::snprintf(buf, sizeof(buf), "%ld", ms);
                 if (stream_tx->configure("fec_timeout_ms", std::string_view(buf)) < 0)
                 {

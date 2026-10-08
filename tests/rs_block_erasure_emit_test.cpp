@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <random>
@@ -833,4 +834,46 @@ TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncIgnored)
     }
     EXPECT_EQ(app_tags(out), want);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+}
+
+/* Another thread cycling through more (k, n) pairs than the encode-table cache holds evicts
+ * entries; a decode that is using its pair's tables at that moment must keep them alive. */
+TEST(RsBlockErasureEmitTest, EncodeTablesSurviveCacheEviction)
+{
+    std::atomic<bool> stop {false};
+    std::thread       churn([&stop] {
+        rs_block_erasure c;
+        for (int i = 0; !stop.load(); i++)
+        {
+            const int k = 1 + i % 48;
+            (void)c.init(k, k + 1 + i % 5, 20);
+        }
+    });
+
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 8, 20));
+    rs_block_erasure dec;
+    int              recovered_blocks = 0;
+    for (uint8_t round = 0; round < 200; round++)
+    {
+        std::vector<std::vector<uint8_t>> air;
+        for (uint8_t i = 0; i < 4; i++)
+        {
+            const uint8_t app[64] = {static_cast<uint8_t>(round), i};
+            std::vector<std::vector<uint8_t>> part;
+            enc.push_app(app, sizeof(app), &part);
+            air.insert(air.end(), part.begin(), part.end());
+        }
+        ASSERT_EQ(8U, air.size());
+        /* Parity only: every SDU must come from a decode. */
+        vstreamer::fec_rx_payload_list out;
+        for (size_t s = 4; s < air.size(); s++)
+        {
+            feed_append(dec, air[s], &out);
+        }
+        recovered_blocks += out.size() == 4 ? 1 : 0;
+    }
+    stop = true;
+    churn.join();
+    EXPECT_EQ(200, recovered_blocks);
 }
