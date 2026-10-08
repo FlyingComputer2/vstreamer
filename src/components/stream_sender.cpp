@@ -177,8 +177,36 @@ std::string stream_sender::name() const
 
 
 
+bool stream_sender::queue_has_room_for_sdu() const
+{
+    size_t pkts = 1;
+    size_t pkt_bytes = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fec_mode_e::none == fec_mode)
+        {
+            pkt_bytes = k_stream_header_len + stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+        }
+        else
+        {
+            /* One SDU can close a block: its data shard plus all of the block's parity. */
+            pkts = static_cast<size_t>(std::max(1, fec_n - fec_k + 1));
+            pkt_bytes =
+                k_stream_header_len + stream_max_fec_shard(static_cast<size_t>(max_datagram));
+        }
+    }
+    const size_t limit = queue_byte_limit();
+    std::lock_guard<std::mutex> lock(q_mu);
+    if (queue.empty())
+    {
+        return true;
+    }
+    return queue_bytes + pkts * pkt_bytes <= limit && queue.size() + pkts <= k_queue_packet_cap;
+}
+
 int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                         std::chrono::steady_clock::time_point release)
+                                         std::chrono::steady_clock::time_point release,
+                                         bool force)
 {
     if (nullptr == data || 0 == len)
     {
@@ -202,7 +230,7 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
 
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        if (!queue.empty() &&
+        if (!force && !queue.empty() &&
             (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
         {
             return -EAGAIN;
@@ -827,6 +855,13 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
         std::lock_guard<std::mutex> lock(mu);
         mode = fec_mode;
     }
+    /* Accept the whole SDU or none of it: once it is in an FEC block, every shard it produces
+     * must reach the queue, or the block goes out without some of its data or parity. */
+    if (pdu_no_evict && !queue_has_room_for_sdu())
+    {
+        queue_full_rejects.fetch_add(1, std::memory_order_relaxed);
+        return -EAGAIN;
+    }
     if (fec_mode_e::none == mode)
     {
         {
@@ -840,7 +875,7 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
         const auto release = std::chrono::steady_clock::now();
         if (pdu_no_evict)
         {
-            const int er = try_enqueue_wire_copy(data, len, false, release);
+            const int er = try_enqueue_wire_copy(data, len, false, release, true);
             if (0 != er)
             {
                 return er;
@@ -878,13 +913,11 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
                 for (size_t j = 0; j < air.size(); j++)
                 {
                     auto &pkt = air[j];
-                    const int er = try_enqueue_wire_copy(
-                        pkt.data(), pkt.size(), true,
-                        t0 + fec_spread_offset(j, air.size(), spread));
-                    if (0 != er)
-                    {
-                        return er;
-                    }
+                    /* Room was checked above; a failure here is oversize or no buffer,
+                     * which drops only this shard and is counted in dropped. */
+                    (void)try_enqueue_wire_copy(pkt.data(), pkt.size(), true,
+                                                t0 + fec_spread_offset(j, air.size(), spread),
+                                                true);
                 }
             }
             else
@@ -1552,6 +1585,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, dropped.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("queue_full_rejects" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      queue_full_rejects.load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }

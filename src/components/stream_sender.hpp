@@ -75,8 +75,12 @@ private:
     void pace_wire_send(size_t bytes);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                            std::chrono::steady_clock::time_point release);
+    /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */
     [[nodiscard]] int try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                            std::chrono::steady_clock::time_point release);
+                                            std::chrono::steady_clock::time_point release,
+                                            bool force = false);
+    /* True when the queue has room for every wire packet one app SDU can produce. */
+    [[nodiscard]] bool queue_has_room_for_sdu() const;
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
 
     [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, size_t ingress_bytes,
@@ -155,6 +159,7 @@ private:
     std::atomic<uint64_t> pkts_sent {0};
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> dropped {0};
+    std::atomic<uint64_t> queue_full_rejects {0};
 
     double   ingress_rate_t0 = 0.;
     uint64_t ingress_rate_bytes = 0;
