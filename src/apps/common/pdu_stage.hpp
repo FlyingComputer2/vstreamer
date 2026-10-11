@@ -18,9 +18,12 @@ constexpr int64_t k_pdu_stage_wait_cap_ns = 50'000'000LL;
 
 void log_pdu_stage_latency(const char *stage, const component_pdu &pdu);
 
+/* Entry stamps keyed by ts_us for node latency across components that are not 1:1 in time.
+ * Stamps whose output never appears (dropped frames) are pruned once the map grows. */
 void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns,
                        std::unordered_map<uint64_t, int64_t> *input_mono_by_ts_us);
 
+/* Records exit − entry for pdu.ts_us as the stage's node latency and drops the stamp. */
 void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
                                 std::unordered_map<uint64_t, int64_t> *edge_mono_by_ts_us);
 

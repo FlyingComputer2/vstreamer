@@ -351,6 +351,17 @@ Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
 `h264_encoder.out_bytes`, `stream_sender.peer_fec_gap_count`,
 `stream_sender.peer_fec_packet_received`, `stream_sender.peer_udp_gap_count`,
 `stream_sender.peer_udp_packet_received`, `source.state`, `latency.glass_ms`.
+
+Latency metrics come in two kinds:
+
+| Key | Meaning |
+|-----|---------|
+| `latency.<stage>_ms`, `<component>.latency_ms` | Cumulative: capture age (`now − ts_us`) of the latest frame at that stage. |
+| `latency.<node>_node_ms`, `<component>.node_latency_ms` | Per node: exit stamp − entry stamp on the same frame, for the last frame through that node. |
+
+Nodes: `jpeg` (`jpeg_decoder`), `encoder_queue` (NV12 queue wait), `enc` (`h264_encoder`), `dec`
+(`h264_decoder`), `present` (`sdl_sink` input and present). Encoder and decoder are matched by
+`ts_us` because they hold several frames at once. Each app half publishes only its own keys.
 `stream_sender.peer_*` packet/gap counters come from the link reports the sender received, never
 from the receiver object. The reports travel the emulator's reverse direction, so
 `set_constant_loss` affects them too. `peer_report_age_ms` (`-1` if never), `peer_reports_*` and

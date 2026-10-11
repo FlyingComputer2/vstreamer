@@ -6,12 +6,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 #include "core/sequence_gap.hpp"
 #include "core/sdu_caps.hpp"
 
 namespace vstreamer::apps
 {
+
+namespace
+{
+
+constexpr size_t  k_pdu_edge_stamps_max = 64;
+constexpr int64_t k_pdu_edge_stamp_ttl_ns = 1'000'000'000LL;
+
+}  // namespace
 
 void log_pdu_stage_latency(const char *stage, const component_pdu &pdu)
 {
@@ -46,6 +55,18 @@ void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns,
     {
         return;
     }
+    if (input_mono_by_ts_us->size() >= k_pdu_edge_stamps_max)
+    {
+        const int64_t cutoff = mono_ns - k_pdu_edge_stamp_ttl_ns;
+        for (auto it = input_mono_by_ts_us->begin(); it != input_mono_by_ts_us->end();)
+        {
+            it = it->second < cutoff ? input_mono_by_ts_us->erase(it) : std::next(it);
+        }
+        if (input_mono_by_ts_us->size() >= k_pdu_edge_stamps_max)
+        {
+            input_mono_by_ts_us->clear();
+        }
+    }
     (*input_mono_by_ts_us)[ts_us] = mono_ns;
 }
 
@@ -65,7 +86,7 @@ void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
     const double  ms = static_cast<double>(now_ns - it->second) / 1e6;
     if (ms >= 0.0)
     {
-        record_stage_latency_ms(stage, ms);
+        record_stage_node_latency_ms(stage, ms);
     }
     edge_mono_by_ts_us->erase(it);
 }
