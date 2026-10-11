@@ -3,7 +3,6 @@ set(VSTREAMER_TEST_SOURCES
     buffer_pool_test.cpp
     component_contract_test.cpp
     link_emulator_test.cpp
-    bench_console_test.cpp
     cpu_map_test.cpp
     h264_level_test.cpp
     key_util_test.cpp
@@ -66,9 +65,16 @@ if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_MPP OR ENABLE_H264_DECOD
     list(APPEND VSTREAMER_TEST_SOURCES codec_caps_rejection_test.cpp)
 endif()
 
+# bench_console wraps the TX console handlers, which apps_common builds only with an encoder.
+if(VSTREAMER_APP_TX_OK)
+    list(APPEND VSTREAMER_TEST_SOURCES
+        bench_console_test.cpp
+        ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/bench_console.cpp
+    )
+endif()
+
 add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
-                              ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp
-                              ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/bench_console.cpp)
+                              ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp)
 target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source apps_common)
 target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
