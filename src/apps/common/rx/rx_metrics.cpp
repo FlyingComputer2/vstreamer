@@ -95,12 +95,10 @@ void publish_latency_metrics(double glass_ms)
     metric_store(*g_pipeline_metrics.get_metric("latency.present_ms"),
                  apps::g_latency_present_ms.load(std::memory_order_relaxed));
 
-    const double dec_node_ms = apps::g_node_latency_dec_ms.load(std::memory_order_relaxed);
-    const double present_node_ms = apps::g_node_latency_present_ms.load(std::memory_order_relaxed);
-    metric_store(*g_pipeline_metrics.get_metric("latency.dec_node_ms"), dec_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("latency.present_node_ms"), present_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("h264_decoder.node_latency_ms"), dec_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("sdl_sink.node_latency_ms"), present_node_ms);
+    publish_node_latency_metric(apps::g_node_latency_dec_ms, "latency.dec_node_ms",
+                                "h264_decoder.node_latency_ms");
+    publish_node_latency_metric(apps::g_node_latency_present_ms, "latency.present_node_ms",
+                                "sdl_sink.node_latency_ms");
 }
 
 }  // namespace vstreamer::apps::rx

@@ -325,16 +325,12 @@ void publish_tx_latency_metrics(component_coder *enc)
     metric_store(*g_pipeline_metrics.get_metric("latency.enc_out_ms"), enc_out_ms);
     metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.latency_ms"), jpeg_ms);
 
-    const double jpeg_node_ms = apps::g_node_latency_jpeg_ms.load(std::memory_order_relaxed);
-    const double enc_q_node_ms =
-        apps::g_node_latency_encoder_queue_ms.load(std::memory_order_relaxed);
-    const double enc_node_ms = apps::g_node_latency_enc_ms.load(std::memory_order_relaxed);
-    metric_store(*g_pipeline_metrics.get_metric("latency.jpeg_node_ms"), jpeg_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("latency.encoder_queue_node_ms"), enc_q_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("latency.enc_node_ms"), enc_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("jpeg_decoder.node_latency_ms"), jpeg_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("encoder_queue.node_latency_ms"), enc_q_node_ms);
-    metric_store(*g_pipeline_metrics.get_metric("h264_encoder.node_latency_ms"), enc_node_ms);
+    publish_node_latency_metric(apps::g_node_latency_jpeg_ms, "latency.jpeg_node_ms",
+                                "jpeg_decoder.node_latency_ms");
+    publish_node_latency_metric(apps::g_node_latency_encoder_queue_ms,
+                                "latency.encoder_queue_node_ms", "encoder_queue.node_latency_ms");
+    publish_node_latency_metric(apps::g_node_latency_enc_ms, "latency.enc_node_ms",
+                                "h264_encoder.node_latency_ms");
     double enc_lat_ms = enc_out_ms;
     if (nullptr != enc)
     {

@@ -8,9 +8,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
-#include <unordered_map>
 
 namespace
 {
@@ -21,6 +21,7 @@ using vstreamer::apps::g_pipeline_metrics;
  * removed, so the TX publish must not have created them yet. ctest runs each test on its own. */
 TEST(StageLatencyMetricsTest, RxPublishOmitsTxStageKeys)
 {
+    vstreamer::apps::g_node_latency_dec_ms.store(4.5);
     vstreamer::apps::rx::publish_latency_metrics(12.0);
 
     std::string v;
@@ -32,6 +33,25 @@ TEST(StageLatencyMetricsTest, RxPublishOmitsTxStageKeys)
     EXPECT_FALSE(g_pipeline_metrics.format_metric("latency.enc_out_ms", &v));
     EXPECT_TRUE(g_pipeline_metrics.format_metric("latency.dec_node_ms", &v));
     EXPECT_FALSE(g_pipeline_metrics.format_metric("latency.enc_node_ms", &v));
+    /* present has not measured a frame in this process. */
+    EXPECT_FALSE(g_pipeline_metrics.format_metric("latency.present_node_ms", &v));
+    EXPECT_FALSE(g_pipeline_metrics.format_metric("sdl_sink.node_latency_ms", &v));
+}
+
+TEST(StageLatencyMetricsTest, UnmeasuredNodeIsNotPublished)
+{
+    std::atomic<double> node {vstreamer::apps::k_node_latency_none};
+    vstreamer::apps::publish_node_latency_metric(node, "latency.test_unmeasured_node_ms",
+                                                 "test_unmeasured.node_latency_ms");
+    std::string v;
+    EXPECT_FALSE(g_pipeline_metrics.format_metric("latency.test_unmeasured_node_ms", &v));
+    EXPECT_FALSE(g_pipeline_metrics.format_metric("test_unmeasured.node_latency_ms", &v));
+
+    vstreamer::apps::record_stage_node_latency_ms(&node, 3.5);
+    vstreamer::apps::publish_node_latency_metric(node, "latency.test_unmeasured_node_ms",
+                                                 "test_unmeasured.node_latency_ms");
+    ASSERT_TRUE(g_pipeline_metrics.format_metric("test_unmeasured.node_latency_ms", &v));
+    EXPECT_NE(std::string::npos, v.find("3.5")) << v;
 }
 
 TEST(StageLatencyMetricsTest, TxPublishCarriesTxStageValues)
@@ -71,18 +91,18 @@ TEST(StageLatencyMetricsTest, TxPublishCarriesNodeValues)
 
 TEST(StageLatencyMetricsTest, EdgeLatencyIsExitMinusEntryForSameTs)
 {
-    std::unordered_map<uint64_t, int64_t> stamps;
-    const int64_t                         now_ns = vstreamer::steady_mono_ns();
+    vstreamer::apps::pdu_stamp_map stamps;
+    const int64_t                  now_ns = vstreamer::steady_mono_ns();
     vstreamer::apps::note_pdu_input_ts(1000, now_ns - 5'000'000, &stamps);
     vstreamer::apps::note_pdu_input_ts(2000, now_ns - 50'000'000, &stamps);
 
     vstreamer::component_pdu out;
     out.ts_us = 1000;
     out.sdu_type = vstreamer::sdu_type_e::H264_AU;
-    vstreamer::apps::g_node_latency_enc_ms.store(0.0);
-    vstreamer::apps::record_pdu_edge_latency_ms("enc", out, &stamps);
+    std::atomic<double> node {vstreamer::apps::k_node_latency_none};
+    vstreamer::apps::record_pdu_edge_latency_ms(&node, out, &stamps);
 
-    const double ms = vstreamer::apps::g_node_latency_enc_ms.load();
+    const double ms = node.load();
     EXPECT_GE(ms, 5.0);
     EXPECT_LT(ms, 50.0);
     EXPECT_EQ(1U, stamps.size());
@@ -91,8 +111,8 @@ TEST(StageLatencyMetricsTest, EdgeLatencyIsExitMinusEntryForSameTs)
 
 TEST(StageLatencyMetricsTest, EdgeStampsForDroppedFramesArePruned)
 {
-    std::unordered_map<uint64_t, int64_t> stamps;
-    const int64_t                         now_ns = vstreamer::steady_mono_ns();
+    vstreamer::apps::pdu_stamp_map stamps;
+    const int64_t                  now_ns = vstreamer::steady_mono_ns();
     for (uint64_t ts = 1; ts <= 64; ts++)
     {
         vstreamer::apps::note_pdu_input_ts(ts, now_ns - 2'000'000'000LL, &stamps);
@@ -100,6 +120,36 @@ TEST(StageLatencyMetricsTest, EdgeStampsForDroppedFramesArePruned)
     vstreamer::apps::note_pdu_input_ts(100, now_ns, &stamps);
     EXPECT_EQ(1U, stamps.size());
     EXPECT_EQ(1U, stamps.count(100));
+}
+
+/* A drop burst fills the map with young stamps: only the oldest is evicted, so frames still
+ * inside the node keep their stamps. */
+TEST(StageLatencyMetricsTest, YoungStampsAtCapEvictOnlyTheOldest)
+{
+    vstreamer::apps::pdu_stamp_map stamps;
+    const int64_t                  now_ns = vstreamer::steady_mono_ns();
+    for (uint64_t ts = 1; ts <= 64; ts++)
+    {
+        vstreamer::apps::note_pdu_input_ts(ts, now_ns - static_cast<int64_t>(100 - ts) * 1'000'000,
+                                           &stamps);
+    }
+    vstreamer::apps::note_pdu_input_ts(100, now_ns, &stamps);
+    EXPECT_EQ(64U, stamps.size());
+    EXPECT_EQ(0U, stamps.count(1));
+    EXPECT_EQ(1U, stamps.count(2));
+    EXPECT_EQ(1U, stamps.count(64));
+    EXPECT_EQ(1U, stamps.count(100));
+}
+
+/* Retries after -EAGAIN re-stamp the same frame; the first stamp wins so the wait counts. */
+TEST(StageLatencyMetricsTest, RestampKeepsFirstEntry)
+{
+    vstreamer::apps::pdu_stamp_map stamps;
+    const int64_t                  now_ns = vstreamer::steady_mono_ns();
+    vstreamer::apps::note_pdu_input_ts(7, now_ns - 30'000'000, &stamps);
+    vstreamer::apps::note_pdu_input_ts(7, now_ns, &stamps);
+    ASSERT_EQ(1U, stamps.count(7));
+    EXPECT_EQ(now_ns - 30'000'000, stamps[7]);
 }
 
 }  // namespace

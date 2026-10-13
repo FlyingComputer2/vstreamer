@@ -46,9 +46,6 @@ using apps::record_pdu_edge_latency_ms;
 namespace
 {
 
-/* Encoder entry stamps by ts_us; owned by the encode stage thread. */
-using enc_stamp_map = std::unordered_map<uint64_t, int64_t>;
-
 [[nodiscard]] size_t pdu_bytes(const component_pdu &pdu)
 {
     return is_caps(pdu.sdu_type) ? 0U : pdu.sdu.size();
@@ -131,10 +128,10 @@ void drain_pay_pdus_to_sender(rtp_h264_pay &pay, stream_sender &sender, bench_di
 }
 
 bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag &diag,
-                            component_pdu &&au, enc_stamp_map *enc_in_mono)
+                            component_pdu &&au, apps::pdu_stamp_map *enc_in_mono)
 {
     log_pdu_stage_latency("enc_out", au);
-    record_pdu_edge_latency_ms("enc", au, enc_in_mono);
+    record_pdu_edge_latency_ms(&apps::g_node_latency_enc_ms, au, enc_in_mono);
     diag.tx_enc_out_bytes.fetch_add(pdu_bytes(au), std::memory_order_relaxed);
     auto *pay_in = dynamic_cast<component_input *>(&pay);
     if (nullptr == pay_in || pay_in->input(std::move(au)) < 0)
@@ -146,7 +143,7 @@ bool forward_encoded_au_pdu(rtp_h264_pay &pay, stream_sender &sender, bench_diag
 }
 
 bool drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &sender,
-                   bench_diag &diag, enc_stamp_map *enc_in_mono)
+                   bench_diag &diag, apps::pdu_stamp_map *enc_in_mono)
 {
     auto *enc_out = dynamic_cast<component_output *>(&enc);
     if (nullptr == enc_out)
@@ -165,7 +162,7 @@ bool drain_encoder(apps::tx::encoder_t &enc, rtp_h264_pay &pay, stream_sender &s
 
 bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sender *sender,
                             bench_diag *diag, component_pdu &nv12, bool *accepted,
-                            enc_stamp_map *enc_in_mono)
+                            apps::pdu_stamp_map *enc_in_mono)
 {
     if (nullptr != accepted)
     {
@@ -176,6 +173,9 @@ bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_
     {
         return false;
     }
+    /* Stamped before the first attempt (repeat calls keep it), so backpressure and the copy
+     * into the encoder count toward the enc node. */
+    note_pdu_input_ts(nv12.ts_us, steady_mono_ns(), enc_in_mono);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
     bool       got_enc_in = false;
     while (g_run.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < deadline)
@@ -187,7 +187,6 @@ bool submit_nv12_to_encoder(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_
             diag->tx_nv12++;
             got_enc_in = true;
             log_pdu_stage_latency("enc_in", nv12);
-            note_pdu_input_ts(nv12.ts_us, steady_mono_ns(), enc_in_mono);
             break;
         }
         if (-ECANCELED == enc_in_r)
@@ -310,7 +309,7 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     uint64_t last_seq = 0;
     bool     have_seq = false;
     int      inflight = 0;
-    std::unordered_map<uint64_t, int64_t> jpeg_in_mono;
+    apps::pdu_stamp_map jpeg_in_mono;
     component_pdu raw;
     bool          holding = false;
     while (g_run.load(std::memory_order_relaxed))
@@ -331,7 +330,7 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
                 inflight--;
                 note_pdu_sequence_gap(out.seq, last_seq, have_seq, nullptr);
                 log_pdu_stage_latency("jpeg_nv12", out);
-                record_pdu_edge_latency_ms("jpeg_nv12", out, &jpeg_in_mono);
+                record_pdu_edge_latency_ms(&apps::g_node_latency_jpeg_ms, out, &jpeg_in_mono);
                 diag->tx_jpeg_nv12++;
                 diag->tx_jpeg_nv12_bytes += pdu_bytes(out);
                 (void)nv12_pipe->push(std::move(out), &diag->tx_nv12_q_drop);
@@ -364,12 +363,11 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
                 holding = false;
                 continue;
             }
-            const uint64_t raw_ts_us = raw.ts_us;
-            const int64_t  in_mono_ns = steady_mono_ns();
-            const int      ir = jdec_in->input(std::move(raw));
+            /* First attempt's stamp is kept across EAGAIN retries. */
+            note_pdu_input_ts(raw.ts_us, steady_mono_ns(), &jpeg_in_mono);
+            const int ir = jdec_in->input(std::move(raw));
             if (0 == ir)
             {
-                note_pdu_input_ts(raw_ts_us, in_mono_ns, &jpeg_in_mono);
                 holding = false;
                 inflight++;
                 continue;
@@ -413,7 +411,7 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     sender->set_wakeup(enc_wake);
     component_pdu nv12_pdu;
     int64_t       nv12_enqueue_mono_ns = 0;
-    enc_stamp_map enc_in_mono;
+    apps::pdu_stamp_map enc_in_mono;
     bool          holding = false;
     uint64_t                              last_seq = 0;
     bool                                  have_seq = false;
@@ -443,7 +441,8 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
                         static_cast<double>(steady_mono_ns() - nv12_enqueue_mono_ns) / 1e6;
                     if (ms >= 0.0)
                     {
-                        apps::record_stage_node_latency_ms("encoder_queue", ms);
+                        apps::record_stage_node_latency_ms(
+                            &apps::g_node_latency_encoder_queue_ms, ms);
                     }
                 }
                 holding = true;

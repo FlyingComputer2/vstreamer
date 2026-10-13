@@ -212,8 +212,11 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 #else
     const size_t enc_q_depth = 0;
 #endif
-    /* Capture age when the frame left the NV12 queue into the encoder (includes queue wait). */
-    const double enc_q_latency_ms = apps::g_latency_enc_in_ms.load(std::memory_order_relaxed);
+    double       enc_q_latency_ms = 0.0;
+    if (jpeg_out_fps > 0.5)
+    {
+        enc_q_latency_ms = static_cast<double>(enc_q_depth) * 1000.0 / jpeg_out_fps;
+    }
     uint64_t ch_fwd_drops = 0;
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     ch_fwd_drops = ch.dropped_rate + ch.dropped_loss + ch.dropped_queue;

@@ -22,7 +22,10 @@ extern std::atomic<double>  g_latency_dec_out_ms;
 extern std::atomic<double>  g_latency_present_ms;
 
 /* Per-node delay (ms) for the last frame through that node: exit stamp − entry stamp on the
- * same frame. The g_latency_* globals above are cumulative capture age at each stage. */
+ * same frame. The g_latency_* globals above are cumulative capture age at each stage.
+ * k_node_latency_none until the node has measured a frame; such nodes are not published. */
+constexpr double k_node_latency_none = -1.0;
+
 extern std::atomic<double> g_node_latency_jpeg_ms;
 extern std::atomic<double> g_node_latency_encoder_queue_ms;
 extern std::atomic<double> g_node_latency_enc_ms;
@@ -37,7 +40,7 @@ void stage_latency_set_diag_enabled(bool enabled);
 
 void note_source_pdu(const vstreamer::component_pdu &pdu);
 void record_stage_latency_ms(const char *stage, double ms);
-void record_stage_node_latency_ms(const char *stage, double ms);
+void record_stage_node_latency_ms(std::atomic<double> *node, double ms);
 
 }  // namespace vstreamer::apps
 

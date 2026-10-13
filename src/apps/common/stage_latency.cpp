@@ -23,11 +23,11 @@ std::atomic<double>  g_latency_dec_in_ms {0.0};
 std::atomic<double>  g_latency_dec_out_ms {0.0};
 std::atomic<double>  g_latency_present_ms {0.0};
 
-std::atomic<double> g_node_latency_jpeg_ms {0.0};
-std::atomic<double> g_node_latency_encoder_queue_ms {0.0};
-std::atomic<double> g_node_latency_enc_ms {0.0};
-std::atomic<double> g_node_latency_dec_ms {0.0};
-std::atomic<double> g_node_latency_present_ms {0.0};
+std::atomic<double> g_node_latency_jpeg_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_encoder_queue_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_enc_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_dec_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_present_ms {k_node_latency_none};
 
 namespace
 {
@@ -120,31 +120,11 @@ void record_stage_latency_ms(const char *stage, double ms)
     }
 }
 
-void record_stage_node_latency_ms(const char *stage, double ms)
+void record_stage_node_latency_ms(std::atomic<double> *node, double ms)
 {
-    if (nullptr == stage || ms < 0.0)
+    if (nullptr != node && ms >= 0.0)
     {
-        return;
-    }
-    if (0 == std::strcmp(stage, "jpeg_nv12"))
-    {
-        g_node_latency_jpeg_ms.store(ms, std::memory_order_relaxed);
-    }
-    else if (0 == std::strcmp(stage, "encoder_queue"))
-    {
-        g_node_latency_encoder_queue_ms.store(ms, std::memory_order_relaxed);
-    }
-    else if (0 == std::strcmp(stage, "enc"))
-    {
-        g_node_latency_enc_ms.store(ms, std::memory_order_relaxed);
-    }
-    else if (0 == std::strcmp(stage, "dec"))
-    {
-        g_node_latency_dec_ms.store(ms, std::memory_order_relaxed);
-    }
-    else if (0 == std::strcmp(stage, "present"))
-    {
-        g_node_latency_present_ms.store(ms, std::memory_order_relaxed);
+        node->store(ms, std::memory_order_relaxed);
     }
 }
 

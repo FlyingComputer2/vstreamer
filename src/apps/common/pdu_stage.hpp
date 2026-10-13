@@ -18,14 +18,17 @@ constexpr int64_t k_pdu_stage_wait_cap_ns = 50'000'000LL;
 
 void log_pdu_stage_latency(const char *stage, const component_pdu &pdu);
 
-/* Entry stamps keyed by ts_us for node latency across components that are not 1:1 in time.
- * Stamps whose output never appears (dropped frames) are pruned once the map grows. */
-void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns,
-                       std::unordered_map<uint64_t, int64_t> *input_mono_by_ts_us);
+/* Node entry stamps (steady mono ns) keyed by ts_us, for nodes that hold several frames at once.
+ * Owned by one stage thread. */
+using pdu_stamp_map = std::unordered_map<uint64_t, int64_t>;
 
-/* Records exit − entry for pdu.ts_us as the stage's node latency and drops the stamp. */
-void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
-                                std::unordered_map<uint64_t, int64_t> *edge_mono_by_ts_us);
+/* Stamps ts_us entering a node; a frame already stamped keeps its first stamp. Stamps whose
+ * output never appears (dropped frames) expire after 1 s; at the size cap the oldest goes. */
+void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns, pdu_stamp_map *input_mono_by_ts_us);
+
+/* Stores exit − entry for pdu.ts_us into *node and drops the stamp. */
+void record_pdu_edge_latency_ms(std::atomic<double> *node, const component_pdu &pdu,
+                                pdu_stamp_map *edge_mono_by_ts_us);
 
 void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
                            std::atomic<uint64_t> *gap_counter);
