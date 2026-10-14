@@ -300,6 +300,25 @@ TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
     sender.close();
 }
 
+/* fec_timeout_ms 0 never flushes a partial block: nothing leaves until k SDUs fill it. */
+TEST(FecTimeoutTest, ZeroWaitsForFullBlock)
+{
+    wire_sniffer             sniff;
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "fec_timeout_ms", "0"));
+    open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0))));
+    EXPECT_TRUE(sniff.collect(1, 150).empty());  // 150 ms: 7x the default timeout
+    for (uint8_t t = 1; t < 4; t++)
+    {
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
+    }
+    const auto got = sniff.collect(6, 1000);
+    ASSERT_EQ(6u, got.size());  // 4 data + 2 parity, one full block
+    EXPECT_EQ(6, got.front().n_sent);
+    sender.close();
+}
+
 /* Two blocks closed 10 ms apart with a 30 ms window overlap: their shards interleave on the
  * wire, and the wire sequence still counts up in send order. */
 TEST(FecSpreadTest, OverlappingBlocksInterleave)
