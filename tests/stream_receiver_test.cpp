@@ -466,8 +466,18 @@ TEST(StreamReceiverTest, TelemetryCountersResetOnReopen)
     sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
     vstreamer::stream_link_report rep {};
     ASSERT_TRUE(recv_link_report_wire(s, &rep, 200));
+    /* telemetry_sent is counted after sendto returns, so the report can arrive first. */
     std::string sent;
-    ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
+    const auto  sent_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    do
+    {
+        ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
+        if ("0" != sent)
+        {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < sent_deadline);
     EXPECT_NE("0", sent);
 
     receiver.close();

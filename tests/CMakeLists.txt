@@ -80,7 +80,16 @@ target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMA
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 
 include(GoogleTest)
-gtest_discover_tests(vstreamer_tests DISCOVERY_MODE PRE_TEST)
+# These suites assert millisecond send and wakeup timing, which parallel ctest load breaks;
+# run them on their own.
+set(VSTREAMER_TIMING_TESTS "FecSpreadTest.*:StageLoopDrainTest.*")
+gtest_discover_tests(vstreamer_tests DISCOVERY_MODE PRE_TEST TEST_FILTER "-${VSTREAMER_TIMING_TESTS}")
+gtest_discover_tests(
+    vstreamer_tests
+    DISCOVERY_MODE PRE_TEST
+    TEST_FILTER "${VSTREAMER_TIMING_TESTS}"
+    PROPERTIES RUN_SERIAL TRUE
+)
 
 if(TARGET uvc_stream_sender AND TARGET sdl_stream_receiver)
     add_executable(split_apps_test split_apps_test.cpp)

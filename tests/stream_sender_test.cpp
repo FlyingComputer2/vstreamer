@@ -858,14 +858,27 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
     }
     EXPECT_TRUE(saw_eagain);
 
-    std::string dropped_before;
-    ASSERT_EQ(0, sender.query("dropped", &dropped_before));
-    const uint64_t dropped0 = std::strtoull(dropped_before.c_str(), nullptr, 10);
-    auto overflow_pkt = vstreamer::test_pdu::make_stream_dgram(9999, 64);
-    EXPECT_EQ(-EAGAIN, sender.input(std::move(overflow_pkt)));
-    std::string dropped_after;
-    ASSERT_EQ(0, sender.query("dropped", &dropped_after));
-    EXPECT_EQ(dropped0, std::strtoull(dropped_after.c_str(), nullptr, 10));
+    /* The pacer keeps sending, so a slot can free between the EAGAIN above and this push;
+     * the push then succeeds and refills the queue. Retry until one is refused. */
+    bool refused = false;
+    for (int attempt = 0; attempt < 50 && !refused; ++attempt)
+    {
+        std::string dropped_before;
+        ASSERT_EQ(0, sender.query("dropped", &dropped_before));
+        const uint64_t dropped0 = std::strtoull(dropped_before.c_str(), nullptr, 10);
+        auto overflow_pkt = vstreamer::test_pdu::make_stream_dgram(9999, 64);
+        const int rc = sender.input(std::move(overflow_pkt));
+        if (0 == rc)
+        {
+            continue;
+        }
+        ASSERT_EQ(-EAGAIN, rc);
+        refused = true;
+        std::string dropped_after;
+        ASSERT_EQ(0, sender.query("dropped", &dropped_after));
+        EXPECT_EQ(dropped0, std::strtoull(dropped_after.c_str(), nullptr, 10));
+    }
+    EXPECT_TRUE(refused);
 
     sender.close();
 }

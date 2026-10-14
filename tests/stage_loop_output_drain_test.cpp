@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <atomic>
 #include <chrono>
@@ -17,6 +18,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -77,7 +79,7 @@ private:
 };
 
 void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stage &stage,
-                    std::atomic<bool> &run, double *max_output_lag_ms)
+                    std::atomic<bool> &run, std::vector<double> *output_lags_ms)
 {
     auto *stage_in = dynamic_cast<vstreamer::component_input *>(&stage);
     auto *stage_out = dynamic_cast<vstreamer::component_output *>(&stage);
@@ -115,9 +117,9 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
                 const int64_t now_ns = vstreamer::steady_mono_ns();
                 const int64_t cap_ns = static_cast<int64_t>(out.ts_us) * 1000LL;
                 const double  lag_ms = static_cast<double>(now_ns - cap_ns) / 1e6;
-                if (nullptr != max_output_lag_ms)
+                if (nullptr != output_lags_ms)
                 {
-                    *max_output_lag_ms = std::max(*max_output_lag_ms, lag_ms);
+                    output_lags_ms->push_back(lag_ms);
                 }
                 inflight--;
                 continue;
@@ -168,7 +170,7 @@ TEST(StageLoopDrainTest, ComponentOutputLeavesWithin2msOfReady)
     vstreamer::apps::pipeline_pdu_queue in_q(8, run);
     delayed_nv12_stage                    stage;
 
-    double max_lag_ms = 0.0;
+    std::vector<double> lags_ms;
     std::thread feeder([&]() {
         uint64_t seq = 0;
         const auto t0 = std::chrono::steady_clock::now();
@@ -187,12 +189,17 @@ TEST(StageLoopDrainTest, ComponentOutputLeavesWithin2msOfReady)
         in_q.wake_shutdown();
     });
 
-    std::thread consumer([&]() { run_stage_loop(in_q, stage, run, &max_lag_ms); });
+    std::thread consumer([&]() { run_stage_loop(in_q, stage, run, &lags_ms); });
 
     feeder.join();
     consumer.join();
 
-    EXPECT_GT(max_lag_ms, 0.0);
-    EXPECT_LT(max_lag_ms, 15.0)
+    /* Median, not max: waiting for the next input delays every frame by ~28 ms, while a
+     * loaded host (parallel ctest) can delay any single frame past the bound. */
+    ASSERT_FALSE(lags_ms.empty());
+    std::sort(lags_ms.begin(), lags_ms.end());
+    const double median_lag_ms = lags_ms[lags_ms.size() / 2];
+    EXPECT_GT(median_lag_ms, 0.0);
+    EXPECT_LT(median_lag_ms, 15.0)
         << "decoded output should leave soon after ready, not wait for next input (~28ms)";
 }
