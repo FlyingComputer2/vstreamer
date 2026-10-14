@@ -23,6 +23,12 @@ std::atomic<double>  g_latency_dec_in_ms {0.0};
 std::atomic<double>  g_latency_dec_out_ms {0.0};
 std::atomic<double>  g_latency_present_ms {0.0};
 
+std::atomic<double> g_node_latency_jpeg_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_encoder_queue_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_enc_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_dec_ms {k_node_latency_none};
+std::atomic<double> g_node_latency_present_ms {k_node_latency_none};
+
 namespace
 {
 
@@ -111,6 +117,14 @@ void record_stage_latency_ms(const char *stage, double ms)
     {
         g_latency_present_ms.store(ms, std::memory_order_relaxed);
         g_glass_latency_ms.store(ms, std::memory_order_relaxed);
+    }
+}
+
+void record_stage_node_latency_ms(std::atomic<double> *node, double ms)
+{
+    if (nullptr != node && ms >= 0.0)
+    {
+        node->store(ms, std::memory_order_relaxed);
     }
 }
 

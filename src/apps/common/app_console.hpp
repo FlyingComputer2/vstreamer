@@ -6,6 +6,7 @@
 #include <atomic>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -31,10 +32,13 @@ public:
     app_console(const app_console &) = delete;
     app_console &operator=(const app_console &) = delete;
 
+    using metric_name_filter_fn = std::function<bool(std::string_view name)>;
+
     void set_bind_host(const char *host);
     void set_pipeline_metrics(const vstreamer::metrics *source);
     void set_pipeline_metrics_sync_live(std::function<void()> sync_live);
     void set_source_state_metrics_refresh(std::function<void()> refresh);
+    void set_metric_name_filter(metric_name_filter_fn filter);
 
     void add_handler(handler_fn handler, std::string help_text);
 
@@ -65,6 +69,7 @@ private:
     const vstreamer::metrics *pipeline_metrics = nullptr;
     std::function<void()>     pipeline_metrics_sync_live;
     std::function<void()>     source_state_metrics_refresh;
+    metric_name_filter_fn     metric_filter;
 };
 
 }  // namespace vstreamer::apps

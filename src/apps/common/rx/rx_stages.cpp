@@ -25,9 +25,11 @@ using namespace vstreamer;
 using apps::g_cpu_map;
 using apps::g_run;
 using apps::log_pdu_stage_latency;
+using apps::note_pdu_input_ts;
 using apps::note_pdu_sequence_gap;
 using apps::pdu_rx_au_queue;
 using apps::present_pdu_queue;
+using apps::record_pdu_edge_latency_ms;
 using apps::rx::ensure_decoder_open;
 using apps::rx::g_rx;
 using apps::wait_for_pdu;
@@ -42,7 +44,8 @@ namespace
     return is_caps(pdu.sdu_type) ? 0U : pdu.sdu.size();
 }
 
-bool drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, bench_diag &diag)
+bool drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, bench_diag &diag,
+                    apps::pdu_stamp_map *dec_in_mono)
 {
     if (ensure_decoder_open(dec) < 0)
     {
@@ -64,13 +67,14 @@ bool drain_dec_pdus(h264_decoder_mpp *dec, present_pdu_queue *present_queue, ben
         diag.rx_nv12_out++;
         diag.rx_nv12_out_bytes += pdu_bytes(frame);
         log_pdu_stage_latency("dec_out", frame);
+        record_pdu_edge_latency_ms(&apps::g_node_latency_dec_ms, frame, dec_in_mono);
         (void)present_queue->push(std::move(frame), &diag.rx_present_q_drop);
     }
     return drained;
 }
 
 int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queue *present_queue,
-                     bench_diag &diag)
+                     bench_diag &diag, apps::pdu_stamp_map *dec_in_mono)
 {
     if (ensure_decoder_open(dec) < 0)
     {
@@ -82,6 +86,9 @@ int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queu
         return -ENOTSUP;
     }
     const size_t bytes = pdu.sdu.size();
+    /* Stamped before the first attempt (repeat calls keep it), so backpressure and the packet
+     * put count toward the dec node. */
+    note_pdu_input_ts(pdu.ts_us, steady_mono_ns(), dec_in_mono);
     for (int attempt = 0; g_run.load(std::memory_order_relaxed) && attempt < 48; attempt++)
     {
         component_pdu attempt_pdu = pdu;
@@ -99,7 +106,7 @@ int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queu
         if (-EAGAIN == r)
         {
             diag.rx_dec_in_eagain++;
-            drain_dec_pdus(dec, present_queue, diag);
+            drain_dec_pdus(dec, present_queue, diag, dec_in_mono);
             std::this_thread::sleep_for(std::chrono::microseconds(200));
             continue;
         }
@@ -153,7 +160,9 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
             continue;
         }
         log_pdu_stage_latency("present", pdu);
-        if (sink_pdu->input(std::move(pdu)) == 0)
+        const int64_t present_in_ns = steady_mono_ns();
+        const bool    presented = sink_pdu->input(std::move(pdu)) == 0;
+        if (presented)
         {
             diag->rx_present_ok++;
         }
@@ -164,6 +173,12 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
         if (auto *sdl = dynamic_cast<sdl_sink *>(display))
         {
             (void)sdl->present_pending();
+        }
+        if (presented)
+        {
+            apps::record_stage_node_latency_ms(
+                &apps::g_node_latency_present_ms,
+                static_cast<double>(steady_mono_ns() - present_in_ns) / 1e6);
         }
     }
 }
@@ -237,6 +252,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
     bool          holding = false;
     uint64_t            last_seq = 0;
     bool                have_seq = false;
+    apps::pdu_stamp_map dec_in_mono;
     while (g_run.load(std::memory_order_relaxed))
     {
         if (g_rx.skip_decode.load())
@@ -244,7 +260,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        bool progressed = drain_dec_pdus(dec, present_queue, *diag);
+        bool progressed = drain_dec_pdus(dec, present_queue, *diag, &dec_in_mono);
         if (!holding)
         {
             if (au_in_queue->try_pop(pdu))
@@ -279,11 +295,11 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
         }
         if (holding)
         {
-            const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag);
+            const int r = feed_decoder_pdu(dec, pdu, present_queue, *diag, &dec_in_mono);
             if (0 == r)
             {
                 holding = false;
-                if (drain_dec_pdus(dec, present_queue, *diag))
+                if (drain_dec_pdus(dec, present_queue, *diag, &dec_in_mono))
                 {
                     progressed = true;
                 }
@@ -291,7 +307,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             }
             if (-EAGAIN == r)
             {
-                if (drain_dec_pdus(dec, present_queue, *diag))
+                if (drain_dec_pdus(dec, present_queue, *diag, &dec_in_mono))
                 {
                     progressed = true;
                 }
@@ -308,7 +324,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
             wait_for_pdu(*wake, *owner, g_run);
         }
     }
-    drain_dec_pdus(dec, present_queue, *diag);
+    drain_dec_pdus(dec, present_queue, *diag, &dec_in_mono);
 }
 
 #endif

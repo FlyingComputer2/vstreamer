@@ -13,6 +13,14 @@
 namespace vstreamer::apps
 {
 
+namespace
+{
+
+constexpr size_t  k_pdu_edge_stamps_max = 64;
+constexpr int64_t k_pdu_edge_stamp_ttl_ns = 1'000'000'000LL;
+
+}  // namespace
+
 void log_pdu_stage_latency(const char *stage, const component_pdu &pdu)
 {
     if (nullptr == stage || is_caps(pdu.sdu_type) || pdu.ts_us <= 0)
@@ -39,20 +47,44 @@ void log_pdu_stage_latency(const char *stage, const component_pdu &pdu)
                  pdu.ts_us);
 }
 
-void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns,
-                       std::unordered_map<uint64_t, int64_t> *input_mono_by_ts_us)
+void note_pdu_input_ts(uint64_t ts_us, int64_t mono_ns, pdu_stamp_map *input_mono_by_ts_us)
 {
     if (nullptr == input_mono_by_ts_us || 0 == ts_us)
     {
         return;
     }
-    (*input_mono_by_ts_us)[ts_us] = mono_ns;
+    if (input_mono_by_ts_us->size() >= k_pdu_edge_stamps_max &&
+        0 == input_mono_by_ts_us->count(ts_us))
+    {
+        const int64_t cutoff = mono_ns - k_pdu_edge_stamp_ttl_ns;
+        auto          oldest = input_mono_by_ts_us->end();
+        for (auto it = input_mono_by_ts_us->begin(); it != input_mono_by_ts_us->end();)
+        {
+            if (it->second < cutoff)
+            {
+                it = input_mono_by_ts_us->erase(it);
+                continue;
+            }
+            if (oldest == input_mono_by_ts_us->end() || it->second < oldest->second)
+            {
+                oldest = it;
+            }
+            ++it;
+        }
+        /* Still full of young stamps (a drop burst): evict only the oldest, so frames still
+         * inside the node keep theirs. */
+        if (input_mono_by_ts_us->size() >= k_pdu_edge_stamps_max)
+        {
+            input_mono_by_ts_us->erase(oldest);
+        }
+    }
+    (void)input_mono_by_ts_us->try_emplace(ts_us, mono_ns);
 }
 
-void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
-                                std::unordered_map<uint64_t, int64_t> *edge_mono_by_ts_us)
+void record_pdu_edge_latency_ms(std::atomic<double> *node, const component_pdu &pdu,
+                                pdu_stamp_map *edge_mono_by_ts_us)
 {
-    if (nullptr == stage || nullptr == edge_mono_by_ts_us || is_caps(pdu.sdu_type) || pdu.ts_us == 0)
+    if (nullptr == node || nullptr == edge_mono_by_ts_us || is_caps(pdu.sdu_type) || pdu.ts_us == 0)
     {
         return;
     }
@@ -61,12 +93,7 @@ void record_pdu_edge_latency_ms(const char *stage, const component_pdu &pdu,
     {
         return;
     }
-    const int64_t now_ns = steady_mono_ns();
-    const double  ms = static_cast<double>(now_ns - it->second) / 1e6;
-    if (ms >= 0.0)
-    {
-        record_stage_latency_ms(stage, ms);
-    }
+    record_stage_node_latency_ms(node, static_cast<double>(steady_mono_ns() - it->second) / 1e6);
     edge_mono_by_ts_us->erase(it);
 }
 

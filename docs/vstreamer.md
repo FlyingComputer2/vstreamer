@@ -281,9 +281,14 @@ Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_O
 
 One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
 `max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
-reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`). Capture-to-display latency
-across two hosts needs clock sync, which is not implemented; `latency.glass_ms` is only meaningful
-in `stream_sdl_test`.
+reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`).
+
+**Latency on `sdl_stream_receiver` (`:5091`):** stages are timed from the capture timestamp
+carried in the RTP capture extension (sender stamps at encode; depay maps to local monotonic). The console
+publishes `latency.glass_ms`, `latency.depay_ms`, `latency.dec_in_ms`, `latency.dec_out_ms`, and
+`latency.present_ms` only — not TX-only keys (`latency.source_ms`, `jpeg_ms`, `enc_*`). Those
+appear on the sender console or in `stream_sdl_test` loopback. Glass latency across hosts needs
+aligned `CLOCK_REALTIME` (chrony); see [packet-model.md](packet-model.md).
 
 Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
 `tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
@@ -359,6 +364,28 @@ counters stay 0, age `-1`). Counters read 0 until the first report arrives.
 
 `scripts/cbr_controller.py` reads peer counters and `peer_report_age_ms`, holds bitrate increases
 when telemetry is stale, and adjusts `set_encode_cbr` (AIMD).
+
+Latency metrics come in two kinds. Each app half publishes only its own keys.
+
+| Key | Meaning |
+|-----|---------|
+| `latency.<stage>_ms`, `<component>.latency_ms` | Cumulative: capture age (`now − ts_us`) of the latest frame at that stage. |
+| `latency.<node>_node_ms`, `<component>.node_latency_ms` | Per node: exit stamp − entry stamp on the same frame, for the last frame through that node. Not published until the node has measured a frame. |
+
+| Node | Component key | Entry → exit |
+|------|---------------|--------------|
+| `jpeg` | `jpeg_decoder` | first input attempt → NV12 out |
+| `encoder_queue` | `encoder_queue` | NV12 queue push → pop |
+| `enc` | `h264_encoder` | first input attempt → AU out |
+| `dec` | `h264_decoder` | first input attempt → NV12 out |
+| `present` | `sdl_sink` | sink input → present done |
+
+Entry is the first `input()` attempt, so time spent retrying on `-EAGAIN` (backpressure) counts
+toward the node. On the TX side `encoder_queue` ends where `enc` starts, so the two add up to the
+time from JPEG output to encoded AU. JPEG decoder, encoder and decoder hold several frames at
+once and are matched by `ts_us`. `encoder_queue.latency_ms` is the exception to the cumulative
+rule: it is the queue wait estimated from depth ÷ input fps; the measured wait is
+`encoder_queue.node_latency_ms`.
 
 ### Deployment over winject
 

@@ -97,6 +97,11 @@ void app_console::set_source_state_metrics_refresh(std::function<void()> refresh
     source_state_metrics_refresh = std::move(refresh);
 }
 
+void app_console::set_metric_name_filter(metric_name_filter_fn filter)
+{
+    metric_filter = std::move(filter);
+}
+
 void app_console::add_handler(handler_fn handler, std::string help_text)
 {
     handlers.push_back({std::move(handler), std::move(help_text)});
@@ -169,6 +174,11 @@ bool app_console::handle_line_impl(const char *line, std::string &reply)
         {
             source_state_metrics_refresh();
         }
+        if (metric_filter && !metric_filter(name))
+        {
+            reply = "err unknown metric\n";
+            return true;
+        }
         std::string value;
         if (!pipeline_metrics->format_metric(name, &value))
         {
@@ -195,7 +205,12 @@ bool app_console::handle_line_impl(const char *line, std::string &reply)
         {
             source_state_metrics_refresh();
         }
-        const std::string report = pipeline_metrics->to_string();
+        const std::string report = metric_filter
+                                       ? pipeline_metrics->to_string(
+                                             [this](std::string_view name) {
+                                                 return metric_filter(name);
+                                             })
+                                       : pipeline_metrics->to_string();
         if (report.empty())
         {
             reply = "err metrics empty\n";
