@@ -171,7 +171,10 @@ private:
     double            pace_last_sec = 0.;
     int               queue_ms = 100;
     /* FEC block spreading: a block's shards are released evenly over this window instead of
-     * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the wire. */
+     * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the wire.
+     * Not capped. Shards wait in the send queue until due, so about rate x spread bytes are queued:
+     * past queue_byte_limit() the queue evicts or refuses input. Past the receiver's head-of-line
+     * give-up (max(3 x fec_timeout_ms, 60) ms) it abandons blocks whose last shards are late. */
     std::atomic<int> fec_spread_ms {0};
 
     /* Guards fec (touched by input(), the send thread and configure()).
