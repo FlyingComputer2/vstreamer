@@ -3,9 +3,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <variant>
 #include <vector>
@@ -35,6 +37,10 @@ public:
     std::shared_ptr<metric> get_metric(const std::string &name);
 
     [[nodiscard]] std::string to_string() const;
+
+    /* When filter returns false, the metric is omitted from to_string() output. */
+    using metric_name_filter = std::function<bool(std::string_view name)>;
+    [[nodiscard]] std::string to_string(metric_name_filter filter) const;
 
     /* Single metric by full name (e.g. stream_sender.loss_pct). */
     [[nodiscard]] bool format_metric(const std::string &name, std::string *out) const;

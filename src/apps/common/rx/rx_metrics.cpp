@@ -101,4 +101,14 @@ void publish_latency_metrics(double glass_ms)
                                 "sdl_sink.node_latency_ms");
 }
 
+#if defined(VSTREAMER_APP_SPLIT_RX_ONLY)
+
+bool latency_metric_visible(std::string_view full_name)
+{
+    return full_name != "latency.source_ms" && full_name != "latency.jpeg_ms" &&
+           full_name != "latency.enc_in_ms" && full_name != "latency.enc_out_ms";
+}
+
+#endif
+
 }  // namespace vstreamer::apps::rx

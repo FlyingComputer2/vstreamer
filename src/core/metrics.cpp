@@ -183,6 +183,11 @@ bool metrics::format_metric(const std::string &name, std::string *out) const
 
 std::string metrics::to_string() const
 {
+    return to_string([](std::string_view) { return true; });
+}
+
+std::string metrics::to_string(metric_name_filter filter) const
+{
     std::vector<std::pair<std::string, std::shared_ptr<metric>>> snapshot;
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -194,6 +199,10 @@ std::string metrics::to_string() const
     for (const auto &item : snapshot)
     {
         const std::string &name = item.first;
+        if (filter && !filter(name))
+        {
+            continue;
+        }
         const std::shared_ptr<metric> &ptr = item.second;
         if (nullptr == ptr)
         {
