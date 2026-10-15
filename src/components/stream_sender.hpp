@@ -34,7 +34,7 @@ enum class fec_mode_e
     block,
 };
 
-/* Pad 0 (sink): STREAM_DGRAM in → UDP egress. */
+/* Pad 0 (sink): STREAM_DGRAM or RTP in → UDP egress (payload is opaque). */
 class stream_sender : public component_sink
 {
 public:
