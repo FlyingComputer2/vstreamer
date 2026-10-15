@@ -207,8 +207,8 @@ FU-A, capture-time header extension).
 | `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
 | `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
 | `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
-| `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block) |
-| `fec_spread_ms` | C Q | ≥ 0, default 0 (spread each FEC block's shards over N ms) |
+| `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block after N ms). 0 never flushes: a block leaves only once `fec_k` SDUs fill it |
+| `fec_spread_ms` | C Q | ≥ 0, default 0 (spread each FEC block's shards over N ms). Not capped: keep it under the receiver's head-of-line give-up (`max(3 × fec_timeout_ms, 60)` ms), and keep rate × spread under `queue_byte_limit`, since shards wait in the send queue until due |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
 
@@ -349,7 +349,7 @@ Rover H3 example: `source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 | `get_metric <name>` | one metric |
 | `stats` | link emulator counters |
 | `set_max_kbps <kbps>`, `set_drop_dt_ms <ms>`, `set_constant_loss <pct>` | link emulator |
-| `set_fec none`, `set_fec_k <k>`, `set_fec_n <n>`, `set_fec_spread <ms>`, `set_fec_timeout <ms>` | `stream_sender` FEC (`timeout` 0..60 000 ms) |
+| `set_fec none`, `set_fec_k <k>`, `set_fec_n <n>`, `set_fec_spread <ms>`, `set_fec_timeout <ms>` | `stream_sender` FEC (`timeout` 0..60 000 ms, 0 = wait for a full block) |
 | `set_encode_cbr <kbps>`, `set_encode_qp <qp>`, `set_gop <gop>`, `force_idr` | encoder |
 
 Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,

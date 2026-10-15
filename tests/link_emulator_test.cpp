@@ -36,6 +36,23 @@ int bind_udp_loopback(int port)
     return fd;
 }
 
+/* The emulator counts pkts_out after sendto returns, so a packet can arrive before its count. */
+template <typename Pred>
+bool wait_for(Pred pred, int timeout_ms)
+{
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (!pred())
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 int recv_until(int fd, int expected, int timeout_ms)
 {
     int got = 0;
@@ -81,7 +98,11 @@ TEST(LinkEmulatorTest, BurstNoImpairmentDeliversAll)
     dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     dst.sin_port = htons(static_cast<uint16_t>(k_ingress));
 
-    constexpr int k_pkts = 300;
+    /* Below what the default receive buffer holds (~270 small datagrams at rmem_default), so
+     * the burst cannot overflow it however late the reader below gets to run. */
+    constexpr int k_pkts = 200;
+    int           got = 0;
+    std::thread   reader([&]() { got = recv_until(recv_fd, k_pkts, 3000); });
     uint8_t       payload[8] = {0xAB};
     for (int i = 0; i < k_pkts; ++i)
     {
@@ -91,7 +112,10 @@ TEST(LinkEmulatorTest, BurstNoImpairmentDeliversAll)
                          reinterpret_cast<sockaddr *>(&dst), sizeof(dst)));
     }
 
-    const int got = recv_until(recv_fd, k_pkts, 3000);
+    reader.join();
+    (void)wait_for(
+        [&]() { return ch.forward_stats_snapshot().pkts_out >= static_cast<uint64_t>(k_pkts); },
+        1000);
     const auto stats = ch.forward_stats_snapshot();
 
     close(send_fd);
@@ -196,6 +220,7 @@ TEST(LinkEmulatorTest, ReturnPathIsNatOfForwardFlow)
     ASSERT_TRUE(recv_from(a, 500, &reply_src));
     EXPECT_EQ(htons(k_ingress), reply_src.sin_port);
     EXPECT_EQ(htonl(INADDR_LOOPBACK), reply_src.sin_addr.s_addr);
+    (void)wait_for([&]() { return ch.reverse_stats_snapshot().pkts_out >= 1U; }, 1000);
     EXPECT_EQ(1U, ch.reverse_stats_snapshot().pkts_out);
 
     /* 4. Loss applies to the return path too. */

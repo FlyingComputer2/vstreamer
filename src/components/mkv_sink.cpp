@@ -396,9 +396,11 @@ void mkv_sink::mux_thread_main()
             }
             pkt = std::move(queue.front());
             queue.pop_front();
+            /* Counted under q_mu with the pop, so wait_mux_idle never sees an empty queue
+             * and nothing in flight while this packet is in hand. */
+            mux_in_flight.fetch_add(1, std::memory_order_relaxed);
         }
 
-        mux_in_flight.fetch_add(1, std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> lock(mu);
             if (opened)
@@ -412,7 +414,10 @@ void mkv_sink::mux_thread_main()
                 }
             }
         }
-        mux_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(q_mu);
+            mux_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        }
         q_cv.notify_all();
     }
 }
@@ -428,7 +433,12 @@ void mkv_sink::wait_mux_idle()
 void mkv_sink::stop_mux_thread()
 {
     wait_mux_idle();
-    mux_stop.store(true, std::memory_order_relaxed);
+    {
+        /* Under q_mu: set outside it, the store and notify can land between the mux thread's
+         * predicate check and its sleep, and the thread never wakes to see it. */
+        std::lock_guard<std::mutex> lock(q_mu);
+        mux_stop.store(true, std::memory_order_relaxed);
+    }
     q_cv.notify_all();
     if (mux_thread.joinable())
     {

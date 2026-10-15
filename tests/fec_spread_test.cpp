@@ -13,11 +13,15 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <thread>
@@ -59,6 +63,9 @@ public:
         socklen_t len = sizeof(addr);
         getsockname(fd_, reinterpret_cast<sockaddr *>(&addr), &len);
         port_ = ntohs(addr.sin_port);
+        /* Kernel receive stamps: a late wakeup of this thread must not bunch shards together. */
+        const int on = 1;
+        EXPECT_EQ(0, setsockopt(fd_, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof(on)));
     }
     ~wire_sniffer()
     {
@@ -83,14 +90,21 @@ public:
             {
                 continue;
             }
-            const ssize_t n = recv(fd_, buf, sizeof(buf), MSG_DONTWAIT);
+            iovec   iov {buf, sizeof(buf)};
+            alignas(cmsghdr) uint8_t ctrl[CMSG_SPACE(sizeof(timespec))];
+            msghdr  msg {};
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = ctrl;
+            msg.msg_controllen = sizeof(ctrl);
+            const ssize_t n = recvmsg(fd_, &msg, MSG_DONTWAIT);
             if (n < static_cast<ssize_t>(vstreamer::k_stream_header_len +
                                          rs_block_erasure::k_header_len))
             {
                 continue;
             }
             shard s;
-            s.at = clock_type::now();
+            s.at = arrival_time(msg);
             s.wire_seq = vstreamer::stream_header_sequence_be16(buf);
             const uint8_t *fec = buf + vstreamer::k_stream_header_len;
             int            k = 0;
@@ -106,6 +120,31 @@ public:
     }
 
 private:
+    /* SO_TIMESTAMPNS stamps CLOCK_REALTIME; shift it onto clock_type by its age. */
+    static clock_type::time_point arrival_time(msghdr &msg)
+    {
+        const auto now = clock_type::now();
+        for (cmsghdr *c = CMSG_FIRSTHDR(&msg); nullptr != c; c = CMSG_NXTHDR(&msg, c))
+        {
+            if (SOL_SOCKET == c->cmsg_level && SCM_TIMESTAMPNS == c->cmsg_type)
+            {
+                timespec rx {};
+                std::memcpy(&rx, CMSG_DATA(c), sizeof(rx));
+                timespec wall {};
+                clock_gettime(CLOCK_REALTIME, &wall);
+                const int64_t age_ns = (static_cast<int64_t>(wall.tv_sec) - rx.tv_sec) *
+                                           1'000'000'000LL +
+                                       (wall.tv_nsec - rx.tv_nsec);
+                if (age_ns >= 0)
+                {
+                    return now - std::chrono::nanoseconds(age_ns);
+                }
+                break;
+            }
+        }
+        return now;
+    }
+
     int      fd_ = -1;
     uint16_t port_ = 0;
 };
@@ -228,11 +267,21 @@ TEST(FecSpreadTest, BlockSpreadOverWindowInOrder)
     }
     const auto got = sniff.collect(6, 1000);
     ASSERT_EQ(6u, got.size());
+    /* Measure each shard against the schedule set by the least-delayed shard. Against shard 0,
+     * a late first wakeup of the send thread (shard 0 then leaves with shard 1) reads as every
+     * later shard being early. Spread off would put shards up to 25 ms behind; allow 8. */
+    double origin_ms = 0.0;
+    for (size_t i = 0; i < got.size(); i++)
+    {
+        const double expect_ms = 30.0 * static_cast<double>(i) / 6.0;
+        origin_ms = std::min(origin_ms, ms_between(got.front().at, got[i].at) - expect_ms);
+    }
     for (size_t i = 0; i < got.size(); i++)
     {
         EXPECT_EQ(static_cast<int>(i), got[i].idx);
         const double expect_ms = 30.0 * static_cast<double>(i) / 6.0;
-        EXPECT_NEAR(ms_between(got.front().at, got[i].at), expect_ms, 4.0) << "shard " << i;
+        const double late_ms = ms_between(got.front().at, got[i].at) - expect_ms - origin_ms;
+        EXPECT_LT(late_ms, 8.0) << "shard " << i;
     }
     sender.close();
 }
@@ -248,6 +297,25 @@ TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
     ASSERT_EQ(5u, got.size());  // 1 data + 4 parity
     EXPECT_EQ(5, got.front().n_sent);
     EXPECT_NEAR(ms_between(got.front().at, got.back().at), 20.0 * 4 / 5, 4.0);
+    sender.close();
+}
+
+/* fec_timeout_ms 0 never flushes a partial block: nothing leaves until k SDUs fill it. */
+TEST(FecTimeoutTest, ZeroWaitsForFullBlock)
+{
+    wire_sniffer             sniff;
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "fec_timeout_ms", "0"));
+    open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0))));
+    EXPECT_TRUE(sniff.collect(1, 150).empty());  // 150 ms: 7x the default timeout
+    for (uint8_t t = 1; t < 4; t++)
+    {
+        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
+    }
+    const auto got = sniff.collect(6, 1000);
+    ASSERT_EQ(6u, got.size());  // 4 data + 2 parity, one full block
+    EXPECT_EQ(6, got.front().n_sent);
     sender.close();
 }
 
