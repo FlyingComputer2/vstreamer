@@ -91,7 +91,7 @@ is not built returns `nullptr`.
 | `h264_decoder_mpp` | coder | H264 → NV12 | `h264_decoder_mpp`, `h264_decoder` | `ENABLE_H264_DECODER_MPP` |
 | `rtp_h264_pay` | coder | H264 FRAME → SOCK | `rtp_h264_pay`, `rtp_pay` | `ENABLE_RTP_H264_PAY` |
 | `rtp_h264_depay` | coder | SOCK → H264 FRAME | `rtp_h264_depay`, `rtp_depay` | `ENABLE_RTP_H264_DEPAY` |
-| `stream_sender` | sink | SOCK → UDP | `stream_sender`, `stream_sink` | `ENABLE_STREAM_SENDER` |
+| `stream_sender` | sink | SOCK or RTP → UDP | `stream_sender`, `stream_sink` | `ENABLE_STREAM_SENDER` |
 | `mkv_sink` | sink | MJPEG → .mkv | `mkv`, `mkv_sink` | `ENABLE_MKV_SINK` |
 | `sdl_sink` | sink | NV12 → window | `sdl`, `sdl_sink`, `display`, `sdl_kmsdrm`² | `ENABLE_SDL_SINK` |
 
@@ -294,6 +294,66 @@ aligned `CLOCK_REALTIME` (chrony); see [packet-model.md](packet-model.md).
 Stage threads and metrics for TX/RX are shared via `apps_common` (`tx_stages`, `rx_stages`,
 `tx_metrics`, `rx_metrics`) and `vstreamer_bench_pipeline` (`metrics_sync.cpp`, channel metrics)
 so `stream_sdl_test` and the split apps stay aligned.
+
+## App: `vstreamer` (pipeline file + management plane)
+
+`src/apps/vstreamer/` (`ENABLE_APP_VSTREAMER`, default ON) builds its pipelines from a pipeline
+file with `vstreamer::pipeline` (`core/pipeline.hpp`) and serves a UDP management plane. Unlike
+`uvc_stream_sender` / `sdl_stream_receiver` it has no media flags: the file says everything.
+
+```bash
+vstreamer rover_tx.vsp                         # mplane on udp 127.0.0.1:5090
+vstreamer gs_rx.vsp --mplane 0.0.0.0:5091      # reachable from other hosts (no authentication)
+vstreamer rover_tx.vsp --check                 # load and report errors, do not start
+```
+
+### Pipeline file
+
+One command per line, tokens separated by spaces, `#` starts a comment. Examples:
+[`src/apps/vstreamer/examples/`](../src/apps/vstreamer/examples/) (`rover_tx.vsp`, `gs_rx.vsp`,
+`noise_loopback.vsp`).
+
+| Command | Meaning |
+|---------|---------|
+| `queue <name> [capacity]` | cross-pipeline queue, default capacity 8; full drops the oldest frame, never caps |
+| `pipeline <name> [cpu=<n>]` | start a pipeline (one thread); the `node`/`link` lines below belong to it |
+| `node <name> <factory_type> [key=value ...]` | add a node; each `key=value` is a `configure()` in order |
+| `link <a> -> <b> [-> <c> ...]` | link nodes; `<name>:<port>` picks a port; `@<queue>` is the queue's writer at the end of a chain, its reader at the start |
+| `set <node> <key> <value...>` | `configure()`; the rest of the line is the value (may contain spaces) |
+| `enable <node> [timeout_ms]` | open a sink's send gate (`component_sink::set_enabled`) |
+
+Node names are unique across the file; queue endpoint nodes are named `@<queue>`. A queue needs
+exactly one writer and one reader, in different pipelines. Any error stops the load with
+`<file>:<line>: <message>`.
+
+`stream_sender` sends nothing until its gate is open. `enable snd` opens it for good (what
+`uvc_stream_sender` does); `enable snd <ms>` closes it again after `<ms>` unless the operator
+re-sends `enable` over the mplane (deadman).
+
+Pipelines start readers first (a pipeline reading a queue starts before the one writing it) and
+stop writers first. When a node fails (see the error rules in `core/pipeline.hpp`), the app stops
+all pipelines, waits 1 s and brings each back to the state last asked for (`start`/`pause`/`stop`
+over the mplane), retrying while a node cannot open (e.g. the camera is unplugged).
+
+### Management plane (UDP, one request per datagram)
+
+Replies end in a newline: `ok`, `ok <value>`, or `err <errno> <NAME>` (e.g. `err -2 ENOENT`);
+listing verbs answer one `ok …` line per item.
+
+| Verb | Effect |
+|------|--------|
+| `get <node> <key>` | `query()`; `pipeline.rejects` is PDUs the node refused |
+| `set <node> <key> <value...>` | `configure()` |
+| `nodes` | `ok <pipeline> <node> <type>` per node |
+| `state` | `ok <pipeline> stopped\|paused\|running\|error` per pipeline |
+| `start`, `pause`, `stop` `[<pipeline>\|all]` | control; no argument means all |
+| `enable <node> [timeout_ms]`, `disable <node>`, `enabled <node>` | sink send gate |
+| `ping`, `help` | `pong`, verb list |
+
+```bash
+echo "get enc cbr" | nc -u -w1 127.0.0.1 5090
+echo "set enc cbr 2500000" | nc -u -w1 127.0.0.1 5090
+```
 
 ## Bench app: `stream_sdl_test`
 

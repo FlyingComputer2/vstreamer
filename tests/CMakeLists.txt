@@ -74,10 +74,19 @@ if(VSTREAMER_APP_TX_OK)
     )
 endif()
 
+if(TARGET vstreamer_app)
+    list(APPEND VSTREAMER_TEST_SOURCES vstreamer_app_test.cpp)
+endif()
+
 add_executable(vstreamer_tests ${VSTREAMER_TEST_SOURCES}
                               ${CMAKE_SOURCE_DIR}/src/apps/stream_sdl_test/link_emulator.cpp)
 target_link_libraries(vstreamer_tests PRIVATE GTest::gtest_main vstreamer_source apps_common
                       ${VSTREAMER_LSAN_HOOKS})
+if(TARGET vstreamer_app)
+    target_link_libraries(vstreamer_tests PRIVATE vstreamer_app)
+    target_compile_definitions(vstreamer_tests PRIVATE
+        "VSTREAMER_APP_EXAMPLES_DIR=\"${CMAKE_SOURCE_DIR}/src/apps/vstreamer/examples\"")
+endif()
 target_include_directories(vstreamer_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/tests)
 target_compile_options(vstreamer_tests PRIVATE -Wall -Wextra -Wpedantic)
 
