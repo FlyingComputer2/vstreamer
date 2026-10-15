@@ -35,23 +35,8 @@ if(ENABLE_H264_DECODER_MPP OR ENABLE_H264_ENCODER_MPP)
     endif()
 endif()
 
-set(VSTREAMER_SOURCES
-    src/core/metrics.cpp
-    src/core/sdu_type.cpp
-    src/core/sdu_caps.cpp
-    src/core/port_caps.cpp
-    src/core/pdu_wakeup.cpp
-    src/core/buffer_pool.cpp
-    src/core/component_sink.cpp
-    src/core/rtp_h264.cpp
-    src/core/pix_convert.cpp
-    src/core/h264_level.cpp
-    src/core/h264_sps.cpp
-    src/core/mkv_writer.cpp
-    src/core/component_factory.cpp
-    src/core/pipeline.cpp
-    src/core/pipeline_queue.cpp
-)
+set(VSTREAMER_SOURCES)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/vstreamer_sources.cmake)
 
 if(ENABLE_NOISE_SOURCE)
     set(PFFFT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -95,31 +80,15 @@ endif()
 if(ENABLE_H264_ENCODER_INTEL)
     list(APPEND VSTREAMER_SOURCES src/components/h264_encoder_intel.cpp)
 endif()
-if(ENABLE_MKV_SINK)
-    list(APPEND VSTREAMER_SOURCES src/components/mkv_sink.cpp)
-endif()
 if(ENABLE_SDL_SINK)
     list(APPEND VSTREAMER_SOURCES
         src/components/sdl_nv12_presenter.cpp
         src/components/sdl_sink.cpp
     )
 endif()
-if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
+if(VSTREAMER_NEEDS_ISAL)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/isal_ec.cmake)
     vstreamer_add_isal_ec()
-    list(APPEND VSTREAMER_SOURCES src/core/rs_block_erasure.cpp)
-endif()
-if(ENABLE_STREAM_SENDER)
-    list(APPEND VSTREAMER_SOURCES src/components/stream_sender.cpp)
-endif()
-if(ENABLE_STREAM_RECEIVER)
-    list(APPEND VSTREAMER_SOURCES src/components/stream_receiver.cpp)
-endif()
-if(ENABLE_RTP_H264_PAY)
-    list(APPEND VSTREAMER_SOURCES src/components/rtp_h264_pay.cpp)
-endif()
-if(ENABLE_RTP_H264_DEPAY)
-    list(APPEND VSTREAMER_SOURCES src/components/rtp_h264_depay.cpp)
 endif()
 
 set(VSTREAMER_LIBS)

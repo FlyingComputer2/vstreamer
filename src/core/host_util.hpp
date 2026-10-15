@@ -3,6 +3,8 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
+/* lwIP declares sockaddr_in in <sys/socket.h>, not <netinet/in.h>. */
+#include <sys/socket.h>
 #include <netinet/in.h>
 
 #include <cerrno>

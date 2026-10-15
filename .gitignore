@@ -29,3 +29,5 @@ __pycache__/
 *~
 .env
 .env.*
+idf/example/sdkconfig
+idf/example/sdkconfig.old

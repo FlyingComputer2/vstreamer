@@ -8,11 +8,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     enable_language(ASM)
 endif()
 
-function(vstreamer_add_isal_ec)
-    if(TARGET isal_ec)
-        return()
-    endif()
-
+# Downloads ISA-L once; sets VSTREAMER_ISAL_ROOT in the caller's scope.
+macro(vstreamer_fetch_isal)
     include(FetchContent)
     FetchContent_Declare(isa-l
         GIT_REPOSITORY https://github.com/intel/isa-l.git
@@ -23,8 +20,16 @@ function(vstreamer_add_isal_ec)
     if(NOT isa-l_POPULATED)
         FetchContent_Populate(isa-l)
     endif()
+    set(VSTREAMER_ISAL_ROOT "${isa-l_SOURCE_DIR}")
+endmacro()
 
-    set(ISAL_ROOT "${isa-l_SOURCE_DIR}")
+function(vstreamer_add_isal_ec)
+    if(TARGET isal_ec)
+        return()
+    endif()
+
+    vstreamer_fetch_isal()
+    set(ISAL_ROOT "${VSTREAMER_ISAL_ROOT}")
     set(ISAL_EC_SOURCES "${ISAL_ROOT}/erasure_code/ec_base.c")
     set(ISAL_EC_NEON OFF)
 
