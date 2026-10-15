@@ -252,7 +252,9 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
 }
 
 /* Presents on the calling thread, so input() must come from the thread that renders (the one
- * that opened and prepared the sink). With vsync the present can block for one refresh. */
+ * that opened and prepared the sink). With vsync the present can block for one refresh.
+ * A failed present drops that frame and is counted in the presenter (stats fail=); it is not
+ * an input() error, since the frame was accepted. */
 int sdl_sink::input(component_pdu &&in)
 {
     {
@@ -267,8 +269,8 @@ int sdl_sink::input(component_pdu &&in)
             return r;
         }
     }
-    const int r = present_pending();
-    return (-EAGAIN == r) ? 0 : r;
+    (void)present_pending();
+    return 0;
 }
 
 

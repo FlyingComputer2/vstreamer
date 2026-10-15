@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+#include <climits>
+#include <cstdint>
 
 #include <atomic>
 #include <chrono>
@@ -77,6 +79,10 @@ public:
         out.seq = next_++;
         return 0;
     }
+
+    [[nodiscard]] int64_t next_deadline_ns() const override { return deadline_ns.load(); }
+
+    std::atomic<int64_t> deadline_ns {INT64_MAX};
 
     void set_idle_result(int r)
     {
@@ -193,6 +199,7 @@ public:
 
     int input(component_pdu &&in) override
     {
+        attempts.fetch_add(1);
         if (blocked.load())
         {
             return -EAGAIN;
@@ -236,8 +243,9 @@ public:
         return got().size() >= n;
     }
 
-    std::atomic<bool> blocked {false};
-    bool              reject_odd = false;
+    std::atomic<bool>     blocked {false};
+    std::atomic<uint64_t> attempts {0};
+    bool                  reject_odd = false;
     int               open_result = 0;
 
 private:
@@ -378,6 +386,39 @@ TEST(PipelineTest, BackpressureLosesNothing)
     c.snk->blocked = false;
     ASSERT_TRUE(c.snk->wait_for(50));
     EXPECT_EQ(iota_seq(50), c.snk->got());
+}
+
+/* A source whose deadline has passed while its output link is held must not make the
+ * pipeline thread spin: the held PDU is retried on a short timer instead. */
+TEST(PipelineTest, HeldLinkWithPastDeadlineDoesNotSpin)
+{
+    chain c(5);
+    c.src->deadline_ns = 1;
+    c.snk->blocked = true;
+    ASSERT_EQ(0, c.p.start());
+    std::this_thread::sleep_for(20ms);
+    const uint64_t before = c.snk->attempts.load();
+    std::this_thread::sleep_for(100ms);
+    const uint64_t retries = c.snk->attempts.load() - before;
+    /* 200 us retry: about 500 in 100 ms. A spin makes far more. */
+    EXPECT_GT(retries, 50U);
+    EXPECT_LT(retries, 1000U);
+    c.snk->blocked = false;
+    ASSERT_TRUE(c.snk->wait_for(5));
+}
+
+/* A node that frees input room does not notify, so the held PDU must be retried well before
+ * the 50 ms idle cap. */
+TEST(PipelineTest, HeldPduRetriedQuicklyAfterRoomFrees)
+{
+    chain c(1);
+    c.snk->blocked = true;
+    ASSERT_EQ(0, c.p.start());
+    std::this_thread::sleep_for(20ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    c.snk->blocked = false;
+    ASSERT_TRUE(c.snk->wait_for(1));
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, 25ms);
 }
 
 TEST(PipelineTest, RejectedPdusAreCountedAndPipelineKeepsRunning)
@@ -560,6 +601,13 @@ TEST(PipelineQueueTest, DropsOldestDataButKeepsCaps)
     EXPECT_EQ(9U, out.seq);
     EXPECT_EQ(-ECANCELED, q.pop(out));
     q.reopen();
+    EXPECT_EQ(-EAGAIN, q.pop(out));
+
+    /* A restart drops what the previous producer session left behind. */
+    ASSERT_EQ(0, q.push(vstreamer::test_pdu::make_stream_dgram(11, 8)));
+    q.close();
+    q.reopen();
+    EXPECT_EQ(0U, q.depth());
     EXPECT_EQ(-EAGAIN, q.pop(out));
 
     EXPECT_EQ(-EINVAL, q.set_capacity(0));

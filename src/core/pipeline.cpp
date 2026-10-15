@@ -33,6 +33,9 @@ namespace
 /* Upper bound on one idle sleep, so a node that never notifies and has no deadline is still
  * polled. */
 constexpr int64_t k_idle_wait_cap_ns = 50'000'000LL;
+/* Retry interval for a PDU held on a link because the next node returned -EAGAIN (the stage
+ * threads in apps/ retry after 200 us). */
+constexpr int64_t k_held_retry_ns = 200'000LL;
 /* PDUs pulled from one node per pass before moving on, so one busy node cannot starve the
  * others or delay a control command. */
 constexpr int k_max_pulls_per_pass = 64;
@@ -119,7 +122,7 @@ struct pipeline::impl
 
     int  open_all();
     void close_all();
-    void thread_main(std::promise<int> *started, command_e first);
+    void thread_main(std::promise<int> started, command_e first);
     bool step();
     bool flush_held(node_entry &n);
     bool deliver(node_entry &n, component_pdu &&pdu);
@@ -348,17 +351,19 @@ bool pipeline::impl::deliver(node_entry &n, component_pdu &&pdu)
         {
             continue;
         }
-        component_pdu copy = pdu;
-        copy.port = l->to_port;
-        component_pdu attempt = copy;
-        const int     r = l->to->in->input(std::move(attempt));
+        /* input() may consume its argument even when it refuses, so the original stays here and
+         * is copied again only on -EAGAIN. */
+        component_pdu attempt = pdu;
+        attempt.port = l->to_port;
+        const int r = l->to->in->input(std::move(attempt));
         if (0 == r)
         {
             continue;
         }
         if (-EAGAIN == r)
         {
-            l->held = std::move(copy);
+            l->held = pdu;
+            l->held->port = l->to_port;
             clear = false;
             continue;
         }
@@ -419,17 +424,34 @@ bool pipeline::impl::step()
     return moved;
 }
 
+/* Earliest node deadline still ahead, capped. A deadline already past belongs to a node that
+ * could not be pulled (its link is held, or it was not ready yet); waiting on it would spin. A
+ * held link is retried after k_held_retry_ns, since nodes notify when output is ready, not when
+ * input room frees up. */
 int64_t pipeline::impl::next_deadline() const
 {
-    int64_t deadline = steady_mono_ns() + k_idle_wait_cap_ns;
+    const int64_t now = steady_mono_ns();
+    int64_t       deadline = now + k_idle_wait_cap_ns;
     for (const node_entry *n : order)
     {
-        deadline = std::min(deadline, n->owner->next_deadline_ns());
+        const int64_t d = n->owner->next_deadline_ns();
+        if (d > now)
+        {
+            deadline = std::min(deadline, d);
+        }
+    }
+    for (const auto &l : links)
+    {
+        if (l->held)
+        {
+            deadline = std::min(deadline, now + k_held_retry_ns);
+            break;
+        }
     }
     return deadline;
 }
 
-void pipeline::impl::thread_main(std::promise<int> *started, command_e first)
+void pipeline::impl::thread_main(std::promise<int> started, command_e first)
 {
     thread_id.store(std::this_thread::get_id());
     pin_current_thread_to_cpu(cpu);
@@ -437,11 +459,11 @@ void pipeline::impl::thread_main(std::promise<int> *started, command_e first)
     const int r = open_all();
     if (r < 0)
     {
-        started->set_value(r);
+        started.set_value(r);
         return;
     }
     state.store(command_e::RUN == first ? pipeline_state_e::RUNNING : pipeline_state_e::PAUSED);
-    started->set_value(0);
+    started.set_value(0);
 
     for (;;)
     {
@@ -773,7 +795,7 @@ int pipeline::spawn(bool run)
     }
     std::promise<int> started;
     std::future<int>  result = started.get_future();
-    impl_->thread = std::thread(&impl::thread_main, impl_.get(), &started,
+    impl_->thread = std::thread(&impl::thread_main, impl_.get(), std::move(started),
                                 run ? command_e::RUN : command_e::PAUSE);
     const int r = result.get();
     if (r < 0)

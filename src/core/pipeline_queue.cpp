@@ -194,9 +194,12 @@ void pipeline_queue::close()
     }
 }
 
+/* PDUs left from the previous producer session are dropped: after a restart the consumer must
+ * not see old frames or caps for a format that may have changed. */
 void pipeline_queue::reopen()
 {
     std::lock_guard<std::mutex> lock(mu_);
+    q_.clear();
     closed_ = false;
 }
 

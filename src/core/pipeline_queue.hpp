@@ -54,8 +54,9 @@ public:
      * node reports that as -EAGAIN: a stopped producer is not an error for the consumer). */
     int pop(component_pdu &out);
 
-    /* Producer pipeline stopped for good; the consumer drains what is left, then sees
-     * -ECANCELED. reopen() undoes it when the producer starts again. */
+    /* Producer pipeline stopped; the consumer drains what is left, then sees -ECANCELED.
+     * reopen() undoes it when the producer starts again and drops anything still queued from
+     * the previous session. */
     void close();
     void reopen();
 

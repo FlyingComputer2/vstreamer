@@ -77,14 +77,26 @@ class pipeline_queue;
  *     cap.stop();
  *     enc.stop();
  *
- * GS RX in one pipeline:
+ * GS RX, with the display in its own pipeline: sdl_sink::input() presents and can block for a
+ * vsync refresh, which must not hold up the receiver and decoder. Capacity 1 keeps only the
+ * newest frame for the display:
+ *
+ *     auto shown = std::make_shared<pipeline_queue>(1);
  *
  *     pipeline rx("rx");
  *     rx.add_source("rcv", "stream_receiver");
  *     rx.add_coder("depay", "rtp_h264_depay");
  *     rx.add_coder("dec", "h264_decoder");
- *     rx.add_sink("display", "sdl_sink");
- *     rx.link_chain({"rcv", "depay", "dec", "display"});
+ *     rx.add_queue_sink("to_display", shown);
+ *     rx.link_chain({"rcv", "depay", "dec", "to_display"});
+ *
+ *     pipeline display("display");
+ *     display.add_queue_source("from_rx", shown);
+ *     display.add_sink("screen", "sdl_sink");
+ *     display.configure("screen", "video_driver", "kmsdrm");
+ *     display.link("from_rx", "screen");
+ *
+ *     display.start();
  *     rx.start();
  *
  * Error handling, registered by the app that owns the pipelines. The handler runs on the

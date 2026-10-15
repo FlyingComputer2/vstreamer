@@ -40,7 +40,7 @@ public:
 
     int prepare(int width, int height);
     /* Present queued NV12 on the calling thread (must match prepare/open thread). input()
-     * already presents, so this only retries a frame whose present failed. */
+     * already presents everything it queues, so this normally returns -EAGAIN. */
     int present_pending();
     [[nodiscard]] std::thread::id bound_render_thread() const;
     /* Queues the frame and presents it on the calling thread, which must be the render thread.
