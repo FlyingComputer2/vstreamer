@@ -1,0 +1,20 @@
+# Rover TX: UVC MJPEG camera -> H.264 -> RTP -> stream_sender.
+# Capture runs on its own thread; decode/encode/send on another.
+# Same defaults as uvc_stream_sender (1080p30, 4 Mbit/s CBR, MTU 1400).
+
+queue cap_q 8
+
+pipeline capture cpu=2
+node cam v4l2_source device=/dev/video0 size=1920x1080 fps=30 format=mjpeg
+link cam -> @cap_q
+
+pipeline encode cpu=3
+node jdec jpeg_decoder  size=1920x1080 fps=30 output_mode=convert
+node enc  h264_encoder  size=1920x1080 fps=30 gop=30 rc=cbr cbr=4000000
+node pay  rtp_h264_pay  fps=30 mtu=1400
+node snd  stream_sender mtu=1400 max_datagram=1476 stream=192.168.1.10:5001
+link @cap_q -> jdec -> enc -> pay -> snd
+
+# Open the send gate now, as uvc_stream_sender does. For an operator deadman use
+# "enable snd <timeout_ms>" and re-send "enable snd <timeout_ms>" over the mplane.
+enable snd

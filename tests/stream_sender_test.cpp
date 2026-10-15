@@ -824,6 +824,25 @@ TEST(StreamSenderTest, PortCapsAdvertisesStreamDgram)
     std::string              val;
     ASSERT_EQ(0, sender.query("inport-0.caps-0.sdu_type", &val));
     EXPECT_EQ("STREAM_DGRAM", val);
+    ASSERT_EQ(0, sender.query("inport-0.caps-1.sdu_type", &val));
+    EXPECT_EQ("RTP", val);
+}
+
+/* rtp_h264_pay output can be linked straight to the sender, without relabelling. */
+TEST(StreamSenderTest, AcceptsRtpPdus)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, sender.open());
+    auto pdu = vstreamer::test_pdu::make_stream_dgram(1, 64);
+    pdu.sdu_type = vstreamer::sdu_type_e::RTP;
+    EXPECT_EQ(0, sender.input(std::move(pdu)));
+    auto other = vstreamer::test_pdu::make_stream_dgram(2, 64);
+    other.sdu_type = vstreamer::sdu_type_e::H264_AU;
+    EXPECT_EQ(-EINVAL, sender.input(std::move(other)));
+    sender.close();
 }
 
 TEST(StreamSenderTest, PduInputEagainWhenQueueFull)

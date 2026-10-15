@@ -92,6 +92,10 @@ const std::vector<port_desc> &stream_sender::input_ports()
         port_caps_entry caps {};
         caps.sdu_type = sdu_type_e::STREAM_DGRAM;
         p.caps.push_back(caps);
+        /* RTP from rtp_h264_pay goes out unchanged: the payload is opaque here. */
+        port_caps_entry rtp {};
+        rtp.sdu_type = sdu_type_e::RTP;
+        p.caps.push_back(rtp);
         return std::vector<port_desc> {p};
     }();
     return ports;
@@ -951,7 +955,8 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
 
 int stream_sender::input(component_pdu &&in)
 {
-    if (0 != in.port || in.sdu_type != sdu_type_e::STREAM_DGRAM)
+    if (0 != in.port ||
+        (in.sdu_type != sdu_type_e::STREAM_DGRAM && in.sdu_type != sdu_type_e::RTP))
     {
         return -EINVAL;
     }

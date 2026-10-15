@@ -7,6 +7,7 @@ endif()
 
 option(ENABLE_APP_UVC_STREAM_SENDER "Build uvc_stream_sender" ON)
 option(ENABLE_APP_SDL_STREAM_RECEIVER "Build sdl_stream_receiver" ON)
+option(ENABLE_APP_VSTREAMER "Build vstreamer (pipelines from a pipeline file + UDP mplane)" ON)
 
 if(ENABLE_APP_UVC_STREAM_SENDER AND NOT VSTREAMER_APP_TX_OK)
     message(STATUS "ENABLE_APP_UVC_STREAM_SENDER=OFF (TX component set incomplete)")
@@ -22,6 +23,9 @@ if(ENABLE_APP_UVC_STREAM_SENDER)
 endif()
 if(ENABLE_APP_SDL_STREAM_RECEIVER)
     add_subdirectory(sdl_stream_receiver)
+endif()
+if(ENABLE_APP_VSTREAMER)
+    add_subdirectory(vstreamer)
 endif()
 
 if(ENABLE_TEST_STREAM_SDL)

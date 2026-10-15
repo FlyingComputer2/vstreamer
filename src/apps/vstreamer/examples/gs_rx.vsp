@@ -1,0 +1,17 @@
+# Ground station RX: stream_receiver -> RTP depay -> H.264 decode -> display.
+# The display has its own pipeline: sdl_sink presents inside input() and can block for a
+# vsync refresh, which must not hold up the receiver and decoder. Capacity 1 keeps only the
+# newest frame. Same defaults as sdl_stream_receiver.
+
+queue shown 1
+
+pipeline rx cpu=2
+node rcv   stream_receiver listen=0.0.0.0:5001 max_datagram=1476
+node depay rtp_h264_depay  fps=30
+node dec   h264_decoder    size=1920x1080 fps=30 output_size_mode=stream
+link rcv -> depay -> dec -> @shown
+
+pipeline display cpu=3
+node screen sdl_sink video_driver=kmsdrm
+set screen title vstreamer ground station
+link @shown -> screen
