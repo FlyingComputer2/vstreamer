@@ -316,7 +316,7 @@ One command per line, tokens separated by spaces, `#` starts a comment. Examples
 | Command | Meaning |
 |---------|---------|
 | `queue <name> [capacity]` | cross-pipeline queue, default capacity 8; full drops the oldest frame, never caps |
-| `pipeline <name> [cpu=<n>]` | start a pipeline (one thread); the `node`/`link` lines below belong to it |
+| `pipeline <name> [cpu=<n>]` | start a pipeline (one thread, pinned to `<n>` after its nodes open, so threads they start in `open()` stay unpinned); the `node`/`link` lines below belong to it |
 | `node <name> <factory_type> [key=value ...]` | add a node; each `key=value` is a `configure()` in order |
 | `link <a> -> <b> [-> <c> ...]` | link nodes; `<name>:<port>` picks a port; `@<queue>` is the queue's writer at the end of a chain, its reader at the start |
 | `set <node> <key> <value...>` | `configure()`; the rest of the line is the value (may contain spaces) |

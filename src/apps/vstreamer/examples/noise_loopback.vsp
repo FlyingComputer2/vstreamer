@@ -1,7 +1,7 @@
 # Bench: synthetic NV12 -> H.264 -> RTP -> UDP loopback -> decode -> display, one host.
 # Needs an H.264 encoder and the MPP decoder; uses a desktop SDL window.
 
-queue shown 1
+queue shown 2
 
 pipeline tx
 node noise noise_source size=1280x720 fps=30 format=nv12

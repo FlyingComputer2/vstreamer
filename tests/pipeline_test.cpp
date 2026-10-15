@@ -4,6 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <cerrno>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #include <climits>
 #include <cstdint>
 
@@ -582,6 +587,73 @@ TEST(PipelineTest, FanOutAndPortsReachEveryLink)
     EXPECT_EQ(std::vector<uint8_t>(20, 0), pa->ports());
     EXPECT_EQ(std::vector<uint8_t>(20, 3), pb->ports());
 }
+
+#if defined(__linux__)
+namespace
+{
+
+int cpu_count_of_this_thread()
+{
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (0 != pthread_getaffinity_np(pthread_self(), sizeof(set), &set))
+    {
+        return -1;
+    }
+    return CPU_COUNT(&set);
+}
+
+/* Starts a worker thread in open(), like stream_receiver or the MPP codecs, and records the
+ * worker's and the pipeline thread's CPU counts. */
+class threaded_source : public vstreamer::component_source
+{
+public:
+    [[nodiscard]] std::string name() const override { return "threaded_source"; }
+    int open() override
+    {
+        std::thread([this] { worker_cpus = cpu_count_of_this_thread(); }).join();
+        return 0;
+    }
+    void close() override {}
+    int  output(component_pdu &) override
+    {
+        pipeline_cpus = cpu_count_of_this_thread();
+        return -EAGAIN;
+    }
+    int configure(std::string_view, std::string_view) override { return -ENOTSUP; }
+    int query(std::string_view, std::string *) const override { return -ENOTSUP; }
+
+    std::atomic<int> worker_cpus {0};
+    std::atomic<int> pipeline_cpus {0};
+};
+
+}  // namespace
+
+/* cpu= pins the pipeline thread, but not threads its nodes start while opening. */
+TEST(PipelineTest, CpuPinDoesNotLeakIntoThreadsStartedInOpen)
+{
+    const int all = cpu_count_of_this_thread();
+    if (all < 2)
+    {
+        GTEST_SKIP() << "needs at least two CPUs";
+    }
+    call_log log;
+    pipeline p("pin");
+    auto     src = std::make_unique<threaded_source>();
+    auto    *psrc = src.get();
+    ASSERT_EQ(0, p.add_source("src", std::move(src)));
+    ASSERT_EQ(0, p.add_sink("snk", std::make_unique<fake_sink>("snk", &log)));
+    ASSERT_EQ(0, p.link("src", "snk"));
+    ASSERT_EQ(0, p.set_cpu(0));
+    ASSERT_EQ(0, p.start());
+    for (int i = 0; i < 500 && psrc->pipeline_cpus.load() == 0; i++)
+    {
+        std::this_thread::sleep_for(1ms);
+    }
+    EXPECT_EQ(1, psrc->pipeline_cpus.load());
+    EXPECT_EQ(all, psrc->worker_cpus.load());
+}
+#endif
 
 TEST(PipelineQueueTest, DropsOldestDataButKeepsCaps)
 {
