@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include "core/component_pdu.hpp"
 #include "core/pdu_wakeup.hpp"
@@ -24,6 +25,9 @@ class component_source;
  * One pipeline writes through a queue sink node (pipeline::add_queue_sink), another reads
  * through a queue source node (pipeline::add_queue_source). Shared by shared_ptr, so either
  * pipeline may be destroyed first.
+ *
+ * The queue remembers the latest caps PDU so a consumer pipeline restarted on its own still
+ * learns the format (replay_caps()).
  *
  * When full, push() drops the oldest data PDU so a slow consumer never stalls the producer
  * pipeline (a stale frame is worth less than a fresh one). Caps PDUs are never dropped: a
@@ -63,6 +67,11 @@ public:
     /* Set by the consumer pipeline when its queue source node joins the graph. */
     void bind_consumer_wakeup(std::shared_ptr<pdu_wakeup> w);
 
+    /* Consumer pipeline (re)opened: puts the latest caps PDU of this producer session back at
+     * the front unless a caps PDU is already next. A restarted consumer's nodes have forgotten
+     * the format, and the producer sends caps only when the format changes. */
+    void replay_caps();
+
     [[nodiscard]] size_t   depth() const;
     [[nodiscard]] size_t   capacity() const;
     [[nodiscard]] uint64_t pushed() const;
@@ -76,6 +85,7 @@ private:
     std::deque<component_pdu>   q_;
     size_t                      capacity_;
     bool                        closed_ = false;
+    std::optional<component_pdu> last_caps_;
     std::shared_ptr<pdu_wakeup> consumer_wake_;
     std::atomic<uint64_t>       pushed_ {0};
     std::atomic<uint64_t>       drops_ {0};

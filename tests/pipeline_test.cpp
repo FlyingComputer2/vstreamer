@@ -70,7 +70,12 @@ public:
 
     int output(component_pdu &out) override
     {
+        output_calls.fetch_add(1);
         std::lock_guard<std::mutex> lock(mu_);
+        if (!ready.load())
+        {
+            return -EAGAIN;
+        }
         if (next_ >= count_)
         {
             return idle_result_;
@@ -83,6 +88,9 @@ public:
     [[nodiscard]] int64_t next_deadline_ns() const override { return deadline_ns.load(); }
 
     std::atomic<int64_t> deadline_ns {INT64_MAX};
+    /* While false, output() returns -EAGAIN even when PDUs remain (a node not ready yet). */
+    std::atomic<bool>     ready {true};
+    std::atomic<uint64_t> output_calls {0};
 
     void set_idle_result(int r)
     {
@@ -400,25 +408,31 @@ TEST(PipelineTest, HeldLinkWithPastDeadlineDoesNotSpin)
     const uint64_t before = c.snk->attempts.load();
     std::this_thread::sleep_for(100ms);
     const uint64_t retries = c.snk->attempts.load() - before;
-    /* 200 us retry: about 500 in 100 ms. A spin makes far more. */
+    /* 200 us retry: about 500 in 100 ms. Waiting for the 50 ms idle cap gives about 2 (nodes
+     * do not notify when input room frees); a spin makes far more. */
     EXPECT_GT(retries, 50U);
     EXPECT_LT(retries, 1000U);
     c.snk->blocked = false;
     ASSERT_TRUE(c.snk->wait_for(5));
 }
 
-/* A node that frees input room does not notify, so the held PDU must be retried well before
- * the 50 ms idle cap. */
-TEST(PipelineTest, HeldPduRetriedQuicklyAfterRoomFrees)
+/* A node whose deadline has passed (it fell due during a pass) and that does not notify must be
+ * pulled again within about k_held_retry_ns, not after the 50 ms idle cap, and without spinning. */
+TEST(PipelineTest, PastDeadlineOnPullableNodeIsNotMissed)
 {
     chain c(1);
-    c.snk->blocked = true;
+    c.src->ready = false;
+    c.src->deadline_ns = 1;
     ASSERT_EQ(0, c.p.start());
     std::this_thread::sleep_for(20ms);
-    const auto t0 = std::chrono::steady_clock::now();
-    c.snk->blocked = false;
+    const uint64_t before = c.src->output_calls.load();
+    std::this_thread::sleep_for(100ms);
+    const uint64_t polls = c.src->output_calls.load() - before;
+    /* 200 us: about 500 in 100 ms. Missed deadlines give about 2; a spin far more. */
+    EXPECT_GT(polls, 50U);
+    EXPECT_LT(polls, 1000U);
+    c.src->ready = true;
     ASSERT_TRUE(c.snk->wait_for(1));
-    EXPECT_LT(std::chrono::steady_clock::now() - t0, 25ms);
 }
 
 TEST(PipelineTest, RejectedPdusAreCountedAndPipelineKeepsRunning)
@@ -613,6 +627,52 @@ TEST(PipelineQueueTest, DropsOldestDataButKeepsCaps)
     EXPECT_EQ(-EINVAL, q.set_capacity(0));
     EXPECT_EQ(0, q.set_capacity(1));
     EXPECT_EQ(1U, q.capacity());
+}
+
+/* Restarting only the consumer pipeline: its nodes forgot the format and the producer will not
+ * send caps again, so the queue replays the latest caps first. */
+TEST(PipelineQueueTest, ConsumerRestartGetsCapsAgain)
+{
+    auto q = std::make_shared<pipeline_queue>(8);
+    auto src = vstreamer::make_pipeline_queue_source(q);
+    vstreamer::video_raw_caps caps {};
+    caps.width = 64;
+    caps.height = 32;
+    ASSERT_EQ(0, q->push(vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps, 0, 0)));
+    ASSERT_EQ(0, q->push(vstreamer::test_pdu::make_stream_dgram(1, 8)));
+
+    ASSERT_EQ(0, src->open());
+    component_pdu out;
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_TRUE(vstreamer::is_caps(out.sdu_type));
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_EQ(1U, out.seq);
+    src->close();
+
+    ASSERT_EQ(0, q->push(vstreamer::test_pdu::make_stream_dgram(2, 8)));
+    ASSERT_EQ(0, src->open());
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_TRUE(vstreamer::is_caps(out.sdu_type));
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_EQ(2U, out.seq);
+
+    /* Caps already next: not doubled. */
+    src->close();
+    ASSERT_EQ(0, src->open());
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_TRUE(vstreamer::is_caps(out.sdu_type));
+    EXPECT_EQ(-EAGAIN, src->output(out));
+    src->close();
+    ASSERT_EQ(0, src->open());
+    ASSERT_EQ(0, src->output(out));
+    EXPECT_TRUE(vstreamer::is_caps(out.sdu_type));
+    EXPECT_EQ(-EAGAIN, src->output(out));
+
+    /* A new producer session forgets the old caps. */
+    q->reopen();
+    src->close();
+    ASSERT_EQ(0, src->open());
+    EXPECT_EQ(-EAGAIN, src->output(out));
 }
 
 TEST(PipelineQueueTest, TwoPipelinesThroughQueue)

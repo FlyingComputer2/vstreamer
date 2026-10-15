@@ -100,8 +100,8 @@ class pipeline_queue;
  *     rx.start();
  *
  * Error handling, registered by the app that owns the pipelines. The handler runs on the
- * pipeline thread, so it must not call start()/pause()/stop() on that pipeline (-EDEADLK); it
- * hands the failure to the app thread, which decides what to do:
+ * pipeline thread, so it must not call start()/pause()/stop() on any pipeline; it hands the
+ * failure to the app thread, which decides what to do:
  *
  *     struct failure { std::string pipe, node; int err; };
  *     std::mutex mu;
@@ -163,11 +163,13 @@ class pipeline
 public:
     /* Called on the pipeline thread when a node returns an error other than -EAGAIN. The
      * pipeline is in ERROR when the callback runs; no more PDUs move until stop(). Called once
-     * per entry into ERROR. Must not call start()/pause()/stop() on this pipeline. */
+     * per entry into ERROR. Keep it short and hand the failure to an app thread: it must not
+     * call start()/pause()/stop() on any pipeline (this one returns -EDEADLK; another one may be
+     * blocked in its own handler and deadlock) and must not destroy this pipeline. */
     using error_fn = std::function<void(const std::string &node, int err)>;
 
     explicit pipeline(std::string name);
-    ~pipeline(); /* stop() + join */
+    ~pipeline(); /* stop() + join; never from the pipeline thread (error handler) */
 
     pipeline(const pipeline &) = delete;
     pipeline &operator=(const pipeline &) = delete;

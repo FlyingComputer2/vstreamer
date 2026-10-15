@@ -100,7 +100,12 @@ public:
 
     [[nodiscard]] std::string name() const override { return "pipeline_queue_source"; }
 
-    int  open() override { return 0; }
+    int open() override
+    {
+        q_->replay_caps();
+        return 0;
+    }
+
     void close() override {}
 
     int output(component_pdu &out) override
@@ -157,6 +162,10 @@ int pipeline_queue::push(component_pdu &&pdu)
             return -ECANCELED;
         }
         trim_locked(capacity_ - 1);
+        if (is_caps(pdu.sdu_type))
+        {
+            last_caps_ = pdu;
+        }
         q_.push_back(std::move(pdu));
         pushed_.fetch_add(1, std::memory_order_relaxed);
         wake = consumer_wake_;
@@ -200,7 +209,18 @@ void pipeline_queue::reopen()
 {
     std::lock_guard<std::mutex> lock(mu_);
     q_.clear();
+    last_caps_.reset();
     closed_ = false;
+}
+
+void pipeline_queue::replay_caps()
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!last_caps_ || (!q_.empty() && is_caps(q_.front().sdu_type)))
+    {
+        return;
+    }
+    q_.push_front(*last_caps_);
 }
 
 void pipeline_queue::bind_consumer_wakeup(std::shared_ptr<pdu_wakeup> w)

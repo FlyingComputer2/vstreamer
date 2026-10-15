@@ -424,29 +424,26 @@ bool pipeline::impl::step()
     return moved;
 }
 
-/* Earliest node deadline still ahead, capped. A deadline already past belongs to a node that
- * could not be pulled (its link is held, or it was not ready yet); waiting on it would spin. A
- * held link is retried after k_held_retry_ns, since nodes notify when output is ready, not when
- * input room frees up. */
+/* Earliest node deadline, capped. A node whose output link is held is not pulled, so its
+ * deadline is skipped (waiting on a past one would spin); the held link is retried after
+ * k_held_retry_ns instead, since nodes notify when output is ready, not when input room frees
+ * up. Any other node whose deadline has passed (it fell due during the pass) gets another pass
+ * after k_held_retry_ns rather than being missed until the cap. */
 int64_t pipeline::impl::next_deadline() const
 {
     const int64_t now = steady_mono_ns();
     int64_t       deadline = now + k_idle_wait_cap_ns;
     for (const node_entry *n : order)
     {
-        const int64_t d = n->owner->next_deadline_ns();
-        if (d > now)
-        {
-            deadline = std::min(deadline, d);
-        }
-    }
-    for (const auto &l : links)
-    {
-        if (l->held)
+        const bool held = std::any_of(n->out_links.begin(), n->out_links.end(),
+                                      [](const link_entry *l) { return l->held.has_value(); });
+        if (held)
         {
             deadline = std::min(deadline, now + k_held_retry_ns);
-            break;
+            continue;
         }
+        const int64_t d = n->owner->next_deadline_ns();
+        deadline = std::min(deadline, std::max(d, now + k_held_retry_ns));
     }
     return deadline;
 }

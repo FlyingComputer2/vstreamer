@@ -278,6 +278,8 @@ int sdl_sink::configure(std::string_view key, std::string_view value)
 {
     if ("title" == key)
     {
+        /* open()/close() emplace and reset present under mu, possibly on another thread. */
+        std::lock_guard<std::mutex> lock(mu);
         if (present.has_value())
         {
             present->set_title(value);
