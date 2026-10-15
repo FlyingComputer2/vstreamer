@@ -5,13 +5,13 @@
 
 queue shown 1
 
-pipeline rx cpu=2
+pipeline rx
 node rcv   stream_receiver listen=0.0.0.0:5001 max_datagram=1476
 node depay rtp_h264_depay  fps=30
 node dec   h264_decoder    size=1920x1080 fps=30 output_size_mode=stream
 link rcv -> depay -> dec -> @shown
 
-pipeline display cpu=3
+pipeline display
 node screen sdl_sink video_driver=kmsdrm
 set screen title vstreamer ground station
 link @shown -> screen

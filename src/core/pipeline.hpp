@@ -241,7 +241,9 @@ public:
     /* Node name and error of the failure that put the pipeline in ERROR; empty / 0 otherwise. */
     void last_error(std::string *node_name, int *err) const;
 
-    /* STOPPED only. Pin the pipeline thread to cpu (-1 = no pinning). */
+    /* STOPPED only. Pin the pipeline thread to cpu (-1 = no pinning). The pin is applied after
+     * the nodes are opened, so threads that components start in open() are not pinned with it;
+     * threads a component starts later (while running) do inherit it. */
     int set_cpu(int cpu);
     void set_error_handler(error_fn fn);
 

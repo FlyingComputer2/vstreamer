@@ -451,14 +451,17 @@ int64_t pipeline::impl::next_deadline() const
 void pipeline::impl::thread_main(std::promise<int> started, command_e first)
 {
     thread_id.store(std::this_thread::get_id());
-    pin_current_thread_to_cpu(cpu);
 
+    /* Pinned only after the nodes are open: threads a component starts in open() (receive
+     * threads, codec workers) inherit the affinity of the thread that creates them and must not
+     * all share the pipeline's CPU. */
     const int r = open_all();
     if (r < 0)
     {
         started.set_value(r);
         return;
     }
+    pin_current_thread_to_cpu(cpu);
     state.store(command_e::RUN == first ? pipeline_state_e::RUNNING : pipeline_state_e::PAUSED);
     started.set_value(0);
 
