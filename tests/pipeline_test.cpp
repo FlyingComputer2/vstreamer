@@ -605,6 +605,59 @@ TEST(PipelineQueueTest, TwoPipelinesThroughQueue)
     EXPECT_EQ(pipeline_state_e::RUNNING, cons.state());
 }
 
+#if defined(ENABLE_SDL_SINK)
+/* RX layout: the display gets its own pipeline so the vsync wait inside sdl_sink::input() does
+ * not stall the nodes before it. */
+TEST(PipelineQueueTest, SdlSinkInDisplayPipeline)
+{
+    setenv("SDL_VIDEODRIVER", "dummy", 1);
+    call_log log;
+    auto     q = std::make_shared<pipeline_queue>(1);
+
+    pipeline rx("rx");
+    pipeline display("display");
+    auto     src = std::make_unique<fake_source>("src", &log, 0);
+    ASSERT_EQ(0, rx.add_source("src", std::move(src)));
+    ASSERT_EQ(0, rx.add_queue_sink("to_display", q));
+    ASSERT_EQ(0, rx.link("src", "to_display"));
+    ASSERT_EQ(0, display.add_queue_source("from_rx", q));
+    ASSERT_EQ(0, display.add_sink("display", "sdl_sink"));
+    ASSERT_EQ(0, display.configure("display", "video_driver", "dummy"));
+    ASSERT_EQ(0, display.link("from_rx", "display"));
+
+    ASSERT_EQ(0, display.start());
+    ASSERT_EQ(0, rx.start());
+
+    /* Frames pushed straight into the queue, as a decoder output would arrive. */
+    vstreamer::video_raw_caps caps {};
+    caps.width = 64;
+    caps.height = 32;
+    caps.hor_stride = 64;
+    caps.ver_stride = 32;
+    ASSERT_EQ(0, q->push(vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps, 0, 0)));
+    for (int i = 0; i < 5; i++)
+    {
+        ASSERT_EQ(0, q->push(vstreamer::test_pdu::make_nv12(64, 32, 1000U + static_cast<uint64_t>(i))));
+        std::this_thread::sleep_for(5ms);
+    }
+
+    std::string stats;
+    bool        presented = false;
+    for (int i = 0; i < 500 && !presented; i++)
+    {
+        ASSERT_EQ(0, display.query("display", "stats", &stats));
+        presented = stats.rfind("frames=0", 0) != 0;
+        std::this_thread::sleep_for(2ms);
+    }
+    EXPECT_TRUE(presented) << stats;
+    EXPECT_EQ(pipeline_state_e::RUNNING, display.state());
+    ASSERT_EQ(0, display.query("display", "pipeline.rejects", &stats));
+    EXPECT_EQ("0", stats);
+    ASSERT_EQ(0, rx.stop());
+    ASSERT_EQ(0, display.stop());
+}
+#endif
+
 #if defined(ENABLE_NOISE_SOURCE)
 TEST(PipelineTest, NoiseSourceByFactoryName)
 {

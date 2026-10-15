@@ -251,14 +251,24 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     return enq;
 }
 
+/* Presents on the calling thread, so input() must come from the thread that renders (the one
+ * that opened and prepared the sink). With vsync the present can block for one refresh. */
 int sdl_sink::input(component_pdu &&in)
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened.load(std::memory_order_acquire))
     {
-        return -EBADF;
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened.load(std::memory_order_acquire))
+        {
+            return -EBADF;
+        }
+        const int r = input_pdu_locked(std::move(in));
+        if (r < 0)
+        {
+            return r;
+        }
     }
-    return input_pdu_locked(std::move(in));
+    const int r = present_pending();
+    return (-EAGAIN == r) ? 0 : r;
 }
 
 
