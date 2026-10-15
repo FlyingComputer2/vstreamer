@@ -48,6 +48,8 @@ set(VSTREAMER_SOURCES
     src/core/h264_level.cpp
     src/core/h264_sps.cpp
     src/core/component_factory.cpp
+    src/core/pipeline.cpp
+    src/core/pipeline_queue.cpp
 )
 
 if(ENABLE_NOISE_SOURCE)

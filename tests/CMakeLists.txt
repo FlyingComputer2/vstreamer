@@ -14,6 +14,7 @@ set(VSTREAMER_TEST_SOURCES
     stage_loop_output_drain_test.cpp
     peer_link_metrics_test.cpp
     pipeline_controller_test.cpp
+    pipeline_test.cpp
     stream_header_test.cpp
     stream_telemetry_test.cpp
     pix_convert_test.cpp
