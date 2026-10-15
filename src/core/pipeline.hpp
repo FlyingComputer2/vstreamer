@@ -78,10 +78,10 @@ class pipeline_queue;
  *     enc.stop();
  *
  * GS RX, with the display in its own pipeline: sdl_sink::input() presents and can block for a
- * vsync refresh, which must not hold up the receiver and decoder. Capacity 1 keeps only the
- * newest frame for the display:
+ * vsync refresh, which must not hold up the receiver and decoder. Capacity 2 holds a frame
+ * that arrives while the previous one waits for vsync; when full, the oldest is dropped:
  *
- *     auto shown = std::make_shared<pipeline_queue>(1);
+ *     auto shown = std::make_shared<pipeline_queue>(2);
  *
  *     pipeline rx("rx");
  *     rx.add_source("rcv", "stream_receiver");

@@ -1,9 +1,10 @@
 # Ground station RX: stream_receiver -> RTP depay -> H.264 decode -> display.
 # The display has its own pipeline: sdl_sink presents inside input() and can block for a
-# vsync refresh, which must not hold up the receiver and decoder. Capacity 1 keeps only the
-# newest frame. Same defaults as sdl_stream_receiver.
+# vsync refresh, which must not hold up the receiver and decoder. Capacity 2 holds a frame
+# that arrives while the previous one waits for vsync (capacity 1 dropped ~10% of camera
+# frames); a full queue still drops the oldest. Same defaults as sdl_stream_receiver.
 
-queue shown 1
+queue shown 2
 
 pipeline rx
 node rcv   stream_receiver listen=0.0.0.0:5001 max_datagram=1476
