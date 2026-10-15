@@ -47,6 +47,7 @@ set(VSTREAMER_SOURCES
     src/core/pix_convert.cpp
     src/core/h264_level.cpp
     src/core/h264_sps.cpp
+    src/core/mkv_writer.cpp
     src/core/component_factory.cpp
     src/core/pipeline.cpp
     src/core/pipeline_queue.cpp
@@ -122,13 +123,9 @@ if(ENABLE_RTP_H264_DEPAY)
 endif()
 
 set(VSTREAMER_LIBS)
-if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_CEDAR OR ENABLE_H264_ENCODER_INTEL OR ENABLE_MKV_SINK)
+if(ENABLE_JPEG_DECODER_MULTICORE OR ENABLE_H264_ENCODER_CEDAR OR ENABLE_H264_ENCODER_INTEL)
     pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET libavcodec libavutil)
     list(APPEND VSTREAMER_LIBS PkgConfig::LIBAV)
-endif()
-if(ENABLE_MKV_SINK)
-    pkg_check_modules(LIBAVFORMAT REQUIRED IMPORTED_TARGET libavformat)
-    list(APPEND VSTREAMER_LIBS PkgConfig::LIBAVFORMAT)
 endif()
 if(ENABLE_SDL_SINK)
     pkg_check_modules(SDL2 REQUIRED IMPORTED_TARGET sdl2)

@@ -8,17 +8,18 @@
 
 #include "test_pdu_helpers.hpp"
 
+#include "core/mkv_writer.hpp"
+
+#include <algorithm>
 #include <cerrno>
-
-extern "C"
-{
-#include <libavformat/avformat.h>
-}
-
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -56,7 +57,37 @@ constexpr uint8_t k_minimal_jpeg[] = {
     0xdb, 0x20, 0xa8, 0xa8, 0xa8, 0xff, 0xd9,
 };
 
-bool probe_video_span(const std::string &path, int *frame_count, double *duration_sec)
+/* Runs a shell command; returns its stdout, or false when it fails. */
+bool run_cmd(const std::string &cmd, std::string *out)
+{
+    FILE *p = popen(cmd.c_str(), "r");
+    if (nullptr == p)
+    {
+        return false;
+    }
+    std::string text;
+    char        buf[4096];
+    size_t      n = 0;
+    while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0)
+    {
+        text.append(buf, n);
+    }
+    const int status = pclose(p);
+    if (nullptr != out)
+    {
+        *out = text;
+    }
+    return 0 == status;
+}
+
+bool have_tool(const char *name)
+{
+    return run_cmd(std::string("command -v ") + name + " >/dev/null 2>&1", nullptr);
+}
+
+/* Demuxes with ffprobe (an independent reader): packet count, end of last packet, keyframes. */
+bool probe_video_span(const std::string &path, int *frame_count, double *duration_sec,
+                      int *key_count = nullptr)
 {
     if (nullptr == frame_count || nullptr == duration_sec)
     {
@@ -64,58 +95,150 @@ bool probe_video_span(const std::string &path, int *frame_count, double *duratio
     }
     *frame_count = 0;
     *duration_sec = 0.0;
+    if (nullptr != key_count)
+    {
+        *key_count = 0;
+    }
 
-    AVFormatContext *ctx = nullptr;
-    if (avformat_open_input(&ctx, path.c_str(), nullptr, nullptr) < 0 || nullptr == ctx)
+    std::string text;
+    if (!run_cmd("ffprobe -v error -select_streams v:0 -show_entries "
+                 "packet=pts_time,duration_time,flags -of csv=p=0 '" +
+                     path + "'",
+                 &text))
     {
         return false;
     }
-    if (avformat_find_stream_info(ctx, nullptr) < 0)
+    std::istringstream in(text);
+    std::string        line;
+    double             last_end = 0.0;
+    while (std::getline(in, line))
     {
-        avformat_close_input(&ctx);
-        return false;
-    }
-    int vindex = -1;
-    for (unsigned i = 0; i < ctx->nb_streams; ++i)
-    {
-        if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)
+        if (line.empty())
         {
-            vindex = static_cast<int>(i);
-            break;
+            continue;
+        }
+        double pts = 0.0;
+        double dur = 0.0;
+        char   flags[16] = {};
+        if (std::sscanf(line.c_str(), "%lf,%lf,%15s", &pts, &dur, flags) < 2)
+        {
+            return false;
+        }
+        ++(*frame_count);
+        last_end = std::max(last_end, pts + dur);
+        if (nullptr != key_count && 'K' == flags[0])
+        {
+            ++(*key_count);
         }
     }
-    if (vindex < 0)
-    {
-        avformat_close_input(&ctx);
-        return false;
-    }
-    const AVRational tb = ctx->streams[vindex]->time_base;
-
-    AVPacket *pkt = av_packet_alloc();
-    if (nullptr == pkt)
-    {
-        avformat_close_input(&ctx);
-        return false;
-    }
-    int64_t last_end = 0;
-    while (av_read_frame(ctx, pkt) >= 0)
-    {
-        if (pkt->stream_index == vindex)
-        {
-            ++(*frame_count);
-            if (pkt->pts >= 0)
-            {
-                const int64_t dur = pkt->duration > 0 ? pkt->duration : 1;
-                last_end = std::max(last_end, pkt->pts + dur);
-            }
-        }
-        av_packet_unref(pkt);
-    }
-    av_packet_free(&pkt);
-    avformat_close_input(&ctx);
-    *duration_sec = static_cast<double>(last_end) * av_q2d(tb);
+    *duration_sec = last_end;
     return true;
 }
+
+/* Container Duration from the Segment Info (what players show). */
+bool probe_format_duration(const std::string &path, double *duration_sec)
+{
+    std::string text;
+    if (!run_cmd("ffprobe -v error -show_entries format=duration -of csv=p=0 '" + path + "'",
+                 &text))
+    {
+        return false;
+    }
+    return 1 == std::sscanf(text.c_str(), "%lf", duration_sec);
+}
+
+/* Decodes every frame; true when ffmpeg reports no decode errors. */
+bool decodes_cleanly(const std::string &path, int *decoded)
+{
+    std::string text;
+    if (!run_cmd("ffprobe -v error -count_frames -select_streams v:0 -show_entries "
+                 "stream=nb_read_frames -of csv=p=0 '" +
+                     path + "' 2>/dev/null",
+                 &text) ||
+        1 != std::sscanf(text.c_str(), "%d", decoded))
+    {
+        return false;
+    }
+    /* Rockchip ffmpeg builds log an MPP probe line on every run; it is not a decode error. */
+    std::string errors;
+    (void)run_cmd("ffmpeg -v error -i '" + path + "' -f null - 2>&1 | grep -v mpp_platform",
+                  &errors);
+    return errors.empty();
+}
+
+std::vector<uint8_t> read_file(const std::string &path)
+{
+    std::ifstream f(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+/*
+ * Real H.264 from libx264: 320x240, GOP 10, SPS/PPS on every IDR, AUD before each AU so the
+ * Annex-B stream splits into access units on AUD start codes.
+ */
+bool make_h264_aus(const std::filesystem::path &dir, int frames,
+                   std::vector<std::vector<uint8_t>> *aus)
+{
+    const std::string out = (dir / "in.h264").string();
+    char              cmd[1024];
+    std::snprintf(cmd, sizeof(cmd),
+                  "ffmpeg -v error -y -f lavfi -i testsrc=size=320x240:rate=30 -frames:v %d "
+                  "-c:v libx264 -preset ultrafast -bf 0 -g 10 -keyint_min 10 -sc_threshold 0 "
+                  "-x264-params repeat-headers=1:aud=1 -f h264 '%s' 2>&1",
+                  frames, out.c_str());
+    if (!run_cmd(cmd, nullptr))
+    {
+        return false;
+    }
+    const std::vector<uint8_t> es = read_file(out);
+    std::vector<size_t>        starts;
+    for (size_t i = 0; i + 4 < es.size(); ++i)
+    {
+        if (es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 0 && es[i + 3] == 1 &&
+            (es[i + 4] & 0x1F) == 9)
+        {
+            starts.push_back(i);
+        }
+    }
+    starts.push_back(es.size());
+    aus->clear();
+    for (size_t k = 0; k + 1 < starts.size(); ++k)
+    {
+        aus->emplace_back(es.begin() + static_cast<std::ptrdiff_t>(starts[k]),
+                          es.begin() + static_cast<std::ptrdiff_t>(starts[k + 1]));
+    }
+    return static_cast<int>(aus->size()) == frames;
+}
+
+bool au_has_idr(const std::vector<uint8_t> &au)
+{
+    for (size_t i = 0; i + 3 < au.size(); ++i)
+    {
+        if (au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 && (au[i + 3] & 0x1F) == 5)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::filesystem::path fresh_dir(const char *name)
+{
+    const auto      base = std::filesystem::temp_directory_path() / name;
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+    return base;
+}
+
+#define REQUIRE_FFPROBE()                                                                        \
+    do                                                                                           \
+    {                                                                                            \
+        if (!have_tool("ffprobe"))                                                               \
+        {                                                                                        \
+            GTEST_SKIP() << "ffprobe not installed";                                             \
+        }                                                                                        \
+    } while (0)
 
 vstreamer::component_pdu make_mjpeg_caps(int w, int h)
 {
@@ -145,6 +268,8 @@ TEST(MkvSinkTest, PortCapsAdvertisesMjpeg)
     EXPECT_EQ("CAPS_VIDEO_CODED", val);
     ASSERT_EQ(0, sink.query("inport-0.caps-1.sdu_type", &val));
     EXPECT_EQ("MJPEG", val);
+    ASSERT_EQ(0, sink.query("inport-0.caps-2.sdu_type", &val));
+    EXPECT_EQ("H264_AU", val);
 }
 
 TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
@@ -179,6 +304,7 @@ TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
 
 TEST(MkvSinkTest, MicrosecondTimestampsDuration)
 {
+    REQUIRE_FFPROBE();
     const auto base = std::filesystem::temp_directory_path() / "mkv_sink_ts_us";
     std::error_code ec;
     std::filesystem::remove_all(base, ec);
@@ -205,12 +331,16 @@ TEST(MkvSinkTest, MicrosecondTimestampsDuration)
     ASSERT_TRUE(probe_video_span(seg_path, &frames, &dur));
     EXPECT_EQ(frames, 30);
     EXPECT_NEAR(dur, 1.0, 0.1);
+    double fmt_dur = 0.0;
+    ASSERT_TRUE(probe_format_duration(seg_path, &fmt_dur));
+    EXPECT_NEAR(fmt_dur, 1.0, 0.1);
 
     std::filesystem::remove_all(base, ec);
 }
 
 TEST(MkvSinkTest, DurationAndResizeSegments)
 {
+    REQUIRE_FFPROBE();
     const auto base = std::filesystem::temp_directory_path() / "mkv_sink_test";
     std::error_code ec;
     std::filesystem::remove_all(base, ec);
@@ -253,5 +383,100 @@ TEST(MkvSinkTest, DurationAndResizeSegments)
     EXPECT_NEAR(d1, 1.0, 0.15);
     EXPECT_NEAR(d2, 1.0, 0.15);
 
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvSinkTest, H264StartsAtKeyframeAndDecodes)
+{
+    REQUIRE_FFPROBE();
+    const auto base = fresh_dir("mkv_sink_h264");
+    std::vector<std::vector<uint8_t>> aus;
+    if (!make_h264_aus(base, 40, &aus))
+    {
+        GTEST_SKIP() << "ffmpeg with libx264 not available";
+    }
+
+    const std::string out_template = (base / "clip.mkv").string();
+    const std::string seg_path = (base / "clip-001.mkv").string();
+    mkv_sink          sink;
+    ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+    ASSERT_EQ(sink.configure("fps", "30"), 0);
+    ASSERT_EQ(sink.input(make_mjpeg_caps(320, 240)), 0);
+
+    /* Join mid-GOP: AU 0 (IDR) is never seen, so AUs 1..9 cannot be decoded. */
+    for (size_t i = 1; i < aus.size(); ++i)
+    {
+        component_pdu pdu;
+        pdu.ts_us = static_cast<uint64_t>(1000000 + i * 33333);
+        pdu.sdu_type = vstreamer::sdu_type_e::H264_AU;
+        pdu.flags = au_has_idr(aus[i]) ? static_cast<uint8_t>(vstreamer::pdu_flag_e::KEY) : 0;
+        pdu.sdu = shared_sized_buffer::copy_from(aus[i].data(), aus[i].size());
+        ASSERT_EQ(sink.input(std::move(pdu)), 0);
+    }
+    sink.close();
+
+    std::string val;
+    ASSERT_EQ(0, sink.query("skipped", &val));
+    EXPECT_EQ("9", val);
+
+    int    frames = 0;
+    int    keys = 0;
+    double dur = 0.0;
+    ASSERT_TRUE(probe_video_span(seg_path, &frames, &dur, &keys));
+    EXPECT_EQ(frames, 30);
+    EXPECT_EQ(keys, 3);
+    EXPECT_NEAR(dur, 1.0, 0.1);
+
+    std::string codec;
+    ASSERT_TRUE(run_cmd("ffprobe -v error -select_streams v:0 -show_entries "
+                        "stream=codec_name,width,height -of csv=p=0 '" +
+                            seg_path + "'",
+                        &codec));
+    EXPECT_EQ("h264,320,240\n", codec);
+
+    int decoded = 0;
+    EXPECT_TRUE(decodes_cleanly(seg_path, &decoded));
+    EXPECT_EQ(decoded, 30);
+
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvWriterTest, TruncatedFilePlaysUpToLastCluster)
+{
+    REQUIRE_FFPROBE();
+    const auto        base = fresh_dir("mkv_writer_truncated");
+    const std::string path = (base / "live.mkv").string();
+    const std::string copy = (base / "cut.mkv").string();
+
+    vstreamer::mkv_writer       w;
+    vstreamer::mkv_track_config cfg;
+    cfg.codec = vstreamer::mkv_codec_e::MJPEG;
+    cfg.width = 320;
+    cfg.height = 240;
+    cfg.fps = 30;
+    ASSERT_EQ(0, w.open(path, cfg));
+    /* 2.5 s: two closed (flushed) clusters, the third still open. */
+    for (int i = 0; i < 75; ++i)
+    {
+        ASSERT_EQ(0, w.write_frame(k_minimal_jpeg, sizeof(k_minimal_jpeg), i * 33333, 33333,
+                                   true));
+    }
+
+    /* Snapshot what reached the file while recording, as after a power cut. */
+    std::filesystem::copy_file(path, copy);
+    int    frames = 0;
+    double dur = 0.0;
+    ASSERT_TRUE(probe_video_span(copy, &frames, &dur));
+    EXPECT_GE(frames, 60);
+
+    ASSERT_EQ(0, w.close());
+    ASSERT_TRUE(probe_video_span(path, &frames, &dur));
+    EXPECT_EQ(frames, 75);
+    EXPECT_NEAR(dur, 2.5, 0.1);
+
+    std::error_code ec;
     std::filesystem::remove_all(base, ec);
 }

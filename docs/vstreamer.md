@@ -92,7 +92,7 @@ is not built returns `nullptr`.
 | `rtp_h264_pay` | coder | H264 FRAME → SOCK | `rtp_h264_pay`, `rtp_pay` | `ENABLE_RTP_H264_PAY` |
 | `rtp_h264_depay` | coder | SOCK → H264 FRAME | `rtp_h264_depay`, `rtp_depay` | `ENABLE_RTP_H264_DEPAY` |
 | `stream_sender` | sink | SOCK or RTP → UDP | `stream_sender`, `stream_sink` | `ENABLE_STREAM_SENDER` |
-| `mkv_sink` | sink | MJPEG → .mkv | `mkv`, `mkv_sink` | `ENABLE_MKV_SINK` |
+| `mkv_sink` | sink | MJPEG / H.264 → .mkv | `mkv`, `mkv_sink` | `ENABLE_MKV_SINK` |
 | `sdl_sink` | sink | NV12 → window | `sdl`, `sdl_sink`, `display`, `sdl_kmsdrm`² | `ENABLE_SDL_SINK` |
 
 ¹ `h264_encoder` picks the first built of MPP, Cedar, Intel.
@@ -235,13 +235,18 @@ restart is recognised by distance: a base more than 2048 SDUs ahead of the emit 
 held shard that far behind once the old session has been silent for `emit_hold_ms`, resyncs to
 the new session without counting the jump as loss.
 
-**`mkv_sink`** — MJPEG → Matroska, incremental cluster writes.
+**`mkv_sink`** — MJPEG or H.264 (Annex-B AUs) → Matroska through `core/mkv_writer` (stdio, no
+libav). Clusters of ~1 s start on keyframes and are flushed and fsync'ed as they close; the
+Segment is written with unknown size, so a file cut off by power loss plays up to the last closed
+cluster. Sizes, Duration and Cues are filled in on stop. H.264 recording starts at the first
+keyframe with SPS and PPS (earlier AUs count as `skipped`); a codec or size change starts a new
+segment.
 
 | Key | C/Q | Values |
 |-----|-----|--------|
 | `output` | C Q | path template (empty = stop recording) |
 | `size`, `fps` | C | stream parameters |
-| `segment`, `stats` | Q | informational |
+| `segment`, `stats`, `skipped`, `dropped` | Q | informational |
 
 **`sdl_sink`** — NV12 preview through `sdl_nv12_presenter` (OpenGL; the window is owned by the
 thread that opens it). `input()` presents the frame on the calling thread, so call it from the
@@ -495,7 +500,7 @@ defines the same `ENABLE_*` macros for `#ifdef` in app code, and
 | `ENABLE_H264_ENCODER_MPP` | OFF | `h264_encoder_mpp`; turned OFF with a warning if `rockchip_mpp` is not found |
 | `ENABLE_H264_ENCODER_CEDAR` | OFF | `h264_encoder_cedar` (libavcodec `h264_cedrus`) |
 | `ENABLE_H264_ENCODER_INTEL` | OFF | `h264_encoder_intel` (libavcodec `h264_vaapi`) |
-| `ENABLE_MKV_SINK` | ON | `mkv_sink` (libavformat) |
+| `ENABLE_MKV_SINK` | ON | `mkv_sink` (no external deps) |
 | `ENABLE_SDL_SINK` | OFF | `sdl_sink` (SDL2) |
 | `ENABLE_STREAM_SENDER` | ON | `stream_sender`; with the receiver, builds ISA-L EC and `rs_block_erasure` |
 | `ENABLE_STREAM_RECEIVER` | ON | `stream_receiver` |
@@ -544,7 +549,7 @@ component layer exists today; the rest is still design.
 | Config file loader (`key = value`, `source`/`sink`/`encoder`/`decoder`/`feedback`) | **not started** | |
 | Core console (verbs → `configure`/`query`, winject-connected client) | **not started** | bench uses `bench_console` |
 | `stream_request` operator gate / deadman | **not started** | `component_sink::set_enabled(on, timeout_ms)` is the hook |
-| MP4 record sink | **not started** | `mkv_sink` records MJPEG today |
+| MP4 record sink | **not started** | `mkv_sink` records MJPEG and H.264 as .mkv today |
 | Rover / winject deployment wiring | **not started** | [usecase.md](usecase.md) |
 
 Design constraints carried forward for those pieces: capture/decode/encode keep running when the
