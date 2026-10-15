@@ -170,10 +170,6 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
         {
             diag->rx_present_err++;
         }
-        if (auto *sdl = dynamic_cast<sdl_sink *>(display))
-        {
-            (void)sdl->present_pending();
-        }
         if (presented)
         {
             apps::record_stage_node_latency_ms(

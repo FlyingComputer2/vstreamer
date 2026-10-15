@@ -251,14 +251,26 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     return enq;
 }
 
+/* Presents on the calling thread, so input() must come from the thread that renders (the one
+ * that opened and prepared the sink). With vsync the present can block for one refresh.
+ * A failed present drops that frame and is counted in the presenter (stats fail=); it is not
+ * an input() error, since the frame was accepted. */
 int sdl_sink::input(component_pdu &&in)
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened.load(std::memory_order_acquire))
     {
-        return -EBADF;
+        std::lock_guard<std::mutex> lock(mu);
+        if (!opened.load(std::memory_order_acquire))
+        {
+            return -EBADF;
+        }
+        const int r = input_pdu_locked(std::move(in));
+        if (r < 0)
+        {
+            return r;
+        }
     }
-    return input_pdu_locked(std::move(in));
+    (void)present_pending();
+    return 0;
 }
 
 
@@ -266,6 +278,8 @@ int sdl_sink::configure(std::string_view key, std::string_view value)
 {
     if ("title" == key)
     {
+        /* open()/close() emplace and reset present under mu, possibly on another thread. */
+        std::lock_guard<std::mutex> lock(mu);
         if (present.has_value())
         {
             present->set_title(value);

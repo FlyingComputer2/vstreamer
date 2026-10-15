@@ -244,7 +244,8 @@ the new session without counting the jump as loss.
 | `segment`, `stats` | Q | informational |
 
 **`sdl_sink`** — NV12 preview through `sdl_nv12_presenter` (OpenGL; the window is owned by the
-thread that opens it).
+thread that opens it). `input()` presents the frame on the calling thread, so call it from the
+thread that opened the sink; with vsync each call can block for up to one display refresh.
 
 | Key | C/Q | Values |
 |-----|-----|--------|

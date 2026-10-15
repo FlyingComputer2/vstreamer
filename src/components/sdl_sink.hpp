@@ -39,9 +39,12 @@ public:
     void close() override;
 
     int prepare(int width, int height);
-    /* Present queued NV12 on the calling thread (must match prepare/open thread). */
+    /* Present queued NV12 on the calling thread (must match prepare/open thread). input()
+     * already presents everything it queues, so this normally returns -EAGAIN. */
     int present_pending();
     [[nodiscard]] std::thread::id bound_render_thread() const;
+    /* Queues the frame and presents it on the calling thread, which must be the render thread.
+     * Caps PDUs only update the input caps. */
     int input(component_pdu &&in) override;
 
     int configure(std::string_view key, std::string_view value) override;

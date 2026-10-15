@@ -75,7 +75,7 @@ TEST(SdlSinkTest, PduInputRequiresOpen)
     ASSERT_EQ(-EBADF, sink.input(make_nv12_caps(64, 64)));
 }
 
-TEST(SdlSinkTest, PresentPendingOnPrepareThread)
+TEST(SdlSinkTest, InputPresentsOnCallingThread)
 {
     setenv("SDL_VIDEODRIVER", "dummy", 1);
     vstreamer::sdl_sink sink;
@@ -86,7 +86,12 @@ TEST(SdlSinkTest, PresentPendingOnPrepareThread)
     EXPECT_EQ(prep_thread, sink.bound_render_thread());
     ASSERT_EQ(0, sink.input(make_nv12_caps(64, 64)));
     ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 1'000'000)));
-    EXPECT_EQ(0, sink.present_pending());
+    ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 1'033'000)));
+    /* Both frames were presented inside input(); nothing is left pending. */
+    EXPECT_EQ(-EAGAIN, sink.present_pending());
+    std::string stats;
+    ASSERT_EQ(0, sink.query("stats", &stats));
+    EXPECT_EQ(0U, stats.rfind("frames=2", 0)) << stats;
     sink.close();
 }
 
