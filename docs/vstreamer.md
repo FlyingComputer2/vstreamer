@@ -88,6 +88,7 @@ is not built returns `nullptr`.
 | `h264_encoder_mpp` | coder | NV12 → H264 | `h264_encoder_mpp`, `h264_encoder` | `ENABLE_H264_ENCODER_MPP` |
 | `h264_encoder_cedar` | coder | NV12 → H264 | `h264_encoder_cedar`, `h264_encoder`¹ | `ENABLE_H264_ENCODER_CEDAR` |
 | `h264_encoder_intel` | coder | NV12 → H264 | `h264_encoder_intel`, `h264_encoder`¹ | `ENABLE_H264_ENCODER_INTEL` |
+| `h264_encoder_esp32p4` | coder | O_UYY_E_VYY → H264 | `h264_encoder_esp32p4`, `h264_encoder`³ | ESP-IDF, esp32p4 target |
 | `h264_decoder_mpp` | coder | H264 → NV12 | `h264_decoder_mpp`, `h264_decoder` | `ENABLE_H264_DECODER_MPP` |
 | `rtp_h264_pay` | coder | H264 FRAME → SOCK | `rtp_h264_pay`, `rtp_pay` | `ENABLE_RTP_H264_PAY` |
 | `rtp_h264_depay` | coder | SOCK → H264 FRAME | `rtp_h264_depay`, `rtp_depay` | `ENABLE_RTP_H264_DEPAY` |
@@ -97,6 +98,7 @@ is not built returns `nullptr`.
 
 ¹ `h264_encoder` picks the first built of MPP, Cedar, Intel.
 ² `sdl_kmsdrm`, `sdl_kmsdrm_sink`, `kmsdrm_sink` return an `sdl_sink` with `video_driver=kmsdrm`.
+³ Only built by the ESP-IDF component, where it is the only encoder.
 
 ### Keys
 
@@ -163,6 +165,22 @@ part of `v4l2_source`.
 **`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
 Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
 `status`.
+
+**`h264_encoder_esp32p4`** — ESP32-P4 hardware H.264 (`esp_h264`). Input is `O_UYY_E_VYY`, the
+packed YUV 4:2:0 the P4 ISP writes (w × h × 3/2 bytes; line pairs U Y Y … / V Y Y …); the encoder
+cannot read NV12. Encoding is synchronous in `input()`: ~34 ms per 1080p frame on the pipeline
+thread. Raw caps must match `size`. Constrained Baseline; IDR AUs carry `KEY`.
+
+| Key | C/Q | Values / default |
+|-----|-----|------------------|
+| `size` | C Q | 80..1920 × 80..2032, both even, default `1920x1080`; reopens the encoder |
+| `fps` | C Q | 1..120, default 30, live |
+| `gop` | C Q | 1..255, default 30, live |
+| `bitrate` (`bps`) | C Q | 10 000..100 000 000, default 4 000 000, live |
+| `qp_min`, `qp_max` | C Q | 0..51, defaults 20 / 40; reopens the encoder |
+| `idr` | C | IDR on the next frame |
+| `encode_ms` | Q | last / max encode time |
+| `stats`, `status`, `backend` | Q | informational |
 
 **`h264_decoder_mpp`** — Rockchip MPP H.264 → NV12. Lock order `mu` → `mpp_io_mu`.
 
@@ -512,6 +530,14 @@ defines the same `ENABLE_*` macros for `#ifdef` in app code, and
 
 ASan builds (`-fsanitize=address` in `CMAKE_CXX_FLAGS`) link LeakSanitizer suppressions for
 SDL/Mesa from `cmake/lsan_suppressions.txt`.
+
+**ESP-IDF.** `idf/vstreamer` is an ESP-IDF component with the core and `mkv_sink`,
+`stream_sender`, `stream_receiver`, `rtp_h264_pay`, `rtp_h264_depay`, plus `h264_encoder_esp32p4`
+on the esp32p4 target (pulls `espressif/esp_h264`); no apps. Add it to `EXTRA_COMPONENT_DIRS`.
+`idf/example` is an esp32p4 smoke test (UDP loopback through a pipeline, hardware encode, a
+base64 clip dump). On ESP-IDF, pipeline control must come from a pthread (`std::thread`), not
+`app_main`; `stream_sender` sends only after `set_enabled(true, …)`; raise
+`CONFIG_LWIP_UDP_RECVMBOX_SIZE` (default 6) for video-rate bursts.
 
 Reference configurations:
 

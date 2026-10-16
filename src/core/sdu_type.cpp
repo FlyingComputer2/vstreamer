@@ -22,6 +22,7 @@ constexpr sdu_type_name_entry k_sdu_type_names[] = {
     {sdu_type_e::RTP, "RTP"},
     {sdu_type_e::STREAM_DGRAM, "STREAM_DGRAM"},
     {sdu_type_e::PCM, "PCM"},
+    {sdu_type_e::O_UYY_E_VYY, "O_UYY_E_VYY"},
     {sdu_type_e::CAPS_VIDEO_RAW, "CAPS_VIDEO_RAW"},
     {sdu_type_e::CAPS_VIDEO_CODED, "CAPS_VIDEO_CODED"},
     {sdu_type_e::CAPS_AUDIO, "CAPS_AUDIO"},

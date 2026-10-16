@@ -1,12 +1,21 @@
-// Loopback smoke test for the vstreamer component on ESP-IDF:
+// Smoke tests for the vstreamer component on ESP-IDF.
+//
+// 1. Loopback:
 //
 //   stream_sender (tx) -> UDP 127.0.0.1:5600 -> [pipeline: stream_receiver -> stream_sender]
 //                      -> UDP 127.0.0.1:5601 -> stream_receiver (rx)
 //
 // Runs on a pthread (see app_main). Runs every thread the IDF build has (pipeline, send, telemetry, receive, mkv mux), counts
 // the datagrams that arrive at rx and prints each thread's unused stack.
+//
+// 2. h264_encoder_esp32p4 (esp32p4 only): encodes synthetic O_UYY_E_VYY frames at 1080p for
+// timing, then a short 320x240 clip that it prints as H264_BEGIN / base64 lines / H264_END so
+// the host can decode it.
 
+#include "components/components_config.hpp"
+#include "core/component_coder.hpp"
 #include "core/component_factory.hpp"
+#include "core/sdu_caps.hpp"
 #include "core/component_pdu.hpp"
 #include "core/component_sink.hpp"
 #include "core/component_source.hpp"
@@ -16,6 +25,8 @@
 
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+#include "mbedtls/base64.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -60,6 +71,145 @@ void print_query(const char *who, const vstreamer::component &c, const char *key
         std::printf("  %s %s = %s\n", who, key, v.c_str());
     }
 }
+
+#ifdef ENABLE_H264_ENCODER_ESP32P4
+
+/* Moving diagonal gradient in the P4 ISP layout: line pairs U Y Y ... / V Y Y ... */
+void fill_frame(uint8_t *p, int w, int h, int frame)
+{
+    const int line_bytes = w * 3 / 2;
+    for (int y = 0; y < h; ++y)
+    {
+        uint8_t      *row = p + static_cast<size_t>(y) * line_bytes;
+        const uint8_t c = (y & 1) == 0 ? static_cast<uint8_t>(128 + (y * 64) / h)   /* U */
+                                       : static_cast<uint8_t>(192 - (y * 64) / h);  /* V */
+        for (int x = 0; x < w; x += 2)
+        {
+            row[0] = c;
+            row[1] = static_cast<uint8_t>(x + y + 4 * frame);
+            row[2] = static_cast<uint8_t>(x + 1 + y + 4 * frame);
+            row += 3;
+        }
+    }
+}
+
+void dump_clip(const std::string &clip, int frames)
+{
+    std::printf("H264_BEGIN frames=%d bytes=%u\n", frames, static_cast<unsigned>(clip.size()));
+    unsigned char line[80];
+    for (size_t off = 0; off < clip.size(); off += 57)
+    {
+        const size_t n = clip.size() - off < 57 ? clip.size() - off : 57;
+        size_t       olen = 0;
+        mbedtls_base64_encode(line, sizeof(line) - 1, &olen,
+                              reinterpret_cast<const unsigned char *>(clip.data()) + off, n);
+        line[olen] = 0;
+        std::printf("H264 %s\n", line);
+        if ((off / 57) % 64 == 63)
+        {
+            std::fflush(stdout);
+            vTaskDelay(1);
+        }
+    }
+    std::printf("H264_END\n");
+    std::fflush(stdout);
+}
+
+/* Encodes `frames` frames; appends the bitstream to clip when non-null. */
+int encode_frames(int w, int h, int frames, int gop, std::string *clip)
+{
+    auto enc = vstreamer::component_factory::create_coder("h264_encoder");
+    if (!enc)
+    {
+        std::printf("h264_encoder not in the build\n");
+        return -1;
+    }
+    char size[32];
+    std::snprintf(size, sizeof(size), "%dx%d", w, h);
+    enc->configure("size", size);
+    enc->configure("gop", std::to_string(gop));
+    if (enc->open() < 0)
+    {
+        std::printf("encoder open %s failed\n", size);
+        return -1;
+    }
+    vstreamer::video_raw_caps caps {};
+    caps.width = w;
+    caps.height = h;
+    caps.fps_num = 30;
+    caps.fps_den = 1;
+    if (enc->input(vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps, 0, 0)) < 0)
+    {
+        std::printf("encoder rejected caps\n");
+        return -1;
+    }
+
+    const size_t frame_bytes = static_cast<size_t>(w) * h * 3 / 2;
+    int          aus = 0;
+    int          keys = 0;
+    size_t       bytes = 0;
+    const int64_t t0 = esp_timer_get_time();
+    for (int i = 0; i < frames; ++i)
+    {
+        vstreamer::component_pdu in;
+        in.ts_us = static_cast<uint64_t>(i) * 33333;
+        in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
+        in.sdu = vstreamer::shared_sized_buffer::allocate(frame_bytes);
+        in.sdu.resize(frame_bytes);
+        fill_frame(in.sdu.u8(), w, h, i);
+        const int r = enc->input(std::move(in));
+        if (r < 0)
+        {
+            std::printf("encode frame %d failed: %d\n", i, r);
+            return -1;
+        }
+        vstreamer::component_pdu out;
+        while (enc->output(out) == 0)
+        {
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            ++aus;
+            bytes += out.sdu.size();
+            if (vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY))
+            {
+                ++keys;
+            }
+            if (nullptr != clip)
+            {
+                clip->append(reinterpret_cast<const char *>(out.sdu.u8()), out.sdu.size());
+            }
+        }
+    }
+    const double sec = (esp_timer_get_time() - t0) / 1e6;
+    std::string  stats;
+    enc->query("stats", &stats);
+    std::printf("encode %s: %d AUs, %d IDR, %u bytes, %.1f fps incl. frame fill; %s\n", size, aus,
+                keys, static_cast<unsigned>(bytes), frames / sec, stats.c_str());
+    enc->close();
+    return aus == frames ? 0 : -1;
+}
+
+int run_encoder()
+{
+    print_heap("encoder start");
+    int r = encode_frames(1920, 1080, 60, 30, nullptr);
+    std::string clip;
+    if (0 == r)
+    {
+        r = encode_frames(320, 240, 30, 10, &clip);
+    }
+    print_heap("encoder end");
+    if (0 == r)
+    {
+        dump_clip(clip, 30);
+    }
+    std::printf("encoder test %s\n", 0 == r ? "PASSED" : "FAILED");
+    return r;
+}
+
+#endif  // ENABLE_H264_ENCODER_ESP32P4
 
 int run()
 {
@@ -174,6 +324,11 @@ extern "C" void app_main(void)
     esp_event_loop_create_default();
     /* pipeline control uses std::this_thread::get_id(), which needs a pthread; app_main is a
      * plain FreeRTOS task. */
-    auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 16 * 1024}, [] { (void)run(); });
+    auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 16 * 1024}, [] {
+        (void)run();
+#ifdef ENABLE_H264_ENCODER_ESP32P4
+        (void)run_encoder();
+#endif
+    });
     t.join();
 }

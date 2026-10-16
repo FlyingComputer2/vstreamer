@@ -41,6 +41,7 @@ TEST(ComponentPduTest, SduTypeNameRoundTrip)
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::RTP);
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::STREAM_DGRAM);
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::PCM);
+    expect_round_trip_sdu_type(vstreamer::sdu_type_e::O_UYY_E_VYY);
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::CAPS_VIDEO_RAW);
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::CAPS_VIDEO_CODED);
     expect_round_trip_sdu_type(vstreamer::sdu_type_e::CAPS_AUDIO);
@@ -87,6 +88,8 @@ TEST(ComponentPduTest, CapsTypeForDataTypes)
 {
     EXPECT_EQ(vstreamer::sdu_type_e::CAPS_VIDEO_RAW,
               vstreamer::caps_type_for(vstreamer::sdu_type_e::NV12));
+    EXPECT_EQ(vstreamer::sdu_type_e::CAPS_VIDEO_RAW,
+              vstreamer::caps_type_for(vstreamer::sdu_type_e::O_UYY_E_VYY));
     EXPECT_EQ(vstreamer::sdu_type_e::CAPS_VIDEO_CODED,
               vstreamer::caps_type_for(vstreamer::sdu_type_e::H264_AU));
     EXPECT_EQ(vstreamer::sdu_type_e::CAPS_AUDIO,

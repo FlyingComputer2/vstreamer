@@ -17,6 +17,9 @@ enum class sdu_type_e : uint16_t
     RTP,
     STREAM_DGRAM,
     PCM,
+    /* YUV 4:2:0 packed as the ESP32-P4 ISP writes it and its H.264 encoder reads it, w * h * 3 / 2
+     * bytes: odd lines U Y Y U Y Y ..., even lines V Y Y V Y Y ... (Espressif O_UYY_E_VYY). */
+    O_UYY_E_VYY,
 
     CAPS_BASE = 0x8000,
     CAPS_VIDEO_RAW = CAPS_BASE,

@@ -28,6 +28,7 @@ sdu_type_e caps_type_for(sdu_type_e data_type)
     switch (data_type)
     {
     case sdu_type_e::NV12:
+    case sdu_type_e::O_UYY_E_VYY:
         return sdu_type_e::CAPS_VIDEO_RAW;
     case sdu_type_e::MJPEG:
     case sdu_type_e::H264_AU:

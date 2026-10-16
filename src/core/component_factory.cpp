@@ -34,6 +34,10 @@
 #include "components/h264_encoder_intel.hpp"
 #endif
 
+#ifdef ENABLE_H264_ENCODER_ESP32P4
+#include "components/h264_encoder_esp32p4.hpp"
+#endif
+
 #ifdef ENABLE_MKV_SINK
 #include "components/mkv_sink.hpp"
 #endif
@@ -131,6 +135,14 @@ std::unique_ptr<component_coder> component_factory::create_coder(std::string nam
     )
     {
         return std::make_unique<h264_encoder_intel>();
+    }
+#endif
+
+#ifdef ENABLE_H264_ENCODER_ESP32P4
+    /* ESP-IDF only, so never built next to the Linux encoders. */
+    if ("h264_encoder_esp32p4" == name || "h264_encoder" == name)
+    {
+        return std::make_unique<h264_encoder_esp32p4>();
     }
 #endif
 

@@ -10,6 +10,11 @@ set(ENABLE_RTP_H264_DEPAY ON)
 
 set(VSTREAMER_SOURCES)
 include(${VSTREAMER_ROOT}/cmake/vstreamer_sources.cmake)
+# The P4's hardware H.264 encoder (esp_h264, see idf_component.yml).
+if(IDF_TARGET STREQUAL "esp32p4")
+    set(ENABLE_H264_ENCODER_ESP32P4 ON)
+    list(APPEND VSTREAMER_SOURCES src/components/h264_encoder_esp32p4.cpp)
+endif()
 list(TRANSFORM VSTREAMER_SOURCES PREPEND ${VSTREAMER_ROOT}/)
 
 # ISA-L's portable erasure code; not fetched during IDF's early requirement scan.
@@ -35,7 +40,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS compat
                       ${VSTREAMER_IDF_ISAL_INCLUDES}
     REQUIRES lwip pthread
-    PRIV_REQUIRES vfs
+    PRIV_REQUIRES vfs esp_timer
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

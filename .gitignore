@@ -31,3 +31,4 @@ __pycache__/
 .env.*
 idf/example/sdkconfig
 idf/example/sdkconfig.old
+idf/example/managed_components/
