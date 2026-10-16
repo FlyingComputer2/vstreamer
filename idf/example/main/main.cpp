@@ -20,7 +20,7 @@
 #include "core/component_sink.hpp"
 #include "core/component_source.hpp"
 #include "core/pipeline.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 #include "core/thread_spawn.hpp"
 
 #include "esp_event.h"
@@ -155,7 +155,7 @@ int encode_frames(int w, int h, int frames, int gop, std::string *clip)
         vstreamer::component_pdu in;
         in.ts_us = static_cast<uint64_t>(i) * 33333;
         in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
-        in.sdu = vstreamer::shared_sized_buffer::allocate(frame_bytes);
+        in.sdu = bfc::shared_sized_buffer::allocate(frame_bytes);
         in.sdu.resize(frame_bytes);
         fill_frame(in.sdu.u8(), w, h, i);
         const int r = enc->input(std::move(in));
@@ -198,7 +198,7 @@ vstreamer::component_pdu raw_frame(int w, int h, int i)
     vstreamer::component_pdu in;
     in.ts_us = static_cast<uint64_t>(i) * 33333;
     in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
-    in.sdu = vstreamer::shared_sized_buffer::allocate(bytes);
+    in.sdu = bfc::shared_sized_buffer::allocate(bytes);
     in.sdu.resize(bytes);
     fill_frame(in.sdu.u8(), w, h, i);
     return in;
@@ -344,12 +344,12 @@ int run()
         std::memset(payload, i & 0xFF, sizeof(payload));
         vstreamer::component_pdu pdu;
         pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
-        pdu.sdu = vstreamer::shared_sized_buffer::copy_from(payload, sizeof(payload));
+        pdu.sdu = bfc::shared_sized_buffer::copy_from(payload, sizeof(payload));
         while (tx->input(std::move(pdu)) == -EAGAIN)
         {
             vTaskDelay(pdMS_TO_TICKS(1));
             pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
-            pdu.sdu = vstreamer::shared_sized_buffer::copy_from(payload, sizeof(payload));
+            pdu.sdu = bfc::shared_sized_buffer::copy_from(payload, sizeof(payload));
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
