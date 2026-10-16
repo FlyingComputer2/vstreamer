@@ -69,6 +69,15 @@ under the hood; the gap is ~0.1 ms/frame vs the 33.33 ms budget for 30 fps on cu
 400 MHz + SPIRAM YUV. Remaining options are Espressif guidance for faster CSI→H.264 DMA (e.g.
 internal/coherent buffers) or a silicon/clock revision — not more pipeline threading alone.
 
+**GS check (direct LAN to `192.168.253.106:21090`):** `printf 'metrics\n' | nc -u -w1
+127.0.0.1 5091` on the receiver host — `h264_decoder.depay_au_pps` has measured **~30** while
+UART `live TX` fps stays **~28.8** (cumulative AU counter vs receiver’s short-window rate).
+`peer{rcv=0}` on UART is expected when `telemetry=off`. High `rtp_h264_depay.loss` on a busy
+bench may still need receiver tuning; `render_fps=0` is a separate SDL/KMS issue.
+
+`esp32_h264_isp_src::set_live_tx_hooks()` can run pay/send on the encode thread (legacy style);
+bench showed it **hurts** throughput vs a separate `vs_isp_tx` thread — keep the default split.
+
 `vs_cap_pull` must **not** poll `output()` in a tight loop: use `esp32p4_csi_camera_src::wait_output()`
 so the thread sleeps on `out_cv_` until `vs_csi_cam` delivers a frame (replaces ~1 kHz
 `vTaskDelay(1)` polling and avoids `taskYIELD()` busy-wait).

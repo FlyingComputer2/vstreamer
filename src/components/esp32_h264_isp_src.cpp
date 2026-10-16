@@ -393,7 +393,7 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
-    if (key == "encode_ms")
+    if (key == "encode_ms" || key == "enc_frames")
     {
         return enc_->query(key, value);
     }

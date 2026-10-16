@@ -571,6 +571,10 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     {
         return set_int(value, qp_max);
     }
+    if (key == "enc_frames")
+    {
+        return set_int(value, static_cast<int64_t>(frames_));
+    }
     if (key == "encode_ms")
     {
         char buf[48];

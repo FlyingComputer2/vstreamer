@@ -616,6 +616,7 @@ int run_camera_stream()
     const int64_t stop_at =
         run_forever ? INT64_MAX : esp_timer_get_time() + k_seconds * 1000000LL;
     int64_t       last_stats_us = esp_timer_get_time();
+    uint64_t      last_enc_frames = 0;
 
     auto tx_fn = [&]() {
         while (!stop.load(std::memory_order_acquire))
@@ -652,17 +653,32 @@ int run_camera_stream()
     {
         if (esp_timer_get_time() - last_stats_us >= 10 * 1000000LL)
         {
-            last_stats_us = esp_timer_get_time();
+            const int64_t  now_us = esp_timer_get_time();
+            const double   stat_dt = (now_us - last_stats_us) / 1e6;
+            last_stats_us = now_us;
             std::string isp_stats;
             std::string snd_stats;
+            std::string enc_frames_s;
             src->query("stats", &isp_stats);
             snd->query("stats", &snd_stats);
+            (void)src->query("enc_frames", &enc_frames_s);
+            uint64_t enc_total = 0;
+            if (!enc_frames_s.empty())
+            {
+                enc_total = std::strtoull(enc_frames_s.c_str(), nullptr, 10);
+            }
+            const double enc_fps =
+                stat_dt > 0 && enc_total >= last_enc_frames
+                    ? static_cast<double>(enc_total - last_enc_frames) / stat_dt
+                    : 0.0;
+            last_enc_frames = enc_total;
             const int64_t  t0 = t0_us.load(std::memory_order_relaxed);
             const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
             const uint64_t f = frames.load(std::memory_order_relaxed);
             const uint64_t b = bytes.load(std::memory_order_relaxed);
-            std::printf("live TX %.1f fps %.0f kbps; isp %s; snd %s\n", sec > 0 ? f / sec : 0.0,
-                        sec > 0 ? b * 8 / sec / 1000 : 0.0, isp_stats.c_str(), snd_stats.c_str());
+            std::printf("live TX %.1f fps (enc %.1f) %.0f kbps; isp %s; snd %s\n",
+                        sec > 0 ? f / sec : 0.0, enc_fps, sec > 0 ? b * 8 / sec / 1000 : 0.0,
+                        isp_stats.c_str(), snd_stats.c_str());
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
             esp_timer_get_time() >= stop_at)
