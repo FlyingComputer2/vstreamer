@@ -221,11 +221,16 @@ int esp32_h264_isp_src::open()
 
     stop_.store(false, std::memory_order_release);
     std::thread enc_thread =
-        spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 12}, [this] { encode_main(); });
+        spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 13}, [this] { encode_main(); });
     {
         std::lock_guard<std::mutex> lock(mu);
         encode_thread_ = std::move(enc_thread);
         opened = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+    if (TaskHandle_t enc_task = xTaskGetHandle("vs_isp_enc"); nullptr != enc_task)
+    {
+        cam_->set_wake_task(enc_task);
     }
     return 0;
 }

@@ -31,6 +31,8 @@
 
 #if defined(ESP_PLATFORM)
 #include "esp_cache.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #endif
 
 namespace vstreamer
@@ -455,8 +457,22 @@ void esp32p4_csi_camera_src::capture_main()
         stale.reset();
         notify_wakeup();
         out_cv_.notify_one();
+#if defined(ESP_PLATFORM)
+        if (nullptr != wake_task_)
+        {
+            xTaskNotifyGive(static_cast<TaskHandle_t>(wake_task_));
+        }
+#endif
     }
 }
+
+#if defined(ESP_PLATFORM)
+void esp32p4_csi_camera_src::set_wake_task(void *task_handle)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    wake_task_ = task_handle;
+}
+#endif
 
 int esp32p4_csi_camera_src::open()
 {
@@ -488,6 +504,9 @@ void esp32p4_csi_camera_src::close()
             return;
         }
         source_open = false;
+#if defined(ESP_PLATFORM)
+        wake_task_ = nullptr;
+#endif
         out_cv_.notify_all();
     }
     stop_.store(true, std::memory_order_release);
@@ -577,6 +596,15 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
         {
             return -EAGAIN;
         }
+#if defined(ESP_PLATFORM)
+        if (nullptr != wake_task_)
+        {
+            lock.unlock();
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+            lock.lock();
+            continue;
+        }
+#endif
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         out_cv_.wait_until(lock, deadline, [this] {

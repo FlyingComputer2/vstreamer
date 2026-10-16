@@ -47,6 +47,11 @@ public:
     /* Blocks up to timeout_ms for a frame (or CAPS once). Returns -EAGAIN on timeout. */
     int  wait_output(component_pdu &out, int timeout_ms);
 
+#if defined(ESP_PLATFORM)
+    /* Wake vs_isp_enc via xTaskNotify when a frame lands in ready_q_ (lower latency than cv alone). */
+    void set_wake_task(void *task_handle);
+#endif
+
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
@@ -85,8 +90,11 @@ private:
     std::shared_ptr<ring>        ring_;
     std::thread                  thread_;
     std::atomic<bool>            stop_ {false};
-    static constexpr size_t k_ready_q_max = 2;
+    static constexpr size_t k_ready_q_max = 3;
     std::deque<component_pdu>  ready_q_;
+#if defined(ESP_PLATFORM)
+    void *wake_task_ = nullptr;
+#endif
     bool                         caps_sent_ = false;
     uint64_t                     out_seq_ = 0;
 
