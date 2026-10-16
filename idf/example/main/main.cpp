@@ -641,7 +641,7 @@ int run_camera_stream()
     }
     (void)src->configure("buffers", "6");
     (void)src->configure("fps", "30");
-    (void)src->configure("bitrate", "4000000");
+    (void)src->configure("bitrate", "10000000");
     (void)src->configure("gop", "30");
     (void)src->configure("qp_min", "20");
     (void)src->configure("qp_max", "51");

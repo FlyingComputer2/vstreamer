@@ -48,8 +48,8 @@ encode time, and they were removed. Encode time only moves with the bitstream si
 ## Rate control
 
 esp_h264 has one RC mode: with `qp_min < qp_max` it targets `bitrate` (CBR) and picks a QP
-per frame inside the clamps; `qp_min == qp_max` is constant QP. Live TX uses 4 Mbps with QP
-20–51, measured 4.05–4.3 Mbps. With a floor of 10, a frame at 10 Mbps overflowed the 768 KiB
+per frame inside the clamps; `qp_min == qp_max` is constant QP. Live TX uses 10 Mbps with QP
+20–51 (measured ~9.3–9.9 Mbps; 4 Mbps measured 4.05–4.3). With a floor of 10, a frame at 10 Mbps overflowed the 768 KiB
 bitstream buffer; the buffer is now 1 MiB, an overflow drops one frame and forces an IDR.
 
 At 10 Mbps the encoder still keeps up (~33.5 ms) but the pay/send path falls behind: push
