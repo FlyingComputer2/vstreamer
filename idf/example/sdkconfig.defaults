@@ -31,3 +31,11 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
 # 30 x 1600 B (the Kconfig maximum) took direct-LAN loss from ~1.7% to 0.
 CONFIG_ETH_DMA_BUFFER_SIZE=1600
 CONFIG_ETH_DMA_TX_BUFFER_NUM=30
+# Per-task CPU and heap headroom in the live TX stats ("sys" line).
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+# Packet buffers (lwIP pbufs, ~1.4 KB RTP payloads) default to internal RAM; at 10 Mbps an IDR
+# burst took internal free down to ~300 B. In PSRAM the internal minimum stays ~110 KB, which
+# winject-l3 and the SDIO proxy need on the rover.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024

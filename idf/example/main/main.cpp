@@ -61,6 +61,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace
 {
@@ -503,6 +504,57 @@ int run_camera()
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
     CONFIG_VSTREAMER_IDF_LIVE_TX
 
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+/* CPU per task since the previous call (percent of one core), then heap headroom. */
+void print_sys_stats()
+{
+    struct prev_t
+    {
+        std::string name;
+        uint32_t    rt;
+    };
+    static std::vector<prev_t> prev;
+    static int64_t             prev_us = 0;
+    const UBaseType_t          n = uxTaskGetNumberOfTasks() + 4;
+    std::vector<TaskStatus_t>  st(n);
+    configRUN_TIME_COUNTER_TYPE total = 0;
+    const UBaseType_t got = uxTaskGetSystemState(st.data(), n, &total);
+    const int64_t     now = esp_timer_get_time();
+    const double      dt = prev_us > 0 ? static_cast<double>(now - prev_us) : 0;
+    std::string       line;
+    std::vector<prev_t> cur;
+    for (UBaseType_t i = 0; i < got; ++i)
+    {
+        const std::string name = st[i].pcTaskName;
+        const uint32_t    rt = st[i].ulRunTimeCounter;
+        cur.push_back({name, rt});
+        for (const auto &p : prev)
+        {
+            if (p.name == name && dt > 0)
+            {
+                const double pct = 100.0 * static_cast<uint32_t>(rt - p.rt) / dt;
+                if (pct >= 0.5 || 0 == name.rfind("IDLE", 0))
+                {
+                    char buf[64];
+                    std::snprintf(buf, sizeof(buf), " %s=%.1f%%", name.c_str(), pct);
+                    line += buf;
+                }
+                break;
+            }
+        }
+    }
+    prev = std::move(cur);
+    prev_us = now;
+    std::printf("sys cpu%s; int free=%u min=%u big=%u; psram free=%u min=%u big=%u\n",
+                line.c_str(), heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+                heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+#endif
+
 void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_sink *sender)
 {
     vstreamer::component_pdu out;
@@ -763,6 +815,9 @@ int run_camera_stream()
             std::printf("live TX %.1f fps (enc %.1f) %.0f kbps; isp %s; snd %s\n",
                         sec > 0 ? f / sec : 0.0, enc_fps, sec > 0 ? b * 8 / sec / 1000 : 0.0,
                         isp_stats.c_str(), snd_stats.c_str());
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+            print_sys_stats();
+#endif
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
             esp_timer_get_time() >= stop_at)
