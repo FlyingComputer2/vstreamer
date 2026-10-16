@@ -5,6 +5,7 @@
 #include "core/sdu_type.hpp"
 #include <bfc/shared_sized_buffer.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
@@ -32,6 +33,8 @@ constexpr int k_max_height = 2032;
 /* Bitstream buffer DMA target: cache-line aligned. */
 constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
+/* IDR at 1080p rarely exceeds ~512 KiB at sane QP; internal RAM is faster than SPIRAM. */
+constexpr uint32_t k_max_bitstream_bytes = 768U * 1024U;
 
 size_t frame_bytes(int w, int h)
 {
@@ -155,12 +158,16 @@ int h264_encoder_esp32p4::codec_open_locked()
         return -EIO;
     }
 
-    /* Twice the raw frame: room for an IDR even at qp 0. A larger AU is not written past the
-     * buffer; esp_h264 fails the frame (-EIO). */
+    const uint32_t want_out =
+        std::min(static_cast<uint32_t>(2 * frame_bytes(width, height)), k_max_bitstream_bytes);
     uint32_t actual = 0;
-    auto    *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(
-        k_out_align, 1, static_cast<uint32_t>(2 * frame_bytes(width, height)), &actual,
-        ESP_H264_MEM_SPIRAM));
+    uint8_t *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out,
+                                                                   &actual, ESP_H264_MEM_INTERNAL));
+    if (nullptr == out)
+    {
+        out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual,
+                                                             ESP_H264_MEM_SPIRAM));
+    }
     if (nullptr == out)
     {
         esp_h264_enc_close(enc);

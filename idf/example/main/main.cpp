@@ -570,8 +570,8 @@ int run_camera_stream()
     enc->configure("bitrate", "4000000");
     enc->configure("gop", "30");
     enc->configure("fps", "30");
-    enc->configure("qp_min", "26");
-    enc->configure("qp_max", "46");
+    enc->configure("qp_min", "32");
+    enc->configure("qp_max", "48");
     pay->configure("fps", "30");
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
@@ -654,7 +654,7 @@ int run_camera_stream()
             vstreamer::component_pdu in;
             if (cam->output(in) != 0)
             {
-                live_tx_yield();
+                vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
             }
             if (in.sdu_type != vstreamer::sdu_type_e::CAPS_VIDEO_RAW &&
@@ -708,18 +708,8 @@ int run_camera_stream()
         }
     };
 
-    auto pay_drain_fn = [&]() {
-        while (!stop.load(std::memory_order_acquire))
-        {
-            drain_pay_to_sender(pay_c, snd_s);
-            live_tx_yield();
-        }
-    };
-
     auto capture_thread = vstreamer::spawn_thread(
         vstreamer::thread_opts {"vs_cap_pull", 12 * 1024, 0, 10}, capture_fn);
-    auto pay_drain_thread = vstreamer::spawn_thread(
-        vstreamer::thread_opts {"vs_pay_drain", 8 * 1024, 0, 9}, pay_drain_fn);
     auto encode_thread = vstreamer::spawn_thread(
         vstreamer::thread_opts {"vs_enc_tx", 20 * 1024, 1, 11}, encode_fn);
 
@@ -753,7 +743,6 @@ int run_camera_stream()
     stop.store(true, std::memory_order_release);
     q_cv.notify_all();
     capture_thread.join();
-    pay_drain_thread.join();
     encode_thread.join();
 
     drain_encoder_chain(enc_c, pay_c, snd_s);

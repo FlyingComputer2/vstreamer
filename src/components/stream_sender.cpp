@@ -846,7 +846,7 @@ int stream_sender::open()
         send_stop = false;
         send_thread = spawn_thread(
 #if defined(ESP_PLATFORM)
-            thread_opts {"vs_send", k_send_stack_bytes, 0, 8},
+            thread_opts {"vs_send", k_send_stack_bytes, 0, 12},
 #else
             thread_opts {"vs_send", k_send_stack_bytes},
 #endif
