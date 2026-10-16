@@ -88,9 +88,13 @@ private:
     int      fps = 30;
     int      gop = 30;
     uint32_t bitrate = 4000000;
-    int      qp_min = 38;
+    int      qp_min = 40;
     int      qp_max = 51;
-    int      buffers = 6;
+    int      buffers = 8;
+
+    uint64_t wall_sum_us_ = 0;
+    uint64_t wall_frames_ = 0;
+    int64_t  last_wall_us_ = 0;
 };
 
 }  // namespace vstreamer

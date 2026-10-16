@@ -8,6 +8,8 @@
 #include "core/sdu_type.hpp"
 #include "core/thread_spawn.hpp"
 
+#include <esp_timer.h>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -186,6 +188,13 @@ void esp32_h264_isp_src::encode_main()
             std::fprintf(stderr, "esp32_h264_isp_src: encode failed: %d\n", enc_r);
             break;
         }
+        const int64_t t_done = esp_timer_get_time();
+        if (last_wall_us_ > 0)
+        {
+            wall_sum_us_ += t_done - last_wall_us_;
+            ++wall_frames_;
+        }
+        last_wall_us_ = t_done;
     }
 }
 
@@ -388,8 +397,12 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
         std::string enc_stats;
         cam_->query("stats", &cam_stats);
         enc_->query("stats", &enc_stats);
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "cam %s; enc %s", cam_stats.c_str(), enc_stats.c_str());
+        char buf[320];
+        const double wall_ms =
+            wall_frames_ > 0 ? static_cast<double>(wall_sum_us_) / static_cast<double>(wall_frames_) / 1000.0
+                             : 0.0;
+        std::snprintf(buf, sizeof(buf), "cam %s; enc %s; wall_ms=%.1f", cam_stats.c_str(),
+                      enc_stats.c_str(), wall_ms);
         *value = buf;
         return 0;
     }
