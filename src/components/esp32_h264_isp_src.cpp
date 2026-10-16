@@ -156,6 +156,12 @@ void esp32_h264_isp_src::encode_main()
         const int64_t t_push0 = esp_timer_get_time();
         const int   enc_r = push_encoder_input(in);
         const int64_t t_push1 = esp_timer_get_time();
+        if (-EIO == enc_r)
+        {
+            /* One frame lost (e.g. bitstream overflow); the encoder restarts on an IDR. */
+            std::fprintf(stderr, "esp32_h264_isp_src: encode failed, frame dropped\n");
+            continue;
+        }
         if (enc_r < 0)
         {
             std::fprintf(stderr, "esp32_h264_isp_src: encode failed: %d\n", enc_r);

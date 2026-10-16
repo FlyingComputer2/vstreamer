@@ -9,6 +9,7 @@
 
 #include <bfc/shared_sized_buffer.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cinttypes>
@@ -161,6 +162,10 @@ int xioctl(int fd, unsigned long req, void *arg, const char *what)
 
 #if CONFIG_CAMERA_OV5647
 /*
+ * Also forces the anti-flicker band to the mains frequency: the 1080p table leaves 0x3c01 at
+ * auto-detect, which can pick the wrong band and let lights flicker. The driver derives the
+ * band step and count from the clock, HTS and VTS after loading the table.
+ *
  * esp_cam_sensor's OV5647 1080p30 table says "24Minput" but its PLL (0x3035/0x3036) is the
  * Linux driver's, whose 81.6667 MHz pixel clock needs a 25 MHz xclk. At 24 MHz the clock is
  * 24/25 of that and HTS 2271 x VTS 1199 runs at 28.8 fps. Re-derive VTS for the requested
@@ -171,7 +176,7 @@ constexpr int    k_ov5647_min_vts = 1104; /* 1080 active lines + the Linux drive
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t       s_ov5647_fmt;
 
-void ov5647_fix_frame_rate(int fd, int fps)
+void ov5647_fix_format(int fd, int fps, int light_freq)
 {
     esp_cam_sensor_format_t cur {};
     if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
@@ -199,6 +204,20 @@ void ov5647_fix_frame_rate(int fd, int fps)
         r.val = 0x380e == r.reg ? static_cast<uint8_t>(vts >> 8) : r.val;
         r.val = 0x380f == r.reg ? static_cast<uint8_t>(vts & 0xff) : r.val;
     }
+    if (0 != light_freq)
+    {
+        /* 0x3c01 bit 7: manual band; 0x3c00 bit 2: 50 Hz. Before the end marker. */
+        uint8_t band = 0x40;
+        regs.erase(std::remove_if(regs.begin(), regs.end(),
+                                  [&](const ov5647_reginfo_t &r) {
+                                      band = 0x3c00 == r.reg ? r.val : band;
+                                      return 0x3c00 == r.reg || 0x3c01 == r.reg;
+                                  }),
+                   regs.end());
+        band = 50 == light_freq ? (band | 0x04) : (band & ~0x04);
+        const auto end = regs.empty() ? regs.end() : regs.end() - 1;
+        regs.insert(end, {{0x3c00, band}, {0x3c01, 0x80}});
+    }
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
     s_ov5647_fmt.regs = s_ov5647_regs.data();
@@ -206,8 +225,10 @@ void ov5647_fix_frame_rate(int fd, int fps)
     if (xioctl(fd, VIDIOC_S_SENSOR_FMT, &s_ov5647_fmt, "S_SENSOR_FMT ov5647 vts") == 0)
     {
         std::fprintf(stderr,
-                     "esp32p4_csi_camera_src: ov5647 HTS %d VTS %d -> %.2f fps at 24 MHz xclk\n",
-                     hts, vts, k_ov5647_pclk_hz / (static_cast<double>(hts) * vts));
+                     "esp32p4_csi_camera_src: ov5647 HTS %d VTS %d -> %.2f fps at 24 MHz xclk, "
+                     "flicker band %s\n",
+                     hts, vts, k_ov5647_pclk_hz / (static_cast<double>(hts) * vts),
+                     50 == light_freq ? "50 Hz" : 60 == light_freq ? "60 Hz" : "auto");
     }
 }
 #endif
@@ -281,7 +302,7 @@ int esp32p4_csi_camera_src::capture_open_locked()
         driver = reinterpret_cast<const char *>(cap.driver);
     }
 #if CONFIG_CAMERA_OV5647
-    ov5647_fix_frame_rate(fd, fps);
+    ov5647_fix_format(fd, fps, light_freq);
 #endif
 
     struct v4l2_format fmt {};
@@ -701,6 +722,16 @@ int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view val
     {
         return parse_int(value, k_min_bufs, k_max_bufs, &nbufs);
     }
+    if (key == "light_freq")
+    {
+        int f = 0;
+        if (parse_int(value, 0, 60, &f) < 0 || (0 != f && 50 != f && 60 != f))
+        {
+            return -EINVAL;
+        }
+        light_freq = f;
+        return 0;
+    }
     if (key == "sccb_port")
     {
         return parse_int(value, 0, 1, &sccb_port);
@@ -761,6 +792,10 @@ int esp32p4_csi_camera_src::query(std::string_view key, std::string *value) cons
     if (key == "buffers")
     {
         return set_int(value, nbufs);
+    }
+    if (key == "light_freq")
+    {
+        return set_int(value, light_freq);
     }
     if (key == "driver")
     {

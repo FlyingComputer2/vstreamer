@@ -49,7 +49,18 @@ encode time, and they were removed. Encode time only moves with the bitstream si
 
 esp_h264 has one RC mode: with `qp_min < qp_max` it targets `bitrate` (CBR) and picks a QP
 per frame inside the clamps; `qp_min == qp_max` is constant QP. Live TX uses 4 Mbps with QP
-10–51, measured 4.05–4.3 Mbps.
+20–51, measured 4.05–4.3 Mbps. With a floor of 10, a frame at 10 Mbps overflowed the 768 KiB
+bitstream buffer; the buffer is now 1 MiB, an overflow drops one frame and forces an IDR.
+
+At 10 Mbps the encoder still keeps up (~33.5 ms) but the pay/send path falls behind: push
+time grows to ~35 ms and TX drops to ~28 fps.
+
+## Flicker
+
+The driver derives the anti-flicker band step from the clock, HTS and VTS (287 lines = 8.33 ms
+at 24 MHz, up to 3 bands at VTS 1150), but the 1080p table leaves the 50/60 Hz choice on
+auto-detect. `esp32p4_csi_camera_src` forces it with `light_freq` (60 default, 50, or 0 for
+auto).
 
 ## Direct-LAN loss
 

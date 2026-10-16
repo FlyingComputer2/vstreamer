@@ -33,8 +33,8 @@ constexpr int k_max_height = 2032;
 /* Bitstream buffer DMA target: cache-line aligned. */
 constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
-/* IDR at 1080p rarely exceeds ~512 KiB at sane QP; internal RAM is faster than SPIRAM. */
-constexpr uint32_t k_max_bitstream_bytes = 768U * 1024U;
+/* A 1080p frame at qp 10 overflowed 768 KiB; a larger frame is dropped and the next is an IDR. */
+constexpr uint32_t k_max_bitstream_bytes = 1024U * 1024U;
 constexpr size_t   k_out_slot_count = 6;
 
 size_t frame_bytes(int w, int h)
@@ -352,6 +352,8 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     {
         slot.free = true;
         ++encode_errors_;
+        /* Decoders never saw this frame, so the next one must not reference it. */
+        pending_idr = true;
         return -EIO;
     }
     last_encode_us_ = dt;

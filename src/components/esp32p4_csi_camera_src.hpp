@@ -80,6 +80,7 @@ private:
     int width = 0;  /* 0 = the sensor's mode */
     int height = 0;
     int fps = 30;   /* for the caps; the sensor mode sets the real rate */
+    int light_freq = 60; /* OV5647 anti-flicker band: 50 or 60 Hz mains, 0 = sensor auto-detect */
     int nbufs = 4;
 
     bool        source_open = false;
