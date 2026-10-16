@@ -48,7 +48,7 @@ idf_component_register(
     PRIV_INCLUDE_DIRS compat
                       ${VSTREAMER_IDF_ISAL_INCLUDES}
     REQUIRES lwip pthread
-    PRIV_REQUIRES vfs esp_timer
+    PRIV_REQUIRES vfs esp_timer esp_hw_support heap
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

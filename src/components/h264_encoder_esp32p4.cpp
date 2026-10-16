@@ -21,6 +21,13 @@ extern "C"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_timer.h"
 
+#if defined(ESP_PLATFORM)
+#include "esp_async_memcpy.h"
+#include "esp_memory_utils.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#endif
+
 namespace vstreamer
 {
 namespace
@@ -117,6 +124,18 @@ const std::vector<port_desc> &enc_output_ports()
     return ports;
 }
 
+#if defined(ESP_PLATFORM)
+
+bool staging_copy_done_cb(async_memcpy_handle_t, async_memcpy_event_t *, void *arg)
+{
+    SemaphoreHandle_t sem = static_cast<SemaphoreHandle_t>(arg);
+    BaseType_t        woken = pdFALSE;
+    xSemaphoreGiveFromISR(sem, &woken);
+    return woken == pdTRUE;
+}
+
+#endif
+
 }  // namespace
 
 h264_encoder_esp32p4::h264_encoder_esp32p4() = default;
@@ -183,11 +202,165 @@ int h264_encoder_esp32p4::codec_open_locked()
     live_h_ = height;
     reopen_req = false;
     pending_idr = false;
+#if defined(ESP_PLATFORM)
+    if (staging_open_locked(width, height) < 0)
+    {
+        codec_close_locked();
+        return -ENOMEM;
+    }
+#endif
     return 0;
 }
 
+#if defined(ESP_PLATFORM)
+
+void h264_encoder_esp32p4::staging_close_locked()
+{
+    if (nullptr != async_mcp_)
+    {
+        (void)esp_async_memcpy_uninstall(static_cast<async_memcpy_handle_t>(async_mcp_));
+        async_mcp_ = nullptr;
+    }
+    if (nullptr != copy_done_sem_)
+    {
+        vSemaphoreDelete(static_cast<SemaphoreHandle_t>(copy_done_sem_));
+        copy_done_sem_ = nullptr;
+    }
+    for (int i = 0; i < 2; ++i)
+    {
+        if (nullptr != yuv_stage_[i])
+        {
+            esp_h264_free(yuv_stage_[i]);
+            yuv_stage_[i] = nullptr;
+        }
+    }
+    yuv_stage_cap_ = 0;
+    staging_active_ = false;
+}
+
+int h264_encoder_esp32p4::staging_open_locked(int w, int h)
+{
+    staging_close_locked();
+    const size_t want = frame_bytes(w, h);
+    uint32_t     actual = 0;
+    for (int i = 0; i < 2; ++i)
+    {
+        yuv_stage_[i] = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want, &actual,
+                                                                       ESP_H264_MEM_INTERNAL));
+        if (nullptr == yuv_stage_[i])
+        {
+            staging_close_locked();
+            return -ENOMEM;
+        }
+    }
+    yuv_stage_cap_ = actual;
+    copy_done_sem_ = xSemaphoreCreateBinary();
+    if (nullptr == copy_done_sem_)
+    {
+        staging_close_locked();
+        return -ENOMEM;
+    }
+    xSemaphoreGive(static_cast<SemaphoreHandle_t>(copy_done_sem_));
+
+    async_memcpy_config_t cfg = ASYNC_MEMCPY_DEFAULT_CONFIG();
+    async_memcpy_handle_t mcp = nullptr;
+    esp_err_t           err = esp_async_memcpy_install_gdma_axi(&cfg, &mcp);
+    if (ESP_OK != err)
+    {
+        err = esp_async_memcpy_install(&cfg, &mcp);
+    }
+    if (ESP_OK != err)
+    {
+        staging_close_locked();
+        return -EIO;
+    }
+    async_mcp_ = mcp;
+    staging_active_ = true;
+    return 0;
+}
+
+int h264_encoder_esp32p4::staging_prepare_input_locked(const uint8_t *src, size_t len,
+                                                       uint8_t **enc_src)
+{
+    if (!staging_active_ || len > yuv_stage_cap_ || nullptr == enc_src)
+    {
+        return -EINVAL;
+    }
+    if (!esp_ptr_external_ram(src))
+    {
+        *enc_src = const_cast<uint8_t *>(src);
+        return 0;
+    }
+
+    auto *sem = static_cast<SemaphoreHandle_t>(copy_done_sem_);
+    auto *mcp = static_cast<async_memcpy_handle_t>(async_mcp_);
+    const uint64_t n = frames_;
+
+    const int cur = static_cast<int>(n % 2U);
+    const int prev = 1 - cur;
+    uint8_t *dst = yuv_stage_[cur];
+
+    if (n < 2)
+    {
+        if (xSemaphoreTake(sem, portMAX_DELAY) != pdTRUE)
+        {
+            return -EIO;
+        }
+        if (esp_async_memcpy(mcp, dst, const_cast<uint8_t *>(src), len, staging_copy_done_cb,
+                             copy_done_sem_) != ESP_OK)
+        {
+            xSemaphoreGive(sem);
+            return -EIO;
+        }
+        if (xSemaphoreTake(sem, portMAX_DELAY) != pdTRUE)
+        {
+            return -EIO;
+        }
+        *enc_src = dst;
+        return 0;
+    }
+
+    if (xSemaphoreTake(sem, portMAX_DELAY) != pdTRUE)
+    {
+        return -EIO;
+    }
+    if (esp_async_memcpy(mcp, dst, const_cast<uint8_t *>(src), len, staging_copy_done_cb,
+                         copy_done_sem_) != ESP_OK)
+    {
+        xSemaphoreGive(sem);
+        return -EIO;
+    }
+    *enc_src = yuv_stage_[prev];
+    return 0;
+}
+
+void h264_encoder_esp32p4::staging_finish_frame_locked()
+{
+    /* Async overlap starts at frame index 2 (see staging_prepare_input_locked). */
+    if (!staging_active_ || frames_ < 3)
+    {
+        return;
+    }
+    const int64_t t0 = esp_timer_get_time();
+    if (xSemaphoreTake(static_cast<SemaphoreHandle_t>(copy_done_sem_), portMAX_DELAY) != pdTRUE)
+    {
+        return;
+    }
+    const int64_t dt = esp_timer_get_time() - t0;
+    last_stage_wait_us_ = dt;
+    if (dt > max_stage_wait_us_)
+    {
+        max_stage_wait_us_ = dt;
+    }
+}
+
+#endif
+
 void h264_encoder_esp32p4::codec_close_locked()
 {
+#if defined(ESP_PLATFORM)
+    staging_close_locked();
+#endif
     if (nullptr != enc_)
     {
         auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
@@ -296,9 +469,16 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         pending_idr = false;
     }
 
+    uint8_t *enc_src = const_cast<uint8_t *>(in.sdu.u8());
+#if defined(ESP_PLATFORM)
+    if (staging_prepare_input_locked(in.sdu.u8(), in.sdu.size(), &enc_src) < 0)
+    {
+        return -EIO;
+    }
+#endif
     esp_h264_enc_in_frame_t in_frame {};
     /* The encoder only reads the frame (cache write-back, then DMA). */
-    in_frame.raw_data.buffer = const_cast<uint8_t *>(in.sdu.u8());
+    in_frame.raw_data.buffer = enc_src;
     in_frame.raw_data.len = static_cast<uint32_t>(in.sdu.size());
     in_frame.pts = static_cast<uint32_t>(in.ts_us / 1000);
     esp_h264_enc_out_frame_t out_frame {};
@@ -329,6 +509,9 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     }
     out_q_.push_back(std::move(au));
     ++frames_;
+#if defined(ESP_PLATFORM)
+    staging_finish_frame_locked();
+#endif
     if (idr)
     {
         ++idr_frames_;
@@ -539,9 +722,9 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
         char buf[128];
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
-                      " encode_ms=%.1f max=%.1f",
+                      " encode_ms=%.1f max=%.1f stage_wait_ms=%.1f",
                       frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0,
-                      max_encode_us_ / 1000.0);
+                      max_encode_us_ / 1000.0, last_stage_wait_us_ / 1000.0);
         *value = buf;
         return 0;
     }
