@@ -61,6 +61,13 @@ private:
     int      qp_min = 20;
     int      qp_max = 40;
     bool     pending_idr = false;
+    /* true: our frame-level rate control (esp_h264 at a fixed QP, the frame QP set through the
+     * non-ROI delta). false: esp_h264's own rate control, which limit-cycles at ~1 s. */
+    bool     frame_rc = true;
+    int      rc_qp_ = 0;          /* QP for the next frame */
+    double   rc_buf_bits_ = 0;    /* coded bits minus budget, clamped */
+    double   rc_p_bits_ = 0;      /* filtered P-frame size */
+    uint64_t rc_qp_sum_ = 0;      /* for the stats average */
 
     /* esp_h264 handles and the cache-aligned bitstream buffer; typed in the .cpp. */
     void    *enc_ = nullptr;
@@ -76,6 +83,7 @@ private:
     int      live_w_ = 0;
     int      live_h_ = 0;
 
+    void rc_update_locked(double bits, bool idr);
     void release_out_slot(size_t index);
     int  acquire_out_slot_locked(size_t *index);
 

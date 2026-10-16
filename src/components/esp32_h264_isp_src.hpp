@@ -71,6 +71,10 @@ private:
     std::condition_variable           out_cv_;
     std::deque<component_pdu>         out_q_;
     static constexpr size_t           k_out_q_max = 8;
+    /* A camera frame is encoded only while fewer coded AUs than this wait for output(); otherwise
+     * it is dropped, so a slow consumer costs frames instead of queueing latency. */
+    static constexpr size_t           k_coded_backlog_max = 1;
+    uint64_t                          backlog_drops_ = 0;
 
     std::thread                       encode_thread_;
     std::atomic<bool>                 stop_ {false};

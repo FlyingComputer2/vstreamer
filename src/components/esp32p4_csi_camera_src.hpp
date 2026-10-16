@@ -91,7 +91,7 @@ private:
     std::shared_ptr<ring>        ring_;
     std::thread                  thread_;
     std::atomic<bool>            stop_ {false};
-    static constexpr size_t k_ready_q_max = 3;
+    static constexpr size_t k_ready_q_max = 1; /* newest frame only: older ones are latency */
     std::deque<component_pdu>  ready_q_;
 #if defined(ESP_PLATFORM)
     void *wake_task_ = nullptr;

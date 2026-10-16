@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -36,6 +37,13 @@ constexpr size_t   k_out_q_max = 8;
 /* A 1080p frame at qp 10 overflowed 768 KiB; a larger frame is dropped and the next is an IDR. */
 constexpr uint32_t k_max_bitstream_bytes = 1024U * 1024U;
 constexpr size_t   k_out_slot_count = 6;
+/* Buffered bits are repaid over this long; the buffer is clamped to [-0.5, +1] s of bitrate. */
+constexpr double k_rc_repay_s = 0.5;
+/* A P frame's size also depends on its reference's QP, so a full per-frame correction rings at
+ * a 4-frame period; filter the size and move a quarter of the way, one QP per frame at most. */
+constexpr double k_rc_ema = 0.25;
+constexpr double k_rc_gain = 0.25;
+constexpr int    k_rc_max_step = 1;
 
 size_t frame_bytes(int w, int h)
 {
@@ -141,8 +149,10 @@ int h264_encoder_esp32p4::codec_open_locked()
     cfg.res.width = static_cast<uint16_t>(width);
     cfg.res.height = static_cast<uint16_t>(height);
     cfg.rc.bitrate = bitrate;
+    /* Frame RC: a fixed slice QP of qp_min, raised per frame through the non-ROI delta. A
+     * negative delta hangs the encoder (1 s timeout on every frame), so the base is the floor. */
     cfg.rc.qp_min = static_cast<uint8_t>(qp_min);
-    cfg.rc.qp_max = static_cast<uint8_t>(qp_max);
+    cfg.rc.qp_max = static_cast<uint8_t>(frame_rc ? qp_min : qp_max);
 
     esp_h264_enc_handle_t enc = nullptr;
     if (esp_h264_enc_hw_new(&cfg, &enc) != ESP_H264_ERR_OK || nullptr == enc)
@@ -183,6 +193,21 @@ int h264_encoder_esp32p4::codec_open_locked()
         out_slots_[i].free = true;
     }
 
+    if (frame_rc)
+    {
+        esp_h264_enc_roi_cfg_t roi {};
+        roi.roi_mode = ESP_H264_ROI_MODE_DELTA_QP;
+        roi.none_roi_delta_qp = 0;
+        if (esp_h264_enc_hw_cfg_roi(param, roi) != ESP_H264_ERR_OK)
+        {
+            esp_h264_enc_close(enc);
+            esp_h264_enc_del(enc);
+            return -EIO;
+        }
+        rc_qp_ = std::clamp((qp_min + qp_max) / 2, qp_min, qp_max);
+        rc_buf_bits_ = 0;
+        rc_p_bits_ = 0;
+    }
     enc_ = enc;
     param_ = param;
     live_w_ = width;
@@ -298,6 +323,28 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
     return 0;
 }
 
+/*
+ * Frame-level rate control. The virtual buffer holds coded bits minus the budget; the next P
+ * frame aims at the budget less 1/(fps * repay) of the buffer, and the QP moves a fraction of the
+ * step that size needs (6 QP per halving), at most k_rc_max_step per frame. An IDR's size only
+ * goes into the buffer: it is not a prediction of the next P frame.
+ */
+void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr)
+{
+    const double budget = static_cast<double>(bitrate) / fps;
+    const double second = static_cast<double>(bitrate);
+    rc_buf_bits_ = std::clamp(rc_buf_bits_ + bits - budget, -0.5 * second, second);
+    if (idr || bits <= 0)
+    {
+        return;
+    }
+    rc_p_bits_ = rc_p_bits_ > 0 ? rc_p_bits_ + k_rc_ema * (bits - rc_p_bits_) : bits;
+    const double target = std::max(budget - rc_buf_bits_ / (fps * k_rc_repay_s), 0.25 * budget);
+    const double step = k_rc_gain * 6.0 * std::log2(rc_p_bits_ / target);
+    const int    d = std::clamp(static_cast<int>(std::lround(step)), -k_rc_max_step, k_rc_max_step);
+    rc_qp_ = std::clamp(rc_qp_ + d, qp_min, qp_max);
+}
+
 int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
 {
     if (reopen_req)
@@ -336,6 +383,14 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         pending_idr = false;
     }
 
+    if (frame_rc)
+    {
+        esp_h264_enc_roi_cfg_t roi {};
+        roi.roi_mode = ESP_H264_ROI_MODE_DELTA_QP;
+        roi.none_roi_delta_qp = static_cast<int8_t>(rc_qp_ - qp_min);
+        (void)esp_h264_enc_hw_cfg_roi(static_cast<esp_h264_enc_param_hw_handle_t>(param_), roi);
+    }
+
     esp_h264_enc_in_frame_t in_frame {};
     /* The encoder only reads the frame (cache write-back, then DMA). */
     in_frame.raw_data.buffer = const_cast<uint8_t *>(in.sdu.u8());
@@ -369,6 +424,11 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     {
         sum_p_encode_us_ += dt;
         ++p_frames_;
+    }
+    if (frame_rc)
+    {
+        rc_qp_sum_ += static_cast<uint64_t>(rc_qp_);
+        rc_update_locked(8.0 * out_frame.length, idr);
     }
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
     au.sdu = bfc::shared_sized_buffer::adopt(
@@ -520,6 +580,17 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         pending_idr = true;
         return 0;
     }
+    if (key == "rc")
+    {
+        if (value != "frame" && value != "esp")
+        {
+            return -EINVAL;
+        }
+        const bool f = value == "frame";
+        reopen_req = opened && f != frame_rc;
+        frame_rc = f;
+        return 0;
+    }
     if (key == "reset_stats")
     {
         frames_ = 0;
@@ -530,6 +601,7 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         sum_encode_us_ = 0;
         sum_p_encode_us_ = 0;
         p_frames_ = 0;
+        rc_qp_sum_ = 0;
         return 0;
     }
     return -ENOTSUP;
@@ -604,7 +676,7 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     }
     if (key == "stats")
     {
-        char buf[128];
+        char buf[160];
         const double avg_ms =
             frames_ > 0 ? static_cast<double>(sum_encode_us_) / static_cast<double>(frames_) / 1000.0
                         : 0.0;
@@ -613,9 +685,10 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
                           : 0.0;
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
-                      " encode_ms=%.1f avg=%.1f p_avg=%.1f max=%.1f",
+                      " encode_ms=%.1f avg=%.1f p_avg=%.1f max=%.1f qp=%d avg_qp=%.1f",
                       frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0, avg_ms, p_avg_ms,
-                      max_encode_us_ / 1000.0);
+                      max_encode_us_ / 1000.0, frame_rc ? rc_qp_ : -1,
+                      frame_rc && frames_ > 0 ? static_cast<double>(rc_qp_sum_) / frames_ : 0.0);
         *value = buf;
         return 0;
     }

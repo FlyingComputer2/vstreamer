@@ -35,6 +35,7 @@
 #include "core/pipeline.hpp"
 #include <bfc/shared_sized_buffer.hpp>
 #include "core/thread_spawn.hpp"
+#include "core/time_util.hpp"
 
 #include "esp_cache.h"
 #include "esp_event.h"
@@ -577,6 +578,12 @@ void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_s
     }
 }
 
+/* Camera DQBUF to the AU's last datagram handed to stream_sender, per stats interval. */
+std::atomic<int64_t> g_age_sum_us {0};
+std::atomic<int64_t> g_age_max_us {0};
+std::atomic<int64_t> g_age_n {0};
+std::atomic<int64_t> g_age_in_sum_us {0}; /* DQBUF to the TX thread getting the AU */
+
 bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_sink *sender,
                           vstreamer::component_pdu &&out, size_t *au_bytes, bool *key,
                           std::atomic<uint64_t> *frames, std::atomic<uint64_t> *bytes,
@@ -612,6 +619,9 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
     {
         *key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
     }
+    const int64_t capture_us = static_cast<int64_t>(out.ts_us);
+    g_age_in_sum_us.fetch_add(vstreamer::steady_mono_ns() / 1000 - capture_us,
+                              std::memory_order_relaxed);
     for (;;)
     {
         drain_pay_to_sender(pay, sender);
@@ -628,6 +638,13 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
         vTaskDelay(1);
     }
     drain_pay_to_sender(pay, sender);
+    const int64_t age = vstreamer::steady_mono_ns() / 1000 - capture_us;
+    g_age_sum_us.fetch_add(age, std::memory_order_relaxed);
+    g_age_n.fetch_add(1, std::memory_order_relaxed);
+    if (age > g_age_max_us.load(std::memory_order_relaxed))
+    {
+        g_age_max_us.store(age, std::memory_order_relaxed);
+    }
     if (nullptr != frames)
     {
         frames->fetch_add(1, std::memory_order_relaxed);
@@ -812,8 +829,15 @@ int run_camera_stream()
             const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
             const uint64_t f = frames.load(std::memory_order_relaxed);
             const uint64_t b = bytes.load(std::memory_order_relaxed);
-            std::printf("live TX %.1f fps (enc %.1f) %.0f kbps; isp %s; snd %s\n",
+            const int64_t age_n = g_age_n.exchange(0);
+            const int64_t age_sum = g_age_sum_us.exchange(0);
+            const int64_t age_max = g_age_max_us.exchange(0);
+            const int64_t age_in = g_age_in_sum_us.exchange(0);
+            std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f); "
+                        "isp %s; snd %s\n",
                         sec > 0 ? f / sec : 0.0, enc_fps, sec > 0 ? b * 8 / sec / 1000 : 0.0,
+                        age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
+                        age_n > 0 ? age_in / 1000.0 / age_n : 0.0,
                         isp_stats.c_str(), snd_stats.c_str());
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
             print_sys_stats();

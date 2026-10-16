@@ -152,6 +152,15 @@ void esp32_h264_isp_src::encode_main()
         }
         wait_sum_us_ += t_wait1 - t_wait0;
         ++wait_samples_;
+        if (in.sdu_type == sdu_type_e::O_UYY_E_VYY && !coded_sink_)
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (out_q_.size() >= k_coded_backlog_max)
+            {
+                ++backlog_drops_;
+                continue;
+            }
+        }
 
         const int64_t t_push0 = esp_timer_get_time();
         const int   enc_r = push_encoder_input(in);
@@ -395,8 +404,10 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
         const double push_ms =
             push_samples_ > 0 ? static_cast<double>(push_sum_us_) / static_cast<double>(push_samples_) / 1000.0
                               : 0.0;
-        std::snprintf(buf, sizeof(buf), "cam %s; enc %s; wall_ms=%.1f wait_ms=%.1f push_ms=%.1f",
-                      cam_stats.c_str(), enc_stats.c_str(), wall_ms, wait_ms, push_ms);
+        std::snprintf(buf, sizeof(buf),
+                      "cam %s; enc %s; wall_ms=%.1f wait_ms=%.1f push_ms=%.1f backlog_drops=%" PRIu64,
+                      cam_stats.c_str(), enc_stats.c_str(), wall_ms, wait_ms, push_ms,
+                      backlog_drops_);
         *value = buf;
         return 0;
     }
