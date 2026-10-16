@@ -413,16 +413,17 @@ int mkv_writer::write_header()
         el_master(&b, k_tracks, tracks);
     }
 
-    if (!put(b.data(), b.size()))
+    if (!put(b.data(), b.size()) || write_seekhead(false) < 0 || std::fflush(f_) != 0)
     {
-        return -EIO;
-    }
-    if (write_seekhead(false) < 0)
-    {
+        /* Close it, so the next keyframe starts over with a fresh fopen() instead of leaking
+         * this FILE. */
+        (void)std::fclose(f_);
+        f_ = nullptr;
+        io_error_ = false;
         return -EIO;
     }
     header_written_ = true;
-    return std::fflush(f_) == 0 ? 0 : -EIO;
+    return 0;
 }
 
 int mkv_writer::patch_size(uint64_t size_pos, uint64_t size)

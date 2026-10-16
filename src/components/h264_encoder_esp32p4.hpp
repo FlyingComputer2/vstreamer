@@ -71,14 +71,13 @@ private:
 
     bool             have_input_caps_ = false;
     bool             caps_reject_ = false;
-    bool             have_output_caps_ = false;
+    video_coded_caps caps_out_ {}; /* last CAPS_VIDEO_CODED sent */
     std::deque<component_pdu> out_q_;
     uint64_t         out_seq_ = 0;
 
     uint64_t frames_ = 0;
     uint64_t idr_frames_ = 0;
     uint64_t encode_errors_ = 0;
-    uint64_t dropped_ = 0;
     int64_t  last_encode_us_ = 0;
     int64_t  max_encode_us_ = 0;
 };

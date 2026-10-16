@@ -1,7 +1,6 @@
 # Core sources and the components that build on every platform (Linux and ESP-IDF),
 # relative to the repository root. Reads the ENABLE_* switches; appends to
 # VSTREAMER_SOURCES. ISA-L is the caller's job when VSTREAMER_NEEDS_ISAL is set.
-include_guard(GLOBAL)
 
 list(APPEND VSTREAMER_SOURCES
     src/core/metrics.cpp

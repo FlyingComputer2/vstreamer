@@ -88,6 +88,7 @@ private:
     uint64_t frames_out = 0;
     uint64_t dropped = 0;
     uint64_t skipped = 0;
+    uint64_t write_errors = 0;
 
     static constexpr size_t k_default_queue_depth = 8;
     size_t                  queue_cap = k_default_queue_depth;

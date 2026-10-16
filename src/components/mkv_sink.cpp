@@ -335,9 +335,12 @@ void mkv_sink::mux_thread_main()
                                               ? mkv_codec_e::H264
                                               : mkv_codec_e::MJPEG;
                 const int sr = ensure_session_locked(w, h, codec);
-                if (sr >= 0 && recording)
+                if (sr >= 0 && recording && write_frame_locked(pkt) < 0)
                 {
-                    (void)write_frame_locked(pkt);
+                    /* mkv_writer stops at its first I/O error: close what was written and
+                     * let the next frame start a new segment. */
+                    ++write_errors;
+                    stop_locked();
                 }
             }
         }
@@ -554,10 +557,14 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         {
             return -EINVAL;
         }
-        fps = static_cast<int>(n);
-        if (recording)
+        /* A restart costs H.264 everything up to the next IDR: only on a real change. */
+        if (static_cast<int>(n) != fps)
         {
-            stop_locked();
+            fps = static_cast<int>(n);
+            if (recording)
+            {
+                stop_locked();
+            }
         }
         return 0;
     }
@@ -624,6 +631,14 @@ int mkv_sink::query(std::string_view key, std::string *value) const
         {
             *value = "idle";
         }
+        return 0;
+    }
+
+    if (key == "write_errors")
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, write_errors);
+        *value = buf;
         return 0;
     }
 

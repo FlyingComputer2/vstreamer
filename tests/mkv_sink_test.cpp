@@ -21,6 +21,9 @@
 #include <iterator>
 #include <sstream>
 #include <string>
+#include <chrono>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using vstreamer::component_pdu;
@@ -258,6 +261,322 @@ vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t frame_index)
     return pdu;
 }
 
+/* --- Minimal Matroska reader: checks the writer's structure without ffprobe. --- */
+
+struct mkv_block
+{
+    int64_t  pts_ms = 0;
+    bool     key = false;
+    size_t   offset = 0; /* payload in the file */
+    size_t   size = 0;
+};
+
+struct mkv_summary
+{
+    std::string                doc_type;
+    bool                       segment_unknown_size = false;
+    bool                       segment_size_ok = false;
+    bool                       truncated = false;
+    uint64_t                   timestamp_scale = 0;
+    double                     duration = -1.0; /* -1: no Duration element */
+    std::string                codec_id;
+    std::vector<uint8_t>       codec_private;
+    uint64_t                   width = 0;
+    uint64_t                   height = 0;
+    std::vector<mkv_block>     blocks;
+    int                        clusters = 0;
+    int                        cue_points = 0;
+    bool                       cues_point_at_clusters = true;
+    std::vector<std::pair<uint32_t, uint64_t>> seeks; /* id, position in segment */
+    size_t                     segment_data = 0;
+};
+
+constexpr uint32_t k_id_cluster = 0x1F43B675;
+constexpr uint32_t k_id_cues = 0x1C53BB6B;
+
+bool read_id(const std::vector<uint8_t> &b, size_t *pos, uint32_t *id)
+{
+    if (*pos >= b.size() || 0 == b[*pos])
+    {
+        return false;
+    }
+    int len = 1;
+    while (len <= 4 && !(b[*pos] & (0x80 >> (len - 1))))
+    {
+        ++len;
+    }
+    if (len > 4 || *pos + len > b.size())
+    {
+        return false;
+    }
+    uint32_t v = 0;
+    for (int i = 0; i < len; ++i)
+    {
+        v = (v << 8) | b[*pos + i];
+    }
+    *pos += len;
+    *id = v;
+    return true;
+}
+
+bool read_size(const std::vector<uint8_t> &b, size_t *pos, uint64_t *size, bool *unknown)
+{
+    if (*pos >= b.size() || 0 == b[*pos])
+    {
+        return false;
+    }
+    int len = 1;
+    while (!(b[*pos] & (0x80 >> (len - 1))))
+    {
+        ++len;
+    }
+    if (*pos + len > b.size())
+    {
+        return false;
+    }
+    uint64_t v = b[*pos] & (0xFF >> len);
+    bool     all_ones = v == (0xFFu >> len);
+    for (int i = 1; i < len; ++i)
+    {
+        v = (v << 8) | b[*pos + i];
+        all_ones = all_ones && b[*pos + i] == 0xFF;
+    }
+    *pos += len;
+    *size = v;
+    *unknown = all_ones;
+    return true;
+}
+
+uint64_t read_uint(const std::vector<uint8_t> &b, size_t pos, uint64_t n)
+{
+    uint64_t v = 0;
+    for (uint64_t i = 0; i < n; ++i)
+    {
+        v = (v << 8) | b[pos + i];
+    }
+    return v;
+}
+
+/* Calls fn(id, data_pos, size) for each child in [pos, end); stops at a truncated element or,
+ * when stop_ids is given, at one of those ids (the end of an unknown-size parent). Returns the
+ * position where it stopped. */
+template <typename Fn>
+size_t walk(const std::vector<uint8_t> &b, size_t pos, size_t end, Fn fn, bool *truncated,
+            std::initializer_list<uint32_t> stop_ids = {})
+{
+    while (pos < end)
+    {
+        size_t   p = pos;
+        uint32_t id = 0;
+        uint64_t size = 0;
+        bool     unknown = false;
+        if (!read_id(b, &p, &id))
+        {
+            *truncated = true;
+            return pos;
+        }
+        for (uint32_t s : stop_ids)
+        {
+            if (s == id)
+            {
+                return pos;
+            }
+        }
+        if (!read_size(b, &p, &size, &unknown))
+        {
+            *truncated = true;
+            return pos;
+        }
+        if (unknown || p + size > b.size())
+        {
+            const size_t next = fn(id, p, unknown ? SIZE_MAX : size);
+            if (!unknown)
+            {
+                *truncated = true;
+                return b.size();
+            }
+            pos = next;
+            continue;
+        }
+        (void)fn(id, p, size);
+        pos = p + size;
+    }
+    return pos;
+}
+
+mkv_summary parse_mkv(const std::vector<uint8_t> &b)
+{
+    mkv_summary m;
+    bool        trunc = false;
+    walk(b, 0, b.size(), [&](uint32_t id, size_t data, uint64_t size) -> size_t {
+        if (0x1A45DFA3 == id)
+        {
+            walk(b, data, data + size, [&](uint32_t cid, size_t cd, uint64_t cs) -> size_t {
+                if (0x4282 == cid)
+                {
+                    m.doc_type.assign(b.begin() + cd, b.begin() + cd + cs);
+                }
+                return cd + cs;
+            }, &trunc);
+            return data + size;
+        }
+        if (0x18538067 != id)
+        {
+            return data + size;
+        }
+        m.segment_data = data;
+        m.segment_unknown_size = SIZE_MAX == size;
+        m.segment_size_ok = !m.segment_unknown_size && data + size == b.size();
+        const size_t seg_end = m.segment_unknown_size ? b.size() : data + size;
+        walk(b, data, seg_end, [&](uint32_t sid, size_t sd, uint64_t ss) -> size_t {
+            const size_t s_end = SIZE_MAX == ss ? b.size() : sd + ss;
+            switch (sid)
+            {
+            case 0x114D9B74: /* SeekHead */
+                walk(b, sd, s_end, [&](uint32_t, size_t ed, uint64_t es) -> size_t {
+                    uint32_t seek_id = 0;
+                    uint64_t seek_pos = 0;
+                    walk(b, ed, ed + es, [&](uint32_t fid, size_t fd, uint64_t fs) -> size_t {
+                        if (0x53AB == fid)
+                        {
+                            seek_id = static_cast<uint32_t>(read_uint(b, fd, fs));
+                        }
+                        else if (0x53AC == fid)
+                        {
+                            seek_pos = read_uint(b, fd, fs);
+                        }
+                        return fd + fs;
+                    }, &trunc);
+                    m.seeks.emplace_back(seek_id, seek_pos);
+                    return ed + es;
+                }, &trunc);
+                break;
+            case 0x1549A966: /* Info */
+                walk(b, sd, s_end, [&](uint32_t fid, size_t fd, uint64_t fs) -> size_t {
+                    if (0x2AD7B1 == fid)
+                    {
+                        m.timestamp_scale = read_uint(b, fd, fs);
+                    }
+                    else if (0x4489 == fid && 8 == fs)
+                    {
+                        const uint64_t u = read_uint(b, fd, 8);
+                        std::memcpy(&m.duration, &u, sizeof(u));
+                    }
+                    return fd + fs;
+                }, &trunc);
+                break;
+            case 0x1654AE6B: /* Tracks */
+                walk(b, sd, s_end, [&](uint32_t, size_t td, uint64_t ts) -> size_t {
+                    walk(b, td, td + ts, [&](uint32_t fid, size_t fd, uint64_t fs) -> size_t {
+                        if (0x86 == fid)
+                        {
+                            m.codec_id.assign(b.begin() + fd, b.begin() + fd + fs);
+                        }
+                        else if (0x63A2 == fid)
+                        {
+                            m.codec_private.assign(b.begin() + fd, b.begin() + fd + fs);
+                        }
+                        else if (0xE0 == fid)
+                        {
+                            walk(b, fd, fd + fs, [&](uint32_t vid, size_t vd, uint64_t vs) -> size_t {
+                                if (0xB0 == vid)
+                                {
+                                    m.width = read_uint(b, vd, vs);
+                                }
+                                else if (0xBA == vid)
+                                {
+                                    m.height = read_uint(b, vd, vs);
+                                }
+                                return vd + vs;
+                            }, &trunc);
+                        }
+                        return fd + fs;
+                    }, &trunc);
+                    return td + ts;
+                }, &trunc);
+                break;
+            case k_id_cluster:
+            {
+                ++m.clusters;
+                int64_t cluster_ts = 0;
+                return walk(b, sd, s_end, [&](uint32_t fid, size_t fd, uint64_t fs) -> size_t {
+                    if (0xE7 == fid)
+                    {
+                        cluster_ts = static_cast<int64_t>(read_uint(b, fd, fs));
+                    }
+                    else if (0xA3 == fid && fs >= 4)
+                    {
+                        mkv_block blk;
+                        const auto rel = static_cast<int16_t>((b[fd + 1] << 8) | b[fd + 2]);
+                        blk.pts_ms = cluster_ts + rel;
+                        blk.key = (b[fd + 3] & 0x80) != 0;
+                        blk.offset = fd + 4;
+                        blk.size = fs - 4;
+                        m.blocks.push_back(blk);
+                    }
+                    return fd + fs;
+                }, &trunc, {k_id_cluster, k_id_cues});
+            }
+            case k_id_cues:
+                walk(b, sd, s_end, [&](uint32_t, size_t pd, uint64_t ps) -> size_t {
+                    ++m.cue_points;
+                    walk(b, pd, pd + ps, [&](uint32_t fid, size_t fd, uint64_t fs) -> size_t {
+                        if (0xB7 == fid)
+                        {
+                            walk(b, fd, fd + fs, [&](uint32_t qid, size_t qd, uint64_t qs) -> size_t {
+                                if (0xF1 == qid)
+                                {
+                                    size_t   at = m.segment_data + read_uint(b, qd, qs);
+                                    uint32_t cid = 0;
+                                    m.cues_point_at_clusters = m.cues_point_at_clusters &&
+                                                               read_id(b, &at, &cid) &&
+                                                               k_id_cluster == cid;
+                                }
+                                return qd + qs;
+                            }, &trunc);
+                        }
+                        return fd + fs;
+                    }, &trunc);
+                    return pd + ps;
+                }, &trunc);
+                break;
+            default:
+                break;
+            }
+            return s_end;
+        }, &trunc);
+        return seg_end;
+    }, &trunc);
+    m.truncated = trunc;
+    return m;
+}
+
+/* The SeekHead entry for id points at an element with that id. */
+bool seek_ok(const mkv_summary &m, const std::vector<uint8_t> &b, uint32_t id)
+{
+    for (const auto &[sid, pos] : m.seeks)
+    {
+        if (sid == id)
+        {
+            size_t   at = m.segment_data + pos;
+            uint32_t got = 0;
+            return read_id(b, &at, &got) && got == id;
+        }
+    }
+    return false;
+}
+
+std::vector<uint8_t> annexb(std::initializer_list<std::vector<uint8_t>> nals)
+{
+    std::vector<uint8_t> out;
+    for (const auto &n : nals)
+    {
+        out.insert(out.end(), {0, 0, 0, 1});
+        out.insert(out.end(), n.begin(), n.end());
+    }
+    return out;
+}
+
 }  // namespace
 
 TEST(MkvSinkTest, PortCapsAdvertisesMjpeg)
@@ -476,6 +795,179 @@ TEST(MkvWriterTest, TruncatedFilePlaysUpToLastCluster)
     ASSERT_TRUE(probe_video_span(path, &frames, &dur));
     EXPECT_EQ(frames, 75);
     EXPECT_NEAR(dur, 2.5, 0.1);
+
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvWriterTest, MjpegStructure)
+{
+    const auto        base = fresh_dir("mkv_writer_mjpeg");
+    const std::string path = (base / "a.mkv").string();
+
+    vstreamer::mkv_writer       w;
+    vstreamer::mkv_track_config cfg;
+    cfg.width = 320;
+    cfg.height = 240;
+    ASSERT_EQ(0, w.open(path, cfg));
+    for (int i = 0; i < 75; ++i)
+    {
+        ASSERT_EQ(0, w.write_frame(k_minimal_jpeg, sizeof(k_minimal_jpeg), i * 33333, 33333,
+                                   false));
+    }
+    ASSERT_EQ(0, w.close());
+
+    const std::vector<uint8_t> b = read_file(path);
+    const mkv_summary          m = parse_mkv(b);
+    EXPECT_FALSE(m.truncated);
+    EXPECT_EQ("matroska", m.doc_type);
+    EXPECT_TRUE(m.segment_size_ok);
+    EXPECT_EQ(1000000u, m.timestamp_scale);
+    EXPECT_NEAR(m.duration, 2500.0, 1.0);
+    EXPECT_EQ("V_MJPEG", m.codec_id);
+    EXPECT_EQ(320u, m.width);
+    EXPECT_EQ(240u, m.height);
+    ASSERT_EQ(75u, m.blocks.size());
+    for (size_t i = 0; i < m.blocks.size(); ++i)
+    {
+        EXPECT_TRUE(m.blocks[i].key);
+        EXPECT_EQ(static_cast<int64_t>((i * 33333 + 500) / 1000), m.blocks[i].pts_ms);
+        ASSERT_EQ(sizeof(k_minimal_jpeg), m.blocks[i].size);
+        EXPECT_EQ(0, std::memcmp(b.data() + m.blocks[i].offset, k_minimal_jpeg,
+                                 sizeof(k_minimal_jpeg)));
+    }
+    /* ~1 s clusters, each indexed. */
+    EXPECT_EQ(3, m.clusters);
+    EXPECT_EQ(3, m.cue_points);
+    EXPECT_TRUE(m.cues_point_at_clusters);
+    EXPECT_TRUE(seek_ok(m, b, 0x1549A966));
+    EXPECT_TRUE(seek_ok(m, b, 0x1654AE6B));
+    EXPECT_TRUE(seek_ok(m, b, k_id_cues));
+
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvWriterTest, H264StructureAvccAndKeyframeStart)
+{
+    const auto        base = fresh_dir("mkv_writer_h264");
+    const std::string path = (base / "a.mkv").string();
+    const std::vector<uint8_t> sps = {0x67, 0x42, 0xC0, 0x1E, 0xDA, 0x02};
+    const std::vector<uint8_t> pps = {0x68, 0xCE, 0x3C, 0x80};
+    const std::vector<uint8_t> aud = {0x09, 0xF0};
+    const std::vector<uint8_t> idr = {0x65, 0x88, 0x84, 0x21};
+    const std::vector<uint8_t> p_slice = {0x41, 0x9A, 0x02};
+
+    vstreamer::mkv_writer       w;
+    vstreamer::mkv_track_config cfg;
+    cfg.codec = vstreamer::mkv_codec_e::H264;
+    cfg.width = 320;
+    cfg.height = 240;
+    ASSERT_EQ(0, w.open(path, cfg));
+    const auto p0 = annexb({aud, p_slice});
+    const auto k1 = annexb({aud, sps, pps, idr});
+    const auto p2 = annexb({aud, p_slice});
+    /* No keyframe with SPS/PPS yet: skipped, and no file. */
+    EXPECT_EQ(1, w.write_frame(p0.data(), p0.size(), 0, 33333, false));
+    EXPECT_FALSE(std::filesystem::exists(path));
+    /* The IDR NAL makes it a keyframe even without the KEY flag. */
+    EXPECT_EQ(0, w.write_frame(k1.data(), k1.size(), 33333, 33333, false));
+    EXPECT_EQ(0, w.write_frame(p2.data(), p2.size(), 66667, 33333, false));
+    ASSERT_EQ(0, w.close());
+
+    const std::vector<uint8_t> b = read_file(path);
+    const mkv_summary          m = parse_mkv(b);
+    EXPECT_FALSE(m.truncated);
+    EXPECT_EQ("V_MPEG4/ISO/AVC", m.codec_id);
+
+    std::vector<uint8_t> avcc = {1, sps[1], sps[2], sps[3], 0xFF, 0xE1, 0,
+                                 static_cast<uint8_t>(sps.size())};
+    avcc.insert(avcc.end(), sps.begin(), sps.end());
+    avcc.insert(avcc.end(), {1, 0, static_cast<uint8_t>(pps.size())});
+    avcc.insert(avcc.end(), pps.begin(), pps.end());
+    EXPECT_EQ(avcc, m.codec_private);
+
+    ASSERT_EQ(2u, m.blocks.size());
+    EXPECT_TRUE(m.blocks[0].key);
+    EXPECT_FALSE(m.blocks[1].key);
+    /* Length-prefixed NALs, AUD dropped. */
+    std::vector<uint8_t> want;
+    for (const auto *n : {&sps, &pps, &idr})
+    {
+        want.insert(want.end(), {0, 0, 0, static_cast<uint8_t>(n->size())});
+        want.insert(want.end(), n->begin(), n->end());
+    }
+    EXPECT_EQ(want, std::vector<uint8_t>(b.begin() + m.blocks[0].offset,
+                                         b.begin() + m.blocks[0].offset + m.blocks[0].size));
+    EXPECT_EQ(1, m.cue_points); /* only the keyframe cluster */
+
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvWriterTest, TruncatedStructureReadable)
+{
+    const auto        base = fresh_dir("mkv_writer_cut");
+    const std::string path = (base / "live.mkv").string();
+
+    vstreamer::mkv_writer       w;
+    vstreamer::mkv_track_config cfg;
+    cfg.width = 320;
+    cfg.height = 240;
+    ASSERT_EQ(0, w.open(path, cfg));
+    for (int i = 0; i < 75; ++i)
+    {
+        ASSERT_EQ(0, w.write_frame(k_minimal_jpeg, sizeof(k_minimal_jpeg), i * 33333, 33333,
+                                   true));
+    }
+    /* What is on disk mid-recording: closed clusters are complete, sizes are unknown. */
+    const mkv_summary m = parse_mkv(read_file(path));
+    EXPECT_TRUE(m.segment_unknown_size);
+    EXPECT_LT(m.duration, 0.0);
+    EXPECT_GE(m.blocks.size(), 60u);
+    EXPECT_EQ("V_MJPEG", m.codec_id);
+    ASSERT_EQ(0, w.close());
+
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+}
+
+TEST(MkvSinkTest, UnchangedFpsKeepsSegment)
+{
+    const auto        base = fresh_dir("mkv_sink_same_fps");
+    const std::string out_template = (base / "clip.mkv").string();
+
+    mkv_sink sink;
+    ASSERT_EQ(sink.open(), 0);
+    ASSERT_EQ(sink.configure("queue_depth", "128"), 0);
+    ASSERT_EQ(sink.configure("output", out_template.c_str()), 0);
+    ASSERT_EQ(sink.configure("fps", "30"), 0);
+    ASSERT_EQ(sink.input(make_mjpeg_caps(320, 240)), 0);
+    for (int i = 0; i < 10; ++i)
+    {
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(320, 240, i)), 0);
+    }
+    /* Let the mux thread write them before reconfiguring. */
+    for (int t = 0; t < 200; ++t)
+    {
+        std::string seg;
+        if (sink.query("segment", &seg) == 0 && std::filesystem::exists(seg) &&
+            std::filesystem::file_size(seg) > 0)
+        {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(sink.configure("fps", "30"), 0);
+    for (int i = 10; i < 20; ++i)
+    {
+        ASSERT_EQ(sink.input(make_mjpeg_pdu(320, 240, i)), 0);
+    }
+    sink.close();
+
+    EXPECT_FALSE(std::filesystem::exists(base / "clip-002.mkv"));
+    const mkv_summary m = parse_mkv(read_file((base / "clip-001.mkv").string()));
+    EXPECT_EQ(20u, m.blocks.size());
 
     std::error_code ec;
     std::filesystem::remove_all(base, ec);

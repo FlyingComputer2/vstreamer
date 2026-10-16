@@ -17,7 +17,6 @@
 #include <random>
 #include <thread>
 #include <vector>
-#include <vector>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

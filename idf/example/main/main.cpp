@@ -32,6 +32,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -191,6 +192,76 @@ int encode_frames(int w, int h, int frames, int gop, std::string *clip)
     return aus == frames ? 0 : -1;
 }
 
+vstreamer::component_pdu raw_frame(int w, int h, int i)
+{
+    const size_t             bytes = static_cast<size_t>(w) * h * 3 / 2;
+    vstreamer::component_pdu in;
+    in.ts_us = static_cast<uint64_t>(i) * 33333;
+    in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
+    in.sdu = vstreamer::shared_sized_buffer::allocate(bytes);
+    in.sdu.resize(bytes);
+    fill_frame(in.sdu.u8(), w, h, i);
+    return in;
+}
+
+vstreamer::component_pdu raw_caps(int w, int h)
+{
+    vstreamer::video_raw_caps caps {};
+    caps.width = w;
+    caps.height = h;
+    caps.fps_num = 30;
+    caps.fps_den = 1;
+    return vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps, 0, 0);
+}
+
+/* A full output queue pushes back (-EAGAIN) and keeps the caps PDU first; a runtime resize
+ * sends coded caps of the new size before its first AU. */
+int encoder_runtime_checks()
+{
+    auto enc = vstreamer::component_factory::create_coder("h264_encoder");
+    enc->configure("size", "320x240");
+    if (!enc || enc->open() < 0 || enc->input(raw_caps(320, 240)) < 0)
+    {
+        return -1;
+    }
+    int accepted = 0;
+    int r = 0;
+    while ((r = enc->input(raw_frame(320, 240, accepted))) == 0 && accepted < 20)
+    {
+        ++accepted;
+    }
+    vstreamer::component_pdu out;
+    const bool caps_first = enc->output(out) == 0 &&
+                            out.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_CODED;
+    std::printf("backpressure: %d frames accepted, then %d; caps first: %s\n", accepted, r,
+                caps_first ? "yes" : "no");
+    if (r != -EAGAIN || !caps_first)
+    {
+        return -1;
+    }
+    while (enc->output(out) == 0)
+    {
+    }
+
+    enc->configure("size", "160x120");
+    if (enc->input(raw_caps(160, 120)) < 0 || enc->input(raw_frame(160, 120, 0)) < 0)
+    {
+        std::printf("resize: input failed\n");
+        return -1;
+    }
+    vstreamer::video_coded_caps coded {};
+    const bool caps_ok = enc->output(out) == 0 && vstreamer::read_caps(out, &coded) == 0 &&
+                         160 == coded.width && 120 == coded.height;
+    const bool au_ok = enc->output(out) == 0 &&
+                       out.sdu_type == vstreamer::sdu_type_e::H264_AU &&
+                       vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
+    std::printf("resize: new caps %dx%d first: %s, then IDR AU: %s\n",
+                static_cast<int>(coded.width), static_cast<int>(coded.height),
+                caps_ok ? "yes" : "no", au_ok ? "yes" : "no");
+    enc->close();
+    return caps_ok && au_ok ? 0 : -1;
+}
+
 int run_encoder()
 {
     print_heap("encoder start");
@@ -199,6 +270,10 @@ int run_encoder()
     if (0 == r)
     {
         r = encode_frames(320, 240, 30, 10, &clip);
+    }
+    if (0 == r)
+    {
+        r = encoder_runtime_checks();
     }
     print_heap("encoder end");
     if (0 == r)

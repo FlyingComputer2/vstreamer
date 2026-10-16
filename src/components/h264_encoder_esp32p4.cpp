@@ -155,10 +155,11 @@ int h264_encoder_esp32p4::codec_open_locked()
         return -EIO;
     }
 
-    /* A coded frame never exceeds its raw size at these QPs; the encoder reports overflow. */
+    /* Twice the raw frame: room for an IDR even at qp 0. A larger AU is not written past the
+     * buffer; esp_h264 fails the frame (-EIO). */
     uint32_t actual = 0;
     auto    *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(
-        k_out_align, 1, static_cast<uint32_t>(frame_bytes(width, height)), &actual,
+        k_out_align, 1, static_cast<uint32_t>(2 * frame_bytes(width, height)), &actual,
         ESP_H264_MEM_SPIRAM));
     if (nullptr == out)
     {
@@ -221,7 +222,7 @@ void h264_encoder_esp32p4::close()
     out_q_.clear();
     have_input_caps_ = false;
     caps_reject_ = false;
-    have_output_caps_ = false;
+    caps_out_ = video_coded_caps {};
     opened = false;
     reopen_req = false;
 }
@@ -241,7 +242,8 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
     }
     caps_reject_ = false;
     have_input_caps_ = true;
-    if (!have_output_caps_)
+    /* Sent ahead of the first AU of each size (and fps), including after a runtime resize. */
+    if (caps.width != caps_out_.width || caps.height != caps_out_.height || fps != caps_out_.fps_num)
     {
         video_coded_caps coded {};
         coded.width = caps.width;
@@ -249,7 +251,7 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
         coded.fps_num = fps;
         coded.fps_den = 1;
         out_q_.push_back(make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, coded, in.ts_us, 0));
-        have_output_caps_ = true;
+        caps_out_ = coded;
         notify_wakeup();
     }
     return 0;
@@ -265,7 +267,6 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         {
             return r;
         }
-        have_output_caps_ = false;
     }
     if (nullptr == enc_)
     {
@@ -274,6 +275,11 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     if (in.sdu.size() != frame_bytes(live_w_, live_h_) || nullptr == in.sdu.u8())
     {
         return -EINVAL;
+    }
+    /* Back-pressure instead of dropping: the queue can hold the caps PDU or an IDR. */
+    if (out_q_.size() >= k_out_q_max)
+    {
+        return -EAGAIN;
     }
 
     auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
@@ -303,11 +309,6 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     last_encode_us_ = dt;
     max_encode_us_ = dt > max_encode_us_ ? dt : max_encode_us_;
 
-    if (out_q_.size() >= k_out_q_max)
-    {
-        out_q_.pop_front();
-        ++dropped_;
-    }
     component_pdu au;
     au.ts_us = in.ts_us;
     au.sdu_type = sdu_type_e::H264_AU;
@@ -530,9 +531,9 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     {
         char buf[128];
         std::snprintf(buf, sizeof(buf),
-                      "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64 " dropped=%" PRIu64
+                      "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
                       " encode_ms=%.1f max=%.1f",
-                      frames_, idr_frames_, encode_errors_, dropped_, last_encode_us_ / 1000.0,
+                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0,
                       max_encode_us_ / 1000.0);
         *value = buf;
         return 0;
