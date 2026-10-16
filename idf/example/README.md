@@ -43,3 +43,15 @@ printf 'metrics\n' | nc -u -w1 127.0.0.1 5091 | rg 'udp_packet|h264_decoder.out_
 ```
 
 Expect non-zero `h264_decoder.in_packets` and `sdl_sink.render_fps` when video is healthy.
+
+## 1080p30 expectations (P4)
+
+The OV5647 mode is **1080p30** capture. UART `live TX` lines report:
+
+- `cam frames` — sensor/ISP delivery rate (~30/s when healthy)
+- `enc frames` / `encode_ms` — **esp_h264** HW time per frame
+
+On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode is ~**33.6 ms**/frame (just under the
+33.3 ms budget for 30 fps). MIPI mmap frames add ~**2–3 ms** (`esp_h264` cache writeback on
+~3 MiB YUV), so sustained **live encode is ~26–28 fps** until we use a zero-copy/coherent
+capture buffer path. Watch `encode_ms` on UART; target **≤ 33 ms** for true 1080p30 TX.
