@@ -72,9 +72,13 @@ shows **~28.8–29.0 fps** TX, **`encode_ms` ~33.3–33.5** (`avg`), **`max` ~34
 **`push_ms` ≈ `encode_ms`**, **`wait_ms` ~1.1**. Synthetic heap PSRAM YUV at boot is often **~32.9 ms** avg (under budget); a one-shot
 **CSI mmap** encode bench measured **~33.3 ms** avg (same as live) — the gap vs synthetic
 is scene/complexity, not mmap vs heap alone.
-Sustained **30 fps** needs **`encode_ms` avg ≤ 33.33 ms** so V4L2 buffers turn fast enough
-(`dq_ms` → 33.33); pipeline threading alone does not fix that. Remaining levers: faster
-CSI→H.264 (Espressif/coherent path), encode tuning (QP/bitrate), or HW revision.
+Sustained **30 fps** needs end-to-end **`wall_ms` ≤ 33.33 ms** (UART `dq_ms` tracks this).
+Live runs show **`encode_ms` ~33.3** plus **`wait_ms` ~1.2** and scheduling overhead →
+**`wall_ms` ~34.7** (~**28.9 fps**) even when synthetic PSRAM heap encode is **~32.9 ms**.
+QP/bitrate, HW deblock bypass, MB-decimate score, ISP-pipeline off, and a 2-deep camera
+`ready_q_` did not close that gap on bench. Remaining levers: **~1 ms+ faster live
+`esp_h264_enc_process`** (Espressif CSI→H.264 / coherent or M2M path) or lower non-HW
+pipeline overhead; internal 1080p YUV alloc still fails on this board’s heap layout.
 
 **GS check (direct LAN to `192.168.253.106:21090`):** `printf 'metrics\n' | nc -u -w1
 127.0.0.1 5091` on the receiver host — `h264_decoder.depay_au_pps` has measured **~30** while

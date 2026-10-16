@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -84,7 +85,8 @@ private:
     std::shared_ptr<ring>        ring_;
     std::thread                  thread_;
     std::atomic<bool>            stop_ {false};
-    std::optional<component_pdu> ready_;
+    static constexpr size_t k_ready_q_max = 2;
+    std::deque<component_pdu>  ready_q_;
     bool                         caps_sent_ = false;
     uint64_t                     out_seq_ = 0;
 

@@ -44,7 +44,7 @@ struct esp32p4_csi_camera_src::ring
     bool                    streaming = false;
     std::vector<uint8_t *>  ptr;
     std::vector<uint32_t>   len;
-    /* Dequeued and not yet back in the driver (in ready_ or downstream). */
+    /* Dequeued and not yet back in the driver (in ready_q_ or downstream). */
     int held = 0;
 
     /* Release callback of a frame PDU; runs on whichever thread drops the last reference. */
@@ -436,12 +436,13 @@ void esp32p4_csi_camera_src::capture_main()
         std::optional<component_pdu> stale;
         {
             std::lock_guard<std::mutex> lock(mu);
-            if (ready_)
+            if (ready_q_.size() >= k_ready_q_max)
             {
-                stale = std::move(ready_);
+                stale = std::move(ready_q_.front());
+                ready_q_.pop_front();
                 ++dropped_;
             }
-            ready_ = std::move(pdu);
+            ready_q_.push_back(std::move(pdu));
             ++frames_;
             if (frames_ > 1)
             {
@@ -499,8 +500,11 @@ void esp32p4_csi_camera_src::close()
     {
         std::lock_guard<std::mutex> lock(mu);
         r = std::move(ring_);
-        last = std::move(ready_);
-        ready_.reset();
+        while (!ready_q_.empty())
+        {
+            last = std::move(ready_q_.front());
+            ready_q_.pop_front();
+        }
     }
     /* Outside mu: a consumer may block in output() while it still holds a frame. */
     last.reset();
@@ -531,12 +535,12 @@ int esp32p4_csi_camera_src::try_pop_output_locked(component_pdu &out)
         caps_sent_ = true;
         return 0;
     }
-    if (!ready_)
+    if (ready_q_.empty())
     {
         return -EAGAIN;
     }
-    out = std::move(*ready_);
-    ready_.reset();
+    out = std::move(ready_q_.front());
+    ready_q_.pop_front();
     out.seq = out_seq_++;
     return 0;
 }
@@ -576,10 +580,10 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         out_cv_.wait_until(lock, deadline, [this] {
-            return ready_.has_value() || !source_open ||
+            return !ready_q_.empty() || !source_open ||
                    stop_.load(std::memory_order_acquire);
         });
-        if (!ready_ && source_open && !stop_.load(std::memory_order_acquire))
+        if (ready_q_.empty() && source_open && !stop_.load(std::memory_order_acquire))
         {
             return -EAGAIN;
         }
