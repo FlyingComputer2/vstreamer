@@ -51,10 +51,16 @@ The OV5647 mode is **1080p30** capture. UART `live TX` lines report:
 - `cam frames` — sensor/ISP delivery rate (~30/s when healthy)
 - `enc frames` / `encode_ms` — **esp_h264** HW time per frame
 
-On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode is ~**33.6 ms**/frame (just under the
-33.3 ms budget for 30 fps). MIPI mmap frames add ~**2–3 ms** (`esp_h264` cache writeback on
-~3 MiB YUV), so sustained **live encode is ~26–28 fps** until we use a zero-copy/coherent
-capture buffer path. Watch `encode_ms` on UART; target **≤ 33 ms** for true 1080p30 TX.
+On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode (CPU-filled **internal** buffer) is
+~**33.6 ms**/frame — just under the 33.3 ms budget for 30 fps. **Live CSI** mmap buffers live
+in **SPIRAM** (`CSI_MEM_CAPS`); the same encoder reports ~**35.6–36 ms**/frame (~**26 fps**
+TX) even with correct post-capture `esp_cache_msync` (M2C, cache-line aligned). The gap is
+not fixed by skipping `esp_h264` input writeback alone — HW encode from SPIRAM YUV is slower
+than from internal RAM.
+
+**Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady. Remaining work is
+likely an **esp_video / esp_h264** path that feeds the H.264 DMA from internal or
+driver-coherent buffers (e.g. V4L2 HW H.264 M2M, or Espressif-supported zero-copy CSI→enc).
 
 `vs_cap_pull` must **not** poll `output()` in a tight loop: use `esp32p4_csi_camera_src::wait_output()`
 so the thread sleeps on `out_cv_` until `vs_csi_cam` delivers a frame (replaces ~1 kHz
