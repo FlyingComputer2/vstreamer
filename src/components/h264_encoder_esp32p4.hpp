@@ -21,7 +21,7 @@ namespace vstreamer
 
 /*
  * O_UYY_E_VYY (ESP32-P4 ISP layout) → H.264 on the P4's hardware encoder (esp_h264).
- * Encoding is synchronous in input(): ~33–36 ms per 1080p frame (SPIRAM YUV staged to internal).
+ * Encoding is synchronous in input(): about 35 ms per 1080p frame on the calling thread.
  */
 class h264_encoder_esp32p4 : public component_coder
 {
@@ -80,20 +80,6 @@ private:
     uint64_t encode_errors_ = 0;
     int64_t  last_encode_us_ = 0;
     int64_t  max_encode_us_ = 0;
-    int64_t  last_stage_wait_us_ = 0;
-    int64_t  max_stage_wait_us_ = 0;
-
-#if defined(ESP_PLATFORM)
-    void staging_close_locked();
-    int  staging_open_locked(int w, int h);
-    int  staging_prepare_input_locked(const uint8_t *src, size_t len, uint8_t **enc_src);
-    void staging_finish_frame_locked();
-    void *async_mcp_ = nullptr;
-    void *copy_done_sem_ = nullptr;
-    uint8_t *yuv_stage_[2] = {nullptr, nullptr};
-    uint32_t yuv_stage_cap_ = 0;
-    bool staging_active_ = false;
-#endif
 };
 
 }  // namespace vstreamer

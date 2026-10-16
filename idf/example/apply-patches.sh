@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Apply local patches to managed_components (not tracked in git).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+H264_SRC="$ROOT/managed_components/espressif__esp_h264/hw/src/esp_h264_enc_single_hw.c"
+PATCH="$ROOT/patches/esp_h264_psram_invalidate.patch"
+if [[ ! -f "$H264_SRC" ]]; then
+  echo "apply-patches: run idf.py build once so managed_components exist" >&2
+  exit 1
+fi
+if patch -R --dry-run -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH" >/dev/null 2>&1; then
+  echo "apply-patches: esp_h264 PSRAM invalidate patch already applied"
+  exit 0
+fi
+patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH"
+echo "apply-patches: applied esp_h264 PSRAM invalidate patch"

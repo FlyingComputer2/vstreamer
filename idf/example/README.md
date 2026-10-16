@@ -56,7 +56,8 @@ On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode (CPU-filled **internal** b
 in **SPIRAM** (`CSI_MEM_CAPS`); the same encoder reports ~**35.6–36 ms**/frame (~**26 fps**
 TX) even with correct post-capture `esp_cache_msync` (M2C, cache-line aligned). The gap is
 not fixed by skipping `esp_h264` input writeback alone — HW encode from SPIRAM YUV is slower
-than from internal RAM.
+than from internal RAM. The IDF example patches `esp_h264` HW encode to **invalidate** (not
+C2M writeback) PSRAM YUV produced by the ISP before the H.264 DMA read.
 
 **Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady. Remaining work is
 likely an **esp_video / esp_h264** path that feeds the H.264 DMA from internal or
