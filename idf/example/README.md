@@ -2,6 +2,8 @@
 
 Smoke tests and **live camera TX** over Ethernet (no winject/radio).
 
+**Work log (1080p30 bench, coherency, branches):** [docs/esp32p4-1080p30-live-tx.md](docs/esp32p4-1080p30-live-tx.md)
+
 ## P4 (Waveshare ESP32-P4-WIFI6-DEV-KIT + OV5647)
 
 ```bash
@@ -83,7 +85,9 @@ pipeline overhead; internal 1080p YUV alloc still fails on this board’s heap l
 **GS check (direct LAN to `192.168.253.106:21090`):** `printf 'metrics\n' | nc -u -w1
 127.0.0.1 5091` on the receiver host — `h264_decoder.depay_au_pps` has measured **~30** while
 UART `live TX` fps stays **~28.8** (cumulative AU counter vs receiver’s short-window rate).
-`peer{rcv=0}` on UART is expected when `telemetry=off`. High `rtp_h264_depay.loss` on a busy
+`peer{rcv=0}` on UART is expected when `telemetry=off`. With `telemetry=on`,
+bench has shown `peer{rcv=100 lost=0}` to GS on direct LAN while UART `live TX`
+stays ~**28.9 fps** (encode-limited, not wire loss). High `rtp_h264_depay.loss` on a busy
 bench may still need receiver tuning; `render_fps=0` is a separate SDL/KMS issue.
 
 `esp32_h264_isp_src::set_live_tx_hooks()` can run pay/send on the encode thread (legacy style);

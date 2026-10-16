@@ -279,9 +279,29 @@ int esp32p4_csi_camera_src::capture_open_locked()
 
     struct v4l2_streamparm parm {};
     parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    parm.parm.capture.timeperframe.numerator = 1;
-    parm.parm.capture.timeperframe.denominator = fps > 0 ? static_cast<uint32_t>(fps) : 30U;
-    (void)xioctl(fd, VIDIOC_S_PARM, &parm, "S_PARM fps");
+    if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0)
+    {
+        const uint32_t num = parm.parm.capture.timeperframe.numerator;
+        const uint32_t den = parm.parm.capture.timeperframe.denominator;
+        const float    driver_fps = (num > 0 && den > 0) ? static_cast<float>(den) / num : 0.f;
+        std::fprintf(stderr,
+                     "esp32p4_csi_camera_src: driver timeperframe %u/%u (~%.2f fps) cap=0x%x\n", num,
+                     den, driver_fps, parm.parm.capture.capability);
+        if (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)
+        {
+            parm.parm.capture.timeperframe.numerator = 1;
+            parm.parm.capture.timeperframe.denominator =
+                fps > 0 ? static_cast<uint32_t>(fps) : 30U;
+            (void)xioctl(fd, VIDIOC_S_PARM, &parm, "S_PARM fps");
+        }
+    }
+    else
+    {
+        parm.parm.capture.timeperframe.numerator = 1;
+        parm.parm.capture.timeperframe.denominator =
+            fps > 0 ? static_cast<uint32_t>(fps) : 30U;
+        (void)xioctl(fd, VIDIOC_S_PARM, &parm, "S_PARM fps");
+    }
 
     struct v4l2_requestbuffers req {};
     req.count = static_cast<uint32_t>(nbufs);

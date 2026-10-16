@@ -665,7 +665,7 @@ int run_camera_stream()
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
     snd->configure("mtu", "1400");
     snd->configure("max_kbps", "0");
-    snd->configure("telemetry", "on");
+    snd->configure("telemetry", "off");
     snd->configure("fec", "none");
 
     if (pay->open() < 0 || snd->open() < 0)
