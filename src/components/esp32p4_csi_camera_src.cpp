@@ -255,6 +255,12 @@ int esp32p4_csi_camera_src::capture_open_locked()
     live_w = static_cast<int>(fmt.fmt.pix.width);
     live_h = static_cast<int>(fmt.fmt.pix.height);
 
+    struct v4l2_streamparm parm {};
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = fps > 0 ? static_cast<uint32_t>(fps) : 30U;
+    (void)xioctl(fd, VIDIOC_S_PARM, &parm, "S_PARM fps");
+
     struct v4l2_requestbuffers req {};
     req.count = static_cast<uint32_t>(nbufs);
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -436,7 +442,8 @@ int esp32p4_csi_camera_src::open()
     caps_sent_ = false;
     stop_.store(false, std::memory_order_release);
     /* capture_main() waits for mu, so it starts once open() returns. */
-    thread_ = spawn_thread(thread_opts {"vs_csi_cam", 4096}, [this] { capture_main(); });
+    thread_ = spawn_thread(thread_opts {"vs_csi_cam", 8 * 1024, 0, 12},
+                           [this] { capture_main(); });
     return 0;
 }
 

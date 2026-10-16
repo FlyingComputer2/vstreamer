@@ -28,3 +28,5 @@ CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
 # vs_send can pace/back up under 1080p load; 8s avoids false trips while still catching hangs.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=8
+# Live TX: 1080p30 needs both cores at full speed (esp_h264 HW target ~33 ms/frame).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y

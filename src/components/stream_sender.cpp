@@ -844,8 +844,13 @@ int stream_sender::open()
         }
 
         send_stop = false;
-        send_thread = spawn_thread(thread_opts {"vs_send", k_send_stack_bytes},
-                                   &stream_sender::send_thread_main, this);
+        send_thread = spawn_thread(
+#if defined(ESP_PLATFORM)
+            thread_opts {"vs_send", k_send_stack_bytes, 0, 8},
+#else
+            thread_opts {"vs_send", k_send_stack_bytes},
+#endif
+            &stream_sender::send_thread_main, this);
 
         {
             std::lock_guard<std::mutex> plock(peer_mu);
