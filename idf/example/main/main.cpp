@@ -42,6 +42,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include <climits>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -452,7 +453,8 @@ void drain_encoder_chain(vstreamer::component_coder *enc, vstreamer::component_c
 
 int run_camera_stream()
 {
-    constexpr int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
+    const int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
+    const bool  run_forever = (0 == k_seconds);
 
     auto cam = vstreamer::component_factory::create_source("csi_camera");
     auto enc = vstreamer::component_factory::create_coder("h264_encoder");
@@ -500,15 +502,25 @@ int run_camera_stream()
     }
     snd_s->set_enabled(true, 0);
 
-    std::printf("live TX streaming %s for %d s (size %s)\n", CONFIG_VSTREAMER_RX_PEER, k_seconds,
-                size.c_str());
+    if (run_forever)
+    {
+        std::printf("live TX streaming %s until reset (size %s)\n", CONFIG_VSTREAMER_RX_PEER,
+                    size.c_str());
+    }
+    else
+    {
+        std::printf("live TX streaming %s for %d s (size %s)\n", CONFIG_VSTREAMER_RX_PEER,
+                    k_seconds, size.c_str());
+    }
 
     int           frames = 0;
     int           keys = 0;
     size_t        bytes = 0;
     int64_t       t0 = 0;
-    const int64_t deadline = esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
-    const int64_t stop_at = esp_timer_get_time() + k_seconds * 1000000LL;
+    const int64_t deadline =
+        run_forever ? INT64_MAX : esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
+    const int64_t stop_at =
+        run_forever ? INT64_MAX : esp_timer_get_time() + k_seconds * 1000000LL;
 
     while (esp_timer_get_time() < deadline)
     {
@@ -635,7 +647,7 @@ done:
     enc->close();
     cam->close();
     print_heap("live end");
-    const bool ok = sec > 0 && frames / sec >= 15;
+    const bool ok = run_forever ? frames > 0 : (sec > 0 && frames / sec >= 15);
     std::printf("live TX %s\n", ok ? "PASSED" : "FAILED");
     return ok ? 0 : -1;
 }
@@ -766,7 +778,12 @@ extern "C" void app_main(void)
     auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 24 * 1024}, [] {
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
     CONFIG_VSTREAMER_IDF_LIVE_TX
-        (void)run_camera_stream();
+        while (true)
+        {
+            (void)run_camera_stream();
+            std::printf("live TX restarting in 3 s\n");
+            vTaskDelay(pdMS_TO_TICKS(3000));
+        }
 #else
         (void)run();
 #ifdef ENABLE_H264_ENCODER_ESP32P4
