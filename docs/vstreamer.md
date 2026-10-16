@@ -53,7 +53,7 @@ virtual int query(std::string_view key, std::string *value) const = 0;
 ### `component_pdu` and buffers
 
 Wires carry `component_pdu` ([component_pdu.hpp](../src/core/component_pdu.hpp)): SDU bytes in
-`shared_sized_buffer` ([shared_sized_buffer.hpp](../src/core/shared_sized_buffer.hpp)),
+`bfc::shared_sized_buffer` (from [bfc](https://github.com/therooftopprinz/bfc)),
 `sdu_type_e` (e.g. `NV12`, `H264_AU`, `STREAM_DGRAM`, `RTP`), `ts_us`, `seq`, and `flags`
 (`pdu_flag_e::KEY`, `AU_END`, …). Caps PDUs embed `video_raw_caps` / `video_coded_caps` via
 `make_caps_pdu()`.
