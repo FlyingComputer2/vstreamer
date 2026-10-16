@@ -55,7 +55,7 @@ public:
 private:
     static const std::vector<port_desc> &output_ports();
     void pipeline_main();
-    int  push_encoder_input(component_pdu &&in);
+    int  push_encoder_input(component_pdu &in);
 
     std::unique_ptr<esp32p4_csi_camera_src> cam_;
     std::unique_ptr<h264_encoder_esp32p4>     enc_;

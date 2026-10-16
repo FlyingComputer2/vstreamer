@@ -55,7 +55,7 @@ std::string esp32_h264_isp_src::name() const
     return "esp32_h264_isp_src";
 }
 
-int esp32_h264_isp_src::push_encoder_input(component_pdu &&in)
+int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
 {
     auto drain_to_out_q = [&] {
         component_pdu out;
@@ -72,10 +72,31 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &&in)
         }
     };
 
-    drain_to_out_q();
-    const int r = enc_->input(std::move(in));
-    drain_to_out_q();
-    return r;
+    constexpr int k_max_backpressure = 2000;
+    for (int attempt = 0; attempt < k_max_backpressure; ++attempt)
+    {
+        if (stop_.load(std::memory_order_acquire))
+        {
+            return -ECANCELED;
+        }
+        drain_to_out_q();
+        component_pdu work = in;
+        const int       r = enc_->input(std::move(work));
+        drain_to_out_q();
+        if (-EAGAIN != r)
+        {
+            if (0 == r)
+            {
+                in.sdu = {};
+            }
+            return r;
+        }
+        notify_wakeup();
+        std::unique_lock<std::mutex> lock(mu);
+        out_cv_.wait_for(lock, std::chrono::milliseconds(5),
+                         [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
+    }
+    return -EAGAIN;
 }
 
 void esp32_h264_isp_src::pipeline_main()
@@ -92,20 +113,7 @@ void esp32_h264_isp_src::pipeline_main()
         {
             continue;
         }
-        const int enc_r = push_encoder_input(std::move(in));
-        if (-EAGAIN == enc_r)
-        {
-            /* Encoder bitstream slots or out_q full — drop oldest coded PDUs so slots recycle. */
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                while (out_q_.size() > 1)
-                {
-                    out_q_.pop_front();
-                }
-            }
-            notify_wakeup();
-            continue;
-        }
+        const int enc_r = push_encoder_input(in);
         if (enc_r < 0)
         {
             std::fprintf(stderr, "esp32_h264_isp_src: encode failed: %d\n", enc_r);

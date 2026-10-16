@@ -559,9 +559,9 @@ int run_camera_stream()
     }
     (void)src->configure("buffers", "6");
     (void)src->configure("fps", "30");
-    (void)src->configure("bitrate", "4000000");
+    (void)src->configure("bitrate", "3500000");
     (void)src->configure("gop", "30");
-    (void)src->configure("qp_min", "38");
+    (void)src->configure("qp_min", "40");
     (void)src->configure("qp_max", "51");
     const int cr = src->open();
     if (-ENODEV == cr)
@@ -646,8 +646,9 @@ int run_camera_stream()
         }
     };
 
+    /* Core 0: keep pay/send off vs_h264_isp (core 1) so coded PDUs drain under encode load. */
     auto tx_thread =
-        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_isp_tx", 16 * 1024, 1, 11}, tx_fn);
+        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_isp_tx", 16 * 1024, 0, 13}, tx_fn);
 
     while (!stop.load(std::memory_order_acquire) && esp_timer_get_time() < deadline)
     {

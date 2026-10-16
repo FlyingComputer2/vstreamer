@@ -35,7 +35,8 @@ constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
 /* IDR at 1080p rarely exceeds ~512 KiB at sane QP; internal RAM is faster than SPIRAM. */
 constexpr uint32_t k_max_bitstream_bytes = 768U * 1024U;
-constexpr size_t   k_out_slot_count = 4;
+/* Match typical CSI buffer count so TX back-pressure does not stall encode. */
+constexpr size_t   k_out_slot_count = 6;
 
 size_t frame_bytes(int w, int h)
 {

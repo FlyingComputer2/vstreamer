@@ -10,7 +10,7 @@ if [[ ! -f "$H264_SRC" ]]; then
 fi
 if patch -R --dry-run -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH" >/dev/null 2>&1; then
   echo "apply-patches: esp_h264 PSRAM invalidate patch already applied"
-  exit 0
+else
+  patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH"
+  echo "apply-patches: applied esp_h264 PSRAM invalidate patch"
 fi
-patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH"
-echo "apply-patches: applied esp_h264 PSRAM invalidate patch"
