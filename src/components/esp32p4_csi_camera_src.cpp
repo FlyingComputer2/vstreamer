@@ -1,0 +1,604 @@
+#include "components/esp32p4_csi_camera_src.hpp"
+
+#include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sdu_caps.hpp"
+#include "core/sdu_type.hpp"
+#include "core/thread_spawn.hpp"
+#include "core/time_util.hpp"
+
+#include <bfc/shared_sized_buffer.hpp>
+
+#include <cerrno>
+#include <chrono>
+#include <cinttypes>
+#include <condition_variable>
+#include <cstdio>
+#include <cstring>
+#include <utility>
+#include <vector>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#include "esp_video_device.h"
+#include "esp_video_init.h"
+#include "esp_video_ioctl.h"
+#include "linux/videodev2.h"
+
+namespace vstreamer
+{
+
+struct esp32p4_csi_camera_src::ring
+{
+    std::mutex              mu;
+    std::condition_variable cv;
+    int                     fd = -1;
+    bool                    streaming = false;
+    std::vector<uint8_t *>  ptr;
+    std::vector<uint32_t>   len;
+    /* Dequeued and not yet back in the driver (in ready_ or downstream). */
+    int held = 0;
+
+    /* Release callback of a frame PDU; runs on whichever thread drops the last reference. */
+    void requeue(uint32_t index)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (streaming)
+        {
+            struct v4l2_buffer b {};
+            b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            b.memory = V4L2_MEMORY_MMAP;
+            b.index = index;
+            if (ioctl(fd, VIDIOC_QBUF, &b) != 0)
+            {
+                std::fprintf(stderr, "esp32p4_csi_camera_src: QBUF %" PRIu32 ": %s\n", index,
+                             std::strerror(errno));
+            }
+        }
+        --held;
+        cv.notify_all();
+    }
+};
+
+namespace
+{
+
+constexpr int k_min_bufs = 2;
+constexpr int k_max_bufs = 8;
+/* Bounds the capture thread's DQBUF so stop is seen while frames are held downstream. */
+constexpr int k_dqbuf_timeout_ms = 100;
+/* How long close() waits for frames still downstream before it frees the driver buffers. */
+constexpr auto k_release_wait = std::chrono::seconds(1);
+
+std::mutex s_video_init_mu;
+bool       s_video_init_done = false;
+
+size_t frame_bytes(int w, int h)
+{
+    return static_cast<size_t>(w) * static_cast<size_t>(h) * 3 / 2;
+}
+
+int parse_int(std::string_view v, int64_t lo, int64_t hi, int *out)
+{
+    int64_t n = 0;
+    if (key_parse_i64(v, &n) < 0 || n < lo || n > hi)
+    {
+        return -EINVAL;
+    }
+    *out = static_cast<int>(n);
+    return 0;
+}
+
+int set_int(std::string *value, int64_t n)
+{
+    char buf[32];
+    if (key_format_i64(n, buf, sizeof(buf)) < 0)
+    {
+        return -EINVAL;
+    }
+    *value = buf;
+    return 0;
+}
+
+int parse_size(std::string_view s, int *w, int *h)
+{
+    const size_t x = s.find_first_of("xX");
+    if (x == std::string_view::npos)
+    {
+        return -EINVAL;
+    }
+    int ww = 0;
+    int hh = 0;
+    /* O_UYY_E_VYY pairs lines and the chroma is 2x2: both even. 0x0 = the sensor's mode. */
+    if (parse_int(s.substr(0, x), 0, 4096, &ww) < 0 || parse_int(s.substr(x + 1), 0, 4096, &hh) < 0 ||
+        (ww % 2) || (hh % 2) || ((0 == ww) != (0 == hh)))
+    {
+        return -EINVAL;
+    }
+    *w = ww;
+    *h = hh;
+    return 0;
+}
+
+const std::vector<port_desc> &output_ports()
+{
+    static const std::vector<port_desc> ports = [] {
+        port_desc       p;
+        port_caps_entry caps {};
+        caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        p.caps.push_back(caps);
+        port_caps_entry data {};
+        data.sdu_type = sdu_type_e::O_UYY_E_VYY;
+        p.caps.push_back(data);
+        return std::vector<port_desc> {p};
+    }();
+    return ports;
+}
+
+int xioctl(int fd, unsigned long req, void *arg, const char *what)
+{
+    if (ioctl(fd, req, arg) == 0)
+    {
+        return 0;
+    }
+    const int e = errno;
+    std::fprintf(stderr, "esp32p4_csi_camera_src: %s: %s\n", what, std::strerror(e));
+    return -(e ? e : EIO);
+}
+
+}  // namespace
+
+esp32p4_csi_camera_src::esp32p4_csi_camera_src() = default;
+
+esp32p4_csi_camera_src::~esp32p4_csi_camera_src()
+{
+    close();
+}
+
+std::string esp32p4_csi_camera_src::name() const
+{
+    return "esp32p4_csi_camera_src";
+}
+
+int esp32p4_csi_camera_src::capture_open_locked()
+{
+    {
+        std::lock_guard<std::mutex> lock(s_video_init_mu);
+        if (!s_video_init_done)
+        {
+            esp_video_init_csi_config_t csi {};
+            csi.sccb_config.init_sccb = true;
+            csi.sccb_config.i2c_config.port = static_cast<uint8_t>(sccb_port);
+            csi.sccb_config.i2c_config.scl_pin = static_cast<gpio_num_t>(sccb_scl);
+            csi.sccb_config.i2c_config.sda_pin = static_cast<gpio_num_t>(sccb_sda);
+            csi.sccb_config.freq = static_cast<uint32_t>(sccb_freq);
+            csi.reset_pin = static_cast<gpio_num_t>(reset_pin);
+            csi.pwdn_pin = static_cast<gpio_num_t>(pwdn_pin);
+            esp_video_init_config_t cfg {};
+            cfg.csi = &csi;
+            if (esp_video_init(&cfg) != ESP_OK)
+            {
+                std::fprintf(stderr,
+                             "esp32p4_csi_camera_src: esp_video_init failed (no sensor on SCCB "
+                             "sda=%d scl=%d?)\n",
+                             sccb_sda, sccb_scl);
+                return -ENODEV;
+            }
+            s_video_init_done = true;
+        }
+    }
+
+    const int fd = ::open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
+    if (fd < 0)
+    {
+        std::fprintf(stderr, "esp32p4_csi_camera_src: open %s: %s\n",
+                     ESP_VIDEO_MIPI_CSI_DEVICE_NAME, std::strerror(errno));
+        return -ENODEV;
+    }
+    auto r = std::make_shared<ring>();
+    r->fd = fd;
+    auto fail = [&](int err) {
+        for (size_t i = 0; i < r->ptr.size(); ++i)
+        {
+            if (nullptr != r->ptr[i])
+            {
+                munmap(r->ptr[i], r->len[i]);
+            }
+        }
+        ::close(fd);
+        return err;
+    };
+
+    struct v4l2_capability cap {};
+    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0)
+    {
+        driver = reinterpret_cast<const char *>(cap.driver);
+    }
+
+    struct v4l2_format fmt {};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    int err = xioctl(fd, VIDIOC_G_FMT, &fmt, "G_FMT");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    if (width > 0)
+    {
+        fmt.fmt.pix.width = static_cast<uint32_t>(width);
+        fmt.fmt.pix.height = static_cast<uint32_t>(height);
+    }
+    /* esp_video's YUV420 is the ISP's packed O_UYY_E_VYY, which the P4 H.264 core reads. */
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUV420;
+    err = xioctl(fd, VIDIOC_S_FMT, &fmt, "S_FMT YUV420");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    err = xioctl(fd, VIDIOC_G_FMT, &fmt, "G_FMT");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUV420 ||
+        (width > 0 && (fmt.fmt.pix.width != static_cast<uint32_t>(width) ||
+                       fmt.fmt.pix.height != static_cast<uint32_t>(height))))
+    {
+        std::fprintf(stderr, "esp32p4_csi_camera_src: sensor mode is %" PRIu32 "x%" PRIu32
+                     ", not YUV420 %dx%d\n",
+                     fmt.fmt.pix.width, fmt.fmt.pix.height, width, height);
+        return fail(-EINVAL);
+    }
+    live_w = static_cast<int>(fmt.fmt.pix.width);
+    live_h = static_cast<int>(fmt.fmt.pix.height);
+
+    struct v4l2_requestbuffers req {};
+    req.count = static_cast<uint32_t>(nbufs);
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    err = xioctl(fd, VIDIOC_REQBUFS, &req, "REQBUFS");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    r->ptr.assign(req.count, nullptr);
+    r->len.assign(req.count, 0);
+    for (uint32_t i = 0; i < req.count; ++i)
+    {
+        struct v4l2_buffer b {};
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        err = xioctl(fd, VIDIOC_QUERYBUF, &b, "QUERYBUF");
+        if (err < 0)
+        {
+            return fail(err);
+        }
+        void *p = mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+        if (MAP_FAILED == p)
+        {
+            return fail(-ENOMEM);
+        }
+        r->ptr[i] = static_cast<uint8_t *>(p);
+        r->len[i] = b.length;
+        if (b.length < frame_bytes(live_w, live_h))
+        {
+            return fail(-EINVAL);
+        }
+    }
+
+    struct timeval tv {};
+    tv.tv_usec = k_dqbuf_timeout_ms * 1000;
+    err = xioctl(fd, VIDIOC_S_DQBUF_TIMEOUT, &tv, "S_DQBUF_TIMEOUT");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    for (uint32_t i = 0; i < req.count; ++i)
+    {
+        struct v4l2_buffer b {};
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        b.index = i;
+        err = xioctl(fd, VIDIOC_QBUF, &b, "QBUF");
+        if (err < 0)
+        {
+            return fail(err);
+        }
+    }
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    err = xioctl(fd, VIDIOC_STREAMON, &type, "STREAMON");
+    if (err < 0)
+    {
+        return fail(err);
+    }
+    r->streaming = true;
+    ring_ = std::move(r);
+    return 0;
+}
+
+void esp32p4_csi_camera_src::release_ring(std::shared_ptr<ring> r)
+{
+    std::unique_lock<std::mutex> lock(r->mu);
+    r->streaming = false;
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    (void)ioctl(r->fd, VIDIOC_STREAMOFF, &type);
+    if (!r->cv.wait_for(lock, k_release_wait, [&] { return r->held <= 0; }))
+    {
+        /* Closing the device frees the buffers; a consumer still reads one. Leak instead. */
+        std::fprintf(stderr,
+                     "esp32p4_csi_camera_src: %d frame(s) still held downstream; leaving %s "
+                     "open\n",
+                     r->held, ESP_VIDEO_MIPI_CSI_DEVICE_NAME);
+        return;
+    }
+    for (size_t i = 0; i < r->ptr.size(); ++i)
+    {
+        munmap(r->ptr[i], r->len[i]);
+    }
+    ::close(r->fd);
+    r->fd = -1;
+}
+
+void esp32p4_csi_camera_src::capture_main()
+{
+    std::shared_ptr<ring> r;
+    size_t                want = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        r = ring_;
+        want = frame_bytes(live_w, live_h);
+    }
+    if (!r)
+    {
+        return;
+    }
+    while (!stop_.load(std::memory_order_acquire))
+    {
+        struct v4l2_buffer b {};
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        b.memory = V4L2_MEMORY_MMAP;
+        /* Blocks up to k_dqbuf_timeout_ms; times out while every buffer is downstream. */
+        if (ioctl(r->fd, VIDIOC_DQBUF, &b) != 0)
+        {
+            if (ETIMEDOUT != errno)
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                ++dqbuf_errors_;
+            }
+            continue;
+        }
+        /* esp_video leaves the V4L2 timestamp at 0. */
+        const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000);
+        if (b.index >= r->ptr.size())
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            ++dqbuf_errors_;
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(r->mu);
+            ++r->held;
+        }
+        /* Short or errored frame (bytesused 0): straight back to the driver. */
+        if (b.bytesused != want)
+        {
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                ++dqbuf_errors_;
+            }
+            r->requeue(b.index);
+            continue;
+        }
+
+        component_pdu pdu;
+        pdu.ts_us = ts_us;
+        pdu.sdu_type = sdu_type_e::O_UYY_E_VYY;
+        pdu.port = 0;
+        const uint32_t index = b.index;
+        pdu.sdu = bfc::shared_sized_buffer::adopt(
+            reinterpret_cast<std::byte *>(r->ptr[index]), r->len[index], b.bytesused,
+            [r, index](std::byte *) { r->requeue(index); });
+
+        std::optional<component_pdu> stale;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (ready_)
+            {
+                stale = std::move(ready_);
+                ++dropped_;
+            }
+            ready_ = std::move(pdu);
+            ++frames_;
+        }
+        /* stale's buffer is requeued here, outside mu. */
+        stale.reset();
+        notify_wakeup();
+    }
+}
+
+int esp32p4_csi_camera_src::open()
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (source_open)
+    {
+        return 0;
+    }
+    const int r = capture_open_locked();
+    if (r < 0)
+    {
+        return r;
+    }
+    source_open = true;
+    caps_sent_ = false;
+    stop_.store(false, std::memory_order_release);
+    /* capture_main() waits for mu, so it starts once open() returns. */
+    thread_ = spawn_thread(thread_opts {"vs_csi_cam", 4096}, [this] { capture_main(); });
+    return 0;
+}
+
+void esp32p4_csi_camera_src::close()
+{
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!source_open)
+        {
+            return;
+        }
+        source_open = false;
+    }
+    stop_.store(true, std::memory_order_release);
+    if (thread_.joinable())
+    {
+        thread_.join();
+    }
+    std::shared_ptr<ring>        r;
+    std::optional<component_pdu> last;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        r = std::move(ring_);
+        last = std::move(ready_);
+        ready_.reset();
+    }
+    /* Outside mu: a consumer may block in output() while it still holds a frame. */
+    last.reset();
+    if (r)
+    {
+        release_ring(std::move(r));
+    }
+}
+
+int esp32p4_csi_camera_src::output(component_pdu &out)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (!source_open)
+    {
+        return -EBADF;
+    }
+    if (!caps_sent_)
+    {
+        video_raw_caps caps {};
+        caps.width = live_w;
+        caps.height = live_h;
+        caps.hor_stride = live_w;
+        caps.ver_stride = live_h;
+        caps.fps_num = fps;
+        caps.fps_den = 1;
+        out = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps,
+                            static_cast<uint64_t>(steady_mono_ns() / 1000), 0);
+        out.seq = out_seq_++;
+        caps_sent_ = true;
+        return 0;
+    }
+    if (!ready_)
+    {
+        return -EAGAIN;
+    }
+    out = std::move(*ready_);
+    ready_.reset();
+    out.seq = out_seq_++;
+    return 0;
+}
+
+int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view value)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (key == "fps")
+    {
+        return parse_int(value, 1, 120, &fps);
+    }
+    /* The rest take effect on the next open(). */
+    if (source_open)
+    {
+        return -EBUSY;
+    }
+    if (key == "size")
+    {
+        return parse_size(value, &width, &height);
+    }
+    if (key == "buffers")
+    {
+        return parse_int(value, k_min_bufs, k_max_bufs, &nbufs);
+    }
+    if (key == "sccb_port")
+    {
+        return parse_int(value, 0, 1, &sccb_port);
+    }
+    if (key == "sccb_scl")
+    {
+        return parse_int(value, 0, 63, &sccb_scl);
+    }
+    if (key == "sccb_sda")
+    {
+        return parse_int(value, 0, 63, &sccb_sda);
+    }
+    if (key == "sccb_freq")
+    {
+        return parse_int(value, 10000, 1000000, &sccb_freq);
+    }
+    if (key == "reset_pin")
+    {
+        return parse_int(value, -1, 63, &reset_pin);
+    }
+    if (key == "pwdn_pin")
+    {
+        return parse_int(value, -1, 63, &pwdn_pin);
+    }
+    return -ENOTSUP;
+}
+
+int esp32p4_csi_camera_src::query(std::string_view key, std::string *value) const
+{
+    if (nullptr == value)
+    {
+        return -EINVAL;
+    }
+    const int r = port_caps_query(output_ports(), false, key, value);
+    if (0 == r || -EINVAL == r)
+    {
+        return r;
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (key == "state" || key == "status")
+    {
+        *value = source_open ? "capturing" : "closed";
+        return 0;
+    }
+    if (key == "size")
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%dx%d", source_open ? live_w : width,
+                      source_open ? live_h : height);
+        *value = buf;
+        return 0;
+    }
+    if (key == "fps")
+    {
+        return set_int(value, fps);
+    }
+    if (key == "buffers")
+    {
+        return set_int(value, nbufs);
+    }
+    if (key == "driver")
+    {
+        *value = driver;
+        return 0;
+    }
+    if (key == "stats")
+    {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf),
+                      "frames=%" PRIu64 " dropped=%" PRIu64 " dqbuf_errors=%" PRIu64, frames_,
+                      dropped_, dqbuf_errors_);
+        *value = buf;
+        return 0;
+    }
+    return -ENOTSUP;
+}
+
+}  // namespace vstreamer

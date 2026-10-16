@@ -14,6 +14,10 @@
 #include "components/v4l2_source.hpp"
 #endif
 
+#ifdef ENABLE_ESP32P4_CSI_CAMERA_SRC
+#include "components/esp32p4_csi_camera_src.hpp"
+#endif
+
 #ifdef ENABLE_JPEG_DECODER_MULTICORE
 #include "components/jpeg_decoder_multicore.hpp"
 #endif
@@ -78,6 +82,13 @@ std::unique_ptr<component_source> component_factory::create_source(std::string n
     if ("v4l2" == name || "v4l2_source" == name)
     {
         return std::make_unique<v4l2_source>();
+    }
+#endif
+
+#ifdef ENABLE_ESP32P4_CSI_CAMERA_SRC
+    if ("esp32p4_csi_camera_src" == name || "csi_camera" == name)
+    {
+        return std::make_unique<esp32p4_csi_camera_src>();
     }
 #endif
 

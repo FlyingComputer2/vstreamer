@@ -11,6 +11,10 @@
 // 2. h264_encoder_esp32p4 (esp32p4 only): encodes synthetic O_UYY_E_VYY frames at 1080p for
 // timing, then a short 320x240 clip that it prints as H264_BEGIN / base64 lines / H264_END so
 // the host can decode it.
+//
+// 3. esp32p4_csi_camera_src -> h264_encoder_esp32p4 (esp32p4 only): captures from the MIPI-CSI
+// sensor in sdkconfig for a few seconds, reports fps and dumps the first second as a clip.
+// Skipped when no sensor answers on SCCB.
 
 #include "components/components_config.hpp"
 #include "core/component_coder.hpp"
@@ -286,6 +290,111 @@ int run_encoder()
 
 #endif  // ENABLE_H264_ENCODER_ESP32P4
 
+#if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4)
+
+int run_camera()
+{
+    constexpr int     k_seconds = 5;
+    constexpr int     k_clip_frames = 30;
+    auto              cam = vstreamer::component_factory::create_source("csi_camera");
+    auto              enc = vstreamer::component_factory::create_coder("h264_encoder");
+    if (!cam || !enc)
+    {
+        std::printf("camera or encoder not in the build\n");
+        return -1;
+    }
+    print_heap("camera start");
+    const int cr = cam->open();
+    if (-ENODEV == cr)
+    {
+        std::printf("camera test SKIPPED (no sensor)\n");
+        return 0;
+    }
+    if (cr < 0)
+    {
+        std::printf("camera open failed: %d\n", cr);
+        return -1;
+    }
+    std::string size;
+    cam->query("size", &size);
+    enc->configure("size", size);
+    if (enc->open() < 0)
+    {
+        std::printf("encoder open %s failed\n", size.c_str());
+        return -1;
+    }
+
+    int           frames = 0;
+    int           keys = 0;
+    int           clip_frames = 0;
+    size_t        bytes = 0;
+    std::string   clip;
+    int64_t       t0 = 0;
+    const int64_t deadline = esp_timer_get_time() + (k_seconds + 1) * 1000000LL;
+    while (esp_timer_get_time() < deadline)
+    {
+        vstreamer::component_pdu in;
+        if (cam->output(in) != 0)
+        {
+            vTaskDelay(1);
+            continue;
+        }
+        if (in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY && 0 == t0)
+        {
+            /* Rate from the first frame, past sensor start-up. */
+            t0 = esp_timer_get_time();
+        }
+        const int r = enc->input(std::move(in));
+        if (r < 0)
+        {
+            std::printf("encode failed: %d\n", r);
+            break;
+        }
+        vstreamer::component_pdu out;
+        while (enc->output(out) == 0)
+        {
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            ++frames;
+            bytes += out.sdu.size();
+            const bool key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
+            keys += key ? 1 : 0;
+            /* Start the clip on an IDR so it decodes on its own. */
+            if (clip_frames < k_clip_frames && (clip_frames > 0 || key))
+            {
+                clip.append(reinterpret_cast<const char *>(out.sdu.u8()), out.sdu.size());
+                ++clip_frames;
+            }
+        }
+        if (t0 > 0 && esp_timer_get_time() - t0 >= k_seconds * 1000000LL)
+        {
+            break;
+        }
+    }
+    const double sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
+    std::string  cam_stats;
+    std::string  enc_stats;
+    cam->query("stats", &cam_stats);
+    enc->query("stats", &enc_stats);
+    std::printf("camera %s: %d AUs, %d IDR, %.1f fps, %.0f kbps; cam %s; enc %s\n", size.c_str(),
+                frames, keys, sec > 0 ? frames / sec : 0.0, sec > 0 ? bytes * 8 / sec / 1000 : 0.0,
+                cam_stats.c_str(), enc_stats.c_str());
+    enc->close();
+    cam->close();
+    print_heap("camera end");
+    const bool ok = sec > 0 && frames / sec >= 20;
+    if (ok)
+    {
+        dump_clip(clip, clip_frames);
+    }
+    std::printf("camera test %s\n", ok ? "PASSED" : "FAILED");
+    return ok ? 0 : -1;
+}
+
+#endif
+
 int run()
 {
     using vstreamer::component_factory;
@@ -403,6 +512,9 @@ extern "C" void app_main(void)
         (void)run();
 #ifdef ENABLE_H264_ENCODER_ESP32P4
         (void)run_encoder();
+#endif
+#if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4)
+        (void)run_camera();
 #endif
     });
     t.join();
