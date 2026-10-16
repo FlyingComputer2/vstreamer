@@ -74,10 +74,7 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &&in)
 
     drain_to_out_q();
     const int r = enc_->input(std::move(in));
-    if (0 == r)
-    {
-        drain_to_out_q();
-    }
+    drain_to_out_q();
     return r;
 }
 
@@ -95,9 +92,23 @@ void esp32_h264_isp_src::pipeline_main()
         {
             continue;
         }
-        if (push_encoder_input(std::move(in)) < 0)
+        const int enc_r = push_encoder_input(std::move(in));
+        if (-EAGAIN == enc_r)
         {
-            std::fprintf(stderr, "esp32_h264_isp_src: encode failed\n");
+            /* Encoder bitstream slots or out_q full — drop oldest coded PDUs so slots recycle. */
+            {
+                std::lock_guard<std::mutex> lock(mu);
+                while (out_q_.size() > 1)
+                {
+                    out_q_.pop_front();
+                }
+            }
+            notify_wakeup();
+            continue;
+        }
+        if (enc_r < 0)
+        {
+            std::fprintf(stderr, "esp32_h264_isp_src: encode failed: %d\n", enc_r);
             break;
         }
     }
