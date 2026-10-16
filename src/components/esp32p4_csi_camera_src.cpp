@@ -29,6 +29,10 @@
 #include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
 
+#if defined(ESP_PLATFORM)
+#include "esp_cache.h"
+#endif
+
 namespace vstreamer
 {
 
@@ -81,6 +85,22 @@ size_t frame_bytes(int w, int h)
 {
     return static_cast<size_t>(w) * static_cast<size_t>(h) * 3 / 2;
 }
+
+#if defined(ESP_PLATFORM)
+void sync_device_frame_to_cpu(void *addr, size_t len)
+{
+    constexpr size_t align = 64U;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t start = base & ~(align - 1U);
+    uintptr_t       end = base + len;
+    end = (end + align - 1U) & ~(align - 1U);
+    if (end > start)
+    {
+        (void)esp_cache_msync(reinterpret_cast<void *>(start), end - start,
+                              ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+    }
+}
+#endif
 
 int parse_int(std::string_view v, int64_t lo, int64_t hi, int *out)
 {
@@ -399,6 +419,10 @@ void esp32p4_csi_camera_src::capture_main()
             r->requeue(b.index);
             continue;
         }
+
+#if defined(ESP_PLATFORM)
+        sync_device_frame_to_cpu(r->ptr[b.index], b.bytesused);
+#endif
 
         component_pdu pdu;
         pdu.ts_us = ts_us;

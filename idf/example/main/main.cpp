@@ -38,6 +38,7 @@
 
 #include "esp_event.h"
 #include "esp_heap_caps.h"
+#include "esp_pm.h"
 #include "esp_timer.h"
 #include "mbedtls/base64.h"
 #include "esp_netif.h"
@@ -553,6 +554,11 @@ int run_camera_stream()
     }
 
     print_heap("live start");
+    esp_pm_lock_handle_t pm_lock = nullptr;
+    if (esp_pm_lock_create(ESP_PM_APB_FREQ_MAX, 0, "live_tx", &pm_lock) == ESP_OK)
+    {
+        esp_pm_lock_acquire(pm_lock);
+    }
     (void)cam->configure("buffers", "6");
     (void)cam->configure("fps", "30");
     const int cr = cam->open();
@@ -573,8 +579,8 @@ int run_camera_stream()
     enc->configure("bitrate", "4000000");
     enc->configure("gop", "30");
     enc->configure("fps", "30");
-    enc->configure("qp_min", "32");
-    enc->configure("qp_max", "48");
+    enc->configure("qp_min", "38");
+    enc->configure("qp_max", "51");
     pay->configure("fps", "30");
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
@@ -771,6 +777,11 @@ int run_camera_stream()
     pay->close();
     enc->close();
     cam->close();
+    if (nullptr != pm_lock)
+    {
+        esp_pm_lock_release(pm_lock);
+        esp_pm_lock_delete(pm_lock);
+    }
     print_heap("live end");
     const bool ok = run_forever ? f > 0 : (sec > 0 && f / sec >= 15);
     std::printf("live TX %s\n", ok ? "PASSED" : "FAILED");

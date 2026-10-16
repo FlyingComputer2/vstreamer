@@ -3,6 +3,7 @@ CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
 # esp_video + sensor drivers outgrow the default 1 MB app partition.
 CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
 CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
 CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 # app_main only starts the smoke-test thread.
