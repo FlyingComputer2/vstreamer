@@ -264,7 +264,7 @@ segment.
 |-----|-----|--------|
 | `output` | C Q | path template (empty = stop recording) |
 | `size`, `fps` | C | stream parameters |
-| `segment`, `stats`, `skipped`, `dropped` | Q | informational |
+| `segment`, `stats`, `skipped`, `dropped`, `write_errors` | Q | informational; a write error closes the segment and the next frame starts a new one |
 
 **`sdl_sink`** — NV12 preview through `sdl_nv12_presenter` (OpenGL; the window is owned by the
 thread that opens it). `input()` presents the frame on the calling thread, so call it from the
