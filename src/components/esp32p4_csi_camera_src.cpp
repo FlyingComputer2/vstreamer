@@ -420,13 +420,17 @@ void esp32p4_csi_camera_src::capture_main()
             continue;
         }
 
-        /* Coherency before esp_h264 DMA is handled in the encoder (PSRAM invalidate). */
+        /* Invalidate CPU cache for ISP-filled PSRAM before the encode thread reads/DMAs YUV.
+         * Doing this here overlaps msync with esp_h264 on the previous frame. */
+        const uint32_t index = b.index;
+#if defined(ESP_PLATFORM)
+        sync_device_frame_to_cpu(r->ptr[index], want);
+#endif
 
         component_pdu pdu;
         pdu.ts_us = ts_us;
         pdu.sdu_type = sdu_type_e::O_UYY_E_VYY;
         pdu.port = 0;
-        const uint32_t index = b.index;
         pdu.sdu = bfc::shared_sized_buffer::adopt(
             reinterpret_cast<std::byte *>(r->ptr[index]), r->len[index], b.bytesused,
             [r, index](std::byte *) { r->requeue(index); });

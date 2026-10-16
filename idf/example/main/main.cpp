@@ -291,6 +291,78 @@ int encoder_runtime_checks()
     return caps_ok && au_ok ? 0 : -1;
 }
 
+/* Pure esp_h264 HW process time on internal vs PSRAM YUV (live TX QP/GOP). */
+void bench_h264_yuv_ram_compare()
+{
+    constexpr int w = 1920;
+    constexpr int h = 1080;
+    constexpr int k_frames = 45;
+    const size_t  frame_bytes = static_cast<size_t>(w) * h * 3 / 2;
+
+    auto run_on = [&](int caps, const char *label) {
+        uint8_t *mem = static_cast<uint8_t *>(
+            heap_caps_aligned_alloc(64, frame_bytes, caps | MALLOC_CAP_CACHE_ALIGNED));
+        if (nullptr == mem)
+        {
+            std::printf("bench h264 %s: alloc failed\n", label);
+            return;
+        }
+        std::memset(mem, 0x80, frame_bytes);
+
+        auto enc = vstreamer::component_factory::create_coder("h264_encoder");
+        if (!enc)
+        {
+            heap_caps_free(mem);
+            return;
+        }
+        enc->configure("size", "1920x1080");
+        enc->configure("gop", "30");
+        enc->configure("qp_min", "38");
+        enc->configure("qp_max", "51");
+        if (enc->open() < 0)
+        {
+            std::printf("bench h264 %s: open failed\n", label);
+            heap_caps_free(mem);
+            return;
+        }
+        vstreamer::video_raw_caps caps_pdu {};
+        caps_pdu.width = w;
+        caps_pdu.height = h;
+        caps_pdu.fps_num = 30;
+        caps_pdu.fps_den = 1;
+        (void)enc->input(vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps_pdu,
+                                                  0, 0));
+
+        for (int i = 0; i < k_frames; ++i)
+        {
+            vstreamer::component_pdu in;
+            in.ts_us = static_cast<uint64_t>(i) * 33333;
+            in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
+            in.sdu = bfc::shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(mem),
+                                                     frame_bytes, frame_bytes,
+                                                     [](std::byte *) {});
+            const int r = enc->input(std::move(in));
+            if (r < 0)
+            {
+                std::printf("bench h264 %s: encode %d failed: %d\n", label, i, r);
+                break;
+            }
+            vstreamer::component_pdu out;
+            while (enc->output(out) == 0)
+            {
+            }
+        }
+        std::string stats;
+        enc->query("stats", &stats);
+        std::printf("bench h264 %s: %s\n", label, stats.c_str());
+        enc->close();
+        heap_caps_free(mem);
+    };
+
+    run_on(MALLOC_CAP_INTERNAL, "internal");
+    run_on(MALLOC_CAP_SPIRAM, "psram");
+}
+
 int run_encoder()
 {
     print_heap("encoder start");
@@ -539,6 +611,8 @@ int run_camera_stream()
 {
     const int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
     const bool  run_forever = (0 == k_seconds);
+
+    bench_h264_yuv_ram_compare();
 
     auto src = vstreamer::component_factory::create_source("h264_isp_src");
     auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
