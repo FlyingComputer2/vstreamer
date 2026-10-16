@@ -42,12 +42,20 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include <cinttypes>
 #include <climits>
+#include <atomic>
+#include <condition_variable>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <chrono>
+#include <optional>
 #include <string>
+#include <thread>
 
 namespace
 {
@@ -427,6 +435,72 @@ void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_s
     }
 }
 
+bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_sink *sender,
+                          vstreamer::component_pdu &&out, size_t *au_bytes, bool *key,
+                          std::atomic<uint64_t> *frames, std::atomic<uint64_t> *bytes,
+                          std::atomic<uint64_t> *keys)
+{
+    if (out.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_CODED)
+    {
+        for (;;)
+        {
+            const int r = pay->input(std::move(out));
+            if (0 == r)
+            {
+                return true;
+            }
+            if (-EAGAIN != r)
+            {
+                std::printf("pay caps failed: %d\n", r);
+                return false;
+            }
+            drain_pay_to_sender(pay, sender);
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+    {
+        return true;
+    }
+    if (nullptr != au_bytes)
+    {
+        *au_bytes = out.sdu.size();
+    }
+    if (nullptr != key)
+    {
+        *key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
+    }
+    for (;;)
+    {
+        drain_pay_to_sender(pay, sender);
+        const int r = pay->input(std::move(out));
+        if (0 == r)
+        {
+            break;
+        }
+        if (-EAGAIN != r)
+        {
+            std::printf("pay failed: %d\n", r);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    drain_pay_to_sender(pay, sender);
+    if (nullptr != frames)
+    {
+        frames->fetch_add(1, std::memory_order_relaxed);
+    }
+    if (nullptr != bytes && nullptr != au_bytes)
+    {
+        bytes->fetch_add(*au_bytes, std::memory_order_relaxed);
+    }
+    if (nullptr != keys && key && *key)
+    {
+        keys->fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 void drain_encoder_chain(vstreamer::component_coder *enc, vstreamer::component_coder *pay,
                          vstreamer::component_sink *sender)
 {
@@ -470,7 +544,7 @@ int run_camera_stream()
     }
 
     print_heap("live start");
-    (void)cam->configure("buffers", "4");
+    (void)cam->configure("buffers", "6");
     const int cr = cam->open();
     if (-ENODEV == cr)
     {
@@ -494,6 +568,8 @@ int run_camera_stream()
     snd->configure("mtu", "1400");
     snd->configure("max_kbps", "8000");
     snd->configure("telemetry", "off");
+    /* Direct LAN e2e: raw RTP in stream PDUs (no RS block FEC). */
+    snd->configure("fec", "none");
 
     if (enc->open() < 0 || pay->open() < 0 || snd->open() < 0)
     {
@@ -512,44 +588,27 @@ int run_camera_stream()
         std::printf("live TX streaming %s for %d s (size %s)\n", CONFIG_VSTREAMER_RX_PEER,
                     k_seconds, size.c_str());
     }
+    std::fflush(stdout);
 
-    int           frames = 0;
-    int           keys = 0;
-    size_t        bytes = 0;
-    int64_t       t0 = 0;
+    std::atomic<uint64_t> frames {0};
+    std::atomic<uint64_t> keys {0};
+    std::atomic<uint64_t> bytes {0};
+    std::atomic<int64_t>  t0_us {0};
+    std::atomic<bool>     stop {false};
+    std::mutex            q_mu;
+    std::condition_variable q_cv;
+    std::deque<vstreamer::component_pdu> q;
+    constexpr size_t k_q_max = 3;
+
     const int64_t deadline =
         run_forever ? INT64_MAX : esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
     const int64_t stop_at =
         run_forever ? INT64_MAX : esp_timer_get_time() + k_seconds * 1000000LL;
-
-    while (esp_timer_get_time() < deadline)
-    {
+    int64_t       last_stats_us = esp_timer_get_time();
+    auto encode_pdu = [&](vstreamer::component_pdu &&in) -> bool {
         drain_encoder_chain(enc_c, pay_c, snd_s);
-
-        vstreamer::component_pdu in;
-        if (cam->output(in) != 0)
-        {
-            vTaskDelay(pdMS_TO_TICKS(1));
-            if (t0 > 0 && esp_timer_get_time() >= stop_at)
-            {
-                break;
-            }
-            continue;
-        }
-        const bool is_raw_caps = in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW;
-        const bool is_frame = in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY;
-        if (!is_raw_caps && !is_frame)
-        {
-            continue;
-        }
-        if (is_frame && 0 == t0)
-        {
-            t0 = esp_timer_get_time();
-        }
-
         for (;;)
         {
-            drain_encoder_chain(enc_c, pay_c, snd_s);
             const int r = enc_c->input(std::move(in));
             if (0 == r)
             {
@@ -558,96 +617,143 @@ int run_camera_stream()
             if (-EAGAIN != r)
             {
                 std::printf("encode failed: %d\n", r);
-                goto done;
+                return false;
             }
+            drain_encoder_chain(enc_c, pay_c, snd_s);
             vTaskDelay(pdMS_TO_TICKS(1));
-            if (esp_timer_get_time() >= stop_at)
-            {
-                goto done;
-            }
         }
-
-        if (is_raw_caps)
-        {
-            continue;
-        }
-
         vstreamer::component_pdu out;
         while (enc_c->output(out) == 0)
         {
-            if (out.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_CODED)
+            size_t au_bytes = 0;
+            bool   key = false;
+            if (!forward_coded_output(pay_c, snd_s, std::move(out), &au_bytes, &key, &frames,
+                                      &bytes, &keys))
             {
-                for (;;)
-                {
-                    const int r = pay_c->input(std::move(out));
-                    if (0 == r)
-                    {
-                        break;
-                    }
-                    if (-EAGAIN != r)
-                    {
-                        std::printf("pay caps failed: %d\n", r);
-                        goto done;
-                    }
-                    drain_pay_to_sender(pay_c, snd_s);
-                    vTaskDelay(pdMS_TO_TICKS(1));
-                }
-                continue;
-            }
-            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
-            {
-                continue;
-            }
-            const size_t au_bytes = out.sdu.size();
-            const bool   key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
-            for (;;)
-            {
-                drain_pay_to_sender(pay_c, snd_s);
-                const int r = pay_c->input(std::move(out));
-                if (0 == r)
-                {
-                    break;
-                }
-                if (-EAGAIN != r)
-                {
-                    std::printf("pay failed: %d\n", r);
-                    goto done;
-                }
-                vTaskDelay(pdMS_TO_TICKS(1));
-            }
-            drain_pay_to_sender(pay_c, snd_s);
-            ++frames;
-            bytes += au_bytes;
-            if (key)
-            {
-                ++keys;
+                return false;
             }
         }
+        return true;
+    };
 
-        if (t0 > 0 && esp_timer_get_time() >= stop_at)
+    auto capture_fn = [&]() {
+        while (!stop.load(std::memory_order_acquire))
+        {
+            vstreamer::component_pdu in;
+            if (cam->output(in) != 0)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            if (in.sdu_type != vstreamer::sdu_type_e::CAPS_VIDEO_RAW &&
+                in.sdu_type != vstreamer::sdu_type_e::O_UYY_E_VYY)
+            {
+                continue;
+            }
+            if (in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY &&
+                0 == t0_us.load(std::memory_order_relaxed))
+            {
+                t0_us.store(esp_timer_get_time(), std::memory_order_relaxed);
+            }
+            {
+                std::lock_guard<std::mutex> lock(q_mu);
+                if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW)
+                {
+                    q.push_front(std::move(in));
+                }
+                else
+                {
+                    if (q.size() >= k_q_max)
+                    {
+                        q.pop_front();
+                    }
+                    q.push_back(std::move(in));
+                }
+            }
+            q_cv.notify_one();
+        }
+    };
+
+    auto encode_fn = [&]() {
+        while (!stop.load(std::memory_order_acquire))
+        {
+            vstreamer::component_pdu in;
+            {
+                std::unique_lock<std::mutex> lock(q_mu);
+                q_cv.wait_for(lock, std::chrono::milliseconds(50),
+                              [&] { return stop.load(std::memory_order_acquire) || !q.empty(); });
+                if (q.empty())
+                {
+                    continue;
+                }
+                in = std::move(q.front());
+                q.pop_front();
+            }
+            if (!encode_pdu(std::move(in)))
+            {
+                stop.store(true, std::memory_order_release);
+            }
+        }
+    };
+
+    auto capture_thread =
+        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_cap_pull", 12 * 1024}, capture_fn);
+    auto encode_thread =
+        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_enc_tx", 16 * 1024}, encode_fn);
+
+    while (!stop.load(std::memory_order_acquire) && esp_timer_get_time() < deadline)
+    {
+        if (esp_timer_get_time() - last_stats_us >= 10 * 1000000LL)
+        {
+            last_stats_us = esp_timer_get_time();
+            std::string cam_stats;
+            std::string enc_stats;
+            std::string snd_stats;
+            cam->query("stats", &cam_stats);
+            enc->query("stats", &enc_stats);
+            snd->query("stats", &snd_stats);
+            const int64_t t0 = t0_us.load(std::memory_order_relaxed);
+            const double  sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
+            const uint64_t f = frames.load(std::memory_order_relaxed);
+            const uint64_t b = bytes.load(std::memory_order_relaxed);
+            std::printf("live TX %.1f fps %.0f kbps; cam %s; enc %s; snd %s\n",
+                        sec > 0 ? f / sec : 0.0, sec > 0 ? b * 8 / sec / 1000 : 0.0,
+                        cam_stats.c_str(), enc_stats.c_str(), snd_stats.c_str());
+        }
+        if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
+            esp_timer_get_time() >= stop_at)
         {
             break;
         }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-done:
+    stop.store(true, std::memory_order_release);
+    q_cv.notify_all();
+    capture_thread.join();
+    encode_thread.join();
+
     drain_encoder_chain(enc_c, pay_c, snd_s);
-    const double sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
-    std::string  cam_stats;
-    std::string  enc_stats;
-    std::string  snd_stats;
+    const int64_t  t0 = t0_us.load(std::memory_order_relaxed);
+    const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
+    const uint64_t f = frames.load(std::memory_order_relaxed);
+    const uint64_t k = keys.load(std::memory_order_relaxed);
+    const uint64_t b = bytes.load(std::memory_order_relaxed);
+    std::string    cam_stats;
+    std::string    enc_stats;
+    std::string    snd_stats;
     cam->query("stats", &cam_stats);
     enc->query("stats", &enc_stats);
     snd->query("stats", &snd_stats);
-    std::printf("live TX done: %d AUs, %d IDR, %.1f fps, %.0f kbps; cam %s; enc %s; snd %s\n",
-                frames, keys, sec > 0 ? frames / sec : 0.0, sec > 0 ? bytes * 8 / sec / 1000 : 0.0,
+    std::printf("live TX done: %" PRIu64 " AUs, %" PRIu64 " IDR, %.1f fps, %.0f kbps; cam %s; enc %s; snd %s\n",
+                f, k, sec > 0 ? f / sec : 0.0, sec > 0 ? b * 8 / sec / 1000 : 0.0,
                 cam_stats.c_str(), enc_stats.c_str(), snd_stats.c_str());
     snd->close();
     pay->close();
     enc->close();
     cam->close();
     print_heap("live end");
-    const bool ok = run_forever ? frames > 0 : (sec > 0 && frames / sec >= 15);
+    const bool ok = run_forever ? f > 0 : (sec > 0 && f / sec >= 15);
     std::printf("live TX %s\n", ok ? "PASSED" : "FAILED");
     return ok ? 0 : -1;
 }
