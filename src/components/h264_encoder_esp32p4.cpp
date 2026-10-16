@@ -3,7 +3,7 @@
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_type.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <cerrno>
 #include <cinttypes>
@@ -315,7 +315,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     au.port = 0;
     const bool idr = out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR;
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
-    au.sdu = shared_sized_buffer::copy_from(out_buf_, out_frame.length);
+    au.sdu = bfc::shared_sized_buffer::copy_from(out_buf_, out_frame.length);
     if (au.sdu.empty())
     {
         return -ENOMEM;

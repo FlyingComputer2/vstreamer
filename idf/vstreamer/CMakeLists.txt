@@ -20,7 +20,11 @@ list(TRANSFORM VSTREAMER_SOURCES PREPEND ${VSTREAMER_ROOT}/)
 # ISA-L's portable erasure code; not fetched during IDF's early requirement scan.
 set(VSTREAMER_IDF_ISAL_SOURCES)
 set(VSTREAMER_IDF_ISAL_INCLUDES)
+# bfc (header-only: shared_sized_buffer); public, component_pdu.hpp includes it.
+set(VSTREAMER_IDF_BFC_INCLUDES)
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
+    include(${VSTREAMER_ROOT}/cmake/BfcFetch.cmake)
+    set(VSTREAMER_IDF_BFC_INCLUDES ${bfc_SOURCE_DIR}/src)
     if(VSTREAMER_NEEDS_ISAL)
         include(${VSTREAMER_ROOT}/cmake/isal_ec.cmake)
         vstreamer_fetch_isal()
@@ -37,6 +41,7 @@ idf_component_register(
          ${VSTREAMER_IDF_ISAL_SOURCES}
     INCLUDE_DIRS ${VSTREAMER_ROOT}/src
                  ${CMAKE_CURRENT_BINARY_DIR}/generated
+                 ${VSTREAMER_IDF_BFC_INCLUDES}
     PRIV_INCLUDE_DIRS compat
                       ${VSTREAMER_IDF_ISAL_INCLUDES}
     REQUIRES lwip pthread
