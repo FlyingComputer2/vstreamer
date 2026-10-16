@@ -560,9 +560,10 @@ int run_camera_stream()
     (void)src->configure("buffers", "6");
     (void)src->configure("fps", "30");
     (void)src->configure("bitrate", "4000000");
-    (void)src->configure("gop", "60");
+    (void)src->configure("gop", "30");
     (void)src->configure("qp_min", "38");
     (void)src->configure("qp_max", "51");
+
     const int cr = src->open();
     if (-ENODEV == cr)
     {
@@ -581,10 +582,8 @@ int run_camera_stream()
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
     snd->configure("mtu", "1400");
-    /* Direct LAN: no wire pacing (avoids vs_send blocking under TWDT on ESP32-P4). */
     snd->configure("max_kbps", "0");
     snd->configure("telemetry", "off");
-    /* Direct LAN e2e: raw RTP in stream PDUs (no RS block FEC). */
     snd->configure("fec", "none");
 
     if (pay->open() < 0 || snd->open() < 0)
@@ -646,7 +645,6 @@ int run_camera_stream()
         }
     };
 
-    /* Core 0: keep pay/send off vs_h264_isp (core 1) so coded PDUs drain under encode load. */
     auto tx_thread =
         vstreamer::spawn_thread(vstreamer::thread_opts {"vs_isp_tx", 16 * 1024, 0, 13}, tx_fn);
 

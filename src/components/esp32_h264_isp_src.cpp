@@ -8,6 +8,9 @@
 #include "core/sdu_type.hpp"
 #include "core/thread_spawn.hpp"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 #include <chrono>
 #include <cerrno>
 #include <cinttypes>
@@ -55,12 +58,32 @@ std::string esp32_h264_isp_src::name() const
     return "esp32_h264_isp_src";
 }
 
+void esp32_h264_isp_src::set_live_tx_hooks(coded_sink_fn sink, wire_drain_fn drain)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (opened)
+    {
+        return;
+    }
+    coded_sink_ = std::move(sink);
+    wire_drain_ = std::move(drain);
+}
+
 int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
 {
     auto drain_to_out_q = [&] {
         component_pdu out;
         while (enc_->output(out) == 0)
         {
+            if (coded_sink_)
+            {
+                if (!coded_sink_(std::move(out)))
+                {
+                    stop_.store(true, std::memory_order_release);
+                    return;
+                }
+                continue;
+            }
             std::lock_guard<std::mutex> lock(mu);
             if (out_q_.size() >= k_out_q_max)
             {
@@ -92,6 +115,15 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
             return r;
         }
         notify_wakeup();
+        if (wire_drain_)
+        {
+            wire_drain_();
+        }
+        if (coded_sink_)
+        {
+            vTaskDelay(1);
+            continue;
+        }
         std::unique_lock<std::mutex> lock(mu);
         out_cv_.wait_for(lock, std::chrono::milliseconds(5),
                          [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
@@ -231,6 +263,8 @@ void esp32_h264_isp_src::close()
     }
     out_q_.clear();
     raw_q_.clear();
+    coded_sink_ = nullptr;
+    wire_drain_ = nullptr;
     opened = false;
     stop_.store(false, std::memory_order_release);
 }
