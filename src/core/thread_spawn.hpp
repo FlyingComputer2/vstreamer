@@ -24,6 +24,8 @@ struct thread_opts
     /* ESP-IDF core, fixed at creation (FreeRTOS cannot move a task later); -1 = any core.
      * Ignored on Linux, where pin_current_thread_to_cpu() pins a running thread. */
     int cpu = -1;
+    /* FreeRTOS priority (0..configMAX_PRIORITIES-1); -1 keeps the pthread default. */
+    int prio = -1;
 };
 
 /*
@@ -44,6 +46,10 @@ template <typename... Args>
         cfg.stack_size = opts.stack_bytes;
     }
     cfg.pin_to_core = (opts.cpu >= 0 && opts.cpu < portNUM_PROCESSORS) ? opts.cpu : tskNO_AFFINITY;
+    if (opts.prio >= 0)
+    {
+        cfg.prio = static_cast<size_t>(opts.prio);
+    }
     cfg.thread_name = opts.name;
     cfg.inherit_cfg = false;
     (void)esp_pthread_set_cfg(&cfg);

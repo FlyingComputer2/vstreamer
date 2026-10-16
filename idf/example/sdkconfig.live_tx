@@ -1,0 +1,6 @@
+# Live camera TX instead of the smoke tests: layer on top of sdkconfig.defaults with
+#   idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.live_tx" build
+# Streams to the bench GS receiver until reset.
+CONFIG_VSTREAMER_IDF_LIVE_TX=y
+CONFIG_VSTREAMER_RX_PEER="192.168.253.106:21090"
+CONFIG_VSTREAMER_LIVE_TX_SECONDS=0

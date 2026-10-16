@@ -1,12 +1,16 @@
 #include "components/h264_encoder_esp32p4.hpp"
 
 #include "core/key_util.hpp"
+#include "core/latency_query.hpp"
+#include "core/time_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_type.hpp"
 #include <bfc/shared_sized_buffer.hpp>
 
+#include <algorithm>
 #include <cerrno>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -32,6 +36,17 @@ constexpr int k_max_height = 2032;
 /* Bitstream buffer DMA target: cache-line aligned. */
 constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
+/* A 1080p frame at qp 10 overflowed 768 KiB; a larger frame is dropped and the next is an IDR. */
+constexpr uint32_t k_max_bitstream_bytes = 1024U * 1024U;
+/* AUs downstream (pay, sender) hold slots; a slot short means an encode waits. */
+constexpr size_t   k_out_slot_count = 6;
+/* Buffered bits are repaid over this long; the buffer is clamped to [-0.5, +1] s of bitrate. */
+constexpr double k_rc_repay_s = 0.5;
+/* A P frame's size also depends on its reference's QP, so a full per-frame correction rings at
+ * a 4-frame period; filter the size and move a quarter of the way, one QP per frame at most. */
+constexpr double k_rc_ema = 0.25;
+constexpr double k_rc_gain = 0.25;
+constexpr int    k_rc_max_step = 1;
 
 size_t frame_bytes(int w, int h)
 {
@@ -137,8 +152,10 @@ int h264_encoder_esp32p4::codec_open_locked()
     cfg.res.width = static_cast<uint16_t>(width);
     cfg.res.height = static_cast<uint16_t>(height);
     cfg.rc.bitrate = bitrate;
+    /* Frame RC: a fixed slice QP of qp_min, raised per frame through the non-ROI delta. A
+     * negative delta hangs the encoder (1 s timeout on every frame), so the base is the floor. */
     cfg.rc.qp_min = static_cast<uint8_t>(qp_min);
-    cfg.rc.qp_max = static_cast<uint8_t>(qp_max);
+    cfg.rc.qp_max = static_cast<uint8_t>(frame_rc ? qp_min : qp_max);
 
     esp_h264_enc_handle_t enc = nullptr;
     if (esp_h264_enc_hw_new(&cfg, &enc) != ESP_H264_ERR_OK || nullptr == enc)
@@ -155,23 +172,46 @@ int h264_encoder_esp32p4::codec_open_locked()
         return -EIO;
     }
 
-    /* Twice the raw frame: room for an IDR even at qp 0. A larger AU is not written past the
-     * buffer; esp_h264 fails the frame (-EIO). */
-    uint32_t actual = 0;
-    auto    *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(
-        k_out_align, 1, static_cast<uint32_t>(2 * frame_bytes(width, height)), &actual,
-        ESP_H264_MEM_SPIRAM));
-    if (nullptr == out)
+    if (frame_rc)
     {
-        esp_h264_enc_close(enc);
-        esp_h264_enc_del(enc);
-        return -ENOMEM;
+        esp_h264_enc_roi_cfg_t roi {};
+        roi.roi_mode = ESP_H264_ROI_MODE_DELTA_QP;
+        roi.none_roi_delta_qp = 0;
+        if (esp_h264_enc_hw_cfg_roi(param, roi) != ESP_H264_ERR_OK)
+        {
+            esp_h264_enc_close(enc);
+            esp_h264_enc_del(enc);
+            return -EIO;
+        }
+        rc_qp_ = std::clamp((qp_min + qp_max) / 2, qp_min, qp_max);
+        rc_buf_bits_ = 0;
+        rc_p_bits_ = 0;
     }
+
+    /* PSRAM: internal RAM is kept for DMA, stacks and the network stack. */
+    const uint32_t want_out =
+        std::min(static_cast<uint32_t>(2 * frame_bytes(width, height)), k_max_bitstream_bytes);
+    auto pool = std::make_shared<slot_pool>();
+    pool->slots.resize(k_out_slot_count);
+    for (auto &slot : pool->slots)
+    {
+        uint32_t actual = 0;
+        slot.buf = static_cast<uint8_t *>(
+            esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual, ESP_H264_MEM_SPIRAM));
+        if (nullptr == slot.buf)
+        {
+            pool->retire();
+            esp_h264_enc_close(enc);
+            esp_h264_enc_del(enc);
+            return -ENOMEM;
+        }
+        slot.cap = actual;
+    }
+    pool->wake = [this] { notify_wakeup(); };
+    pool_ = std::move(pool);
 
     enc_ = enc;
     param_ = param;
-    out_buf_ = out;
-    out_cap_ = actual;
     live_w_ = width;
     live_h_ = height;
     reopen_req = false;
@@ -189,14 +229,80 @@ void h264_encoder_esp32p4::codec_close_locked()
         enc_ = nullptr;
         param_ = nullptr;
     }
-    if (nullptr != out_buf_)
+    if (pool_)
     {
-        esp_h264_free(out_buf_);
-        out_buf_ = nullptr;
-        out_cap_ = 0;
+        pool_->retire();
+        pool_.reset();
     }
     live_w_ = 0;
     live_h_ = 0;
+}
+
+h264_encoder_esp32p4::slot_pool::~slot_pool()
+{
+    for (const slot &s : slots)
+    {
+        if (nullptr != s.buf)
+        {
+            esp_h264_free(s.buf);
+        }
+    }
+}
+
+void h264_encoder_esp32p4::slot_pool::release(size_t index)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (index >= slots.size())
+    {
+        return;
+    }
+    if (retired)
+    {
+        esp_h264_free(slots[index].buf);
+        slots[index].buf = nullptr;
+        return;
+    }
+    slots[index].free = true;
+    /* Under mu: retire() clears wake under it too, so the encoder cannot be gone mid-call. */
+    if (wake)
+    {
+        wake();
+    }
+}
+
+void h264_encoder_esp32p4::slot_pool::retire()
+{
+    std::lock_guard<std::mutex> lock(mu);
+    retired = true;
+    wake = nullptr;
+    for (slot &s : slots)
+    {
+        if (s.free && nullptr != s.buf)
+        {
+            esp_h264_free(s.buf);
+            s.buf = nullptr;
+        }
+    }
+}
+
+int h264_encoder_esp32p4::acquire_out_slot_locked(size_t *index)
+{
+    if (!pool_)
+    {
+        return -EBADF;
+    }
+    std::lock_guard<std::mutex> lock(pool_->mu);
+    for (size_t i = 0; i < pool_->slots.size(); ++i)
+    {
+        auto &slot = pool_->slots[i];
+        if (slot.free && nullptr != slot.buf)
+        {
+            slot.free = false;
+            *index = i;
+            return 0;
+        }
+    }
+    return -EAGAIN;
 }
 
 int h264_encoder_esp32p4::open()
@@ -217,14 +323,19 @@ int h264_encoder_esp32p4::open()
 
 void h264_encoder_esp32p4::close()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    codec_close_locked();
-    out_q_.clear();
-    have_input_caps_ = false;
-    caps_reject_ = false;
-    caps_out_ = video_coded_caps {};
-    opened = false;
-    reopen_req = false;
+    std::deque<component_pdu> queued;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        codec_close_locked();
+        queued.swap(out_q_);
+        have_input_caps_ = false;
+        caps_reject_ = false;
+        caps_out_ = video_coded_caps {};
+        opened = false;
+        reopen_req = false;
+    }
+    /* Releasing an AU frees its slot through the retired pool; done outside mu all the same. */
+    queued.clear();
 }
 
 int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
@@ -257,6 +368,28 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
     return 0;
 }
 
+/*
+ * Frame-level rate control. The virtual buffer holds coded bits minus the budget; the next P
+ * frame aims at the budget less 1/(fps * repay) of the buffer, and the QP moves a fraction of the
+ * step that size needs (6 QP per halving), at most k_rc_max_step per frame. An IDR's size only
+ * goes into the buffer: it is not a prediction of the next P frame.
+ */
+void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr)
+{
+    const double budget = static_cast<double>(bitrate) / fps;
+    const double second = static_cast<double>(bitrate);
+    rc_buf_bits_ = std::clamp(rc_buf_bits_ + bits - budget, -0.5 * second, second);
+    if (idr || bits <= 0)
+    {
+        return;
+    }
+    rc_p_bits_ = rc_p_bits_ > 0 ? rc_p_bits_ + k_rc_ema * (bits - rc_p_bits_) : bits;
+    const double target = std::max(budget - rc_buf_bits_ / (fps * k_rc_repay_s), 0.25 * budget);
+    const double step = k_rc_gain * 6.0 * std::log2(rc_p_bits_ / target);
+    const int    d = std::clamp(static_cast<int>(std::lround(step)), -k_rc_max_step, k_rc_max_step);
+    rc_qp_ = std::clamp(rc_qp_ + d, qp_min, qp_max);
+}
+
 int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
 {
     if (reopen_req)
@@ -281,6 +414,15 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     {
         return -EAGAIN;
     }
+    size_t out_index = 0;
+    if (acquire_out_slot_locked(&out_index) < 0)
+    {
+        return -EAGAIN;
+    }
+    /* The slot is ours until released: buf and cap do not change while it is not free. */
+    const std::shared_ptr<slot_pool> pool = pool_;
+    uint8_t *const                   slot_buf = pool->slots[out_index].buf;
+    const uint32_t                   slot_cap = pool->slots[out_index].cap;
 
     auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
     if (pending_idr)
@@ -289,24 +431,36 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         pending_idr = false;
     }
 
+    if (frame_rc)
+    {
+        esp_h264_enc_roi_cfg_t roi {};
+        roi.roi_mode = ESP_H264_ROI_MODE_DELTA_QP;
+        roi.none_roi_delta_qp = static_cast<int8_t>(rc_qp_ - qp_min);
+        (void)esp_h264_enc_hw_cfg_roi(static_cast<esp_h264_enc_param_hw_handle_t>(param_), roi);
+    }
+
     esp_h264_enc_in_frame_t in_frame {};
     /* The encoder only reads the frame (cache write-back, then DMA). */
     in_frame.raw_data.buffer = const_cast<uint8_t *>(in.sdu.u8());
     in_frame.raw_data.len = static_cast<uint32_t>(in.sdu.size());
     in_frame.pts = static_cast<uint32_t>(in.ts_us / 1000);
     esp_h264_enc_out_frame_t out_frame {};
-    out_frame.raw_data.buffer = out_buf_;
-    out_frame.raw_data.len = out_cap_;
+    out_frame.raw_data.buffer = slot_buf;
+    out_frame.raw_data.len = slot_cap;
 
     const int64_t t0 = esp_timer_get_time();
     const esp_h264_err_t err = esp_h264_enc_process(enc, &in_frame, &out_frame);
     const int64_t dt = esp_timer_get_time() - t0;
-    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > out_cap_)
+    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > slot_cap)
     {
+        pool->release(out_index);
         ++encode_errors_;
+        /* Decoders never saw this frame, so the next one must not reference it. */
+        pending_idr = true;
         return -EIO;
     }
     last_encode_us_ = dt;
+    sum_encode_us_ += dt;
     max_encode_us_ = dt > max_encode_us_ ? dt : max_encode_us_;
 
     component_pdu au;
@@ -314,12 +468,32 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     au.sdu_type = sdu_type_e::H264_AU;
     au.port = 0;
     const bool idr = out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR;
+    if (!idr)
+    {
+        sum_p_encode_us_ += dt;
+        ++p_frames_;
+    }
+    if (frame_rc)
+    {
+        rc_qp_sum_ += static_cast<uint64_t>(rc_qp_);
+        rc_update_locked(8.0 * out_frame.length, idr);
+    }
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
-    au.sdu = bfc::shared_sized_buffer::copy_from(out_buf_, out_frame.length);
+    au.sdu = bfc::shared_sized_buffer::adopt(
+        reinterpret_cast<std::byte *>(slot_buf), slot_cap, out_frame.length,
+        [pool, out_index](std::byte *) { pool->release(out_index); });
     if (au.sdu.empty())
     {
+        pool->release(out_index);
         return -ENOMEM;
     }
+    const int64_t now_ns = steady_mono_ns();
+    latency_store(latency_ms_, now_ns, static_cast<int64_t>(in.ts_us) * 1000);
+    if (entry_ts_us_ == in.ts_us && 0 != entry_ns_)
+    {
+        latency_store(node_latency_ms_, now_ns, entry_ns_);
+    }
+    entry_ns_ = 0;
     out_q_.push_back(std::move(au));
     ++frames_;
     if (idr)
@@ -352,6 +526,11 @@ int h264_encoder_esp32p4::input(component_pdu &&in)
     if (caps_reject_ || !have_input_caps_)
     {
         return -ENOTSUP;
+    }
+    if (in.ts_us != entry_ts_us_ || 0 == entry_ns_)
+    {
+        entry_ts_us_ = in.ts_us;
+        entry_ns_ = steady_mono_ns();
     }
     return encode_locked(in);
 }
@@ -461,6 +640,30 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         pending_idr = true;
         return 0;
     }
+    if (key == "rc")
+    {
+        if (value != "frame" && value != "esp")
+        {
+            return -EINVAL;
+        }
+        const bool f = value == "frame";
+        reopen_req = reopen_req || (opened && f != frame_rc);
+        frame_rc = f;
+        return 0;
+    }
+    if (key == "reset_stats")
+    {
+        frames_ = 0;
+        idr_frames_ = 0;
+        encode_errors_ = 0;
+        last_encode_us_ = 0;
+        max_encode_us_ = 0;
+        sum_encode_us_ = 0;
+        sum_p_encode_us_ = 0;
+        p_frames_ = 0;
+        rc_qp_sum_ = 0;
+        return 0;
+    }
     return -ENOTSUP;
 }
 
@@ -519,6 +722,10 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     {
         return set_int(value, qp_max);
     }
+    if (key == "enc_frames")
+    {
+        return set_int(value, static_cast<int64_t>(frames_));
+    }
     if (key == "encode_ms")
     {
         char buf[48];
@@ -527,14 +734,25 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if (const int r = latency_query(key, latency_ms_, node_latency_ms_, value); -ENOTSUP != r)
+    {
+        return r;
+    }
     if (key == "stats")
     {
-        char buf[128];
+        char buf[160];
+        const double avg_ms =
+            frames_ > 0 ? static_cast<double>(sum_encode_us_) / static_cast<double>(frames_) / 1000.0
+                        : 0.0;
+        const double p_avg_ms =
+            p_frames_ > 0 ? static_cast<double>(sum_p_encode_us_) / static_cast<double>(p_frames_) / 1000.0
+                          : 0.0;
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
-                      " encode_ms=%.1f max=%.1f",
-                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0,
-                      max_encode_us_ / 1000.0);
+                      " encode_ms=%.1f avg=%.1f p_avg=%.1f max=%.1f qp=%d avg_qp=%.1f",
+                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0, avg_ms, p_avg_ms,
+                      max_encode_us_ / 1000.0, frame_rc ? rc_qp_ : -1,
+                      frame_rc && frames_ > 0 ? static_cast<double>(rc_qp_sum_) / frames_ : 0.0);
         *value = buf;
         return 0;
     }

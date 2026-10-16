@@ -69,12 +69,13 @@ public:
     }
 
 private:
+    struct send_thread_wdt;
     void send_thread_main();
     void stop_send_thread();
     void stop_telemetry_thread();
     void telemetry_thread_main();
     void handle_link_report(const stream_link_report &report);
-    void pace_wire_send(size_t bytes);
+    void pace_wire_send(size_t bytes, send_thread_wdt *wdt = nullptr);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                            std::chrono::steady_clock::time_point release);
     /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */

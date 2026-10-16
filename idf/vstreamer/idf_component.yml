@@ -5,3 +5,9 @@ dependencies:
     version: "1.4.*"
     rules:
       - if: "target == esp32p4"
+  # MIPI-CSI capture + ISP for esp32p4_csi_camera_src (esp32p4 only). The sensor driver and
+  # its mode are the application's sdkconfig (CONFIG_CAMERA_*).
+  espressif/esp_video:
+    version: "2.5.*"
+    rules:
+      - if: "target == esp32p4"

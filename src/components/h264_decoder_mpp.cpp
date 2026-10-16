@@ -213,8 +213,14 @@ int h264_decoder_mpp::ensure_decoder_locked()
         return -EIO;
     }
 
-    /* Split Annex-B byte stream into access units inside MPP. */
-    ret = mpp_dec_cfg_set_u32(cfg, "base:split_parse", 1);
+    /* Input is one complete AU per packet (rtp_h264_depay). MPP's own AU splitting would hold
+     * each frame until the next one starts arriving, one frame of latency; fast_out returns a
+     * frame as soon as it is decoded instead of in display order (there are no B-frames). */
+    ret = mpp_dec_cfg_set_u32(cfg, "base:split_parse", 0);
+    if (ret == MPP_OK)
+    {
+        ret = mpp_dec_cfg_set_u32(cfg, "base:fast_out", 1);
+    }
     if (ret != MPP_OK)
     {
         mpp_dec_cfg_deinit(cfg);
