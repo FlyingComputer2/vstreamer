@@ -631,7 +631,7 @@ int run_camera_stream()
     {
         esp_pm_lock_acquire(pm_lock);
     }
-    (void)src->configure("buffers", "8");
+    (void)src->configure("buffers", "6");
     (void)src->configure("fps", "30");
     (void)src->configure("bitrate", "4000000");
     (void)src->configure("gop", "30");
