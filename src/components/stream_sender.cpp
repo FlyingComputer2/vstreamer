@@ -35,12 +35,37 @@ namespace
 {
 
 #if defined(ESP_PLATFORM)
-void esp_feed_task_wdt()
+class send_thread_wdt
 {
-    (void)esp_task_wdt_reset();
-}
+public:
+    send_thread_wdt()
+    {
+        const esp_err_t e = esp_task_wdt_add(nullptr);
+        ok_ = (ESP_OK == e || ESP_ERR_INVALID_STATE == e);
+    }
+    ~send_thread_wdt()
+    {
+        if (ok_)
+        {
+            (void)esp_task_wdt_delete(nullptr);
+        }
+    }
+    void feed()
+    {
+        if (ok_)
+        {
+            (void)esp_task_wdt_reset();
+        }
+    }
+
+private:
+    bool ok_ = false;
+};
 #else
-void esp_feed_task_wdt() {}
+struct send_thread_wdt
+{
+    void feed() {}
+};
 #endif
 
 /* Thread stacks on ESP-IDF; ignored on Linux. */
@@ -389,7 +414,6 @@ void stream_sender::pace_wire_send(size_t bytes)
 
     while (!send_stop.load(std::memory_order_relaxed))
     {
-        esp_feed_task_wdt();
         const double now = now_sec();
         if (pace_last_sec <= 0.)
         {
@@ -566,6 +590,7 @@ stream_peer_link stream_sender::peer_link_snapshot() const
 
 void stream_sender::send_thread_main()
 {
+    send_thread_wdt wdt;
     sockaddr_in dst {};
     bool        dst_ok = false;
     {
@@ -579,7 +604,7 @@ void stream_sender::send_thread_main()
 
     while (!send_stop)
     {
-        esp_feed_task_wdt();
+        wdt.feed();
         if (pace_reset.exchange(false, std::memory_order_relaxed))
         {
             pace_bucket_bytes = 0.;
