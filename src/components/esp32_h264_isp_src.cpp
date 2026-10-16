@@ -179,10 +179,12 @@ void esp32_h264_isp_src::encode_main()
 
 int esp32_h264_isp_src::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
     {
-        return 0;
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return 0;
+        }
     }
 
     char buf[16];
@@ -218,9 +220,13 @@ int esp32_h264_isp_src::open()
     }
 
     stop_.store(false, std::memory_order_release);
-    encode_thread_ = spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 12},
-                                  [this] { encode_main(); });
-    opened = true;
+    std::thread enc_thread =
+        spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 12}, [this] { encode_main(); });
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        encode_thread_ = std::move(enc_thread);
+        opened = true;
+    }
     return 0;
 }
 

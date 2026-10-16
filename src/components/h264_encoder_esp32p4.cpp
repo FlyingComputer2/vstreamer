@@ -518,6 +518,18 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         pending_idr = true;
         return 0;
     }
+    if (key == "reset_stats")
+    {
+        frames_ = 0;
+        idr_frames_ = 0;
+        encode_errors_ = 0;
+        last_encode_us_ = 0;
+        max_encode_us_ = 0;
+        sum_encode_us_ = 0;
+        sum_p_encode_us_ = 0;
+        p_frames_ = 0;
+        return 0;
+    }
     return -ENOTSUP;
 }
 

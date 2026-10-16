@@ -22,17 +22,11 @@ else
   patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$COHERENCY_PATCH"
   echo "apply-patches: applied esp_h264 DQBUF-overlap PSRAM coherency patch"
 fi
-DECIMATE_PATCH="$ROOT/patches/esp_h264_aggressive_decimate.patch"
-if grep -q 'score_luma = 255' "$H264_SRC"; then
-  echo "apply-patches: esp_h264 aggressive decimate patch already applied"
+if grep -q 'db_bypass = 1' "$H264_SRC"; then
+  echo "apply-patches: esp_h264 db_bypass patch already applied"
 else
-  if grep -q 'db_bypass = 1' "$H264_SRC"; then
-    patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$DECIMATE_PATCH"
-  else
-    patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$DB_BYPASS_PATCH" || true
-    patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$DECIMATE_PATCH"
-  fi
-  echo "apply-patches: applied esp_h264 aggressive decimate patch"
+  patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$DB_BYPASS_PATCH"
+  echo "apply-patches: applied esp_h264 db_bypass patch"
 fi
 if grep -q 'align = 64U' "$CACHE_SRC"; then
   echo "apply-patches: esp_h264 aligned invalidate patch already applied"
