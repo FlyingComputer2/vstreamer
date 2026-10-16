@@ -81,7 +81,7 @@ private:
     int      fps = 30;
     int      gop = 30;
     uint32_t bitrate = 4000000;
-    int      qp_min = 40;
+    int      qp_min = 10;
     int      qp_max = 51;
     int      buffers = 6;
 

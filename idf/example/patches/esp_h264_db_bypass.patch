@@ -1,9 +1,0 @@
---- a/hw/src/esp_h264_enc_single_hw.c
-+++ b/hw/src/esp_h264_enc_single_hw.c
-@@ -351,6 +351,7 @@ esp_h264_err_t esp_h264_enc_hw_new(const esp_h264_enc_cfg_hw_t *cfg, esp_h264_en
-     cfg_h264_hal.gop_mode_en = true;
-     cfg_h264_hal.cfg_ch[0].score_luma = H264_SCORE_LUMA;
-     cfg_h264_hal.cfg_ch[0].score_chroma = H264_SCORE_CHROMA;
-+    cfg_h264_hal.cfg_ch[0].db_bypass = 1;
-     h264_hal_dma_context_cfg_t cfg_h264_dma_hal = { 0 };
-     cfg_h264_dma_hal.burst_size = H264_DMA_BURST_SIZE;

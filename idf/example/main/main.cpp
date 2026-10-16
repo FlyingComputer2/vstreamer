@@ -312,7 +312,7 @@ void bench_h264_yuv_ram_compare()
         }
         enc->configure("size", "1920x1080");
         enc->configure("gop", "30");
-        enc->configure("qp_min", "40");
+        enc->configure("qp_min", "10");
         enc->configure("qp_max", "51");
         if (enc->open() < 0)
         {
@@ -643,7 +643,7 @@ int run_camera_stream()
     (void)src->configure("fps", "30");
     (void)src->configure("bitrate", "4000000");
     (void)src->configure("gop", "30");
-    (void)src->configure("qp_min", "40");
+    (void)src->configure("qp_min", "10");
     (void)src->configure("qp_max", "51");
 
     const int cr = src->open();

@@ -28,9 +28,12 @@
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
+#include "sdkconfig.h"
+#if CONFIG_CAMERA_OV5647
+#include "ov5647_types.h"
+#endif
 
 #if defined(ESP_PLATFORM)
-#include "esp_cache.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #endif
@@ -87,22 +90,6 @@ size_t frame_bytes(int w, int h)
 {
     return static_cast<size_t>(w) * static_cast<size_t>(h) * 3 / 2;
 }
-
-#if defined(ESP_PLATFORM)
-void sync_device_frame_to_cpu(void *addr, size_t len)
-{
-    constexpr size_t align = 64U;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(addr);
-    const uintptr_t start = base & ~(align - 1U);
-    uintptr_t       end = base + len;
-    end = (end + align - 1U) & ~(align - 1U);
-    if (end > start)
-    {
-        (void)esp_cache_msync(reinterpret_cast<void *>(start), end - start,
-                              ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-    }
-}
-#endif
 
 int parse_int(std::string_view v, int64_t lo, int64_t hi, int *out)
 {
@@ -172,6 +159,59 @@ int xioctl(int fd, unsigned long req, void *arg, const char *what)
     return -(e ? e : EIO);
 }
 
+#if CONFIG_CAMERA_OV5647
+/*
+ * esp_cam_sensor's OV5647 1080p30 table says "24Minput" but its PLL (0x3035/0x3036) is the
+ * Linux driver's, whose 81.6667 MHz pixel clock needs a 25 MHz xclk. At 24 MHz the clock is
+ * 24/25 of that and HTS 2271 x VTS 1199 runs at 28.8 fps. Re-derive VTS for the requested
+ * rate at 24 MHz and load the table as a custom sensor format.
+ */
+constexpr double k_ov5647_pclk_hz = 81666700.0 * 24.0 / 25.0;
+constexpr int    k_ov5647_min_vts = 1104; /* 1080 active lines + the Linux driver's blanking */
+std::vector<ov5647_reginfo_t> s_ov5647_regs;
+esp_cam_sensor_format_t       s_ov5647_fmt;
+
+void ov5647_fix_frame_rate(int fd, int fps)
+{
+    esp_cam_sensor_format_t cur {};
+    if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
+        std::strcmp(cur.name, "MIPI_2lane_24Minput_RAW10_1920x1080_30fps") != 0 || fps <= 0)
+    {
+        return;
+    }
+    /* cur.regs may already be s_ov5647_regs (a second open), so copy before replacing it. */
+    const auto *src = static_cast<const ov5647_reginfo_t *>(cur.regs);
+    std::vector<ov5647_reginfo_t> regs(src, src + cur.regs_size);
+    int hts = 0;
+    for (const auto &r : regs)
+    {
+        hts = 0x380c == r.reg ? (hts & 0xff) | (r.val << 8) : hts;
+        hts = 0x380d == r.reg ? (hts & 0xff00) | r.val : hts;
+    }
+    if (hts <= 0)
+    {
+        return;
+    }
+    int vts = static_cast<int>(k_ov5647_pclk_hz / (static_cast<double>(hts) * fps));
+    vts = vts < k_ov5647_min_vts ? k_ov5647_min_vts : vts;
+    for (auto &r : regs)
+    {
+        r.val = 0x380e == r.reg ? static_cast<uint8_t>(vts >> 8) : r.val;
+        r.val = 0x380f == r.reg ? static_cast<uint8_t>(vts & 0xff) : r.val;
+    }
+    s_ov5647_regs = std::move(regs);
+    s_ov5647_fmt = cur;
+    s_ov5647_fmt.regs = s_ov5647_regs.data();
+    s_ov5647_fmt.regs_size = s_ov5647_regs.size();
+    if (xioctl(fd, VIDIOC_S_SENSOR_FMT, &s_ov5647_fmt, "S_SENSOR_FMT ov5647 vts") == 0)
+    {
+        std::fprintf(stderr,
+                     "esp32p4_csi_camera_src: ov5647 HTS %d VTS %d -> %.2f fps at 24 MHz xclk\n",
+                     hts, vts, k_ov5647_pclk_hz / (static_cast<double>(hts) * vts));
+    }
+}
+#endif
+
 }  // namespace
 
 esp32p4_csi_camera_src::esp32p4_csi_camera_src() = default;
@@ -240,6 +280,9 @@ int esp32p4_csi_camera_src::capture_open_locked()
     {
         driver = reinterpret_cast<const char *>(cap.driver);
     }
+#if CONFIG_CAMERA_OV5647
+    ov5647_fix_frame_rate(fd, fps);
+#endif
 
     struct v4l2_format fmt {};
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -285,8 +328,10 @@ int esp32p4_csi_camera_src::capture_open_locked()
         const uint32_t den = parm.parm.capture.timeperframe.denominator;
         const float    driver_fps = (num > 0 && den > 0) ? static_cast<float>(den) / num : 0.f;
         std::fprintf(stderr,
-                     "esp32p4_csi_camera_src: driver timeperframe %u/%u (~%.2f fps) cap=0x%x\n", num,
-                     den, driver_fps, parm.parm.capture.capability);
+                     "esp32p4_csi_camera_src: driver timeperframe %" PRIu32 "/%" PRIu32
+                     " (~%.2f fps) cap=0x%" PRIx32 "\n",
+                     num, den, static_cast<double>(driver_fps),
+                     static_cast<uint32_t>(parm.parm.capture.capability));
         if (parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)
         {
             parm.parm.capture.timeperframe.numerator = 1;
@@ -442,10 +487,8 @@ void esp32p4_csi_camera_src::capture_main()
             continue;
         }
 
-        /* Invalidate CPU cache for ISP-filled PSRAM before the encode thread reads/DMAs YUV.
-         * Doing this here overlaps msync with esp_h264 on the previous frame. */
+        /* No cache sync: the CPU never reads the pixels and the H.264 DMA reads PSRAM. */
         const uint32_t index = b.index;
-        sync_device_frame_to_cpu(r->ptr[index], b.bytesused);
 
         component_pdu pdu;
         pdu.ts_us = ts_us;
