@@ -2,7 +2,7 @@
 #include "components/stream_sender.hpp"
 #include "core/fec_spread.hpp"
 #include "core/rs_block_erasure.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 #include "core/stream_header.hpp"
 
 #include <gtest/gtest.h>

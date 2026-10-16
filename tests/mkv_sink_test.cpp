@@ -2,7 +2,7 @@
 
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -24,7 +24,7 @@ extern "C"
 
 using vstreamer::component_pdu;
 using vstreamer::mkv_sink;
-using vstreamer::shared_sized_buffer;
+using bfc::shared_sized_buffer;
 
 namespace
 {
@@ -131,7 +131,7 @@ vstreamer::component_pdu make_mjpeg_pdu(int w, int h, int64_t frame_index)
     pdu.ts_us = static_cast<uint64_t>(frame_index * 33333);
     pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
     pdu.port = 0;
-    pdu.sdu = shared_sized_buffer::copy_from(k_minimal_jpeg, sizeof(k_minimal_jpeg));
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(k_minimal_jpeg, sizeof(k_minimal_jpeg));
     return pdu;
 }
 

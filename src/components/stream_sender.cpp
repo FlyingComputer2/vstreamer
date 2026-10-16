@@ -53,7 +53,7 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
     }
 }
 
-size_t wire_packet_bytes(const shared_sized_buffer &buf)
+size_t wire_packet_bytes(const bfc::shared_sized_buffer &buf)
 {
     return buf.size();
 }
@@ -242,7 +242,7 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
         }
     }
 
-    shared_sized_buffer buf = pool.acquire(wire_len);
+    bfc::shared_sized_buffer buf = pool.acquire(wire_len);
     if (0 == buf.capacity() || buf.size() != wire_len)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -307,7 +307,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         }
     }
 
-    shared_sized_buffer buf = pool.acquire(wire_len);
+    bfc::shared_sized_buffer buf = pool.acquire(wire_len);
     if (0 == buf.capacity() || buf.size() != wire_len)
     {
         std::lock_guard<std::mutex> lock(mu);
@@ -592,7 +592,7 @@ void stream_sender::send_thread_main()
             }
         }
 
-        shared_sized_buffer wire_buf;
+        bfc::shared_sized_buffer wire_buf;
         {
             /* Wake for the earliest release, a new enqueue, or the next FEC tick. */
             std::unique_lock<std::mutex> lock(q_mu);

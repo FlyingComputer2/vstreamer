@@ -4,7 +4,7 @@
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -40,7 +40,7 @@ inline component_pdu make_stream_dgram(uint32_t counter, size_t payload_bytes = 
     pdu.sdu_type = sdu_type_e::STREAM_DGRAM;
     pdu.port = 0;
     pdu.flags = 0;
-    pdu.sdu = shared_sized_buffer::copy_from(storage.data(), storage.size());
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(storage.data(), storage.size());
     return pdu;
 }
 
@@ -54,7 +54,7 @@ inline component_pdu make_nv12(int w, int h, uint64_t ts_us)
     pdu.sdu_type = sdu_type_e::NV12;
     pdu.port = 0;
     pdu.flags = static_cast<uint8_t>(pdu_flag_e::KEY);
-    pdu.sdu = shared_sized_buffer::copy_from(buf.data(), buf.size());
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(buf.data(), buf.size());
     return pdu;
 }
 
@@ -88,7 +88,7 @@ inline component_pdu make_h264_au(const uint8_t *data, size_t len, uint64_t ts_u
     pdu.sdu_type = sdu_type_e::H264_AU;
     pdu.port = 0;
     pdu.flags = key ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
-    pdu.sdu = shared_sized_buffer::copy_from(data, len);
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(data, len);
     return pdu;
 }
 

@@ -19,7 +19,6 @@ set(VSTREAMER_TEST_SOURCES
     stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
-    shared_sized_buffer_test.cpp
 )
 
 if(ENABLE_V4L2_SOURCE)

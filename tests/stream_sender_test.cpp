@@ -3,7 +3,7 @@
 
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
@@ -866,7 +866,7 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
         vstreamer::component_pdu pdu;
         pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
         pdu.port = 0;
-        pdu.sdu = vstreamer::shared_sized_buffer::copy_from(payload.data(), payload.size());
+        pdu.sdu = bfc::shared_sized_buffer::copy_from(payload.data(), payload.size());
         const int rc = sender.input(std::move(pdu));
         if (-EAGAIN == rc)
         {

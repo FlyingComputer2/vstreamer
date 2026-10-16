@@ -1,7 +1,7 @@
 #include "components/h264_encoder_intel.hpp"
 
 #include "core/key_util.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -63,7 +63,7 @@ vstreamer::component_pdu make_nv12_gradient(int w, int h, uint64_t ts_us, int fr
     }
 
     vstreamer::component_pdu pkt = vstreamer::test_pdu::make_nv12(w, h, ts_us);
-    pkt.sdu = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
+    pkt.sdu = bfc::shared_sized_buffer::copy_from(storage.data(), storage.size());
     return pkt;
 }
 

@@ -145,7 +145,7 @@ void rtp_h264_depay::push_au(au_item &&item)
     {
         pdu.flags |= static_cast<uint8_t>(pdu_flag_e::KEY);
     }
-    pdu.sdu = shared_sized_buffer::copy_from(item.buf.data(), item.buf.size());
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(item.buf.data(), item.buf.size());
     if (pdu.sdu.empty() && !item.buf.empty())
     {
         au_dropped++;
@@ -163,7 +163,7 @@ int rtp_h264_depay::input(component_pdu &&in)
         return -EINVAL;
     }
     std::lock_guard<std::mutex> lock(mu);
-    const shared_sized_buffer &feed = in.sdu;
+    const bfc::shared_sized_buffer &feed = in.sdu;
     const uint64_t             rx_ts_us = in.ts_us;
     for (;;)
     {

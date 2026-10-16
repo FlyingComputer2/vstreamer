@@ -19,7 +19,7 @@
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -54,7 +54,7 @@ namespace
     vstreamer::component_pdu pdu;
     pdu.ts_us = 42;
     pdu.sdu_type = vstreamer::sdu_type_e::NV12;
-    pdu.sdu = vstreamer::shared_sized_buffer::copy_from(storage.data(), storage.size());
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(storage.data(), storage.size());
     return pdu;
 }
 
@@ -64,7 +64,7 @@ namespace
     vstreamer::component_pdu pdu;
     pdu.ts_us = 1;
     pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
-    pdu.sdu = vstreamer::shared_sized_buffer::copy_from(&byte, 1);
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(&byte, 1);
     return pdu;
 }
 
@@ -102,7 +102,7 @@ TEST(H264DecoderMppTest, CapsRejectionPdu)
     vstreamer::component_pdu au;
     au.ts_us = 1;
     au.sdu_type = vstreamer::sdu_type_e::H264_AU;
-    au.sdu = vstreamer::shared_sized_buffer::copy_from(&b, 1);
+    au.sdu = bfc::shared_sized_buffer::copy_from(&b, 1);
     EXPECT_EQ(-ENOTSUP, dec.input(std::move(au)));
 
     EXPECT_EQ(0, dec.input(make_coded_caps(320, 240)));

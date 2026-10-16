@@ -191,7 +191,7 @@ int jpeg_decoder_multicore::decode_one(void *dec_v, void *avframe_v, void *pkt_v
     }
 
     size_t nv12_sz = static_cast<size_t>(dw) * static_cast<size_t>(dh) * 3ULL / 2ULL;
-    shared_sized_buffer buf;
+    bfc::shared_sized_buffer buf;
     {
         std::lock_guard<std::mutex> pl(nv12_pool_mu);
         if (!nv12_pool || nv12_pool_bytes != nv12_sz)

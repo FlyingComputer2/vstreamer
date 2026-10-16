@@ -229,7 +229,7 @@ int h264_encoder_intel::drain_packets_locked()
         const size_t sz = static_cast<size_t>(pkt->size);
         std::memcpy(buf, pkt->data, sz);
 
-        shared_sized_buffer payload = shared_sized_buffer::adopt(
+        bfc::shared_sized_buffer payload = bfc::shared_sized_buffer::adopt(
             reinterpret_cast<std::byte *>(buf), sz, sz, [](std::byte *p) {
                 std::free(reinterpret_cast<uint8_t *>(p));
             });

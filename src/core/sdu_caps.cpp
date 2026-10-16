@@ -17,7 +17,7 @@ template <typename T>
     pdu.ts_us = ts_us;
     pdu.sdu_type = caps_type;
     pdu.port = port;
-    pdu.sdu = shared_sized_buffer::copy_from(&caps, sizeof(T));
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(&caps, sizeof(T));
     return pdu;
 }
 

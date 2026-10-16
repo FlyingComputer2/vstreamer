@@ -3,7 +3,7 @@
 #include "core/component_factory.hpp"
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -32,7 +32,7 @@ vstreamer::component_pdu make_nv12_pdu(int w, int h, uint64_t ts_us)
     pdu.ts_us = ts_us;
     pdu.sdu_type = vstreamer::sdu_type_e::NV12;
     pdu.port = 0;
-    pdu.sdu = vstreamer::shared_sized_buffer::copy_from(bytes.data(), bytes.size());
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(bytes.data(), bytes.size());
     return pdu;
 }
 
@@ -103,7 +103,7 @@ TEST(SdlNv12PresenterTest, TryEnqueueEagainWhenQueueFull)
     f.width = 4;
     f.height = 4;
     const size_t sz = 4 * 4 + 8;
-    f.buf = vstreamer::shared_sized_buffer::copy_from(std::vector<uint8_t>(sz, 0).data(), sz);
+    f.buf = bfc::shared_sized_buffer::copy_from(std::vector<uint8_t>(sz, 0).data(), sz);
     ASSERT_EQ(0, present.try_enqueue(f));
     ASSERT_EQ(-EAGAIN, present.try_enqueue(f));
 }
@@ -116,7 +116,7 @@ TEST(SdlNv12PresenterTest, EnqueueDropOldestWhenQueueFull)
     f.width = 4;
     f.height = 4;
     const size_t sz = 4 * 4 + 8;
-    f.buf = vstreamer::shared_sized_buffer::copy_from(std::vector<uint8_t>(sz, 0).data(), sz);
+    f.buf = bfc::shared_sized_buffer::copy_from(std::vector<uint8_t>(sz, 0).data(), sz);
     bool dropped = false;
     ASSERT_EQ(0, present.enqueue_drop(f, &dropped));
     EXPECT_FALSE(dropped);

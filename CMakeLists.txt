@@ -156,8 +156,10 @@ if(CMAKE_CXX_FLAGS MATCHES "fsanitize=address")
     set(VSTREAMER_LSAN_HOOKS vstreamer_lsan_hooks)
     message(STATUS "vstreamer: LeakSanitizer suppressions for SDL/Mesa → cmake/lsan_suppressions.txt")
 endif()
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/BfcFetch.cmake)
 target_include_directories(vstreamer_source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${bfc_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 if(VSTREAMER_LIBS)

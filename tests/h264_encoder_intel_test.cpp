@@ -1,6 +1,6 @@
 #include "components/h264_encoder_intel.hpp"
 
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 

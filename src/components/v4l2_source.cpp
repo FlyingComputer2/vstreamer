@@ -813,7 +813,7 @@ int v4l2_source::dequeue_capture_pdu_locked(component_pdu &out)
                 cap_ns = static_cast<int64_t>(buf.timestamp.tv_sec) * 1000000000LL +
                          static_cast<int64_t>(buf.timestamp.tv_usec) * 1000LL;
             }
-            shared_sized_buffer payload = shared_sized_buffer::adopt(
+            bfc::shared_sized_buffer payload = bfc::shared_sized_buffer::adopt(
                 reinterpret_cast<std::byte *>(tmp), size, size, [](std::byte *p) {
                     std::free(reinterpret_cast<uint8_t *>(p));
                 });
