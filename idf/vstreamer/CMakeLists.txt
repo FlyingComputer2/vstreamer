@@ -15,8 +15,10 @@ include(${VSTREAMER_ROOT}/cmake/vstreamer_sources.cmake)
 if(IDF_TARGET STREQUAL "esp32p4")
     set(ENABLE_H264_ENCODER_ESP32P4 ON)
     set(ENABLE_ESP32P4_CSI_CAMERA_SRC ON)
+    set(ENABLE_ESP32_H264_ISP_SRC ON)
     list(APPEND VSTREAMER_SOURCES src/components/h264_encoder_esp32p4.cpp
-                                  src/components/esp32p4_csi_camera_src.cpp)
+                                  src/components/esp32p4_csi_camera_src.cpp
+                                  src/components/esp32_h264_isp_src.cpp)
 endif()
 list(TRANSFORM VSTREAMER_SOURCES PREPEND ${VSTREAMER_ROOT}/)
 

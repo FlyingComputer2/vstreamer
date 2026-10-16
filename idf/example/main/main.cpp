@@ -16,7 +16,7 @@
 // sensor in sdkconfig for a few seconds, reports fps and dumps the first second as a clip.
 // Skipped when no sensor answers on SCCB.
 //
-// 4. Live TX (CONFIG_VSTREAMER_IDF_LIVE_TX): camera -> encoder -> rtp_h264_pay -> stream_sender
+// 4. Live TX (CONFIG_VSTREAMER_IDF_LIVE_TX): h264_isp_src -> rtp_h264_pay -> stream_sender
 //    to CONFIG_VSTREAMER_RX_PEER over Ethernet (DHCP). Skips tests 1–3.
 
 #include "ethernet_init.hpp"
@@ -540,14 +540,12 @@ int run_camera_stream()
     const int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
     const bool  run_forever = (0 == k_seconds);
 
-    auto cam = vstreamer::component_factory::create_source("csi_camera");
-    auto enc = vstreamer::component_factory::create_coder("h264_encoder");
+    auto src = vstreamer::component_factory::create_source("h264_isp_src");
     auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
     auto snd = vstreamer::component_factory::create_sink("stream_sender");
-    auto *enc_c = dynamic_cast<vstreamer::component_coder *>(enc.get());
     auto *pay_c = dynamic_cast<vstreamer::component_coder *>(pay.get());
     auto *snd_s = dynamic_cast<vstreamer::component_sink *>(snd.get());
-    if (!cam || !enc_c || !pay_c || !snd_s)
+    if (!src || !pay_c || !snd_s)
     {
         std::printf("live TX: missing component\n");
         return -1;
@@ -559,9 +557,13 @@ int run_camera_stream()
     {
         esp_pm_lock_acquire(pm_lock);
     }
-    (void)cam->configure("buffers", "6");
-    (void)cam->configure("fps", "30");
-    const int cr = cam->open();
+    (void)src->configure("buffers", "6");
+    (void)src->configure("fps", "30");
+    (void)src->configure("bitrate", "4000000");
+    (void)src->configure("gop", "30");
+    (void)src->configure("qp_min", "38");
+    (void)src->configure("qp_max", "51");
+    const int cr = src->open();
     if (-ENODEV == cr)
     {
         std::printf("live TX SKIPPED (no sensor)\n");
@@ -574,13 +576,7 @@ int run_camera_stream()
     }
 
     std::string size;
-    cam->query("size", &size);
-    enc->configure("size", size);
-    enc->configure("bitrate", "4000000");
-    enc->configure("gop", "30");
-    enc->configure("fps", "30");
-    enc->configure("qp_min", "38");
-    enc->configure("qp_max", "51");
+    src->query("size", &size);
     pay->configure("fps", "30");
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
@@ -591,7 +587,7 @@ int run_camera_stream()
     /* Direct LAN e2e: raw RTP in stream PDUs (no RS block FEC). */
     snd->configure("fec", "none");
 
-    if (enc->open() < 0 || pay->open() < 0 || snd->open() < 0)
+    if (pay->open() < 0 || snd->open() < 0)
     {
         std::printf("live TX open failed\n");
         return -1;
@@ -600,13 +596,13 @@ int run_camera_stream()
 
     if (run_forever)
     {
-        std::printf("live TX streaming %s until reset (size %s)\n", CONFIG_VSTREAMER_RX_PEER,
-                    size.c_str());
+        std::printf("live TX streaming %s until reset (size %s, h264_isp_src)\n",
+                    CONFIG_VSTREAMER_RX_PEER, size.c_str());
     }
     else
     {
-        std::printf("live TX streaming %s for %d s (size %s)\n", CONFIG_VSTREAMER_RX_PEER,
-                    k_seconds, size.c_str());
+        std::printf("live TX streaming %s for %d s (size %s, h264_isp_src)\n",
+                    CONFIG_VSTREAMER_RX_PEER, k_seconds, size.c_str());
     }
     std::fflush(stdout);
 
@@ -615,135 +611,59 @@ int run_camera_stream()
     std::atomic<uint64_t> bytes {0};
     std::atomic<int64_t>  t0_us {0};
     std::atomic<bool>     stop {false};
-    std::mutex            q_mu;
-    std::condition_variable q_cv;
-    std::deque<vstreamer::component_pdu> q;
-    /* Two frames: minimal latency while absorbing one capture/encode skew. */
-    constexpr size_t k_q_max = 2;
 
     const int64_t deadline =
         run_forever ? INT64_MAX : esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
     const int64_t stop_at =
         run_forever ? INT64_MAX : esp_timer_get_time() + k_seconds * 1000000LL;
     int64_t       last_stats_us = esp_timer_get_time();
-    auto encode_pdu = [&](vstreamer::component_pdu &&in) -> bool {
-        drain_encoder_chain(enc_c, pay_c, snd_s);
-        for (;;)
-        {
-            const int r = enc_c->input(std::move(in));
-            if (0 == r)
-            {
-                break;
-            }
-            if (-EAGAIN != r)
-            {
-                std::printf("encode failed: %d\n", r);
-                return false;
-            }
-            drain_encoder_chain(enc_c, pay_c, snd_s);
-            live_tx_yield();
-        }
-        vstreamer::component_pdu out;
-        while (enc_c->output(out) == 0)
-        {
-            size_t au_bytes = 0;
-            bool   key = false;
-            if (!forward_coded_output(pay_c, snd_s, std::move(out), &au_bytes, &key, &frames,
-                                      &bytes, &keys))
-            {
-                return false;
-            }
-        }
-        return true;
-    };
 
-    auto *csi_cam = static_cast<vstreamer::esp32p4_csi_camera_src *>(cam.get());
-    auto capture_fn = [&]() {
+    auto tx_fn = [&]() {
         while (!stop.load(std::memory_order_acquire))
         {
-            vstreamer::component_pdu in;
-            /* Block on vs_csi_cam's out_cv_ instead of polling output() + vTaskDelay(1)
-             * (~1 kHz mutex wakeups when idle, and live_tx_yield() spun at 100% CPU). */
-            const int pull_r =
-                csi_cam != nullptr ? csi_cam->wait_output(in, 100) : cam->output(in);
-            if (pull_r != 0)
+            vstreamer::component_pdu out;
+            const int              r = src->output(out);
+            if (-EAGAIN == r)
             {
                 continue;
             }
-            if (in.sdu_type != vstreamer::sdu_type_e::CAPS_VIDEO_RAW &&
-                in.sdu_type != vstreamer::sdu_type_e::O_UYY_E_VYY)
+            if (r < 0)
             {
                 continue;
             }
-            if (in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY &&
+            if (out.sdu_type == vstreamer::sdu_type_e::H264_AU &&
                 0 == t0_us.load(std::memory_order_relaxed))
             {
                 t0_us.store(esp_timer_get_time(), std::memory_order_relaxed);
             }
-            {
-                std::lock_guard<std::mutex> lock(q_mu);
-                if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW)
-                {
-                    q.push_front(std::move(in));
-                }
-                else
-                {
-                    if (q.size() >= k_q_max)
-                    {
-                        q.pop_front();
-                    }
-                    q.push_back(std::move(in));
-                }
-            }
-            q_cv.notify_one();
-        }
-    };
-
-    auto encode_fn = [&]() {
-        while (!stop.load(std::memory_order_acquire))
-        {
-            vstreamer::component_pdu in;
-            {
-                std::unique_lock<std::mutex> lock(q_mu);
-                q_cv.wait_for(lock, std::chrono::milliseconds(50),
-                              [&] { return stop.load(std::memory_order_acquire) || !q.empty(); });
-                if (q.empty())
-                {
-                    continue;
-                }
-                in = std::move(q.front());
-                q.pop_front();
-            }
-            if (!encode_pdu(std::move(in)))
+            size_t au_bytes = 0;
+            bool   key = false;
+            if (!forward_coded_output(pay_c, snd_s, std::move(out), &au_bytes, &key, &frames,
+                                      &bytes, &keys))
             {
                 stop.store(true, std::memory_order_release);
             }
         }
     };
 
-    auto capture_thread = vstreamer::spawn_thread(
-        vstreamer::thread_opts {"vs_cap_pull", 12 * 1024, 0, 10}, capture_fn);
-    auto encode_thread = vstreamer::spawn_thread(
-        vstreamer::thread_opts {"vs_enc_tx", 20 * 1024, 1, 11}, encode_fn);
+    auto tx_thread =
+        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_isp_tx", 16 * 1024, 1, 11}, tx_fn);
 
     while (!stop.load(std::memory_order_acquire) && esp_timer_get_time() < deadline)
     {
         if (esp_timer_get_time() - last_stats_us >= 10 * 1000000LL)
         {
             last_stats_us = esp_timer_get_time();
-            std::string cam_stats;
-            std::string enc_stats;
+            std::string isp_stats;
             std::string snd_stats;
-            cam->query("stats", &cam_stats);
-            enc->query("stats", &enc_stats);
+            src->query("stats", &isp_stats);
             snd->query("stats", &snd_stats);
-            const int64_t t0 = t0_us.load(std::memory_order_relaxed);
-            const double  sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
+            const int64_t  t0 = t0_us.load(std::memory_order_relaxed);
+            const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
             const uint64_t f = frames.load(std::memory_order_relaxed);
             const uint64_t b = bytes.load(std::memory_order_relaxed);
-            std::printf("live TX %.1f fps %.0f kbps; cam %s; enc %s; snd %s\n",
-                        sec > 0 ? f / sec : 0.0, sec > 0 ? b * 8 / sec / 1000 : 0.0,
-                        cam_stats.c_str(), enc_stats.c_str(), snd_stats.c_str());
+            std::printf("live TX %.1f fps %.0f kbps; isp %s; snd %s\n", sec > 0 ? f / sec : 0.0,
+                        sec > 0 ? b * 8 / sec / 1000 : 0.0, isp_stats.c_str(), snd_stats.c_str());
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
             esp_timer_get_time() >= stop_at)
@@ -754,29 +674,24 @@ int run_camera_stream()
     }
 
     stop.store(true, std::memory_order_release);
-    q_cv.notify_all();
-    capture_thread.join();
-    encode_thread.join();
+    src->close();
+    tx_thread.join();
 
-    drain_encoder_chain(enc_c, pay_c, snd_s);
+    drain_pay_to_sender(pay_c, snd_s);
     const int64_t  t0 = t0_us.load(std::memory_order_relaxed);
     const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
     const uint64_t f = frames.load(std::memory_order_relaxed);
     const uint64_t k = keys.load(std::memory_order_relaxed);
     const uint64_t b = bytes.load(std::memory_order_relaxed);
-    std::string    cam_stats;
-    std::string    enc_stats;
+    std::string    isp_stats;
     std::string    snd_stats;
-    cam->query("stats", &cam_stats);
-    enc->query("stats", &enc_stats);
+    src->query("stats", &isp_stats);
     snd->query("stats", &snd_stats);
-    std::printf("live TX done: %" PRIu64 " AUs, %" PRIu64 " IDR, %.1f fps, %.0f kbps; cam %s; enc %s; snd %s\n",
+    std::printf("live TX done: %" PRIu64 " AUs, %" PRIu64 " IDR, %.1f fps, %.0f kbps; isp %s; snd %s\n",
                 f, k, sec > 0 ? f / sec : 0.0, sec > 0 ? b * 8 / sec / 1000 : 0.0,
-                cam_stats.c_str(), enc_stats.c_str(), snd_stats.c_str());
+                isp_stats.c_str(), snd_stats.c_str());
     snd->close();
     pay->close();
-    enc->close();
-    cam->close();
     if (nullptr != pm_lock)
     {
         esp_pm_lock_release(pm_lock);
