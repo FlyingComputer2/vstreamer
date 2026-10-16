@@ -1,6 +1,7 @@
 #include "components/esp32p4_csi_camera_src.hpp"
 
 #include "core/key_util.hpp"
+#include "core/latency_query.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
@@ -16,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -81,6 +83,7 @@ constexpr int k_min_bufs = 2;
 constexpr int k_max_bufs = 8;
 /* Bounds the capture thread's DQBUF so stop is seen while frames are held downstream. */
 constexpr int k_dqbuf_timeout_ms = 100;
+constexpr auto k_dqbuf_error_backoff = std::chrono::milliseconds(10);
 /* How long close() waits for frames still downstream before it frees the driver buffers. */
 constexpr auto k_release_wait = std::chrono::seconds(1);
 
@@ -480,8 +483,12 @@ void esp32p4_csi_camera_src::capture_main()
         {
             if (ETIMEDOUT != errno)
             {
-                std::lock_guard<std::mutex> lock(mu);
-                ++dqbuf_errors_;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    ++dqbuf_errors_;
+                }
+                /* A driver in an error state fails at once: do not spin core 0. */
+                std::this_thread::sleep_for(k_dqbuf_error_backoff);
             }
             continue;
         }
@@ -542,9 +549,14 @@ void esp32p4_csi_camera_src::capture_main()
         notify_wakeup();
         out_cv_.notify_one();
 #if defined(ESP_PLATFORM)
-        if (nullptr != wake_task_)
         {
-            xTaskNotifyGive(static_cast<TaskHandle_t>(wake_task_));
+            /* Under mu: set_wake_task(nullptr) runs on the woken task before it exits, so the
+             * handle is alive for as long as it is set. */
+            std::lock_guard<std::mutex> lock(mu);
+            if (nullptr != wake_task_)
+            {
+                xTaskNotifyGive(static_cast<TaskHandle_t>(wake_task_));
+            }
         }
 #endif
     }
@@ -645,6 +657,7 @@ int esp32p4_csi_camera_src::try_pop_output_locked(component_pdu &out)
     out = std::move(ready_q_.front());
     ready_q_.pop_front();
     out.seq = out_seq_++;
+    latency_store(latency_ms_, steady_mono_ns(), static_cast<int64_t>(out.ts_us) * 1000);
     return 0;
 }
 
@@ -660,6 +673,7 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
     {
         timeout_ms = 0;
     }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     std::unique_lock<std::mutex> lock(mu);
     for (;;)
     {
@@ -676,21 +690,23 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
         {
             return -EBADF;
         }
-        if (0 == timeout_ms)
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
         {
             return -EAGAIN;
         }
 #if defined(ESP_PLATFORM)
         if (nullptr != wake_task_)
         {
+            /* Whatever is left of timeout_ms, so a stalled sensor still returns -EAGAIN. */
+            const auto left_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count() + 1;
             lock.unlock();
-            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(timeout_ms));
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(left_ms));
             lock.lock();
             continue;
         }
 #endif
-        const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         out_cv_.wait_until(lock, deadline, [this] {
             return !ready_q_.empty() || !source_open ||
                    stop_.load(std::memory_order_acquire);
@@ -771,6 +787,10 @@ int esp32p4_csi_camera_src::query(std::string_view key, std::string *value) cons
         return r;
     }
 
+    if (const int lr = latency_query(key, latency_ms_, latency_ms_, value); -ENOTSUP != lr)
+    {
+        return lr;
+    }
     std::lock_guard<std::mutex> lock(mu);
     if (key == "state" || key == "status")
     {

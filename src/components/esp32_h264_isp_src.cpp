@@ -4,6 +4,8 @@
 #include "components/h264_encoder_esp32p4.hpp"
 
 #include "core/key_util.hpp"
+#include "core/latency_query.hpp"
+#include "core/time_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_type.hpp"
 #include "core/thread_spawn.hpp"
@@ -17,6 +19,7 @@
 #include <cerrno>
 #include <cinttypes>
 #include <cstdio>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -60,36 +63,14 @@ std::string esp32_h264_isp_src::name() const
     return "esp32_h264_isp_src";
 }
 
-void esp32_h264_isp_src::set_live_tx_hooks(coded_sink_fn sink, wire_drain_fn drain)
-{
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
-    {
-        return;
-    }
-    coded_sink_ = std::move(sink);
-    wire_drain_ = std::move(drain);
-}
-
 void esp32_h264_isp_src::drain_encoder_output()
 {
     component_pdu out;
     while (enc_->output(out) == 0)
     {
-        if (coded_sink_)
-        {
-            if (!coded_sink_(std::move(out)))
-            {
-                stop_.store(true, std::memory_order_release);
-                return;
-            }
-            continue;
-        }
         std::lock_guard<std::mutex> lock(mu);
-        if (out_q_.size() >= k_out_q_max)
-        {
-            out_q_.pop_front();
-        }
+        /* Never drop a coded AU (the next P frames reference it); encode_main keeps the backlog
+         * at k_coded_backlog_max, far below this. */
         out_q_.push_back(std::move(out));
         out_cv_.notify_all();
         notify_wakeup();
@@ -118,15 +99,6 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
             return r;
         }
         notify_wakeup();
-        if (wire_drain_)
-        {
-            wire_drain_();
-        }
-        if (coded_sink_)
-        {
-            vTaskDelay(1);
-            continue;
-        }
         std::unique_lock<std::mutex> lock(mu);
         out_cv_.wait_for(lock, std::chrono::milliseconds(1),
                          [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
@@ -136,6 +108,8 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
 
 void esp32_h264_isp_src::encode_main()
 {
+    /* The camera wakes this task with a notification instead of its condition variable. */
+    cam_->set_wake_task(xTaskGetCurrentTaskHandle());
     while (!stop_.load(std::memory_order_acquire))
     {
         const int64_t t_wait0 = esp_timer_get_time();
@@ -152,7 +126,7 @@ void esp32_h264_isp_src::encode_main()
         }
         wait_sum_us_ += t_wait1 - t_wait0;
         ++wait_samples_;
-        if (in.sdu_type == sdu_type_e::O_UYY_E_VYY && !coded_sink_)
+        if (in.sdu_type == sdu_type_e::O_UYY_E_VYY)
         {
             std::lock_guard<std::mutex> lock(mu);
             if (out_q_.size() >= k_coded_backlog_max)
@@ -190,6 +164,8 @@ void esp32_h264_isp_src::encode_main()
             last_wall_us_ = t_done;
         }
     }
+    /* Before this task is gone: the camera notifies it under its lock while it is set. */
+    cam_->set_wake_task(nullptr);
 }
 
 int esp32_h264_isp_src::open()
@@ -202,11 +178,28 @@ int esp32_h264_isp_src::open()
         }
     }
 
+    int qmin = 0;
+    int qmax = 0;
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%d", buffers);
-    (void)cam_->configure("buffers", buf);
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (qp_min > qp_max)
+        {
+            return -EINVAL;
+        }
+        qmin = qp_min;
+        qmax = qp_max;
+        std::snprintf(buf, sizeof(buf), "%d", buffers);
+    }
+    if (cam_->configure("buffers", buf) < 0)
+    {
+        return -EINVAL;
+    }
     std::snprintf(buf, sizeof(buf), "%d", fps);
-    (void)cam_->configure("fps", buf);
+    if (cam_->configure("fps", buf) < 0)
+    {
+        return -EINVAL;
+    }
 
     const int cr = cam_->open();
     if (cr < 0)
@@ -214,19 +207,26 @@ int esp32_h264_isp_src::open()
         return cr;
     }
 
+    /* Each key must take: a rejected one would leave the encoder at its own default. qp_min goes
+     * to 0 first so that the qp_max/qp_min pair never crosses the encoder's current range. */
     std::string size;
     cam_->query("size", &size);
-    enc_->configure("size", size);
-    std::snprintf(buf, sizeof(buf), "%" PRIu32, bitrate);
-    enc_->configure("bitrate", buf);
-    std::snprintf(buf, sizeof(buf), "%d", gop);
-    enc_->configure("gop", buf);
-    std::snprintf(buf, sizeof(buf), "%d", fps);
-    enc_->configure("fps", buf);
-    std::snprintf(buf, sizeof(buf), "%d", qp_min);
-    enc_->configure("qp_min", buf);
-    std::snprintf(buf, sizeof(buf), "%d", qp_max);
-    enc_->configure("qp_max", buf);
+    const auto num = [](int64_t v) { return std::to_string(v); };
+    const std::pair<const char *, std::string> enc_cfg[] = {
+        {"size", size},          {"bitrate", num(bitrate)}, {"gop", num(gop)},
+        {"fps", num(fps)},       {"qp_min", "0"},           {"qp_max", num(qmax)},
+        {"qp_min", num(qmin)},
+    };
+    for (const auto &[key, value] : enc_cfg)
+    {
+        if (enc_->configure(key, value) < 0)
+        {
+            std::fprintf(stderr, "esp32_h264_isp_src: encoder rejected %s=%s\n", key,
+                         value.c_str());
+            cam_->close();
+            return -EINVAL;
+        }
+    }
 
     if (enc_->open() < 0)
     {
@@ -241,11 +241,6 @@ int esp32_h264_isp_src::open()
         std::lock_guard<std::mutex> lock(mu);
         encode_thread_ = std::move(enc_thread);
         opened = true;
-    }
-    vTaskDelay(pdMS_TO_TICKS(5));
-    if (TaskHandle_t enc_task = xTaskGetHandle("vs_isp_enc"); nullptr != enc_task)
-    {
-        cam_->set_wake_task(enc_task);
     }
     return 0;
 }
@@ -269,8 +264,6 @@ void esp32_h264_isp_src::close()
         cam_->close();
     }
     out_q_.clear();
-    coded_sink_ = nullptr;
-    wire_drain_ = nullptr;
     opened = false;
     stop_.store(false, std::memory_order_release);
 }
@@ -293,6 +286,10 @@ int esp32_h264_isp_src::output(component_pdu &out)
     }
     out = std::move(out_q_.front());
     out_q_.pop_front();
+    if (out.sdu_type == sdu_type_e::H264_AU)
+    {
+        latency_store(latency_ms_, steady_mono_ns(), static_cast<int64_t>(out.ts_us) * 1000);
+    }
     return 0;
 }
 
@@ -316,7 +313,8 @@ int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
     if (key == "gop")
     {
         int64_t n = 0;
-        if (key_parse_i64(value, &n) < 0 || n < 1 || n > 300)
+        /* esp_h264 stores the GOP in 8 bits. */
+        if (key_parse_i64(value, &n) < 0 || n < 1 || n > 255)
         {
             return -EINVAL;
         }
@@ -376,6 +374,10 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
     if (0 == r || -EINVAL == r)
     {
         return r;
+    }
+    if (const int lr = latency_query(key, latency_ms_, latency_ms_, value); -ENOTSUP != lr)
+    {
+        return lr;
     }
     if (key == "status")
     {

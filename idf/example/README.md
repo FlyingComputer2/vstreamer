@@ -12,7 +12,14 @@ cd idf/example
 idf.py set-target esp32p4 build flash monitor
 ```
 
-With `CONFIG_VSTREAMER_IDF_LIVE_TX=y` (default in `sdkconfig.defaults`):
+That build runs the smoke tests (loopback pipeline, encoder, camera → encoder). For live TX,
+layer `sdkconfig.live_tx` on top (delete `sdkconfig` first when switching):
+
+```bash
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.live_tx" build flash monitor
+```
+
+With `CONFIG_VSTREAMER_IDF_LIVE_TX=y`:
 
 - DHCP on Ethernet (IP101 PHY)
 - `csi_camera` → `h264_encoder` → `rtp_h264_pay` → `stream_sender`

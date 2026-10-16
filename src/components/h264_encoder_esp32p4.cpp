@@ -1,6 +1,8 @@
 #include "components/h264_encoder_esp32p4.hpp"
 
 #include "core/key_util.hpp"
+#include "core/latency_query.hpp"
+#include "core/time_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_type.hpp"
 #include <bfc/shared_sized_buffer.hpp>
@@ -36,6 +38,7 @@ constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
 /* A 1080p frame at qp 10 overflowed 768 KiB; a larger frame is dropped and the next is an IDR. */
 constexpr uint32_t k_max_bitstream_bytes = 1024U * 1024U;
+/* AUs downstream (pay, sender) hold slots; a slot short means an encode waits. */
 constexpr size_t   k_out_slot_count = 6;
 /* Buffered bits are repaid over this long; the buffer is clamped to [-0.5, +1] s of bitrate. */
 constexpr double k_rc_repay_s = 0.5;
@@ -169,30 +172,6 @@ int h264_encoder_esp32p4::codec_open_locked()
         return -EIO;
     }
 
-    const uint32_t want_out =
-        std::min(static_cast<uint32_t>(2 * frame_bytes(width, height)), k_max_bitstream_bytes);
-    for (size_t i = 0; i < k_out_slot_count; ++i)
-    {
-        uint32_t actual = 0;
-        uint8_t *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out,
-                                                                       &actual, ESP_H264_MEM_INTERNAL));
-        if (nullptr == out)
-        {
-            out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual,
-                                                                 ESP_H264_MEM_SPIRAM));
-        }
-        if (nullptr == out)
-        {
-            codec_close_locked();
-            esp_h264_enc_close(enc);
-            esp_h264_enc_del(enc);
-            return -ENOMEM;
-        }
-        out_slots_[i].buf = out;
-        out_slots_[i].cap = actual;
-        out_slots_[i].free = true;
-    }
-
     if (frame_rc)
     {
         esp_h264_enc_roi_cfg_t roi {};
@@ -208,6 +187,29 @@ int h264_encoder_esp32p4::codec_open_locked()
         rc_buf_bits_ = 0;
         rc_p_bits_ = 0;
     }
+
+    /* PSRAM: internal RAM is kept for DMA, stacks and the network stack. */
+    const uint32_t want_out =
+        std::min(static_cast<uint32_t>(2 * frame_bytes(width, height)), k_max_bitstream_bytes);
+    auto pool = std::make_shared<slot_pool>();
+    pool->slots.resize(k_out_slot_count);
+    for (auto &slot : pool->slots)
+    {
+        uint32_t actual = 0;
+        slot.buf = static_cast<uint8_t *>(
+            esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual, ESP_H264_MEM_SPIRAM));
+        if (nullptr == slot.buf)
+        {
+            pool->retire();
+            esp_h264_enc_close(enc);
+            esp_h264_enc_del(enc);
+            return -ENOMEM;
+        }
+        slot.cap = actual;
+    }
+    pool->wake = [this] { notify_wakeup(); };
+    pool_ = std::move(pool);
+
     enc_ = enc;
     param_ = param;
     live_w_ = width;
@@ -227,37 +229,75 @@ void h264_encoder_esp32p4::codec_close_locked()
         enc_ = nullptr;
         param_ = nullptr;
     }
-    for (out_slot &slot : out_slots_)
+    if (pool_)
     {
-        if (nullptr != slot.buf)
-        {
-            esp_h264_free(slot.buf);
-            slot.buf = nullptr;
-            slot.cap = 0;
-            slot.free = true;
-        }
+        pool_->retire();
+        pool_.reset();
     }
     live_w_ = 0;
     live_h_ = 0;
 }
 
-void h264_encoder_esp32p4::release_out_slot(size_t index)
+h264_encoder_esp32p4::slot_pool::~slot_pool()
+{
+    for (const slot &s : slots)
+    {
+        if (nullptr != s.buf)
+        {
+            esp_h264_free(s.buf);
+        }
+    }
+}
+
+void h264_encoder_esp32p4::slot_pool::release(size_t index)
 {
     std::lock_guard<std::mutex> lock(mu);
-    if (index < out_slots_.size())
+    if (index >= slots.size())
     {
-        out_slots_[index].free = true;
-        notify_wakeup();
+        return;
+    }
+    if (retired)
+    {
+        esp_h264_free(slots[index].buf);
+        slots[index].buf = nullptr;
+        return;
+    }
+    slots[index].free = true;
+    /* Under mu: retire() clears wake under it too, so the encoder cannot be gone mid-call. */
+    if (wake)
+    {
+        wake();
+    }
+}
+
+void h264_encoder_esp32p4::slot_pool::retire()
+{
+    std::lock_guard<std::mutex> lock(mu);
+    retired = true;
+    wake = nullptr;
+    for (slot &s : slots)
+    {
+        if (s.free && nullptr != s.buf)
+        {
+            esp_h264_free(s.buf);
+            s.buf = nullptr;
+        }
     }
 }
 
 int h264_encoder_esp32p4::acquire_out_slot_locked(size_t *index)
 {
-    for (size_t i = 0; i < out_slots_.size(); ++i)
+    if (!pool_)
     {
-        if (out_slots_[i].free && nullptr != out_slots_[i].buf)
+        return -EBADF;
+    }
+    std::lock_guard<std::mutex> lock(pool_->mu);
+    for (size_t i = 0; i < pool_->slots.size(); ++i)
+    {
+        auto &slot = pool_->slots[i];
+        if (slot.free && nullptr != slot.buf)
         {
-            out_slots_[i].free = false;
+            slot.free = false;
             *index = i;
             return 0;
         }
@@ -283,14 +323,19 @@ int h264_encoder_esp32p4::open()
 
 void h264_encoder_esp32p4::close()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    codec_close_locked();
-    out_q_.clear();
-    have_input_caps_ = false;
-    caps_reject_ = false;
-    caps_out_ = video_coded_caps {};
-    opened = false;
-    reopen_req = false;
+    std::deque<component_pdu> queued;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        codec_close_locked();
+        queued.swap(out_q_);
+        have_input_caps_ = false;
+        caps_reject_ = false;
+        caps_out_ = video_coded_caps {};
+        opened = false;
+        reopen_req = false;
+    }
+    /* Releasing an AU frees its slot through the retired pool; done outside mu all the same. */
+    queued.clear();
 }
 
 int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
@@ -374,7 +419,10 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     {
         return -EAGAIN;
     }
-    out_slot &slot = out_slots_[out_index];
+    /* The slot is ours until released: buf and cap do not change while it is not free. */
+    const std::shared_ptr<slot_pool> pool = pool_;
+    uint8_t *const                   slot_buf = pool->slots[out_index].buf;
+    const uint32_t                   slot_cap = pool->slots[out_index].cap;
 
     auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
     if (pending_idr)
@@ -397,15 +445,15 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     in_frame.raw_data.len = static_cast<uint32_t>(in.sdu.size());
     in_frame.pts = static_cast<uint32_t>(in.ts_us / 1000);
     esp_h264_enc_out_frame_t out_frame {};
-    out_frame.raw_data.buffer = slot.buf;
-    out_frame.raw_data.len = slot.cap;
+    out_frame.raw_data.buffer = slot_buf;
+    out_frame.raw_data.len = slot_cap;
 
     const int64_t t0 = esp_timer_get_time();
     const esp_h264_err_t err = esp_h264_enc_process(enc, &in_frame, &out_frame);
     const int64_t dt = esp_timer_get_time() - t0;
-    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > slot.cap)
+    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > slot_cap)
     {
-        slot.free = true;
+        pool->release(out_index);
         ++encode_errors_;
         /* Decoders never saw this frame, so the next one must not reference it. */
         pending_idr = true;
@@ -432,13 +480,20 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     }
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
     au.sdu = bfc::shared_sized_buffer::adopt(
-        reinterpret_cast<std::byte *>(slot.buf), slot.cap, out_frame.length,
-        [this, out_index](std::byte *) { release_out_slot(out_index); });
+        reinterpret_cast<std::byte *>(slot_buf), slot_cap, out_frame.length,
+        [pool, out_index](std::byte *) { pool->release(out_index); });
     if (au.sdu.empty())
     {
-        slot.free = true;
+        pool->release(out_index);
         return -ENOMEM;
     }
+    const int64_t now_ns = steady_mono_ns();
+    latency_store(latency_ms_, now_ns, static_cast<int64_t>(in.ts_us) * 1000);
+    if (entry_ts_us_ == in.ts_us && 0 != entry_ns_)
+    {
+        latency_store(node_latency_ms_, now_ns, entry_ns_);
+    }
+    entry_ns_ = 0;
     out_q_.push_back(std::move(au));
     ++frames_;
     if (idr)
@@ -471,6 +526,11 @@ int h264_encoder_esp32p4::input(component_pdu &&in)
     if (caps_reject_ || !have_input_caps_)
     {
         return -ENOTSUP;
+    }
+    if (in.ts_us != entry_ts_us_ || 0 == entry_ns_)
+    {
+        entry_ts_us_ = in.ts_us;
+        entry_ns_ = steady_mono_ns();
     }
     return encode_locked(in);
 }
@@ -587,7 +647,7 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
             return -EINVAL;
         }
         const bool f = value == "frame";
-        reopen_req = opened && f != frame_rc;
+        reopen_req = reopen_req || (opened && f != frame_rc);
         frame_rc = f;
         return 0;
     }
@@ -673,6 +733,10 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
                       max_encode_us_ / 1000.0);
         *value = buf;
         return 0;
+    }
+    if (const int r = latency_query(key, latency_ms_, node_latency_ms_, value); -ENOTSUP != r)
+    {
+        return r;
     }
     if (key == "stats")
     {

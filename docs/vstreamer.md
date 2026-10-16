@@ -464,6 +464,11 @@ Latency metrics come in two kinds. Each app half publishes only its own keys.
 | `dec` | `h264_decoder` | first input attempt → NV12 out |
 | `present` | `sdl_sink` | sink input → present done |
 
+On the ESP32-P4, `esp32p4_csi_camera_src`, `h264_encoder_esp32p4` and `esp32_h264_isp_src`
+answer `latency_ms` and `node_latency_ms` as component queries (`-ENODATA` until the first frame).
+For the two sources the entry is the capture (V4L2 DQBUF), so both keys are the same value; the
+encoder's node runs from the first `input()` attempt to the AU out.
+
 Entry is the first `input()` attempt, so time spent retrying on `-EAGAIN` (backpressure) counts
 toward the node. On the TX side `encoder_queue` ends where `enc` starts, so the two add up to the
 time from JPEG output to encoded AU. JPEG decoder, encoder and decoder hold several frames at

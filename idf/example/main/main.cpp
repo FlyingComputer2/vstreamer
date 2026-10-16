@@ -288,91 +288,6 @@ int encoder_runtime_checks()
     return caps_ok && au_ok ? 0 : -1;
 }
 
-/* Pure esp_h264 HW process time on internal vs PSRAM YUV (live TX QP/GOP). */
-void bench_h264_yuv_ram_compare()
-{
-    constexpr int w = 1920;
-    constexpr int h = 1080;
-    constexpr int k_frames = 45;
-    const size_t  frame_bytes = static_cast<size_t>(w) * h * 3 / 2;
-
-    auto run_on = [&](int caps, const char *label) {
-        uint8_t *mem = static_cast<uint8_t *>(
-            heap_caps_aligned_alloc(64, frame_bytes, caps | MALLOC_CAP_CACHE_ALIGNED));
-        if (nullptr == mem)
-        {
-            std::printf("bench h264 %s: alloc failed\n", label);
-            return;
-        }
-        std::memset(mem, 0x80, frame_bytes);
-
-        auto enc = vstreamer::component_factory::create_coder("h264_encoder");
-        if (!enc)
-        {
-            heap_caps_free(mem);
-            return;
-        }
-        enc->configure("size", "1920x1080");
-        enc->configure("gop", "30");
-        enc->configure("qp_min", "20");
-        enc->configure("qp_max", "51");
-        if (enc->open() < 0)
-        {
-            std::printf("bench h264 %s: open failed\n", label);
-            heap_caps_free(mem);
-            return;
-        }
-        vstreamer::video_raw_caps caps_pdu {};
-        caps_pdu.width = w;
-        caps_pdu.height = h;
-        caps_pdu.fps_num = 30;
-        caps_pdu.fps_den = 1;
-        (void)enc->input(vstreamer::make_caps_pdu(vstreamer::sdu_type_e::CAPS_VIDEO_RAW, caps_pdu,
-                                                  0, 0));
-
-        for (int i = 0; i < k_frames; ++i)
-        {
-            if (0 != (caps & MALLOC_CAP_SPIRAM))
-            {
-                constexpr size_t align = 64U;
-                const uintptr_t  base = reinterpret_cast<uintptr_t>(mem);
-                const uintptr_t  start = base & ~(align - 1U);
-                uintptr_t        end = base + frame_bytes;
-                end = (end + align - 1U) & ~(align - 1U);
-                if (end > start)
-                {
-                    (void)esp_cache_msync(reinterpret_cast<void *>(start), end - start,
-                                          ESP_CACHE_MSYNC_FLAG_DIR_C2M);
-                }
-            }
-            vstreamer::component_pdu in;
-            in.ts_us = static_cast<uint64_t>(i) * 33333;
-            in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
-            in.sdu = bfc::shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(mem),
-                                                     frame_bytes, frame_bytes,
-                                                     [](std::byte *) {});
-            const int r = enc->input(std::move(in));
-            if (r < 0)
-            {
-                std::printf("bench h264 %s: encode %d failed: %d\n", label, i, r);
-                break;
-            }
-            vstreamer::component_pdu out;
-            while (enc->output(out) == 0)
-            {
-            }
-        }
-        std::string stats;
-        enc->query("stats", &stats);
-        std::printf("bench h264 %s: %s\n", label, stats.c_str());
-        enc->close();
-        heap_caps_free(mem);
-    };
-
-    run_on(MALLOC_CAP_INTERNAL, "internal");
-    run_on(MALLOC_CAP_SPIRAM, "psram");
-}
-
 int run_encoder()
 {
     print_heap("encoder start");
@@ -403,6 +318,9 @@ int run_camera()
 {
     constexpr int     k_seconds = 5;
     constexpr int     k_clip_frames = 30;
+    /* Printed base64 over the console UART; a noisy 1080p scene codes at ~100 KB a frame until
+     * rate control settles. */
+    constexpr size_t  k_clip_max_bytes = 256 * 1024;
     auto              cam = vstreamer::component_factory::create_source("csi_camera");
     auto              enc = vstreamer::component_factory::create_coder("h264_encoder");
     if (!cam || !enc)
@@ -436,6 +354,7 @@ int run_camera()
     int           clip_frames = 0;
     size_t        bytes = 0;
     std::string   clip;
+    clip.reserve(k_clip_max_bytes);
     int64_t       t0 = 0;
     const int64_t deadline = esp_timer_get_time() + (k_seconds + 1) * 1000000LL;
     while (esp_timer_get_time() < deadline)
@@ -469,7 +388,8 @@ int run_camera()
             const bool key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
             keys += key ? 1 : 0;
             /* Start the clip on an IDR so it decodes on its own. */
-            if (clip_frames < k_clip_frames && (clip_frames > 0 || key))
+            if (clip_frames < k_clip_frames && (clip_frames > 0 || key) &&
+                clip.size() + out.sdu.size() <= k_clip_max_bytes)
             {
                 clip.append(reinterpret_cast<const char *>(out.sdu.u8()), out.sdu.size());
                 ++clip_frames;
@@ -660,36 +580,10 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
     return true;
 }
 
-void drain_encoder_chain(vstreamer::component_coder *enc, vstreamer::component_coder *pay,
-                         vstreamer::component_sink *sender)
-{
-    vstreamer::component_pdu out;
-    while (enc->output(out) == 0)
-    {
-        for (;;)
-        {
-            const int r = pay->input(std::move(out));
-            if (0 == r)
-            {
-                break;
-            }
-            if (-EAGAIN != r)
-            {
-                std::printf("rtp_h264_pay input failed: %d\n", r);
-                return;
-            }
-            drain_pay_to_sender(pay, sender);
-        }
-        drain_pay_to_sender(pay, sender);
-    }
-}
-
 int run_camera_stream()
 {
     const int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
     const bool  run_forever = (0 == k_seconds);
-
-    bench_h264_yuv_ram_compare();
 
     auto src = vstreamer::component_factory::create_source("h264_isp_src");
     auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
@@ -833,11 +727,15 @@ int run_camera_stream()
             const int64_t age_sum = g_age_sum_us.exchange(0);
             const int64_t age_max = g_age_max_us.exchange(0);
             const int64_t age_in = g_age_in_sum_us.exchange(0);
-            std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f); "
-                        "isp %s; snd %s\n",
+            std::string lat;
+            std::string node_lat;
+            (void)src->query("latency_ms", &lat);
+            (void)src->query("node_latency_ms", &node_lat);
+            std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f) "
+                        "latency_ms=%s node_latency_ms=%s; isp %s; snd %s\n",
                         sec > 0 ? f / sec : 0.0, enc_fps, sec > 0 ? b * 8 / sec / 1000 : 0.0,
                         age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
-                        age_n > 0 ? age_in / 1000.0 / age_n : 0.0,
+                        age_n > 0 ? age_in / 1000.0 / age_n : 0.0, lat.c_str(), node_lat.c_str(),
                         isp_stats.c_str(), snd_stats.c_str());
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
             print_sys_stats();
@@ -851,9 +749,10 @@ int run_camera_stream()
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
+    /* Join the TX thread before close(): it may still be packetizing an AU. */
     stop.store(true, std::memory_order_release);
-    src->close();
     tx_thread.join();
+    src->close();
 
     drain_pay_to_sender(pay_c, snd_s);
     const int64_t  t0 = t0_us.load(std::memory_order_relaxed);

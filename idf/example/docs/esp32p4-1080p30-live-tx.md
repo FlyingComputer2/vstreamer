@@ -15,7 +15,7 @@ which drops ~0.5–1% of camera frames.
 ```bash
 . ~/esp/esp-idf-v5.5.5/export.sh
 cd idf/example
-idf.py set-target esp32p4 build flash monitor
+idf.py -D SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.live_tx" set-target esp32p4 build flash monitor
 ```
 
 ## Root cause of the 28.8 fps plateau: the sensor, not the encoder

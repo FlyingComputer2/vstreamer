@@ -10,7 +10,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,11 +52,6 @@ public:
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
-    /* Live TX: drain coded PDUs on the encode thread (pay → sender), same as legacy vs_enc_tx. */
-    using coded_sink_fn = std::function<bool(component_pdu &&)>;
-    using wire_drain_fn = std::function<void()>;
-    void set_live_tx_hooks(coded_sink_fn sink, wire_drain_fn drain);
-
 private:
     static const std::vector<port_desc> &output_ports();
     void encode_main();
@@ -78,9 +72,10 @@ private:
 
     std::thread                       encode_thread_;
     std::atomic<bool>                 stop_ {false};
+    /* Standard latency queries: camera DQBUF to output() of the last AU. The node's entry is the
+     * capture, so node_latency_ms is the same value. */
+    std::atomic<double>               latency_ms_ {-1.0};
     bool                              opened = false;
-    coded_sink_fn coded_sink_;
-    wire_drain_fn wire_drain_;
 
     int      fps = 30;
     int      gop = 30;
