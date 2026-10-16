@@ -71,32 +71,33 @@ void esp32_h264_isp_src::set_live_tx_hooks(coded_sink_fn sink, wire_drain_fn dra
     wire_drain_ = std::move(drain);
 }
 
+void esp32_h264_isp_src::drain_encoder_output()
+{
+    component_pdu out;
+    while (enc_->output(out) == 0)
+    {
+        if (coded_sink_)
+        {
+            if (!coded_sink_(std::move(out)))
+            {
+                stop_.store(true, std::memory_order_release);
+                return;
+            }
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        if (out_q_.size() >= k_out_q_max)
+        {
+            out_q_.pop_front();
+        }
+        out_q_.push_back(std::move(out));
+        out_cv_.notify_all();
+        notify_wakeup();
+    }
+}
+
 int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
 {
-    auto drain_to_out_q = [&] {
-        component_pdu out;
-        while (enc_->output(out) == 0)
-        {
-            if (coded_sink_)
-            {
-                if (!coded_sink_(std::move(out)))
-                {
-                    stop_.store(true, std::memory_order_release);
-                    return;
-                }
-                continue;
-            }
-            std::lock_guard<std::mutex> lock(mu);
-            if (out_q_.size() >= k_out_q_max)
-            {
-                out_q_.pop_front();
-            }
-            out_q_.push_back(std::move(out));
-            out_cv_.notify_all();
-            notify_wakeup();
-        }
-    };
-
     constexpr int k_max_backpressure = 2000;
     for (int attempt = 0; attempt < k_max_backpressure; ++attempt)
     {
@@ -104,15 +105,15 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
         {
             return -ECANCELED;
         }
-        drain_to_out_q();
+        drain_encoder_output();
         component_pdu work = in;
         const int       r = enc_->input(std::move(work));
-        drain_to_out_q();
         if (-EAGAIN != r)
         {
             if (0 == r)
             {
                 in.sdu = {};
+                drain_encoder_output();
             }
             return r;
         }
@@ -127,18 +128,20 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
             continue;
         }
         std::unique_lock<std::mutex> lock(mu);
-        out_cv_.wait_for(lock, std::chrono::milliseconds(5),
+        out_cv_.wait_for(lock, std::chrono::milliseconds(1),
                          [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
     }
     return -EAGAIN;
 }
 
-void esp32_h264_isp_src::capture_main()
+void esp32_h264_isp_src::encode_main()
 {
     while (!stop_.load(std::memory_order_acquire))
     {
+        const int64_t t_wait0 = esp_timer_get_time();
         component_pdu in;
         const int       pull_r = cam_->wait_output(in, 100);
+        const int64_t t_wait1 = esp_timer_get_time();
         if (pull_r != 0)
         {
             continue;
@@ -147,54 +150,30 @@ void esp32_h264_isp_src::capture_main()
         {
             continue;
         }
-        {
-            std::lock_guard<std::mutex> lock(raw_mu_);
-            if (in.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
-            {
-                raw_q_.push_front(std::move(in));
-            }
-            else
-            {
-                if (raw_q_.size() >= k_raw_q_max)
-                {
-                    raw_q_.pop_front();
-                }
-                raw_q_.push_back(std::move(in));
-            }
-        }
-        raw_cv_.notify_one();
-    }
-}
+        wait_sum_us_ += t_wait1 - t_wait0;
+        ++wait_samples_;
 
-void esp32_h264_isp_src::encode_main()
-{
-    while (!stop_.load(std::memory_order_acquire))
-    {
-        component_pdu in;
-        {
-            std::unique_lock<std::mutex> lock(raw_mu_);
-            raw_cv_.wait_for(lock, std::chrono::milliseconds(50),
-                             [&] { return stop_.load(std::memory_order_acquire) || !raw_q_.empty(); });
-            if (raw_q_.empty())
-            {
-                continue;
-            }
-            in = std::move(raw_q_.front());
-            raw_q_.pop_front();
-        }
-        const int enc_r = push_encoder_input(in);
+        const int64_t t_push0 = esp_timer_get_time();
+        const int   enc_r = push_encoder_input(in);
+        const int64_t t_push1 = esp_timer_get_time();
         if (enc_r < 0)
         {
             std::fprintf(stderr, "esp32_h264_isp_src: encode failed: %d\n", enc_r);
             break;
         }
-        const int64_t t_done = esp_timer_get_time();
-        if (last_wall_us_ > 0)
+        push_sum_us_ += t_push1 - t_push0;
+        ++push_samples_;
+
+        if (in.sdu_type == sdu_type_e::O_UYY_E_VYY)
         {
-            wall_sum_us_ += t_done - last_wall_us_;
-            ++wall_frames_;
+            const int64_t t_done = t_push1;
+            if (last_wall_us_ > 0)
+            {
+                wall_sum_us_ += t_done - last_wall_us_;
+                ++wall_frames_;
+            }
+            last_wall_us_ = t_done;
         }
-        last_wall_us_ = t_done;
     }
 }
 
@@ -239,8 +218,6 @@ int esp32_h264_isp_src::open()
     }
 
     stop_.store(false, std::memory_order_release);
-    capture_thread_ = spawn_thread(thread_opts {"vs_isp_cap", 12 * 1024, 0, 10},
-                                   [this] { capture_main(); });
     encode_thread_ = spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 12},
                                   [this] { encode_main(); });
     opened = true;
@@ -251,12 +228,7 @@ void esp32_h264_isp_src::close()
 {
     stop_.store(true, std::memory_order_release);
     out_cv_.notify_all();
-    raw_cv_.notify_all();
     notify_wakeup();
-    if (capture_thread_.joinable())
-    {
-        capture_thread_.join();
-    }
     if (encode_thread_.joinable())
     {
         encode_thread_.join();
@@ -271,7 +243,6 @@ void esp32_h264_isp_src::close()
         cam_->close();
     }
     out_q_.clear();
-    raw_q_.clear();
     coded_sink_ = nullptr;
     wire_drain_ = nullptr;
     opened = false;
@@ -397,12 +368,18 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
         std::string enc_stats;
         cam_->query("stats", &cam_stats);
         enc_->query("stats", &enc_stats);
-        char buf[320];
+        char buf[384];
         const double wall_ms =
             wall_frames_ > 0 ? static_cast<double>(wall_sum_us_) / static_cast<double>(wall_frames_) / 1000.0
                              : 0.0;
-        std::snprintf(buf, sizeof(buf), "cam %s; enc %s; wall_ms=%.1f", cam_stats.c_str(),
-                      enc_stats.c_str(), wall_ms);
+        const double wait_ms =
+            wait_samples_ > 0 ? static_cast<double>(wait_sum_us_) / static_cast<double>(wait_samples_) / 1000.0
+                              : 0.0;
+        const double push_ms =
+            push_samples_ > 0 ? static_cast<double>(push_sum_us_) / static_cast<double>(push_samples_) / 1000.0
+                              : 0.0;
+        std::snprintf(buf, sizeof(buf), "cam %s; enc %s; wall_ms=%.1f wait_ms=%.1f push_ms=%.1f",
+                      cam_stats.c_str(), enc_stats.c_str(), wall_ms, wait_ms, push_ms);
         *value = buf;
         return 0;
     }

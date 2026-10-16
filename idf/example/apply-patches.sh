@@ -8,7 +8,7 @@ if [[ ! -f "$H264_SRC" ]]; then
   echo "apply-patches: run idf.py build once so managed_components exist" >&2
   exit 1
 fi
-if grep -q 'PSRAM YUV from CSI mmap' "$H264_SRC"; then
+if grep -q 'esp_h264_cache_check_and_invalidate' "$H264_SRC"; then
   echo "apply-patches: esp_h264 PSRAM coherency patch already applied"
 else
   patch -p1 -d "$ROOT/managed_components/espressif__esp_h264" -i "$PATCH"

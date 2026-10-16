@@ -423,9 +423,6 @@ void esp32p4_csi_camera_src::capture_main()
         /* Invalidate CPU cache for ISP-filled PSRAM before the encode thread reads/DMAs YUV.
          * Doing this here overlaps msync with esp_h264 on the previous frame. */
         const uint32_t index = b.index;
-#if defined(ESP_PLATFORM)
-        sync_device_frame_to_cpu(r->ptr[index], want);
-#endif
 
         component_pdu pdu;
         pdu.ts_us = ts_us;
@@ -445,6 +442,12 @@ void esp32p4_csi_camera_src::capture_main()
             }
             ready_ = std::move(pdu);
             ++frames_;
+            if (frames_ > 1)
+            {
+                sum_dq_interval_us_ += ts_us - last_dq_ts_us_;
+                ++dq_interval_samples_;
+            }
+            last_dq_ts_us_ = ts_us;
         }
         /* stale's buffer is requeued here, outside mu. */
         stale.reset();
@@ -670,10 +673,16 @@ int esp32p4_csi_camera_src::query(std::string_view key, std::string *value) cons
     }
     if (key == "stats")
     {
-        char buf[96];
+        char buf[128];
+        const double dq_ms =
+            dq_interval_samples_ > 0
+                ? static_cast<double>(sum_dq_interval_us_) /
+                      static_cast<double>(dq_interval_samples_) / 1000.0
+                : 0.0;
         std::snprintf(buf, sizeof(buf),
-                      "frames=%" PRIu64 " dropped=%" PRIu64 " dqbuf_errors=%" PRIu64, frames_,
-                      dropped_, dqbuf_errors_);
+                      "frames=%" PRIu64 " dropped=%" PRIu64 " dqbuf_errors=%" PRIu64
+                      " dq_ms=%.2f",
+                      frames_, dropped_, dqbuf_errors_, dq_ms);
         *value = buf;
         return 0;
     }

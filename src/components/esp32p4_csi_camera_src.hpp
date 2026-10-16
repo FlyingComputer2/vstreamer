@@ -91,6 +91,9 @@ private:
     uint64_t frames_ = 0;
     uint64_t dropped_ = 0;     /* replaced in ready_ before output() took them */
     uint64_t dqbuf_errors_ = 0;
+    uint64_t last_dq_ts_us_ = 0;
+    uint64_t sum_dq_interval_us_ = 0;
+    uint64_t dq_interval_samples_ = 0;
 };
 
 }  // namespace vstreamer

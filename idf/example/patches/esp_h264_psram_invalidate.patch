@@ -14,9 +14,9 @@
          hw_hd->frame_num = 0;
      }
 -    esp_h264_cache_check_and_writeback(in_frame->raw_data.buffer, in_frame->raw_data.len);
-+    /* PSRAM YUV from CSI mmap: M2C invalidate is done at DQBUF in the capture driver path.
-+     * Internal RAM inputs still need C2M writeback before the H.264 DMA read. */
-+    if (!esp_ptr_external_ram(in_frame->raw_data.buffer)) {
++    if (esp_ptr_external_ram(in_frame->raw_data.buffer)) {
++        esp_h264_cache_check_and_invalidate(in_frame->raw_data.buffer, in_frame->raw_data.len);
++    } else {
 +        esp_h264_cache_check_and_writeback(in_frame->raw_data.buffer, in_frame->raw_data.len);
 +    }
      /** In multi-thread, the parameter cannot be set in encoding.

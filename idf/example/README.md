@@ -57,9 +57,9 @@ On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode (CPU-filled **internal** b
 in **SPIRAM** (`CSI_MEM_CAPS`); the same encoder reports ~**35.6–36 ms**/frame (~**26 fps**
 TX) even with correct post-capture `esp_cache_msync` (M2C, cache-line aligned). The gap is
 not fixed by skipping `esp_h264` input writeback alone — HW encode from SPIRAM YUV is slower
-than from internal RAM. PSRAM coherency uses **M2C invalidate at CSI DQBUF** (cache-line
-aligned, on `vs_csi_cam`) so it can overlap `esp_h264` on the prior frame; the IDF patch
-skips PSRAM cache ops inside `esp_h264_enc_process` (internal RAM still writebacks).
+than from internal RAM. The IDF patch uses **PSRAM invalidate** (not C2M writeback) in
+`esp_h264_enc_process` immediately before the H.264 DMA read; internal RAM still writebacks.
+`vs_isp_enc` pulls YUV directly from `esp32p4_csi_camera_src` (no intermediate raw queue).
 
 **Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady and `live TX` ≥ **30 fps**.
 

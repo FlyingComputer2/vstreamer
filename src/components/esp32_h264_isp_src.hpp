@@ -33,8 +33,8 @@ class h264_encoder_esp32p4;
  * h264_encoder nodes in the pipeline graph.
  *
  * YUV stays in CSI mmap buffers until encode (USERPTR-style); encode uses the same
- * esp_h264 path as h264_encoder_esp32p4. A dedicated thread pulls frames and feeds
- * the encoder so downstream only sees coded PDUs.
+ * esp_h264 path as h264_encoder_esp32p4. vs_isp_enc pulls frames from the camera
+ * source directly (no intermediate raw queue).
  */
 class esp32_h264_isp_src : public component_source
 {
@@ -60,9 +60,9 @@ public:
 
 private:
     static const std::vector<port_desc> &output_ports();
-    void capture_main();
     void encode_main();
     int  push_encoder_input(component_pdu &in);
+    void drain_encoder_output();
 
     std::unique_ptr<esp32p4_csi_camera_src> cam_;
     std::unique_ptr<h264_encoder_esp32p4>     enc_;
@@ -72,12 +72,6 @@ private:
     std::deque<component_pdu>         out_q_;
     static constexpr size_t           k_out_q_max = 8;
 
-    std::mutex                        raw_mu_;
-    std::condition_variable           raw_cv_;
-    std::deque<component_pdu>         raw_q_;
-    static constexpr size_t           k_raw_q_max = 2;
-
-    std::thread                       capture_thread_;
     std::thread                       encode_thread_;
     std::atomic<bool>                 stop_ {false};
     bool                              opened = false;
@@ -95,6 +89,10 @@ private:
     uint64_t wall_sum_us_ = 0;
     uint64_t wall_frames_ = 0;
     int64_t  last_wall_us_ = 0;
+    uint64_t wait_sum_us_ = 0;
+    uint64_t wait_samples_ = 0;
+    uint64_t push_sum_us_ = 0;
+    uint64_t push_samples_ = 0;
 };
 
 }  // namespace vstreamer
