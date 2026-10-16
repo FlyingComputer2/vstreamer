@@ -34,40 +34,6 @@ namespace vstreamer
 namespace
 {
 
-#if defined(ESP_PLATFORM)
-class send_thread_wdt
-{
-public:
-    send_thread_wdt()
-    {
-        const esp_err_t e = esp_task_wdt_add(nullptr);
-        ok_ = (ESP_OK == e || ESP_ERR_INVALID_STATE == e);
-    }
-    ~send_thread_wdt()
-    {
-        if (ok_)
-        {
-            (void)esp_task_wdt_delete(nullptr);
-        }
-    }
-    void feed()
-    {
-        if (ok_)
-        {
-            (void)esp_task_wdt_reset();
-        }
-    }
-
-private:
-    bool ok_ = false;
-};
-#else
-struct send_thread_wdt
-{
-    void feed() {}
-};
-#endif
-
 /* Thread stacks on ESP-IDF; ignored on Linux. */
 constexpr size_t k_send_stack_bytes = 12 * 1024;
 constexpr size_t k_telemetry_stack_bytes = 4 * 1024;
@@ -127,6 +93,39 @@ int parse_local_spec(std::string_view spec, std::string *host, int *port)
 }
 
 }  // namespace
+
+#if defined(ESP_PLATFORM)
+struct stream_sender::send_thread_wdt
+{
+    send_thread_wdt()
+    {
+        const esp_err_t e = esp_task_wdt_add(nullptr);
+        ok_ = (ESP_OK == e || ESP_ERR_INVALID_STATE == e);
+    }
+    ~send_thread_wdt()
+    {
+        if (ok_)
+        {
+            (void)esp_task_wdt_delete(nullptr);
+        }
+    }
+    void feed()
+    {
+        if (ok_)
+        {
+            (void)esp_task_wdt_reset();
+        }
+    }
+
+private:
+    bool ok_ = false;
+};
+#else
+struct stream_sender::send_thread_wdt
+{
+    void feed() {}
+};
+#endif
 
 const std::vector<port_desc> &stream_sender::input_ports()
 {
@@ -400,7 +399,7 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
     }
 }
 
-void stream_sender::pace_wire_send(size_t bytes)
+void stream_sender::pace_wire_send(size_t bytes, send_thread_wdt *wdt)
 {
     const int cap_kbps = max_wire_kbps.load(std::memory_order_relaxed);
     if (cap_kbps <= 0)
@@ -414,6 +413,10 @@ void stream_sender::pace_wire_send(size_t bytes)
 
     while (!send_stop.load(std::memory_order_relaxed))
     {
+        if (nullptr != wdt)
+        {
+            wdt->feed();
+        }
         const double now = now_sec();
         if (pace_last_sec <= 0.)
         {
@@ -645,6 +648,7 @@ void stream_sender::send_thread_main()
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
             for (;;)
             {
+                wdt.feed();
                 if (send_stop)
                 {
                     break;
@@ -712,7 +716,7 @@ void stream_sender::send_thread_main()
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
             stream_header_stamp_sequence(wire_buf.u8(), seq);
         }
-        pace_wire_send(wire_buf.size());
+        pace_wire_send(wire_buf.size(), &wdt);
         const ssize_t n = sendto(send_fd, wire_buf.u8(), wire_buf.size(), 0,
                                     reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
         if (n < 0)

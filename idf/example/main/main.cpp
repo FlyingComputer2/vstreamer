@@ -567,7 +567,8 @@ int run_camera_stream()
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
     snd->configure("mtu", "1400");
-    snd->configure("max_kbps", "3500");
+    /* Direct LAN: no wire pacing (avoids vs_send blocking under TWDT on ESP32-P4). */
+    snd->configure("max_kbps", "0");
     snd->configure("telemetry", "off");
     /* Direct LAN e2e: raw RTP in stream PDUs (no RS block FEC). */
     snd->configure("fec", "none");
