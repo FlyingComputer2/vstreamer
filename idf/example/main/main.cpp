@@ -524,17 +524,15 @@ int run_camera_stream()
             }
             continue;
         }
-        if (in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY && 0 == t0)
+        const bool is_raw_caps = in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW;
+        const bool is_frame = in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY;
+        if (!is_raw_caps && !is_frame)
+        {
+            continue;
+        }
+        if (is_frame && 0 == t0)
         {
             t0 = esp_timer_get_time();
-        }
-        if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW)
-        {
-            continue;
-        }
-        if (in.sdu_type != vstreamer::sdu_type_e::O_UYY_E_VYY)
-        {
-            continue;
         }
 
         for (;;)
@@ -557,9 +555,33 @@ int run_camera_stream()
             }
         }
 
+        if (is_raw_caps)
+        {
+            continue;
+        }
+
         vstreamer::component_pdu out;
         while (enc_c->output(out) == 0)
         {
+            if (out.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_CODED)
+            {
+                for (;;)
+                {
+                    const int r = pay_c->input(std::move(out));
+                    if (0 == r)
+                    {
+                        break;
+                    }
+                    if (-EAGAIN != r)
+                    {
+                        std::printf("pay caps failed: %d\n", r);
+                        goto done;
+                    }
+                    drain_pay_to_sender(pay_c, snd_s);
+                    vTaskDelay(pdMS_TO_TICKS(1));
+                }
+                continue;
+            }
             if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
             {
                 continue;
