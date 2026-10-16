@@ -25,13 +25,26 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#if defined(ESP_PLATFORM)
+#include "esp_task_wdt.h"
+#endif
+
 namespace vstreamer
 {
 namespace
 {
 
+#if defined(ESP_PLATFORM)
+void esp_feed_task_wdt()
+{
+    (void)esp_task_wdt_reset();
+}
+#else
+void esp_feed_task_wdt() {}
+#endif
+
 /* Thread stacks on ESP-IDF; ignored on Linux. */
-constexpr size_t k_send_stack_bytes = 8 * 1024;
+constexpr size_t k_send_stack_bytes = 12 * 1024;
 constexpr size_t k_telemetry_stack_bytes = 4 * 1024;
 
 double now_sec()
@@ -376,6 +389,7 @@ void stream_sender::pace_wire_send(size_t bytes)
 
     while (!send_stop.load(std::memory_order_relaxed))
     {
+        esp_feed_task_wdt();
         const double now = now_sec();
         if (pace_last_sec <= 0.)
         {
@@ -565,6 +579,7 @@ void stream_sender::send_thread_main()
 
     while (!send_stop)
     {
+        esp_feed_task_wdt();
         if (pace_reset.exchange(false, std::memory_order_relaxed))
         {
             pace_bucket_bytes = 0.;

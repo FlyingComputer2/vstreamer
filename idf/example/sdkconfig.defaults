@@ -25,3 +25,6 @@ CONFIG_VSTREAMER_RX_PEER="192.168.253.106:21090"
 CONFIG_VSTREAMER_LIVE_TX_SECONDS=0
 # stream_sender pacing uses usleep on CPU0; don't trip IDLE task WDT during live TX.
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+# vs_send can pace/back up under 1080p load; 8s avoids false trips while still catching hangs.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=8

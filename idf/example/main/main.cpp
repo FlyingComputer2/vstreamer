@@ -544,7 +544,8 @@ int run_camera_stream()
     }
 
     print_heap("live start");
-    (void)cam->configure("buffers", "6");
+    (void)cam->configure("buffers", "4");
+    (void)cam->configure("fps", "20");
     const int cr = cam->open();
     if (-ENODEV == cr)
     {
@@ -560,13 +561,13 @@ int run_camera_stream()
     std::string size;
     cam->query("size", &size);
     enc->configure("size", size);
-    enc->configure("bitrate", "4000000");
-    enc->configure("gop", "30");
-    pay->configure("fps", "30");
+    enc->configure("bitrate", "2500000");
+    enc->configure("gop", "20");
+    pay->configure("fps", "20");
     pay->configure("mtu", "1400");
     snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
     snd->configure("mtu", "1400");
-    snd->configure("max_kbps", "8000");
+    snd->configure("max_kbps", "3500");
     snd->configure("telemetry", "off");
     /* Direct LAN e2e: raw RTP in stream PDUs (no RS block FEC). */
     snd->configure("fec", "none");
@@ -598,7 +599,8 @@ int run_camera_stream()
     std::mutex            q_mu;
     std::condition_variable q_cv;
     std::deque<vstreamer::component_pdu> q;
-    constexpr size_t k_q_max = 3;
+    /* Keep one raw frame queued so encode always runs the latest capture. */
+    constexpr size_t k_q_max = 1;
 
     const int64_t deadline =
         run_forever ? INT64_MAX : esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
