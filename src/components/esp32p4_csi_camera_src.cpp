@@ -423,6 +423,7 @@ void esp32p4_csi_camera_src::capture_main()
         /* Invalidate CPU cache for ISP-filled PSRAM before the encode thread reads/DMAs YUV.
          * Doing this here overlaps msync with esp_h264 on the previous frame. */
         const uint32_t index = b.index;
+        sync_device_frame_to_cpu(r->ptr[index], b.bytesused);
 
         component_pdu pdu;
         pdu.ts_us = ts_us;

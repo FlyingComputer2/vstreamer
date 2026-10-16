@@ -36,6 +36,7 @@
 #include <bfc/shared_sized_buffer.hpp>
 #include "core/thread_spawn.hpp"
 
+#include "esp_cache.h"
 #include "esp_event.h"
 #include "esp_heap_caps.h"
 #include "esp_pm.h"
@@ -335,6 +336,19 @@ void bench_h264_yuv_ram_compare()
 
         for (int i = 0; i < k_frames; ++i)
         {
+            if (0 != (caps & MALLOC_CAP_SPIRAM))
+            {
+                constexpr size_t align = 64U;
+                const uintptr_t  base = reinterpret_cast<uintptr_t>(mem);
+                const uintptr_t  start = base & ~(align - 1U);
+                uintptr_t        end = base + frame_bytes;
+                end = (end + align - 1U) & ~(align - 1U);
+                if (end > start)
+                {
+                    (void)esp_cache_msync(reinterpret_cast<void *>(start), end - start,
+                                          ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+                }
+            }
             vstreamer::component_pdu in;
             in.ts_us = static_cast<uint64_t>(i) * 33333;
             in.sdu_type = vstreamer::sdu_type_e::O_UYY_E_VYY;
@@ -512,7 +526,7 @@ void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_s
                 std::printf("stream_sender input failed: %d\n", r);
                 return;
             }
-            live_tx_yield();
+            vTaskDelay(1);
         }
     }
 }
@@ -537,7 +551,7 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
                 return false;
             }
             drain_pay_to_sender(pay, sender);
-            live_tx_yield();
+            vTaskDelay(1);
         }
     }
     if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
@@ -565,7 +579,7 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
             std::printf("pay failed: %d\n", r);
             return false;
         }
-        live_tx_yield();
+        vTaskDelay(1);
     }
     drain_pay_to_sender(pay, sender);
     if (nullptr != frames)

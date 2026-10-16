@@ -60,14 +60,18 @@ not fixed by skipping `esp_h264` input writeback alone — HW encode from SPIRAM
 than from internal RAM. The IDF patch uses **PSRAM invalidate** (not C2M writeback) in
 `esp_h264_enc_process` immediately before the H.264 DMA read; internal RAM still writebacks.
 `vs_isp_enc` pulls YUV directly from `esp32p4_csi_camera_src` (no intermediate raw queue).
+PSRAM **M2C invalidate runs at V4L2 DQBUF** so it can overlap `esp_h264` on the prior frame;
+`esp_h264_enc_process` skips PSRAM cache ops (`esp_h264_psram_dqbuf_coherency.patch`). Optional
+`esp_h264_db_bypass.patch` disables the HW deblocking filter for a small encode-time win.
 
 **Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady and `live TX` ≥ **30 fps**.
 
 With `h264_isp_src` + PSRAM invalidate patch (see `apply-patches.sh`), bench UART typically
 shows **~28.8–29.0 fps** TX, **`encode_ms` ~33.3–33.5** (`avg`), **`max` ~34.5** (IDR),
 **cam `dropped=0`**, **`dq_ms` ~34.7** (DQBUF interval), **`wall_ms` ~34.7**,
-**`push_ms` ≈ `encode_ms`**, **`wait_ms` ~1.1**. Synthetic PSRAM YUV at boot is often
-**~32.9 ms** avg — under the 33.33 ms budget — while live CSI mmap stays ~0.2 ms over.
+**`push_ms` ≈ `encode_ms`**, **`wait_ms` ~1.1**. Synthetic heap PSRAM YUV at boot is often **~32.9 ms** avg (under budget); a one-shot
+**CSI mmap** encode bench measured **~33.3 ms** avg (same as live) — the gap vs synthetic
+is scene/complexity, not mmap vs heap alone.
 Sustained **30 fps** needs **`encode_ms` avg ≤ 33.33 ms** so V4L2 buffers turn fast enough
 (`dq_ms` → 33.33); pipeline threading alone does not fix that. Remaining levers: faster
 CSI→H.264 (Espressif/coherent path), encode tuning (QP/bitrate), or HW revision.

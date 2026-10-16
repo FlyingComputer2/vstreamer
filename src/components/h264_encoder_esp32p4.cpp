@@ -363,6 +363,11 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     au.sdu_type = sdu_type_e::H264_AU;
     au.port = 0;
     const bool idr = out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR;
+    if (!idr)
+    {
+        sum_p_encode_us_ += dt;
+        ++p_frames_;
+    }
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
     au.sdu = bfc::shared_sized_buffer::adopt(
         reinterpret_cast<std::byte *>(slot.buf), slot.cap, out_frame.length,
@@ -589,10 +594,13 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
         const double avg_ms =
             frames_ > 0 ? static_cast<double>(sum_encode_us_) / static_cast<double>(frames_) / 1000.0
                         : 0.0;
+        const double p_avg_ms =
+            p_frames_ > 0 ? static_cast<double>(sum_p_encode_us_) / static_cast<double>(p_frames_) / 1000.0
+                          : 0.0;
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
-                      " encode_ms=%.1f avg=%.1f max=%.1f",
-                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0, avg_ms,
+                      " encode_ms=%.1f avg=%.1f p_avg=%.1f max=%.1f",
+                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0, avg_ms, p_avg_ms,
                       max_encode_us_ / 1000.0);
         *value = buf;
         return 0;

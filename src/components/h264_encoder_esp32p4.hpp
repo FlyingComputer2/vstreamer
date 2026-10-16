@@ -91,6 +91,8 @@ private:
     int64_t  last_encode_us_ = 0;
     int64_t  max_encode_us_ = 0;
     int64_t  sum_encode_us_ = 0;
+    int64_t  sum_p_encode_us_ = 0;
+    uint64_t p_frames_ = 0;
 };
 
 }  // namespace vstreamer
