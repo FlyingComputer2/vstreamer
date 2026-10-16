@@ -1,0 +1,7 @@
+dependencies:
+  idf: ">=5.5"
+  # Hardware H.264 encoder for h264_encoder_esp32p4 (esp32p4 only).
+  espressif/esp_h264:
+    version: "1.4.*"
+    rules:
+      - if: "target == esp32p4"

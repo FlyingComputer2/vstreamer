@@ -1,0 +1,10 @@
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=n
+CONFIG_SPIRAM=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+# app_main only starts the smoke-test thread.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+# A datagram burst (an FEC block at video rate) overflows lwIP's default
+# 6-datagram UDP receive queue and loses more shards than FEC can repair.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64

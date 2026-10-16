@@ -23,12 +23,16 @@
 #include "core/pdu_wakeup.hpp"
 #include "core/pipeline_queue.hpp"
 #include "core/thread_affinity.hpp"
+#include "core/thread_spawn.hpp"
 #include "core/time_util.hpp"
 
 namespace vstreamer
 {
 namespace
 {
+
+/* Stack for the pipeline thread on ESP-IDF; ignored on Linux. */
+constexpr size_t k_pipeline_stack_bytes = 16 * 1024;
 
 /* Upper bound on one idle sleep, so a node that never notifies and has no deadline is still
  * polled. */
@@ -452,9 +456,10 @@ void pipeline::impl::thread_main(std::promise<int> started, command_e first)
 {
     thread_id.store(std::this_thread::get_id());
 
-    /* Pinned only after the nodes are open: threads a component starts in open() (receive
-     * threads, codec workers) inherit the affinity of the thread that creates them and must not
-     * all share the pipeline's CPU. */
+    /* Pinned only after the nodes are open: on Linux, threads a component starts in open()
+     * (receive threads, codec workers) inherit the affinity of the thread that creates them and
+     * must not all share the pipeline's CPU. ESP-IDF fixes the core when the thread is created
+     * (spawn()), and threads started from here do not inherit it. */
     const int r = open_all();
     if (r < 0)
     {
@@ -795,8 +800,10 @@ int pipeline::spawn(bool run)
     }
     std::promise<int> started;
     std::future<int>  result = started.get_future();
-    impl_->thread = std::thread(&impl::thread_main, impl_.get(), std::move(started),
-                                run ? command_e::RUN : command_e::PAUSE);
+    /* Every node's open/input/output runs on this thread, so it gets the largest stack. */
+    impl_->thread = spawn_thread(thread_opts {"vs_pipeline", k_pipeline_stack_bytes, impl_->cpu},
+                                 &impl::thread_main, impl_.get(), std::move(started),
+                                 run ? command_e::RUN : command_e::PAUSE);
     const int r = result.get();
     if (r < 0)
     {

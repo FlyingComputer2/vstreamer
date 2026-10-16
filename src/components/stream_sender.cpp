@@ -5,6 +5,7 @@
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/stream_header.hpp"
+#include "core/thread_spawn.hpp"
 
 #include <cerrno>
 #include <climits>
@@ -28,6 +29,10 @@ namespace vstreamer
 {
 namespace
 {
+
+/* Thread stacks on ESP-IDF; ignored on Linux. */
+constexpr size_t k_send_stack_bytes = 8 * 1024;
+constexpr size_t k_telemetry_stack_bytes = 4 * 1024;
 
 double now_sec()
 {
@@ -795,7 +800,8 @@ int stream_sender::open()
         }
 
         send_stop = false;
-        send_thread = std::thread(&stream_sender::send_thread_main, this);
+        send_thread = spawn_thread(thread_opts {"vs_send", k_send_stack_bytes},
+                                   &stream_sender::send_thread_main, this);
 
         {
             std::lock_guard<std::mutex> plock(peer_mu);
@@ -810,7 +816,8 @@ int stream_sender::open()
         telemetry_stop = false;
         if (telemetry)
         {
-            telemetry_thread = std::thread(&stream_sender::telemetry_thread_main, this);
+            telemetry_thread = spawn_thread(thread_opts {"vs_telemetry", k_telemetry_stack_bytes},
+                                            &stream_sender::telemetry_thread_main, this);
         }
 
         std::fprintf(stderr, "stream_sender: udp://%s:%d mtu=%d\n", host, port, mtu_local);

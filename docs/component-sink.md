@@ -20,5 +20,5 @@ codec parameters (`CAPS_VIDEO_RAW`, `CAPS_VIDEO_CODED`, …).
 | Component | Input SDUs | Notes |
 |-----------|------------|--------|
 | `sdl_sink` | `CAPS_VIDEO_RAW`, `NV12` | Present NV12 |
-| `mkv_sink` | `CAPS_VIDEO_CODED`, `MJPEG` | File recording |
+| `mkv_sink` | `CAPS_VIDEO_CODED`, `MJPEG`, `H264_AU` | File recording |
 | `stream_sender` | `STREAM_DGRAM` | UDP egress + FEC |

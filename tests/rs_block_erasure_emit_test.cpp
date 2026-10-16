@@ -99,6 +99,10 @@ TEST(RsBlockErasureEmitTest, MissingShardsOnRingEvict)
     rs_block_erasure enc_fill;
     ASSERT_TRUE(enc_fill.init(1, 1, 20));
     rs_block_erasure dec;
+    /* Hold far longer than the test: the partial block must leave through ring eviction. With
+     * the default 60 ms head-of-line hold, a slow run (Debug, loaded host) gives it up first and
+     * counts it as given_up instead. */
+    ASSERT_TRUE(dec.init(4, 6, 60000));
     const auto partial = encode_block_apps(enc, 5, {55, 56, 57, 58})[0];
     vstreamer::fec_rx_payload_list out;
     feed_append(dec, partial, &out);

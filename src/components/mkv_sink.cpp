@@ -2,18 +2,13 @@
 
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
+#include "core/thread_spawn.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
-
-extern "C"
-{
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavutil/time.h>
-}
 
 namespace vstreamer
 {
@@ -22,7 +17,8 @@ namespace
 
 double now_sec()
 {
-    return static_cast<double>(av_gettime()) / 1000000.0;
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
 }
 
 int parse_size(std::string_view s, int *w, int *h)
@@ -73,6 +69,8 @@ const std::vector<port_desc> &mkv_input_ports()
         port_caps_entry data {};
         data.sdu_type = sdu_type_e::MJPEG;
         p.caps.push_back(data);
+        data.sdu_type = sdu_type_e::H264_AU;
+        p.caps.push_back(data);
         return std::vector<port_desc> {p};
     }();
     return ports;
@@ -105,19 +103,8 @@ void mkv_sink::stop_locked()
         return;
     }
 
-    auto *oc = static_cast<AVFormatContext *>(fmt);
-    if (nullptr != oc)
-    {
-        av_write_trailer(oc);
-        if (!(oc->oformat->flags & AVFMT_NOFILE))
-        {
-            avio_closep(&oc->pb);
-        }
-        avformat_free_context(oc);
-    }
+    (void)writer.close();
 
-    fmt = nullptr;
-    stream = nullptr;
     output_path.clear();
     last_mux_pts = -1;
     t0 = 0.0;
@@ -151,12 +138,12 @@ std::string mkv_sink::segment_path_locked() const
     {
         return {};
     }
-    char buf[4096];
-    std::snprintf(buf, sizeof(buf), "%s-%03d%s", output_stem.c_str(), segment_index, output_ext.c_str());
-    return buf;
+    char idx[16];
+    std::snprintf(idx, sizeof(idx), "-%03d", segment_index);
+    return output_stem + idx + output_ext;
 }
 
-int mkv_sink::start_locked(int w, int h)
+int mkv_sink::start_locked(int w, int h, mkv_codec_e codec)
 {
     if (output_template.empty())
     {
@@ -172,54 +159,21 @@ int mkv_sink::start_locked(int w, int h)
         return -EINVAL;
     }
 
-    AVFormatContext *oc = nullptr;
-    if (avformat_alloc_output_context2(&oc, nullptr, "matroska", output_path.c_str()) < 0 || nullptr == oc)
+    mkv_track_config cfg;
+    cfg.codec = codec;
+    cfg.width = w;
+    cfg.height = h;
+    cfg.fps = fps > 0 ? fps : 30;
+    const int r = writer.open(output_path, cfg);
+    if (r < 0)
     {
-        return -EIO;
+        output_path.clear();
+        return r;
     }
 
-    AVStream *st = avformat_new_stream(oc, nullptr);
-    if (nullptr == st)
-    {
-        avformat_free_context(oc);
-        return -EIO;
-    }
-
-    const int use_fps = fps > 0 ? fps : 30;
-    st->time_base = AVRational{1, 1000000};
-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codecpar->codec_id = AV_CODEC_ID_MJPEG;
-    st->codecpar->width = w;
-    st->codecpar->height = h;
-    st->codecpar->format = AV_PIX_FMT_YUVJ420P;
-
-    if (!(oc->oformat->flags & AVFMT_NOFILE))
-    {
-        if (avio_open(&oc->pb, output_path.c_str(), AVIO_FLAG_WRITE) < 0)
-        {
-            avformat_free_context(oc);
-            return -EIO;
-        }
-    }
-
-    AVDictionary *mux_opts = nullptr;
-    av_dict_set(&mux_opts, "live", "1", 0);
-    if (avformat_write_header(oc, &mux_opts) < 0)
-    {
-        av_dict_free(&mux_opts);
-        if (!(oc->oformat->flags & AVFMT_NOFILE))
-        {
-            avio_closep(&oc->pb);
-        }
-        avformat_free_context(oc);
-        return -EIO;
-    }
-    av_dict_free(&mux_opts);
-
-    fmt = oc;
-    stream = st;
     live_w = w;
     live_h = h;
+    live_codec = codec;
     last_mux_pts = -1;
     segment_pts_base = -1;
     last_frame_ts_us = -1;
@@ -228,7 +182,7 @@ int mkv_sink::start_locked(int w, int h)
     return 0;
 }
 
-int mkv_sink::ensure_session_locked(int w, int h)
+int mkv_sink::ensure_session_locked(int w, int h, mkv_codec_e codec)
 {
     if (output_template.empty())
     {
@@ -246,47 +200,24 @@ int mkv_sink::ensure_session_locked(int w, int h)
         return -EINVAL;
     }
 
-    if (recording && (w != live_w || h != live_h))
+    if (recording && (w != live_w || h != live_h || codec != live_codec))
     {
         stop_locked();
     }
 
     if (!recording)
     {
-        return start_locked(w, h);
+        return start_locked(w, h, codec);
     }
     return 0;
 }
 
 int mkv_sink::write_frame_locked(const component_pdu &in)
 {
-    auto *oc = static_cast<AVFormatContext *>(fmt);
-    auto *st = static_cast<AVStream *>(stream);
-
-    AVPacket *pkt = av_packet_alloc();
-    if (nullptr == pkt)
-    {
-        return -ENOMEM;
-    }
-
-    uint8_t *buf = static_cast<uint8_t *>(av_malloc(in.sdu.size()));
-    if (nullptr == buf)
-    {
-        av_packet_free(&pkt);
-        return -ENOMEM;
-    }
-    std::memcpy(buf, in.sdu.u8(), in.sdu.size());
-
-    pkt->data = buf;
-    pkt->size = static_cast<int>(in.sdu.size());
-
-    const int use_fps = fps > 0 ? fps : 30;
+    const int     use_fps = fps > 0 ? fps : 30;
     const int64_t frame_ts_us = static_cast<int64_t>(in.ts_us);
-    if (segment_pts_base < 0)
-    {
-        segment_pts_base = frame_ts_us;
-    }
-    int64_t mux_pts = frame_ts_us - segment_pts_base;
+    const int64_t pts_base = segment_pts_base < 0 ? frame_ts_us : segment_pts_base;
+    int64_t       mux_pts = frame_ts_us - pts_base;
     if (mux_pts < 0)
     {
         mux_pts = 0;
@@ -300,34 +231,27 @@ int mkv_sink::write_frame_locked(const component_pdu &in)
             duration_us = delta;
         }
     }
-    last_frame_ts_us = frame_ts_us;
     if (last_mux_pts >= 0 && mux_pts <= last_mux_pts)
     {
         mux_pts = last_mux_pts + 1;
     }
+
+    const int r = writer.write_frame(in.sdu.u8(), in.sdu.size(), mux_pts, duration_us,
+                                     has_flag(in, pdu_flag_e::KEY));
+    if (r < 0)
+    {
+        return r;
+    }
+    if (1 == r)
+    {
+        /* H.264 before the first keyframe with SPS/PPS: not decodable, not timed. */
+        ++skipped;
+        return 0;
+    }
+
+    segment_pts_base = pts_base;
+    last_frame_ts_us = frame_ts_us;
     last_mux_pts = mux_pts;
-    pkt->pts = mux_pts;
-    pkt->dts = mux_pts;
-    pkt->duration = duration_us;
-    pkt->stream_index = st->index;
-    pkt->flags |= AV_PKT_FLAG_KEY;
-    pkt->buf = av_buffer_create(buf, in.sdu.size(), av_buffer_default_free, nullptr, 0);
-    if (nullptr == pkt->buf)
-    {
-        av_free(buf);
-        av_packet_free(&pkt);
-        return -ENOMEM;
-    }
-
-    av_packet_rescale_ts(pkt, AVRational{1, 1000000}, st->time_base);
-
-    int ret = av_interleaved_write_frame(oc, pkt);
-    av_packet_free(&pkt);
-    if (ret < 0)
-    {
-        return -EIO;
-    }
-
     ++frames_out;
     return 0;
 }
@@ -407,10 +331,16 @@ void mkv_sink::mux_thread_main()
             {
                 int w = input_caps_.width;
                 int h = input_caps_.height;
-                const int sr = ensure_session_locked(w, h);
-                if (sr >= 0 && recording)
+                const mkv_codec_e codec = pkt.sdu_type == sdu_type_e::H264_AU
+                                              ? mkv_codec_e::H264
+                                              : mkv_codec_e::MJPEG;
+                const int sr = ensure_session_locked(w, h, codec);
+                if (sr >= 0 && recording && write_frame_locked(pkt) < 0)
                 {
-                    (void)write_frame_locked(pkt);
+                    /* mkv_writer stops at its first I/O error: close what was written and
+                     * let the next frame start a new segment. */
+                    ++write_errors;
+                    stop_locked();
                 }
             }
         }
@@ -473,13 +403,9 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
         caps_reject_ = false;
         input_caps_ = caps;
         have_input_caps_ = true;
-        if (!output_template.empty())
-        {
-            (void)ensure_session_locked(caps.width, caps.height);
-        }
         return 0;
     }
-    if (in.sdu_type != sdu_type_e::MJPEG)
+    if (in.sdu_type != sdu_type_e::MJPEG && in.sdu_type != sdu_type_e::H264_AU)
     {
         return -EINVAL;
     }
@@ -557,7 +483,8 @@ int mkv_sink::open()
     }
     opened = true;
     mux_stop.store(false, std::memory_order_relaxed);
-    mux_thread = std::thread([this] { mux_thread_main(); });
+    /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
+    mux_thread = spawn_thread(thread_opts {"vs_mkv", 8 * 1024}, [this] { mux_thread_main(); });
     return 0;
 }
 
@@ -630,10 +557,14 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         {
             return -EINVAL;
         }
-        fps = static_cast<int>(n);
-        if (recording)
+        /* A restart costs H.264 everything up to the next IDR: only on a real change. */
+        if (static_cast<int>(n) != fps)
         {
-            stop_locked();
+            fps = static_cast<int>(n);
+            if (recording)
+            {
+                stop_locked();
+            }
         }
         return 0;
     }
@@ -700,6 +631,22 @@ int mkv_sink::query(std::string_view key, std::string *value) const
         {
             *value = "idle";
         }
+        return 0;
+    }
+
+    if (key == "write_errors")
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, write_errors);
+        *value = buf;
+        return 0;
+    }
+
+    if (key == "skipped")
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, skipped);
+        *value = buf;
         return 0;
     }
 

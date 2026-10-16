@@ -23,6 +23,8 @@
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
 
+/* lwIP declares sockaddr_in in <sys/socket.h>, not <netinet/in.h>. */
+#include <sys/socket.h>
 #include <netinet/in.h>
 
 namespace vstreamer

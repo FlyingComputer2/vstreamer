@@ -16,6 +16,8 @@
 #include <string_view>
 #include <thread>
 
+/* lwIP declares sockaddr_in in <sys/socket.h>, not <netinet/in.h>. */
+#include <sys/socket.h>
 #include <netinet/in.h>
 
 #include "core/component_sink.hpp"

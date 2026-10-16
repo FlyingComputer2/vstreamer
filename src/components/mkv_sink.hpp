@@ -18,13 +18,15 @@
 #include "core/component_pdu.hpp"
 #include "core/component_sink.hpp"
 #include "core/component_input.hpp"
+#include "core/mkv_writer.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
 
 namespace vstreamer
 {
 
-/* MJPEG → Matroska via libavformat; incremental cluster writes for live-ish playback. */
+/* MJPEG or H.264 → Matroska (mkv_writer); clusters are flushed as they close, so a file cut
+ * off mid-recording still plays. */
 class mkv_sink : public component_sink
 {
 public:
@@ -44,8 +46,8 @@ public:
 
 private:
     void stop_locked();
-    int  start_locked(int w, int h);
-    int  ensure_session_locked(int w, int h);
+    int  start_locked(int w, int h, mkv_codec_e codec);
+    int  ensure_session_locked(int w, int h, mkv_codec_e codec);
     int  write_frame_locked(const component_pdu &in);
     void split_output_template_locked();
     [[nodiscard]] std::string segment_path_locked() const;
@@ -78,12 +80,15 @@ private:
     bool recording = false;
     int  live_w = 0;
     int  live_h = 0;
+    mkv_codec_e live_codec = mkv_codec_e::MJPEG;
     int64_t last_mux_pts = -1;
     int64_t segment_pts_base = -1;
     int64_t last_frame_ts_us = -1;
     double  t0 = 0.0;
     uint64_t frames_out = 0;
     uint64_t dropped = 0;
+    uint64_t skipped = 0;
+    uint64_t write_errors = 0;
 
     static constexpr size_t k_default_queue_depth = 8;
     size_t                  queue_cap = k_default_queue_depth;
@@ -99,9 +104,7 @@ private:
     std::atomic<bool>       mux_stop {false};
     std::atomic<int>        mux_in_flight {0};
 
-    /* Opaque libav handles; typed in the .cpp. */
-    void *fmt = nullptr;
-    void *stream = nullptr;
+    mkv_writer writer;
 };
 
 }  // namespace vstreamer
