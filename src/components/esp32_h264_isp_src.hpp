@@ -75,7 +75,6 @@ private:
     std::thread                       encode_thread_;
     std::atomic<bool>                 stop_ {false};
     bool                              opened = false;
-
     coded_sink_fn coded_sink_;
     wire_drain_fn wire_drain_;
 

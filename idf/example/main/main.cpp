@@ -699,12 +699,12 @@ int run_camera_stream()
             const int              r = src->output(out);
             if (-EAGAIN == r)
             {
-                live_tx_yield();
+                vTaskDelay(1);
                 continue;
             }
             if (r < 0)
             {
-                live_tx_yield();
+                vTaskDelay(1);
                 continue;
             }
             if (out.sdu_type == vstreamer::sdu_type_e::H264_AU &&

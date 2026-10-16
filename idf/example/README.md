@@ -64,11 +64,13 @@ than from internal RAM. The IDF patch uses **PSRAM invalidate** (not C2M writeba
 **Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady and `live TX` ≥ **30 fps**.
 
 With `h264_isp_src` + PSRAM invalidate patch (see `apply-patches.sh`), bench UART typically
-shows **~28.8–29.0 fps** TX, **`encode_ms` ~33.3** (last), **`avg` ~33.4 ms**, **`max` ~34.8**
-(IDR), **cam `dropped=0`**. V4L2 `/dev/video11` M2M still calls the same `esp_h264_enc_process`
-under the hood; the gap is ~0.1 ms/frame vs the 33.33 ms budget for 30 fps on current P4 @
-400 MHz + SPIRAM YUV. Remaining options are Espressif guidance for faster CSI→H.264 DMA (e.g.
-internal/coherent buffers) or a silicon/clock revision — not more pipeline threading alone.
+shows **~28.8–29.0 fps** TX, **`encode_ms` ~33.3–33.5** (`avg`), **`max` ~34.5** (IDR),
+**cam `dropped=0`**, **`dq_ms` ~34.7** (DQBUF interval), **`wall_ms` ~34.7**,
+**`push_ms` ≈ `encode_ms`**, **`wait_ms` ~1.1**. Synthetic PSRAM YUV at boot is often
+**~32.9 ms** avg — under the 33.33 ms budget — while live CSI mmap stays ~0.2 ms over.
+Sustained **30 fps** needs **`encode_ms` avg ≤ 33.33 ms** so V4L2 buffers turn fast enough
+(`dq_ms` → 33.33); pipeline threading alone does not fix that. Remaining levers: faster
+CSI→H.264 (Espressif/coherent path), encode tuning (QP/bitrate), or HW revision.
 
 **GS check (direct LAN to `192.168.253.106:21090`):** `printf 'metrics\n' | nc -u -w1
 127.0.0.1 5091` on the receiver host — `h264_decoder.depay_au_pps` has measured **~30** while
