@@ -60,9 +60,13 @@ not fixed by skipping `esp_h264` input writeback alone — HW encode from SPIRAM
 than from internal RAM. The IDF example patches `esp_h264` HW encode to **invalidate** (not
 C2M writeback) PSRAM YUV produced by the ISP before the H.264 DMA read.
 
-**Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady. Remaining work is
-likely an **esp_video / esp_h264** path that feeds the H.264 DMA from internal or
-driver-coherent buffers (e.g. V4L2 HW H.264 M2M, or Espressif-supported zero-copy CSI→enc).
+**Target for true 1080p30 TX:** UART `encode_ms` ≤ **33 ms** steady and `live TX` ≥ **30 fps**.
+
+With `h264_isp_src` + PSRAM invalidate patch (see `apply-patches.sh`), bench UART typically
+shows **~28.8–29.0 fps** TX, **`encode_ms` ~33.3** (last frame), **`max` ~34.5** (IDR), **cam
+`dropped=0`**. That is ~1 ms/frame short of the 33.3 ms budget for 30 fps. Remaining work is
+likely **V4L2 `/dev/video11` HW H.264 M2M** (`h264_encode_connect` + USERPTR to CSI mmap) or
+another Espressif-supported CSI→enc buffer path, not more graph threading alone.
 
 `vs_cap_pull` must **not** poll `output()` in a tight loop: use `esp32p4_csi_camera_src::wait_output()`
 so the thread sleeps on `out_cv_` until `vs_csi_cam` delivers a frame (replaces ~1 kHz

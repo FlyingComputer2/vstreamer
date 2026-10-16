@@ -54,7 +54,8 @@ public:
 
 private:
     static const std::vector<port_desc> &output_ports();
-    void pipeline_main();
+    void capture_main();
+    void encode_main();
     int  push_encoder_input(component_pdu &in);
 
     std::unique_ptr<esp32p4_csi_camera_src> cam_;
@@ -65,7 +66,13 @@ private:
     std::deque<component_pdu>         out_q_;
     static constexpr size_t           k_out_q_max = 8;
 
-    std::thread                       thread_;
+    std::mutex                        raw_mu_;
+    std::condition_variable           raw_cv_;
+    std::deque<component_pdu>         raw_q_;
+    static constexpr size_t           k_raw_q_max = 2;
+
+    std::thread                       capture_thread_;
+    std::thread                       encode_thread_;
     std::atomic<bool>                 stop_ {false};
     bool                              opened = false;
 

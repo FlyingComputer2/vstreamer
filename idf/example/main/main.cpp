@@ -559,9 +559,9 @@ int run_camera_stream()
     }
     (void)src->configure("buffers", "6");
     (void)src->configure("fps", "30");
-    (void)src->configure("bitrate", "3500000");
-    (void)src->configure("gop", "30");
-    (void)src->configure("qp_min", "40");
+    (void)src->configure("bitrate", "4000000");
+    (void)src->configure("gop", "60");
+    (void)src->configure("qp_min", "38");
     (void)src->configure("qp_max", "51");
     const int cr = src->open();
     if (-ENODEV == cr)

@@ -35,7 +35,6 @@ constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
 /* IDR at 1080p rarely exceeds ~512 KiB at sane QP; internal RAM is faster than SPIRAM. */
 constexpr uint32_t k_max_bitstream_bytes = 768U * 1024U;
-/* Match typical CSI buffer count so TX back-pressure does not stall encode. */
 constexpr size_t   k_out_slot_count = 6;
 
 size_t frame_bytes(int w, int h)
@@ -356,6 +355,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         return -EIO;
     }
     last_encode_us_ = dt;
+    sum_encode_us_ += dt;
     max_encode_us_ = dt > max_encode_us_ ? dt : max_encode_us_;
 
     component_pdu au;
@@ -582,10 +582,13 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     if (key == "stats")
     {
         char buf[128];
+        const double avg_ms =
+            frames_ > 0 ? static_cast<double>(sum_encode_us_) / static_cast<double>(frames_) / 1000.0
+                        : 0.0;
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " idr=%" PRIu64 " errors=%" PRIu64
-                      " encode_ms=%.1f max=%.1f",
-                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0,
+                      " encode_ms=%.1f avg=%.1f max=%.1f",
+                      frames_, idr_frames_, encode_errors_, last_encode_us_ / 1000.0, avg_ms,
                       max_encode_us_ / 1000.0);
         *value = buf;
         return 0;

@@ -99,7 +99,7 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
     return -EAGAIN;
 }
 
-void esp32_h264_isp_src::pipeline_main()
+void esp32_h264_isp_src::capture_main()
 {
     while (!stop_.load(std::memory_order_acquire))
     {
@@ -112,6 +112,41 @@ void esp32_h264_isp_src::pipeline_main()
         if (in.sdu_type != sdu_type_e::CAPS_VIDEO_RAW && in.sdu_type != sdu_type_e::O_UYY_E_VYY)
         {
             continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(raw_mu_);
+            if (in.sdu_type == sdu_type_e::CAPS_VIDEO_RAW)
+            {
+                raw_q_.push_front(std::move(in));
+            }
+            else
+            {
+                if (raw_q_.size() >= k_raw_q_max)
+                {
+                    raw_q_.pop_front();
+                }
+                raw_q_.push_back(std::move(in));
+            }
+        }
+        raw_cv_.notify_one();
+    }
+}
+
+void esp32_h264_isp_src::encode_main()
+{
+    while (!stop_.load(std::memory_order_acquire))
+    {
+        component_pdu in;
+        {
+            std::unique_lock<std::mutex> lock(raw_mu_);
+            raw_cv_.wait_for(lock, std::chrono::milliseconds(50),
+                             [&] { return stop_.load(std::memory_order_acquire) || !raw_q_.empty(); });
+            if (raw_q_.empty())
+            {
+                continue;
+            }
+            in = std::move(raw_q_.front());
+            raw_q_.pop_front();
         }
         const int enc_r = push_encoder_input(in);
         if (enc_r < 0)
@@ -163,8 +198,10 @@ int esp32_h264_isp_src::open()
     }
 
     stop_.store(false, std::memory_order_release);
-    thread_ = spawn_thread(thread_opts {"vs_h264_isp", k_pipeline_stack, 1, 12},
-                           [this] { pipeline_main(); });
+    capture_thread_ = spawn_thread(thread_opts {"vs_isp_cap", 12 * 1024, 0, 10},
+                                   [this] { capture_main(); });
+    encode_thread_ = spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 12},
+                                  [this] { encode_main(); });
     opened = true;
     return 0;
 }
@@ -173,10 +210,15 @@ void esp32_h264_isp_src::close()
 {
     stop_.store(true, std::memory_order_release);
     out_cv_.notify_all();
+    raw_cv_.notify_all();
     notify_wakeup();
-    if (thread_.joinable())
+    if (capture_thread_.joinable())
     {
-        thread_.join();
+        capture_thread_.join();
+    }
+    if (encode_thread_.joinable())
+    {
+        encode_thread_.join();
     }
     std::lock_guard<std::mutex> lock(mu);
     if (enc_)
@@ -188,6 +230,7 @@ void esp32_h264_isp_src::close()
         cam_->close();
     }
     out_q_.clear();
+    raw_q_.clear();
     opened = false;
     stop_.store(false, std::memory_order_release);
 }

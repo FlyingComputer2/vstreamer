@@ -71,7 +71,7 @@ private:
         uint32_t cap = 0;
         bool     free = true;
     };
-    static constexpr size_t k_out_slots = 4;
+    static constexpr size_t k_out_slots = 6;
     std::array<out_slot, k_out_slots> out_slots_ {};
     int      live_w_ = 0;
     int      live_h_ = 0;
@@ -90,6 +90,7 @@ private:
     uint64_t encode_errors_ = 0;
     int64_t  last_encode_us_ = 0;
     int64_t  max_encode_us_ = 0;
+    int64_t  sum_encode_us_ = 0;
 };
 
 }  // namespace vstreamer
