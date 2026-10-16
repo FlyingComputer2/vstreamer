@@ -7,7 +7,8 @@ Smoke tests and **live camera TX** over Ethernet (no winject/radio).
 ```bash
 . ~/esp/esp-idf-v5.5.5/export.sh
 cd idf/example
-idf.py set-target esp32p4 build flash monitor
+idf.py set-target esp32p4 build
+./apply-patches.sh && idf.py build flash monitor
 ```
 
 With `CONFIG_VSTREAMER_IDF_LIVE_TX=y` (default in `sdkconfig.defaults`):

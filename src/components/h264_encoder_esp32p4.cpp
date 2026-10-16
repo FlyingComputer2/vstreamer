@@ -35,6 +35,7 @@ constexpr uint32_t k_out_align = 64;
 constexpr size_t   k_out_q_max = 8;
 /* IDR at 1080p rarely exceeds ~512 KiB at sane QP; internal RAM is faster than SPIRAM. */
 constexpr uint32_t k_max_bitstream_bytes = 768U * 1024U;
+constexpr size_t   k_out_slot_count = 4;
 
 size_t frame_bytes(int w, int h)
 {
@@ -160,25 +161,30 @@ int h264_encoder_esp32p4::codec_open_locked()
 
     const uint32_t want_out =
         std::min(static_cast<uint32_t>(2 * frame_bytes(width, height)), k_max_bitstream_bytes);
-    uint32_t actual = 0;
-    uint8_t *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out,
-                                                                   &actual, ESP_H264_MEM_INTERNAL));
-    if (nullptr == out)
+    for (size_t i = 0; i < k_out_slot_count; ++i)
     {
-        out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual,
-                                                             ESP_H264_MEM_SPIRAM));
-    }
-    if (nullptr == out)
-    {
-        esp_h264_enc_close(enc);
-        esp_h264_enc_del(enc);
-        return -ENOMEM;
+        uint32_t actual = 0;
+        uint8_t *out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out,
+                                                                       &actual, ESP_H264_MEM_INTERNAL));
+        if (nullptr == out)
+        {
+            out = static_cast<uint8_t *>(esp_h264_aligned_calloc(k_out_align, 1, want_out, &actual,
+                                                                 ESP_H264_MEM_SPIRAM));
+        }
+        if (nullptr == out)
+        {
+            codec_close_locked();
+            esp_h264_enc_close(enc);
+            esp_h264_enc_del(enc);
+            return -ENOMEM;
+        }
+        out_slots_[i].buf = out;
+        out_slots_[i].cap = actual;
+        out_slots_[i].free = true;
     }
 
     enc_ = enc;
     param_ = param;
-    out_buf_ = out;
-    out_cap_ = actual;
     live_w_ = width;
     live_h_ = height;
     reopen_req = false;
@@ -196,14 +202,42 @@ void h264_encoder_esp32p4::codec_close_locked()
         enc_ = nullptr;
         param_ = nullptr;
     }
-    if (nullptr != out_buf_)
+    for (out_slot &slot : out_slots_)
     {
-        esp_h264_free(out_buf_);
-        out_buf_ = nullptr;
-        out_cap_ = 0;
+        if (nullptr != slot.buf)
+        {
+            esp_h264_free(slot.buf);
+            slot.buf = nullptr;
+            slot.cap = 0;
+            slot.free = true;
+        }
     }
     live_w_ = 0;
     live_h_ = 0;
+}
+
+void h264_encoder_esp32p4::release_out_slot(size_t index)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (index < out_slots_.size())
+    {
+        out_slots_[index].free = true;
+        notify_wakeup();
+    }
+}
+
+int h264_encoder_esp32p4::acquire_out_slot_locked(size_t *index)
+{
+    for (size_t i = 0; i < out_slots_.size(); ++i)
+    {
+        if (out_slots_[i].free && nullptr != out_slots_[i].buf)
+        {
+            out_slots_[i].free = false;
+            *index = i;
+            return 0;
+        }
+    }
+    return -EAGAIN;
 }
 
 int h264_encoder_esp32p4::open()
@@ -288,6 +322,12 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     {
         return -EAGAIN;
     }
+    size_t out_index = 0;
+    if (acquire_out_slot_locked(&out_index) < 0)
+    {
+        return -EAGAIN;
+    }
+    out_slot &slot = out_slots_[out_index];
 
     auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
     if (pending_idr)
@@ -302,14 +342,15 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     in_frame.raw_data.len = static_cast<uint32_t>(in.sdu.size());
     in_frame.pts = static_cast<uint32_t>(in.ts_us / 1000);
     esp_h264_enc_out_frame_t out_frame {};
-    out_frame.raw_data.buffer = out_buf_;
-    out_frame.raw_data.len = out_cap_;
+    out_frame.raw_data.buffer = slot.buf;
+    out_frame.raw_data.len = slot.cap;
 
     const int64_t t0 = esp_timer_get_time();
     const esp_h264_err_t err = esp_h264_enc_process(enc, &in_frame, &out_frame);
     const int64_t dt = esp_timer_get_time() - t0;
-    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > out_cap_)
+    if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > slot.cap)
     {
+        slot.free = true;
         ++encode_errors_;
         return -EIO;
     }
@@ -322,9 +363,12 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     au.port = 0;
     const bool idr = out_frame.frame_type == ESP_H264_FRAME_TYPE_IDR;
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
-    au.sdu = bfc::shared_sized_buffer::copy_from(out_buf_, out_frame.length);
+    au.sdu = bfc::shared_sized_buffer::adopt(
+        reinterpret_cast<std::byte *>(slot.buf), slot.cap, out_frame.length,
+        [this, out_index](std::byte *) { release_out_slot(out_index); });
     if (au.sdu.empty())
     {
+        slot.free = true;
         return -ENOMEM;
     }
     out_q_.push_back(std::move(au));

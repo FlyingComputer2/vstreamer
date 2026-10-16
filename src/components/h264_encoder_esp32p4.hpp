@@ -6,6 +6,7 @@
 #error "h264_encoder_esp32p4 requires ENABLE_H264_ENCODER_ESP32P4 (ESP-IDF, esp32p4 target)"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -64,10 +65,19 @@ private:
     /* esp_h264 handles and the cache-aligned bitstream buffer; typed in the .cpp. */
     void    *enc_ = nullptr;
     void    *param_ = nullptr;
-    uint8_t *out_buf_ = nullptr;
-    uint32_t out_cap_ = 0;
+    struct out_slot
+    {
+        uint8_t *buf = nullptr;
+        uint32_t cap = 0;
+        bool     free = true;
+    };
+    static constexpr size_t k_out_slots = 4;
+    std::array<out_slot, k_out_slots> out_slots_ {};
     int      live_w_ = 0;
     int      live_h_ = 0;
+
+    void release_out_slot(size_t index);
+    int  acquire_out_slot_locked(size_t *index);
 
     bool             have_input_caps_ = false;
     bool             caps_reject_ = false;

@@ -420,9 +420,7 @@ void esp32p4_csi_camera_src::capture_main()
             continue;
         }
 
-#if defined(ESP_PLATFORM)
-        sync_device_frame_to_cpu(r->ptr[b.index], b.bytesused);
-#endif
+        /* Coherency before esp_h264 DMA is handled in the encoder (PSRAM invalidate). */
 
         component_pdu pdu;
         pdu.ts_us = ts_us;
