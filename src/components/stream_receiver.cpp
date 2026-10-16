@@ -6,6 +6,7 @@
 #include "core/sequence_gap.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
+#include "core/thread_spawn.hpp"
 
 #include <cerrno>
 #include <cinttypes>
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <random>
 #include <thread>
+#include <vector>
 #include <vector>
 
 #include <arpa/inet.h>
@@ -26,6 +28,9 @@
 
 namespace
 {
+
+/* Receive-thread stack on ESP-IDF (the datagram buffer is on the heap); ignored on Linux. */
+constexpr size_t k_recv_stack_bytes = 8 * 1024;
 
 double now_sec()
 {
@@ -312,7 +317,8 @@ void stream_receiver::recv_thread_main()
     /* Bounded wait so block expiry and the in-order emit queue advance even
      * when the wire goes quiet (e.g. tail of a burst loss). */
     constexpr int k_poll_ms = 10;
-    uint8_t       buf[65536];
+    /* Largest UDP datagram; on the heap, not the thread stack (small on ESP-IDF). */
+    std::vector<uint8_t> buf(65536);
     sockaddr_in   peer_addr {};
     socklen_t     peer_len = 0;
     bool          have_peer = false;
@@ -356,13 +362,15 @@ void stream_receiver::recv_thread_main()
                 sockaddr_in src {};
                 msghdr      msg {};
                 iovec       iov {};
-                iov.iov_base = buf;
-                iov.iov_len = sizeof(buf);
+                iov.iov_base = buf.data();
+                iov.iov_len = buf.size();
                 msg.msg_name = &src;
                 msg.msg_namelen = sizeof(src);
                 msg.msg_iov = &iov;
                 msg.msg_iovlen = 1;
-                const ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT | MSG_TRUNC);
+                /* No MSG_TRUNC in flags: lwIP's recvmsg() rejects every flag but MSG_PEEK and
+                 * MSG_DONTWAIT (EOPNOTSUPP). Truncation still shows in msg_flags. */
+                const ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT);
                 if (n <= 0)
                 {
                     break;
@@ -371,7 +379,7 @@ void stream_receiver::recv_thread_main()
                 {
                     rx_truncated.fetch_add(1, std::memory_order_relaxed);
                 }
-                if (ingest_datagram(buf, static_cast<size_t>(n)))
+                if (ingest_datagram(buf.data(), static_cast<size_t>(n)))
                 {
                     const bool peer_changed =
                         have_peer && (0 != std::memcmp(&src, &peer_addr, sizeof(peer_addr)));
@@ -571,7 +579,8 @@ int stream_receiver::open()
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
-        recv_thread = std::thread(&stream_receiver::recv_thread_main, this);
+        recv_thread = spawn_thread(thread_opts {"vs_recv", k_recv_stack_bytes},
+                                   &stream_receiver::recv_thread_main, this);
     }
 
     {

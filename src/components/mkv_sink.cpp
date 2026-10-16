@@ -2,6 +2,7 @@
 
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
+#include "core/thread_spawn.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -137,9 +138,9 @@ std::string mkv_sink::segment_path_locked() const
     {
         return {};
     }
-    char buf[4096];
-    std::snprintf(buf, sizeof(buf), "%s-%03d%s", output_stem.c_str(), segment_index, output_ext.c_str());
-    return buf;
+    char idx[16];
+    std::snprintf(idx, sizeof(idx), "-%03d", segment_index);
+    return output_stem + idx + output_ext;
 }
 
 int mkv_sink::start_locked(int w, int h, mkv_codec_e codec)
@@ -479,7 +480,8 @@ int mkv_sink::open()
     }
     opened = true;
     mux_stop.store(false, std::memory_order_relaxed);
-    mux_thread = std::thread([this] { mux_thread_main(); });
+    /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
+    mux_thread = spawn_thread(thread_opts {"vs_mkv", 8 * 1024}, [this] { mux_thread_main(); });
     return 0;
 }
 

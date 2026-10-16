@@ -1,6 +1,7 @@
 #include "core/buffer_pool.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -10,16 +11,21 @@ namespace vstreamer
 
 struct buffer_pool::state
 {
+    /* One slab for all blocks: a single large allocation (on ESP-IDF it lands in PSRAM instead
+     * of thousands of small blocks filling internal RAM). Blocks keep max_align_t alignment. */
     explicit state(size_t block_bytes_in, size_t depth)
         : block_bytes(block_bytes_in)
     {
-        blocks.reserve(depth);
-        free_list.reserve(depth);
-        for (size_t i = 0; i < depth; ++i)
+        constexpr size_t align = alignof(std::max_align_t);
+        const size_t     stride = (block_bytes + align - 1) / align * align;
+        if (depth > 0 && block_bytes > 0)
         {
-            auto mem = std::make_unique<std::byte[]>(block_bytes);
-            free_list.push_back(mem.get());
-            blocks.push_back(std::move(mem));
+            slab = std::make_unique<std::byte[]>(stride * depth);
+        }
+        free_list.reserve(depth);
+        for (size_t i = 0; slab && i < depth; ++i)
+        {
+            free_list.push_back(slab.get() + i * stride);
         }
     }
 
@@ -28,7 +34,6 @@ struct buffer_pool::state
         accepting = false;
         std::lock_guard<std::mutex> lock(mu);
         free_list.clear();
-        blocks.clear();
     }
 
     void recycle(std::byte *p)
@@ -41,7 +46,7 @@ struct buffer_pool::state
     }
 
     std::mutex                              mu;
-    std::vector<std::unique_ptr<std::byte[]>> blocks;
+    std::unique_ptr<std::byte[]>            slab;
     std::vector<std::byte *>                free_list;
     std::atomic<bool>                       accepting {true};
     const size_t                            block_bytes;

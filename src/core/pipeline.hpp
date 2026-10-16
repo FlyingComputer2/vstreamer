@@ -222,6 +222,10 @@ public:
 
     /* --- Control (any thread except the pipeline thread) ----------------------------------
      *
+     * On ESP-IDF the caller must be a pthread (std::thread): the pipeline-thread check uses
+     * std::this_thread::get_id(), and pthread_self() asserts in a plain FreeRTOS task such as
+     * app_main.
+     *
      * Each call is executed on the pipeline thread and returns its result. Called from the
      * pipeline thread itself (e.g. inside the error handler) they return -EDEADLK.
      *
@@ -241,9 +245,10 @@ public:
     /* Node name and error of the failure that put the pipeline in ERROR; empty / 0 otherwise. */
     void last_error(std::string *node_name, int *err) const;
 
-    /* STOPPED only. Pin the pipeline thread to cpu (-1 = no pinning). The pin is applied after
-     * the nodes are opened, so threads that components start in open() are not pinned with it;
-     * threads a component starts later (while running) do inherit it. */
+    /* STOPPED only. Pin the pipeline thread to cpu (-1 = no pinning). On Linux the pin is
+     * applied after the nodes are opened, so threads that components start in open() are not
+     * pinned with it; threads a component starts later (while running) do inherit it. On ESP-IDF
+     * the core is fixed when the thread is created and no thread started from it inherits it. */
     int set_cpu(int cpu);
     void set_error_handler(error_fn fn);
 
