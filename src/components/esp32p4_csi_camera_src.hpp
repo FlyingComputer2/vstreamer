@@ -69,7 +69,7 @@ private:
     int width = 0;  /* 0 = the sensor's mode */
     int height = 0;
     int fps = 30;   /* for the caps; the sensor mode sets the real rate */
-    int nbufs = 3;
+    int nbufs = 4;
 
     bool        source_open = false;
     std::string driver;

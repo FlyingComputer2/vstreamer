@@ -15,6 +15,12 @@
 // 3. esp32p4_csi_camera_src -> h264_encoder_esp32p4 (esp32p4 only): captures from the MIPI-CSI
 // sensor in sdkconfig for a few seconds, reports fps and dumps the first second as a clip.
 // Skipped when no sensor answers on SCCB.
+//
+// 4. Live TX (CONFIG_VSTREAMER_IDF_LIVE_TX): camera -> encoder -> rtp_h264_pay -> stream_sender
+//    to CONFIG_VSTREAMER_RX_PEER over Ethernet (DHCP). Skips tests 1–3.
+
+#include "ethernet_init.hpp"
+#include "sdkconfig.h"
 
 #include "components/components_config.hpp"
 #include "core/component_coder.hpp"
@@ -395,6 +401,225 @@ int run_camera()
 
 #endif
 
+#if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
+    CONFIG_VSTREAMER_IDF_LIVE_TX
+
+void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_sink *sender)
+{
+    vstreamer::component_pdu out;
+    while (pay->output(out) == 0)
+    {
+        while (true)
+        {
+            const int r = sender->input(std::move(out));
+            if (0 == r)
+            {
+                break;
+            }
+            if (-EAGAIN != r)
+            {
+                std::printf("stream_sender input failed: %d\n", r);
+                return;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+}
+
+void drain_encoder_chain(vstreamer::component_coder *enc, vstreamer::component_coder *pay,
+                         vstreamer::component_sink *sender)
+{
+    vstreamer::component_pdu out;
+    while (enc->output(out) == 0)
+    {
+        for (;;)
+        {
+            const int r = pay->input(std::move(out));
+            if (0 == r)
+            {
+                break;
+            }
+            if (-EAGAIN != r)
+            {
+                std::printf("rtp_h264_pay input failed: %d\n", r);
+                return;
+            }
+            drain_pay_to_sender(pay, sender);
+        }
+        drain_pay_to_sender(pay, sender);
+    }
+}
+
+int run_camera_stream()
+{
+    constexpr int k_seconds = CONFIG_VSTREAMER_LIVE_TX_SECONDS;
+
+    auto cam = vstreamer::component_factory::create_source("csi_camera");
+    auto enc = vstreamer::component_factory::create_coder("h264_encoder");
+    auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
+    auto snd = vstreamer::component_factory::create_sink("stream_sender");
+    auto *enc_c = dynamic_cast<vstreamer::component_coder *>(enc.get());
+    auto *pay_c = dynamic_cast<vstreamer::component_coder *>(pay.get());
+    auto *snd_s = dynamic_cast<vstreamer::component_sink *>(snd.get());
+    if (!cam || !enc_c || !pay_c || !snd_s)
+    {
+        std::printf("live TX: missing component\n");
+        return -1;
+    }
+
+    print_heap("live start");
+    (void)cam->configure("buffers", "4");
+    const int cr = cam->open();
+    if (-ENODEV == cr)
+    {
+        std::printf("live TX SKIPPED (no sensor)\n");
+        return 0;
+    }
+    if (cr < 0)
+    {
+        std::printf("camera open failed: %d\n", cr);
+        return -1;
+    }
+
+    std::string size;
+    cam->query("size", &size);
+    enc->configure("size", size);
+    enc->configure("bitrate", "4000000");
+    enc->configure("gop", "30");
+    pay->configure("fps", "30");
+    pay->configure("mtu", "1400");
+    snd->configure("stream", CONFIG_VSTREAMER_RX_PEER);
+    snd->configure("mtu", "1400");
+    snd->configure("max_kbps", "8000");
+    snd->configure("telemetry", "off");
+
+    if (enc->open() < 0 || pay->open() < 0 || snd->open() < 0)
+    {
+        std::printf("live TX open failed\n");
+        return -1;
+    }
+    snd_s->set_enabled(true, 0);
+
+    std::printf("live TX streaming %s for %d s (size %s)\n", CONFIG_VSTREAMER_RX_PEER, k_seconds,
+                size.c_str());
+
+    int           frames = 0;
+    int           keys = 0;
+    size_t        bytes = 0;
+    int64_t       t0 = 0;
+    const int64_t deadline = esp_timer_get_time() + (k_seconds + 5) * 1000000LL;
+    const int64_t stop_at = esp_timer_get_time() + k_seconds * 1000000LL;
+
+    while (esp_timer_get_time() < deadline)
+    {
+        drain_encoder_chain(enc_c, pay_c, snd_s);
+
+        vstreamer::component_pdu in;
+        if (cam->output(in) != 0)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            if (t0 > 0 && esp_timer_get_time() >= stop_at)
+            {
+                break;
+            }
+            continue;
+        }
+        if (in.sdu_type == vstreamer::sdu_type_e::O_UYY_E_VYY && 0 == t0)
+        {
+            t0 = esp_timer_get_time();
+        }
+        if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW)
+        {
+            continue;
+        }
+        if (in.sdu_type != vstreamer::sdu_type_e::O_UYY_E_VYY)
+        {
+            continue;
+        }
+
+        for (;;)
+        {
+            drain_encoder_chain(enc_c, pay_c, snd_s);
+            const int r = enc_c->input(std::move(in));
+            if (0 == r)
+            {
+                break;
+            }
+            if (-EAGAIN != r)
+            {
+                std::printf("encode failed: %d\n", r);
+                goto done;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+            if (esp_timer_get_time() >= stop_at)
+            {
+                goto done;
+            }
+        }
+
+        vstreamer::component_pdu out;
+        while (enc_c->output(out) == 0)
+        {
+            if (out.sdu_type != vstreamer::sdu_type_e::H264_AU)
+            {
+                continue;
+            }
+            const size_t au_bytes = out.sdu.size();
+            const bool   key = vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY);
+            for (;;)
+            {
+                drain_pay_to_sender(pay_c, snd_s);
+                const int r = pay_c->input(std::move(out));
+                if (0 == r)
+                {
+                    break;
+                }
+                if (-EAGAIN != r)
+                {
+                    std::printf("pay failed: %d\n", r);
+                    goto done;
+                }
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+            drain_pay_to_sender(pay_c, snd_s);
+            ++frames;
+            bytes += au_bytes;
+            if (key)
+            {
+                ++keys;
+            }
+        }
+
+        if (t0 > 0 && esp_timer_get_time() >= stop_at)
+        {
+            break;
+        }
+    }
+
+done:
+    drain_encoder_chain(enc_c, pay_c, snd_s);
+    const double sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
+    std::string  cam_stats;
+    std::string  enc_stats;
+    std::string  snd_stats;
+    cam->query("stats", &cam_stats);
+    enc->query("stats", &enc_stats);
+    snd->query("stats", &snd_stats);
+    std::printf("live TX done: %d AUs, %d IDR, %.1f fps, %.0f kbps; cam %s; enc %s; snd %s\n",
+                frames, keys, sec > 0 ? frames / sec : 0.0, sec > 0 ? bytes * 8 / sec / 1000 : 0.0,
+                cam_stats.c_str(), enc_stats.c_str(), snd_stats.c_str());
+    snd->close();
+    pay->close();
+    enc->close();
+    cam->close();
+    print_heap("live end");
+    const bool ok = sec > 0 && frames / sec >= 15;
+    std::printf("live TX %s\n", ok ? "PASSED" : "FAILED");
+    return ok ? 0 : -1;
+}
+
+#endif
+
 int run()
 {
     using vstreamer::component_factory;
@@ -506,15 +731,28 @@ extern "C" void app_main(void)
     nvs_flash_init();
     esp_netif_init();
     esp_event_loop_create_default();
+    if (vstreamer_idf_ethernet_start() != ESP_OK)
+    {
+        std::printf("Ethernet start failed\n");
+    }
+    else if (vstreamer_idf_wait_for_ip(30000) != ESP_OK)
+    {
+        std::printf("DHCP timeout (continuing anyway)\n");
+    }
     /* pipeline control uses std::this_thread::get_id(), which needs a pthread; app_main is a
      * plain FreeRTOS task. */
-    auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 16 * 1024}, [] {
+    auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 24 * 1024}, [] {
+#if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
+    CONFIG_VSTREAMER_IDF_LIVE_TX
+        (void)run_camera_stream();
+#else
         (void)run();
 #ifdef ENABLE_H264_ENCODER_ESP32P4
         (void)run_encoder();
 #endif
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4)
         (void)run_camera();
+#endif
 #endif
     });
     t.join();
