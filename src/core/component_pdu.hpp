@@ -4,7 +4,7 @@
 #include <cstdint>
 
 #include "core/sdu_type.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 namespace vstreamer
 {
@@ -29,7 +29,7 @@ struct component_pdu
     sdu_type_e          sdu_type = sdu_type_e::UNKNOWN;
     uint8_t             port = 0;
     uint8_t             flags = 0;
-    shared_sized_buffer sdu;
+    bfc::shared_sized_buffer sdu;
 };
 
 [[nodiscard]] inline bool has_flag(const component_pdu &pdu, pdu_flag_e flag)

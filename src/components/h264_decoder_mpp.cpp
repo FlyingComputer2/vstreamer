@@ -394,7 +394,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         nv12_pool = std::make_unique<buffer_pool>(nv12_sz, k_max_ready_frames);
         nv12_pool_bytes = nv12_sz;
     }
-    shared_sized_buffer out_buf = nv12_pool->acquire(nv12_sz);
+    bfc::shared_sized_buffer out_buf = nv12_pool->acquire(nv12_sz);
     if (out_buf.empty())
     {
         return -ENOMEM;

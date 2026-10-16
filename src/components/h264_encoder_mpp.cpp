@@ -775,8 +775,8 @@ bool h264_encoder_mpp::finalize_enc_au_pdu(component_pdu *out)
     }
 
     const size_t out_len = enc_au_accum.size();
-    shared_sized_buffer payload =
-        shared_sized_buffer::copy_from(enc_au_accum.data(), out_len);
+    bfc::shared_sized_buffer payload =
+        bfc::shared_sized_buffer::copy_from(enc_au_accum.data(), out_len);
     enc_au_accum.clear();
     if (payload.empty() && out_len > 0)
     {

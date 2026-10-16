@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 // Packet-block Reed-Solomon erasure FEC (systematic Cauchy MDS via ISA-L).
 // k app datagrams become n on-air shards. Wire header is 5 bytes (see pack_header).
@@ -21,7 +21,7 @@
 namespace vstreamer
 {
 
-using fec_rx_payload_list = std::vector<shared_sized_buffer>;
+using fec_rx_payload_list = std::vector<bfc::shared_sized_buffer>;
 
 class rs_block_erasure
 {
@@ -94,7 +94,7 @@ public:
 
     // Air datagram (full 5-byte FEC shard header + body). Zero-copy RX stores the
     // buffer in the block; systematic emits are subviews of the shard body.
-    void push_air(shared_sized_buffer shard, fec_rx_payload_list* out);
+    void push_air(bfc::shared_sized_buffer shard, fec_rx_payload_list* out);
     void push_air(const uint8_t* data, size_t len, fec_rx_payload_list* out);
 
     uint64_t recovered() const
@@ -164,9 +164,9 @@ public:
     // Decode from shard index -> body. k/n come from the wire header (or
     // from init() via the overload). Returns false if unrecoverable.
     bool decode_block(int k, int n, int sdu_n,
-                      const std::unordered_map<int, shared_sized_buffer>& frags,
+                      const std::unordered_map<int, bfc::shared_sized_buffer>& frags,
                       fec_rx_payload_list* payloads, int* recovered) const;
-    bool decode_block(const std::unordered_map<int, shared_sized_buffer>& frags,
+    bool decode_block(const std::unordered_map<int, bfc::shared_sized_buffer>& frags,
                       fec_rx_payload_list* payloads, int* recovered) const;
 
     [[nodiscard]] size_t max_original() const;
@@ -188,7 +188,7 @@ private:
         int                                              n = 0;
         int                                              sdu_n = 0;
         int                                              released = 0;
-        std::unordered_map<int, shared_sized_buffer>     frags;
+        std::unordered_map<int, bfc::shared_sized_buffer>     frags;
         std::chrono::steady_clock::time_point            first_seen{};
         std::chrono::steady_clock::time_point            last_seen{};
     };
@@ -196,7 +196,7 @@ private:
     struct held_shard_s
     {
         std::chrono::steady_clock::time_point at{};
-        shared_sized_buffer                   shard;
+        bfc::shared_sized_buffer                   shard;
     };
 
     struct ready_block_s
@@ -215,8 +215,8 @@ private:
     void       note_head_hole_sdus(int gap_sdus);
 
     void record_payload_emit();
-    void emit_payload(fec_rx_payload_list* out, shared_sized_buffer&& app);
-    static bool frag_to_app(const shared_sized_buffer& shard, shared_sized_buffer* app);
+    void emit_payload(fec_rx_payload_list* out, bfc::shared_sized_buffer&& app);
+    static bool frag_to_app(const bfc::shared_sized_buffer& shard, bfc::shared_sized_buffer* app);
 
     /* Emits what the block has and returns how many of its SDUs could not be delivered. */
     int abandon_partial_block(const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out);
@@ -230,7 +230,7 @@ private:
     void maybe_rebase_after_silence(uint16_t sdu_base);
     void clear_state_behind(uint16_t base);
     void keep_state_ahead_of(uint16_t base);
-    bool hold_far_behind_shard(uint16_t sdu_base, const shared_sized_buffer& shard,
+    bool hold_far_behind_shard(uint16_t sdu_base, const bfc::shared_sized_buffer& shard,
                                fec_rx_payload_list* out);
     void maybe_resync_to_held(fec_rx_payload_list* out);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);

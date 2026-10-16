@@ -547,7 +547,7 @@ int noise_source::output(component_pdu &out)
     out.sdu_type = sdu_type_e::NV12;
     out.port = 0;
     out.flags = static_cast<uint8_t>(pdu_flag_e::KEY);
-    out.sdu = shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(buf), nv12_sz, nv12_sz,
+    out.sdu = bfc::shared_sized_buffer::adopt(reinterpret_cast<std::byte *>(buf), nv12_sz, nv12_sz,
                                          [](std::byte *p) {
                                              std::free(reinterpret_cast<uint8_t *>(p));
                                          });

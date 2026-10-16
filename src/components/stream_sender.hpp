@@ -121,7 +121,7 @@ private:
     /* A wire datagram and the earliest time the send thread may send it. */
     struct queued_wire
     {
-        shared_sized_buffer                   buf;
+        bfc::shared_sized_buffer                   buf;
         std::chrono::steady_clock::time_point release {};
     };
 

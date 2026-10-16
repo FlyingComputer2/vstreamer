@@ -115,7 +115,7 @@ std::string stream_receiver::name() const
 
 
 
-void stream_receiver::enqueue_payload_buffer(shared_sized_buffer &&payload,
+void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
                                              size_t max_app_bytes, bool discont)
 {
     if (payload.empty() || 0 == max_app_bytes || payload.size() > max_app_bytes)
@@ -233,7 +233,7 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
                 rx_bad_header++;
                 return false;
             }
-            shared_sized_buffer shard = pool.acquire(payload_len);
+            bfc::shared_sized_buffer shard = pool.acquire(payload_len);
             if (0 == shard.capacity() || shard.size() != payload_len)
             {
                 recv_dropped++;
@@ -256,7 +256,7 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
                 recv_dropped++;
                 return false;
             }
-            shared_sized_buffer sdu = pool.acquire(payload_len);
+            bfc::shared_sized_buffer sdu = pool.acquire(payload_len);
             if (0 == sdu.capacity() || sdu.size() != payload_len)
             {
                 recv_dropped++;

@@ -202,7 +202,7 @@ void vstreamer::rs_block_erasure::record_payload_emit()
 }
 
 void vstreamer::rs_block_erasure::emit_payload(fec_rx_payload_list* out,
-                                               shared_sized_buffer&& app)
+                                               bfc::shared_sized_buffer&& app)
 {
     if (nullptr == out || app.empty())
     {
@@ -212,8 +212,8 @@ void vstreamer::rs_block_erasure::emit_payload(fec_rx_payload_list* out,
     record_payload_emit();
 }
 
-bool vstreamer::rs_block_erasure::frag_to_app(const shared_sized_buffer& shard,
-                                              shared_sized_buffer* app)
+bool vstreamer::rs_block_erasure::frag_to_app(const bfc::shared_sized_buffer& shard,
+                                              bfc::shared_sized_buffer* app)
 {
     if (nullptr == app || shard.size() < k_header_len + k_len_prefix)
     {
@@ -351,7 +351,7 @@ void vstreamer::rs_block_erasure::keep_state_ahead_of(uint16_t base)
  * (reordered past a resync) or a new sender session whose random sdu_base landed behind. Hold it
  * until maybe_resync_to_held() can tell the two apart. */
 bool vstreamer::rs_block_erasure::hold_far_behind_shard(uint16_t sdu_base,
-                                                        const shared_sized_buffer& shard,
+                                                        const bfc::shared_sized_buffer& shard,
                                                         fec_rx_payload_list* out)
 {
     const auto t = now();
@@ -523,7 +523,7 @@ void vstreamer::rs_block_erasure::try_stream_head_systematic(
         {
             break;
         }
-        shared_sized_buffer app;
+        bfc::shared_sized_buffer app;
         if (!frag_to_app(it->second, &app))
         {
             break;
@@ -546,7 +546,7 @@ int vstreamer::rs_block_erasure::abandon_partial_block(
         {
             continue;
         }
-        shared_sized_buffer app;
+        bfc::shared_sized_buffer app;
         if (!frag_to_app(it->second, &app))
         {
             continue;
@@ -989,7 +989,7 @@ int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
 }
 
 bool vstreamer::rs_block_erasure::decode_block(
-    const std::unordered_map<int, shared_sized_buffer>& frags, fec_rx_payload_list* payloads,
+    const std::unordered_map<int, bfc::shared_sized_buffer>& frags, fec_rx_payload_list* payloads,
     int* recovered) const
 {
     if (!active)
@@ -1000,7 +1000,7 @@ bool vstreamer::rs_block_erasure::decode_block(
 }
 
 bool vstreamer::rs_block_erasure::decode_block(
-    int k, int n, int sdu_n, const std::unordered_map<int, shared_sized_buffer>& frags,
+    int k, int n, int sdu_n, const std::unordered_map<int, bfc::shared_sized_buffer>& frags,
     fec_rx_payload_list* payloads, int* recovered) const
 {
     if (payloads == nullptr || k < 1 || n < k || n > static_cast<int>(k_max_n) ||
@@ -1065,7 +1065,7 @@ bool vstreamer::rs_block_erasure::decode_block(
         {
             return owned[static_cast<size_t>(idx)];
         }
-        const shared_sized_buffer& shard = frags.at(idx);
+        const bfc::shared_sized_buffer& shard = frags.at(idx);
         owned[static_cast<size_t>(idx)].assign(shard.u8() + k_header_len,
                                                 shard.u8() + shard.size());
         if (owned[static_cast<size_t>(idx)].size() < shard_len)
@@ -1162,7 +1162,7 @@ bool vstreamer::rs_block_erasure::decode_block(
             }
             if (frags.find(i) != frags.end())
             {
-                shared_sized_buffer app;
+                bfc::shared_sized_buffer app;
                 if (!frag_to_app(frags.at(i), &app))
                 {
                     return false;
@@ -1185,7 +1185,7 @@ bool vstreamer::rs_block_erasure::decode_block(
                 continue;
             }
             payloads->push_back(
-                shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
+                bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
             continue;
         }
         const std::vector<uint8_t>& row = data_copy[static_cast<size_t>(i)];
@@ -1202,7 +1202,7 @@ bool vstreamer::rs_block_erasure::decode_block(
         {
             return false;
         }
-        payloads->push_back(shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
+        payloads->push_back(bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
     }
     if (recovered != nullptr)
     {
@@ -1439,10 +1439,10 @@ void vstreamer::rs_block_erasure::push_air(const uint8_t* data, size_t len,
     {
         return;
     }
-    push_air(shared_sized_buffer::copy_from(data, len), out);
+    push_air(bfc::shared_sized_buffer::copy_from(data, len), out);
 }
 
-void vstreamer::rs_block_erasure::push_air(shared_sized_buffer shard,
+void vstreamer::rs_block_erasure::push_air(bfc::shared_sized_buffer shard,
                                            fec_rx_payload_list* out)
 {
     if (out != nullptr)

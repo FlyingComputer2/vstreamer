@@ -75,7 +75,7 @@ private:
     /* Returns true when the datagram is valid stream media (telemetry peer update). */
     bool ingest_datagram(const uint8_t *data, size_t len);
     void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
-    void enqueue_payload_buffer(shared_sized_buffer &&payload, size_t max_app_bytes,
+    void enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, size_t max_app_bytes,
                                 bool discont);
 
     static const std::vector<port_desc> &output_ports();

@@ -6,7 +6,7 @@
 
 #include "test_pdu_helpers.hpp"
 
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 #include "core/time_util.hpp"
 
 #include <cstdint>
@@ -479,7 +479,7 @@ TEST(RtpH264Test, DepayComponentQueuesMultipleAus)
         vstreamer::component_pdu in;
         in.sdu_type = vstreamer::sdu_type_e::RTP;
         in.port = 0;
-        in.sdu = vstreamer::shared_sized_buffer::copy_from(dg.data(), dg.size());
+        in.sdu = bfc::shared_sized_buffer::copy_from(dg.data(), dg.size());
         ASSERT_EQ(0, depay.input(std::move(in)));
     }
 
@@ -620,7 +620,7 @@ void feed_depay_rtp(vstreamer::rtp_h264_depay &depay, const std::vector<uint8_t>
     vstreamer::component_pdu in;
     in.sdu_type = vstreamer::sdu_type_e::RTP;
     in.port = 0;
-    in.sdu = vstreamer::shared_sized_buffer::copy_from(dg.data(), dg.size());
+    in.sdu = bfc::shared_sized_buffer::copy_from(dg.data(), dg.size());
     EXPECT_EQ(0, depay.input(std::move(in)));
 }
 

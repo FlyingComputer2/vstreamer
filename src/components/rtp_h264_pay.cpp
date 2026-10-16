@@ -182,7 +182,7 @@ int rtp_h264_pay::output(component_pdu &out)
     }
 
     const pending_datagram &front = pending.front();
-    shared_sized_buffer     buf = pool.acquire(front.bytes.size());
+    bfc::shared_sized_buffer     buf = pool.acquire(front.bytes.size());
     if (0 == buf.capacity() || buf.size() != front.bytes.size())
     {
         return -ENOMEM;

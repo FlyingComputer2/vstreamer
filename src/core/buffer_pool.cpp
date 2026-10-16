@@ -52,7 +52,7 @@ buffer_pool::buffer_pool(size_t block_bytes, size_t depth) : st(std::make_shared
 {
 }
 
-shared_sized_buffer buffer_pool::acquire(size_t need)
+bfc::shared_sized_buffer buffer_pool::acquire(size_t need)
 {
     if (0 == need)
     {
@@ -65,7 +65,7 @@ shared_sized_buffer buffer_pool::acquire(size_t need)
         {
             st->misses.fetch_add(1, std::memory_order_relaxed);
         }
-        auto buf = shared_sized_buffer::allocate(need);
+        auto buf = bfc::shared_sized_buffer::allocate(need);
         if (0 == buf.capacity())
         {
             return {};
@@ -87,7 +87,7 @@ shared_sized_buffer buffer_pool::acquire(size_t need)
     if (nullptr == raw)
     {
         st->misses.fetch_add(1, std::memory_order_relaxed);
-        auto buf = shared_sized_buffer::allocate(need);
+        auto buf = bfc::shared_sized_buffer::allocate(need);
         if (0 == buf.capacity())
         {
             return {};
@@ -105,8 +105,8 @@ shared_sized_buffer buffer_pool::acquire(size_t need)
         }
     };
 
-    shared_sized_buffer out =
-        shared_sized_buffer::adopt(raw, cap, need, std::move(release_fn));
+    bfc::shared_sized_buffer out =
+        bfc::shared_sized_buffer::adopt(raw, cap, need, std::move(release_fn));
     return out;
 }
 

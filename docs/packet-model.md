@@ -1,7 +1,7 @@
 # Packet model
 
 Pipeline stages exchange **`component_pdu`** (`core/component_pdu.hpp`): a typed SDU in
-`shared_sized_buffer`, plus `sdu_type`, timestamps, flags, and port index. Caps PDUs
+`bfc::shared_sized_buffer`, plus `sdu_type`, timestamps, flags, and port index. Caps PDUs
 (`CAPS_VIDEO_RAW`, `CAPS_VIDEO_CODED`, …) describe geometry and codec parameters via
 `sdu_caps.hpp`.
 

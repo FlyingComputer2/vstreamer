@@ -12,14 +12,14 @@
 #include <string>
 #include <thread>
 
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 namespace vstreamer
 {
 
 struct nv12_present_sample
 {
-    shared_sized_buffer buf;
+    bfc::shared_sized_buffer buf;
     int                 width = 0;
     int                 height = 0;
     uint64_t            ts_us = 0;

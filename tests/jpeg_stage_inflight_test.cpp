@@ -6,7 +6,7 @@
 #include "core/component_output.hpp"
 #include "core/component_pdu.hpp"
 #include "core/sdu_caps.hpp"
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
@@ -28,7 +28,7 @@ vstreamer::component_pdu make_mjpeg_blob(const uint8_t *data, size_t len)
     vstreamer::component_pdu pdu;
     pdu.ts_us = 1000;
     pdu.sdu_type = vstreamer::sdu_type_e::MJPEG;
-    pdu.sdu = vstreamer::shared_sized_buffer::copy_from(data, len);
+    pdu.sdu = bfc::shared_sized_buffer::copy_from(data, len);
     return pdu;
 }
 

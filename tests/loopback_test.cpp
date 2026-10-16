@@ -1,7 +1,7 @@
 #include "components/stream_receiver.hpp"
 #include "components/stream_sender.hpp"
 
-#include "core/shared_sized_buffer.hpp"
+#include <bfc/shared_sized_buffer.hpp>
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 
