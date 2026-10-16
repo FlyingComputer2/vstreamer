@@ -43,6 +43,8 @@ public:
     int  open() override;
     void close() override;
     int  output(component_pdu &out) override;
+    /* Blocks up to timeout_ms for a frame (or CAPS once). Returns -EAGAIN on timeout. */
+    int  wait_output(component_pdu &out, int timeout_ms);
 
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
@@ -53,10 +55,13 @@ public:
 private:
     int  capture_open_locked();
     void capture_main();
+    /* Caller holds mu. 0 = delivered, -EAGAIN = nothing ready. */
+    int  try_pop_output_locked(component_pdu &out);
     /* STREAMOFF, wait for downstream frames, then unmap and close. */
     static void release_ring(std::shared_ptr<ring> r);
 
-    mutable std::mutex mu;
+    mutable std::mutex              mu;
+    std::condition_variable         out_cv_;
 
     /* esp_video_init() parameters. */
     int sccb_port = 0;

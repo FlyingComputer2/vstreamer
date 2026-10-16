@@ -23,6 +23,9 @@
 #include "sdkconfig.h"
 
 #include "components/components_config.hpp"
+#if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC)
+#include "components/esp32p4_csi_camera_src.hpp"
+#endif
 #include "core/component_coder.hpp"
 #include "core/component_factory.hpp"
 #include "core/sdu_caps.hpp"
@@ -648,13 +651,17 @@ int run_camera_stream()
         return true;
     };
 
+    auto *csi_cam = static_cast<vstreamer::esp32p4_csi_camera_src *>(cam.get());
     auto capture_fn = [&]() {
         while (!stop.load(std::memory_order_acquire))
         {
             vstreamer::component_pdu in;
-            if (cam->output(in) != 0)
+            /* Block on vs_csi_cam's out_cv_ instead of polling output() + vTaskDelay(1)
+             * (~1 kHz mutex wakeups when idle, and live_tx_yield() spun at 100% CPU). */
+            const int pull_r =
+                csi_cam != nullptr ? csi_cam->wait_output(in, 100) : cam->output(in);
+            if (pull_r != 0)
             {
-                vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
             }
             if (in.sdu_type != vstreamer::sdu_type_e::CAPS_VIDEO_RAW &&

@@ -55,3 +55,7 @@ On ESP32-P4 @ 400 MHz, synthetic `O_UYY_E_VYY` encode is ~**33.6 ms**/frame (jus
 33.3 ms budget for 30 fps). MIPI mmap frames add ~**2–3 ms** (`esp_h264` cache writeback on
 ~3 MiB YUV), so sustained **live encode is ~26–28 fps** until we use a zero-copy/coherent
 capture buffer path. Watch `encode_ms` on UART; target **≤ 33 ms** for true 1080p30 TX.
+
+`vs_cap_pull` must **not** poll `output()` in a tight loop: use `esp32p4_csi_camera_src::wait_output()`
+so the thread sleeps on `out_cv_` until `vs_csi_cam` delivers a frame (replaces ~1 kHz
+`vTaskDelay(1)` polling and avoids `taskYIELD()` busy-wait).

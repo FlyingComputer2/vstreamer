@@ -423,6 +423,7 @@ void esp32p4_csi_camera_src::capture_main()
         /* stale's buffer is requeued here, outside mu. */
         stale.reset();
         notify_wakeup();
+        out_cv_.notify_one();
     }
 }
 
@@ -456,6 +457,7 @@ void esp32p4_csi_camera_src::close()
             return;
         }
         source_open = false;
+        out_cv_.notify_all();
     }
     stop_.store(true, std::memory_order_release);
     if (thread_.joinable())
@@ -478,9 +480,8 @@ void esp32p4_csi_camera_src::close()
     }
 }
 
-int esp32p4_csi_camera_src::output(component_pdu &out)
+int esp32p4_csi_camera_src::try_pop_output_locked(component_pdu &out)
 {
-    std::lock_guard<std::mutex> lock(mu);
     if (!source_open)
     {
         return -EBADF;
@@ -508,6 +509,51 @@ int esp32p4_csi_camera_src::output(component_pdu &out)
     ready_.reset();
     out.seq = out_seq_++;
     return 0;
+}
+
+int esp32p4_csi_camera_src::output(component_pdu &out)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return try_pop_output_locked(out);
+}
+
+int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
+{
+    if (timeout_ms < 0)
+    {
+        timeout_ms = 0;
+    }
+    std::unique_lock<std::mutex> lock(mu);
+    for (;;)
+    {
+        const int r = try_pop_output_locked(out);
+        if (0 == r || -EBADF == r)
+        {
+            return r;
+        }
+        if (-EAGAIN != r)
+        {
+            return r;
+        }
+        if (!source_open || stop_.load(std::memory_order_acquire))
+        {
+            return -EBADF;
+        }
+        if (0 == timeout_ms)
+        {
+            return -EAGAIN;
+        }
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        out_cv_.wait_until(lock, deadline, [this] {
+            return ready_.has_value() || !source_open ||
+                   stop_.load(std::memory_order_acquire);
+        });
+        if (!ready_ && source_open && !stop_.load(std::memory_order_acquire))
+        {
+            return -EAGAIN;
+        }
+    }
 }
 
 int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view value)
