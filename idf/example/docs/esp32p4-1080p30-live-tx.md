@@ -51,6 +51,14 @@ esp_h264 has one RC mode: with `qp_min < qp_max` it targets `bitrate` (CBR) and 
 per frame inside the clamps; `qp_min == qp_max` is constant QP. Live TX uses 4 Mbps with QP
 10–51, measured 4.05–4.3 Mbps.
 
+## Direct-LAN loss
+
+The GS saw ~1.7% UDP gaps (none dropped on the host) and its decoder mostly waited for IDRs.
+stream_sender writes each AU as a burst of MTU datagrams, and the default EMAC TX ring
+(10 × 512 B) overflowed on every burst; lwIP drops those without an error from `sendto()`, so
+the sender's `dropped` stayed 0. 30 × 1600 B buffers (the Kconfig maximum) took the loss to 0
+and the GS to ~30 fps decoded and rendered, ~37 ms glass latency.
+
 ## What did not help (earlier attempts)
 
 - esp_h264 patches: skipping the PSRAM invalidate in `enc_process`, aligned invalidate,
@@ -67,5 +75,3 @@ per frame inside the clamps; `qp_min == qp_max` is constant QP. Live TX uses 4 M
   to 1920×1056 (3% fewer macroblocks), or run 25 fps.
 - The UART `enc frames` counter runs ahead of `cam frames` between samples; TX fps and
   `dq_ms` agree, so treat `enc` fps as unreliable until that is explained.
-- GS: the long-running `sdl_stream_receiver` showed decoder `out_fps` 0 and ~17% depay loss
-  while receiving this stream; not investigated.

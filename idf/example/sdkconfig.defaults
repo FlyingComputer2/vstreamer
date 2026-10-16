@@ -26,3 +26,8 @@ CONFIG_VSTREAMER_RX_PEER="192.168.253.106:21090"
 CONFIG_VSTREAMER_LIVE_TX_SECONDS=0
 # Live TX: 1080p30 needs both cores at full speed (esp_h264 HW target ~33 ms/frame).
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+# Each AU leaves stream_sender as one burst of MTU datagrams; the default EMAC TX ring
+# (10 x 512 B) overflows on the first few and lwIP drops the rest without telling sendto();
+# 30 x 1600 B (the Kconfig maximum) took direct-LAN loss from ~1.7% to 0.
+CONFIG_ETH_DMA_BUFFER_SIZE=1600
+CONFIG_ETH_DMA_TX_BUFFER_NUM=30
