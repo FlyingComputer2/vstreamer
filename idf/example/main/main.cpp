@@ -68,12 +68,6 @@ namespace
 constexpr int k_datagrams = 300;
 constexpr int k_payload_bytes = 1000;
 
-/* Prefer yield over 1 ms sleeps in the live TX hot path (saves ~1 tick per EAGAIN). */
-void live_tx_yield()
-{
-    taskYIELD();
-}
-
 void print_heap(const char *when)
 {
     std::printf("heap %-16s internal %u (largest %u), psram %u\n", when,
