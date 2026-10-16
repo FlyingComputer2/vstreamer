@@ -176,6 +176,7 @@ int xioctl(int fd, unsigned long req, void *arg, const char *what)
  */
 constexpr double k_ov5647_pclk_hz = 81666700.0 * 24.0 / 25.0;
 constexpr int    k_ov5647_min_vts = 1104; /* 1080 active lines + the Linux driver's blanking */
+constexpr int    k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t       s_ov5647_fmt;
 
@@ -220,6 +221,14 @@ void ov5647_fix_format(int fd, int fps, int light_freq)
         band = 50 == light_freq ? (band | 0x04) : (band & ~0x04);
         const auto end = regs.empty() ? regs.end() : regs.end() - 1;
         regs.insert(end, {{0x3c00, band}, {0x3c01, 0x80}});
+    }
+    /* AGC ceiling 0x3a18/0x3a19: the table's 0x3ff (64x) lets the sensor's own AGC flip gain
+     * between ~0x3ff and ~0x260 on alternate frames (a 15 Hz brightness flicker) once exposure
+     * hits its band limit. At 0x1f0 (31x) the gain settles. */
+    for (auto &r : regs)
+    {
+        r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling >> 8) : r.val;
+        r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling & 0xff) : r.val;
     }
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
