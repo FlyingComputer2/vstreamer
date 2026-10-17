@@ -369,6 +369,10 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
          * while waiting for a clean start. */
         metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.loss"),
                      query_double(*depay, "loss"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.rtp_received"),
+                     query_u64(*depay, "rtp_received"));
+        metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.rtp_lost"),
+                     query_u64(*depay, "rtp_lost"));
         metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.nal_dropped"),
                      query_u64(*depay, "nal_dropped"));
         metric_store(*g_pipeline_metrics.get_metric("rtp_h264_depay.au_dropped"),

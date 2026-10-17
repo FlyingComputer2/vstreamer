@@ -20,6 +20,7 @@
 //    to CONFIG_VSTREAMER_RX_PEER over Ethernet (DHCP). Skips tests 1–3.
 
 #include "ethernet_init.hpp"
+#include "live_mplane.hpp"
 #include "sdkconfig.h"
 
 #include "components/components_config.hpp"
@@ -426,16 +427,24 @@ int run_camera()
     CONFIG_VSTREAMER_IDF_LIVE_TX
 
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-/* CPU per task since the previous call (percent of one core), then heap headroom. */
-void print_sys_stats()
+/* Per-caller window for sys_stats_line(), so the stats print and the mplane do not share one. */
+struct cpu_window
 {
     struct prev_t
     {
         std::string name;
         uint32_t    rt;
     };
-    static std::vector<prev_t> prev;
-    static int64_t             prev_us = 0;
+    std::vector<prev_t> prev;
+    int64_t             prev_us = 0;
+};
+
+/* CPU per task since the previous call on w (percent of one core), then heap headroom. */
+std::string sys_stats_line(cpu_window *w)
+{
+    using prev_t = cpu_window::prev_t;
+    std::vector<prev_t> &prev = w->prev;
+    int64_t             &prev_us = w->prev_us;
     const UBaseType_t          n = uxTaskGetNumberOfTasks() + 4;
     std::vector<TaskStatus_t>  st(n);
     configRUN_TIME_COUNTER_TYPE total = 0;
@@ -466,13 +475,21 @@ void print_sys_stats()
     }
     prev = std::move(cur);
     prev_us = now;
-    std::printf("sys cpu%s; int free=%u min=%u big=%u; psram free=%u min=%u big=%u\n",
-                line.c_str(), heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
-                heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    char heap[160];
+    std::snprintf(heap, sizeof(heap), "; int free=%u min=%u big=%u; psram free=%u min=%u big=%u",
+                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                  heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+                  heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    return "cpu" + line + heap;
+}
+
+void print_sys_stats()
+{
+    static cpu_window w;
+    std::printf("sys %s\n", sys_stats_line(&w).c_str());
 }
 #endif
 
@@ -638,6 +655,29 @@ int run_camera_stream()
     }
     snd_s->set_enabled(true, 0);
 
+    /* Runtime control (FEC k/n, bitrate, ...) for bench sweeps. */
+    live_mplane mplane;
+#if CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT > 0
+    mplane.add_node("src", src.get());
+    mplane.add_node("pay", pay.get());
+    mplane.add_node("snd", snd.get());
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    mplane.add_query("sys", "stats", [] {
+        static cpu_window w;
+        return sys_stats_line(&w);
+    });
+#endif
+    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT); mr < 0)
+    {
+        std::printf("live TX mplane: bind :%d failed (%d)\n", CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT,
+                    mr);
+    }
+    else
+    {
+        std::printf("live TX mplane on udp :%d\n", CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT);
+    }
+#endif
+
     if (run_forever)
     {
         std::printf("live TX streaming %s until reset (size %s, h264_isp_src)\n",
@@ -752,6 +792,7 @@ int run_camera_stream()
     /* Join the TX thread before close(): it may still be packetizing an AU. */
     stop.store(true, std::memory_order_release);
     tx_thread.join();
+    mplane.stop();
     src->close();
 
     drain_pay_to_sender(pay_c, snd_s);

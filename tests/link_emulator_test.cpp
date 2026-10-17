@@ -1,4 +1,4 @@
-#include "apps/stream_sdl_test/link_emulator.hpp"
+#include "apps/common/link_emulator.hpp"
 
 #include <gtest/gtest.h>
 
@@ -85,7 +85,7 @@ TEST(LinkEmulatorTest, BurstNoImpairmentDeliversAll)
     const int     recv_fd = bind_udp_loopback(k_egress);
     ASSERT_GE(recv_fd, 0);
 
-    vstreamer::test_app::link_emulator ch;
+    vstreamer::apps::link_emulator ch;
     ch.set_queue_depth(32);
     ch.set_max_kbps(0.);
     ch.set_constant_loss(0.);
@@ -134,7 +134,7 @@ TEST(LinkEmulatorTest, RateLimitAccounting)
     const int     recv_fd = bind_udp_loopback(k_egress);
     ASSERT_GE(recv_fd, 0);
 
-    vstreamer::test_app::link_emulator ch;
+    vstreamer::apps::link_emulator ch;
     ch.set_queue_depth(0);
     ch.set_max_kbps(50.);
     ch.set_drop_dt_ms(10);
@@ -196,7 +196,7 @@ TEST(LinkEmulatorTest, ReturnPathIsNatOfForwardFlow)
     const int a = socket(AF_INET, SOCK_DGRAM, 0); /* plays the sender (ephemeral port) */
     ASSERT_GE(a, 0);
 
-    vstreamer::test_app::link_emulator ch;
+    vstreamer::apps::link_emulator ch;
     ch.set_queue_depth(0);
     ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress));
 
@@ -233,4 +233,77 @@ TEST(LinkEmulatorTest, ReturnPathIsNatOfForwardFlow)
     ch.stop();
     close(a);
     close(b);
+}
+
+TEST(LinkEmulatorTest, GilbertElliottBurstLoss)
+{
+    constexpr int k_ingress = 19130;
+    constexpr int k_egress = 19131;
+    const int     recv_fd = bind_udp_loopback(k_egress);
+    ASSERT_GE(recv_fd, 0);
+
+    /* Bad fraction 2 / (2 + 25) = 7.4%, mean burst 100 / 25 = 4 datagrams. */
+    vstreamer::apps::link_emulator ch;
+    ch.set_queue_depth(0);
+    ch.set_seed(12345);
+    ch.set_gilbert_elliott({2., 25., 0., 100.});
+    ASSERT_EQ(0, ch.start(k_ingress, "127.0.0.1", k_egress));
+
+    const int send_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(send_fd, 0);
+    sockaddr_in dst {};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dst.sin_port = htons(static_cast<uint16_t>(k_ingress));
+
+    /* Only the emulator's counters are checked, so the receiver may overflow; batches keep the
+     * emulator's own ingress buffer from overflowing. */
+    constexpr int k_pkts = 20000;
+    constexpr int k_batch = 100;
+    uint8_t       payload[8] = {0xAB};
+    for (int i = 0; i < k_pkts; i += k_batch)
+    {
+        for (int j = 0; j < k_batch; ++j)
+        {
+            ASSERT_EQ(static_cast<ssize_t>(sizeof(payload)),
+                      sendto(send_fd, payload, sizeof(payload), 0,
+                             reinterpret_cast<sockaddr *>(&dst), sizeof(dst)));
+        }
+        ASSERT_TRUE(wait_for(
+            [&]() { return ch.forward_stats_snapshot().pkts_in >= static_cast<uint64_t>(i + k_batch); },
+            1000));
+    }
+    ASSERT_TRUE(wait_for(
+        [&]() {
+            const auto s = ch.forward_stats_snapshot();
+            return s.pkts_out + s.dropped_burst >= static_cast<uint64_t>(k_pkts);
+        },
+        3000));
+    const auto stats = ch.forward_stats_snapshot();
+    EXPECT_EQ(static_cast<uint64_t>(k_pkts), stats.pkts_in);
+    EXPECT_EQ(0U, stats.dropped_loss);
+    const double frac = static_cast<double>(stats.dropped_burst) / k_pkts;
+    EXPECT_GT(frac, 0.05);
+    EXPECT_LT(frac, 0.10);
+    ASSERT_GT(stats.bursts, 0U);
+    const double mean_burst = static_cast<double>(stats.dropped_burst) / stats.bursts;
+    EXPECT_GT(mean_burst, 3.0);
+    EXPECT_LT(mean_burst, 5.0);
+
+    /* p_gb = 0 turns the model off; reset_stats zeroes the counters. */
+    ch.set_gilbert_elliott({0., 25., 0., 100.});
+    ch.reset_stats();
+    EXPECT_EQ(0U, ch.forward_stats_snapshot().pkts_in);
+    for (int i = 0; i < 100; ++i)
+    {
+        ASSERT_EQ(static_cast<ssize_t>(sizeof(payload)),
+                  sendto(send_fd, payload, sizeof(payload), 0,
+                         reinterpret_cast<sockaddr *>(&dst), sizeof(dst)));
+    }
+    ASSERT_TRUE(wait_for([&]() { return ch.forward_stats_snapshot().pkts_out >= 100U; }, 3000));
+    EXPECT_EQ(0U, ch.forward_stats_snapshot().dropped_burst);
+
+    close(send_fd);
+    close(recv_fd);
+    ch.stop();
 }

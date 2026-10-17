@@ -1,5 +1,5 @@
 #include "apps/stream_sdl_test/bench_console.hpp"
-#include "apps/stream_sdl_test/link_emulator.hpp"
+#include "apps/common/link_emulator.hpp"
 
 #include <gtest/gtest.h>
 
@@ -65,7 +65,7 @@ std::string udp_console_exchange(int console_port, const char *line, int timeout
 
 TEST(BenchConsoleTest, SetConstantLossOk)
 {
-    vstreamer::test_app::link_emulator link;
+    vstreamer::apps::link_emulator link;
     vstreamer::test_app::bench_console console;
 
     const int port = 19200;

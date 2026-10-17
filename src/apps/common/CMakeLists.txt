@@ -4,6 +4,7 @@ set(_apps_common_sources
     app_console.cpp
     app_metrics.cpp
     cpu_map.cpp
+    link_emulator.cpp
     pipeline_controller.cpp
     pipeline_state.cpp
     pipeline_stage_util.cpp

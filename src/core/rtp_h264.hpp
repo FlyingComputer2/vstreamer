@@ -77,6 +77,11 @@ public:
 
     [[nodiscard]] float packet_loss() const { return loss; }
 
+    /* RTP packets received, and missing from sequence gaps, since reset. */
+    [[nodiscard]] uint64_t rtp_received() const { return received_packets; }
+
+    [[nodiscard]] uint64_t rtp_lost() const { return gap_packets; }
+
     [[nodiscard]] int64_t au_pts() const { return last_au_frame_pts; }
 
     [[nodiscard]] int64_t au_capture_rt_ns() const { return last_au_capture_rt_ns; }

@@ -139,6 +139,8 @@ TEST(RtpH264Test, FuMiddleFragmentDropped)
     EXPECT_GT(dep.need_idr(), need_before);
     EXPECT_GT(dep.nal_dropped(), 0U);
     EXPECT_TRUE(bytes_contain(out, {0x00, 0x00, 0x00, 0x01, 0x65}));
+    EXPECT_EQ(1U, dep.rtp_lost());
+    EXPECT_EQ(dgrams.size(), dep.rtp_received());
 }
 
 TEST(RtpH264Test, ReorderDoesNotInflatePacketLoss)
@@ -156,6 +158,7 @@ TEST(RtpH264Test, ReorderDoesNotInflatePacketLoss)
     }
     EXPECT_EQ(0.f, dep.packet_loss());
     EXPECT_GE(dep.rtp_reordered(), 1U);
+    EXPECT_EQ(0U, dep.rtp_lost());
 }
 
 TEST(RtpH264Test, CsrcAndPaddingParsed)
