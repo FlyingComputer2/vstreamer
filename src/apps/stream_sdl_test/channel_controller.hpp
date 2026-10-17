@@ -7,7 +7,7 @@
 #include <functional>
 
 #include "apps/stream_sdl_test/bench_console.hpp"
-#include "apps/stream_sdl_test/link_emulator.hpp"
+#include "apps/stream_sdl_test/channel_ports.hpp"
 
 namespace vstreamer
 {

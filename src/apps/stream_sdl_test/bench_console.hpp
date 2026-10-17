@@ -17,8 +17,6 @@ class stream_sender;
 namespace vstreamer::test_app
 {
 
-class link_emulator;
-
 /* UDP bench console (:5090 default): channel impairments + pipeline control verbs. */
 class bench_console
 {

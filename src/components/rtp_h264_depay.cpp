@@ -253,6 +253,15 @@ int rtp_h264_depay::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("rtp_received" == key || "rtp_lost" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      "rtp_lost" == key ? depay.rtp_lost() : depay.rtp_received());
+        *value = buf;
+        return 0;
+    }
     if ("need_idr" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

@@ -15,7 +15,6 @@ if(VSTREAMER_APP_TX_OK AND VSTREAMER_APP_RX_OK)
         ${_bench_pipeline_dir}/bench_stream_metrics.cpp
         ${_bench_pipeline_dir}/bench_stream_status_metrics.cpp
         ${_bench_pipeline_dir}/channel_controller.cpp
-        ${_bench_pipeline_dir}/link_emulator.cpp
         ${_bench_pipeline_dir}/bench_console.cpp
     )
 elseif(VSTREAMER_APP_TX_OK)

@@ -1,8 +1,4 @@
-#include "apps/stream_sdl_test/link_emulator.hpp"
-
-#include "components/stream_sender.hpp"
-#include "core/component_coder.hpp"
-#include "core/metrics.hpp"
+#include "apps/common/link_emulator.hpp"
 
 #include <cerrno>
 #include <cinttypes>
@@ -20,7 +16,7 @@
 #include <string>
 #include <thread>
 
-namespace vstreamer::test_app
+namespace vstreamer::apps
 {
 namespace
 {
@@ -39,6 +35,25 @@ uint32_t rng32(uint32_t *state)
     x ^= x << 5;
     *state = x != 0 ? x : 1;
     return *state;
+}
+
+/* True with probability pct percent. */
+bool chance(uint32_t *state, double pct)
+{
+    if (pct <= 0.)
+    {
+        return false;
+    }
+    if (pct >= 100.)
+    {
+        return true;
+    }
+    return static_cast<double>(rng32(state) >> 8) * (100.0 / 16777216.0) < pct;
+}
+
+double clamp_pct(double pct)
+{
+    return pct < 0. ? 0. : (pct > 100. ? 100. : pct);
 }
 
 int bind_ipv4_host(sockaddr_in *in, const std::string &host, int port)
@@ -98,13 +113,13 @@ void link_emulator::set_drop_dt_ms(int ms)
 {
     {
         std::lock_guard<std::mutex> lock(cfg_mu);
-        if (ms < k_chan_min_drop_dt_ms)
+        if (ms < k_link_min_drop_dt_ms)
         {
-            rate_drop_dt_ms = k_chan_min_drop_dt_ms;
+            rate_drop_dt_ms = k_link_min_drop_dt_ms;
         }
-        else if (ms > k_chan_max_drop_dt_ms)
+        else if (ms > k_link_max_drop_dt_ms)
         {
-            rate_drop_dt_ms = k_chan_max_drop_dt_ms;
+            rate_drop_dt_ms = k_link_max_drop_dt_ms;
         }
         else
         {
@@ -117,17 +132,50 @@ void link_emulator::set_drop_dt_ms(int ms)
 void link_emulator::set_constant_loss(double pct)
 {
     std::lock_guard<std::mutex> lock(cfg_mu);
-    if (pct < 0.)
+    loss_pct = clamp_pct(pct);
+}
+
+void link_emulator::set_gilbert_elliott(const gilbert_elliott &ge)
+{
     {
-        loss_pct = 0.;
+        std::lock_guard<std::mutex> lock(cfg_mu);
+        ge_params.p_gb = clamp_pct(ge.p_gb);
+        ge_params.p_bg = clamp_pct(ge.p_bg);
+        ge_params.loss_good = clamp_pct(ge.loss_good);
+        ge_params.loss_bad = clamp_pct(ge.loss_bad);
     }
-    else if (pct > 100.)
+    for (direction_state *dir : {&fwd, &rev})
     {
-        loss_pct = 100.;
+        std::lock_guard<std::mutex> lock(dir->loss_mu);
+        dir->ge_bad = false;
     }
-    else
+}
+
+void link_emulator::set_seed(uint32_t seed)
+{
     {
-        loss_pct = pct;
+        std::lock_guard<std::mutex> lock(fwd.loss_mu);
+        fwd.rng = 0 != seed ? seed : 1;
+        fwd.ge_bad = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(rev.loss_mu);
+        rev.rng = (seed ^ 0xA5A5A5A5u) != 0 ? (seed ^ 0xA5A5A5A5u) : 1;
+        rev.ge_bad = false;
+    }
+}
+
+void link_emulator::reset_stats()
+{
+    for (direction_state *dir : {&fwd, &rev})
+    {
+        for (std::atomic<uint64_t> *c :
+             {&dir->pkts_in, &dir->pkts_out, &dir->bytes_in, &dir->bytes_out, &dir->dropped_rate,
+              &dir->dropped_loss, &dir->dropped_burst, &dir->bursts, &dir->dropped_queue,
+              &dir->dropped_no_route})
+        {
+            c->store(0, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -160,6 +208,12 @@ double link_emulator::constant_loss() const
     return loss_pct;
 }
 
+gilbert_elliott link_emulator::gilbert_elliott_params() const
+{
+    std::lock_guard<std::mutex> lock(cfg_mu);
+    return ge_params;
+}
+
 int link_emulator::queue_depth() const
 {
     std::lock_guard<std::mutex> lock(cfg_mu);
@@ -171,32 +225,30 @@ size_t link_emulator::forward_queue_size() const
     return fwd.ingress_queue_len.load(std::memory_order_relaxed);
 }
 
-link_emulator::forward_stats link_emulator::forward_stats_snapshot() const
+link_emulator::forward_stats link_emulator::snapshot(const direction_state &dir)
 {
     forward_stats s;
-    s.pkts_in = fwd.pkts_in.load(std::memory_order_relaxed);
-    s.pkts_out = fwd.pkts_out.load(std::memory_order_relaxed);
-    s.bytes_in = fwd.bytes_in.load(std::memory_order_relaxed);
-    s.bytes_out = fwd.bytes_out.load(std::memory_order_relaxed);
-    s.dropped_rate = fwd.dropped_rate.load(std::memory_order_relaxed);
-    s.dropped_loss = fwd.dropped_loss.load(std::memory_order_relaxed);
-    s.dropped_queue = fwd.dropped_queue.load(std::memory_order_relaxed);
-    s.dropped_no_route = fwd.dropped_no_route.load(std::memory_order_relaxed);
+    s.pkts_in = dir.pkts_in.load(std::memory_order_relaxed);
+    s.pkts_out = dir.pkts_out.load(std::memory_order_relaxed);
+    s.bytes_in = dir.bytes_in.load(std::memory_order_relaxed);
+    s.bytes_out = dir.bytes_out.load(std::memory_order_relaxed);
+    s.dropped_rate = dir.dropped_rate.load(std::memory_order_relaxed);
+    s.dropped_loss = dir.dropped_loss.load(std::memory_order_relaxed);
+    s.dropped_burst = dir.dropped_burst.load(std::memory_order_relaxed);
+    s.bursts = dir.bursts.load(std::memory_order_relaxed);
+    s.dropped_queue = dir.dropped_queue.load(std::memory_order_relaxed);
+    s.dropped_no_route = dir.dropped_no_route.load(std::memory_order_relaxed);
     return s;
+}
+
+link_emulator::forward_stats link_emulator::forward_stats_snapshot() const
+{
+    return snapshot(fwd);
 }
 
 link_emulator::forward_stats link_emulator::reverse_stats_snapshot() const
 {
-    forward_stats s;
-    s.pkts_in = rev.pkts_in.load(std::memory_order_relaxed);
-    s.pkts_out = rev.pkts_out.load(std::memory_order_relaxed);
-    s.bytes_in = rev.bytes_in.load(std::memory_order_relaxed);
-    s.bytes_out = rev.bytes_out.load(std::memory_order_relaxed);
-    s.dropped_rate = rev.dropped_rate.load(std::memory_order_relaxed);
-    s.dropped_loss = rev.dropped_loss.load(std::memory_order_relaxed);
-    s.dropped_queue = rev.dropped_queue.load(std::memory_order_relaxed);
-    s.dropped_no_route = rev.dropped_no_route.load(std::memory_order_relaxed);
-    return s;
+    return snapshot(rev);
 }
 
 bool link_emulator::should_drop_rate(direction_state &dir, size_t pkt_bytes)
@@ -230,24 +282,34 @@ bool link_emulator::should_drop_rate(direction_state &dir, size_t pkt_bytes)
     return false;
 }
 
-bool link_emulator::should_drop_loss(direction_state &dir)
+link_emulator::egress_status link_emulator::loss_verdict(direction_state &dir)
 {
-    double pct = 0.;
+    double          pct = 0.;
+    gilbert_elliott ge;
     {
         std::lock_guard<std::mutex> lock(cfg_mu);
         pct = loss_pct;
+        ge = ge_params;
     }
-    if (pct <= 0.)
+    std::lock_guard<std::mutex> lock(dir.loss_mu);
+    if (chance(&dir.rng, pct))
     {
-        return false;
+        return egress_status::loss_dropped;
     }
-    if (pct >= 100.)
+    if (ge.p_gb <= 0.)
     {
-        return true;
+        return egress_status::ok;
     }
-    const uint32_t r = rng32(&dir.rng);
-    const double   u = static_cast<double>(r % 10000) / 10000.0;
-    return u < (pct / 100.0);
+    if (dir.ge_bad ? chance(&dir.rng, ge.p_bg) : chance(&dir.rng, ge.p_gb))
+    {
+        dir.ge_bad = !dir.ge_bad;
+        if (dir.ge_bad)
+        {
+            dir.bursts.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return chance(&dir.rng, dir.ge_bad ? ge.loss_bad : ge.loss_good) ? egress_status::burst_dropped
+                                                                      : egress_status::ok;
 }
 
 link_emulator::egress_status link_emulator::try_egress_one(direction_state &dir,
@@ -257,9 +319,9 @@ link_emulator::egress_status link_emulator::try_egress_one(direction_state &dir,
     {
         return egress_status::rate_limited;
     }
-    if (should_drop_loss(dir))
+    if (const egress_status loss = loss_verdict(dir); egress_status::ok != loss)
     {
-        return egress_status::loss_dropped;
+        return loss;
     }
 
     if (!dir.have_egress || dir.egress_fd < 0)
@@ -279,9 +341,9 @@ link_emulator::egress_status link_emulator::try_egress_one(direction_state &dir,
     return egress_status::send_failed;
 }
 
-void link_emulator::egress_packet(direction_state &dir, const uint8_t *buf, size_t n)
+void link_emulator::count_drop(direction_state &dir, egress_status s)
 {
-    switch (try_egress_one(dir, buf, n))
+    switch (s)
     {
     case egress_status::rate_limited:
         dir.dropped_rate.fetch_add(1, std::memory_order_relaxed);
@@ -289,11 +351,19 @@ void link_emulator::egress_packet(direction_state &dir, const uint8_t *buf, size
     case egress_status::loss_dropped:
         dir.dropped_loss.fetch_add(1, std::memory_order_relaxed);
         break;
+    case egress_status::burst_dropped:
+        dir.dropped_burst.fetch_add(1, std::memory_order_relaxed);
+        break;
     case egress_status::ok:
     case egress_status::no_route:
     case egress_status::send_failed:
         break;
     }
+}
+
+void link_emulator::egress_packet(direction_state &dir, const uint8_t *buf, size_t n)
+{
+    count_drop(dir, try_egress_one(dir, buf, n));
 }
 
 void link_emulator::accept_ingress(direction_state &dir, const uint8_t *buf, size_t n)
@@ -337,14 +407,16 @@ void link_emulator::flush_ingress_queue(direction_state &dir)
     while (!hold_remainder && !dir.ingress_queue.empty())
     {
         const std::vector<uint8_t> &pkt = dir.ingress_queue.front();
-        switch (try_egress_one(dir, pkt.data(), pkt.size()))
+        const egress_status st = try_egress_one(dir, pkt.data(), pkt.size());
+        switch (st)
         {
         case egress_status::ok:
             dir.ingress_queue.pop_front();
             break;
         case egress_status::loss_dropped:
+        case egress_status::burst_dropped:
             dir.ingress_queue.pop_front();
-            dir.dropped_loss.fetch_add(1, std::memory_order_relaxed);
+            count_drop(dir, st);
             break;
         case egress_status::rate_limited:
         case egress_status::no_route:
@@ -427,7 +499,7 @@ void link_emulator::set_bind_host(const char *host)
 {
     if (nullptr == host || host[0] == '\0')
     {
-        bind_host = k_loopback_host;
+        bind_host = "127.0.0.1";
         return;
     }
     bind_host = host;
@@ -519,13 +591,19 @@ int link_emulator::start(int ingress_port, const char *egress_host, int egress_p
     rev.egress_fd = fwd.ingress_fd;
     std::memset(&rev.egress_addr, 0, sizeof(rev.egress_addr));
     rev.have_egress = false;
-    rev.rng = 0xA5A5A5A5u;
+    {
+        std::lock_guard<std::mutex> lock(rev.loss_mu);
+        if (1 == rev.rng)
+        {
+            rev.rng = 0xA5A5A5A5u;
+        }
+    }
 
     relay_stop = false;
     relay_thread = std::thread(&link_emulator::relay_thread_main, this);
 
     std::fprintf(stderr,
-                 "channel_controller: fwd :%d -> %s:%d (queue=%d); rev = return path to the "
+                 "link_emulator: fwd :%d -> %s:%d (queue=%d); rev = return path to the "
                  "last fwd source\n",
                  ingress_port, egress_host, egress_port, queue_depth());
     return 0;
@@ -555,4 +633,4 @@ void link_emulator::stop()
     stop_relay();
 }
 
-}  // namespace vstreamer::test_app
+}  // namespace vstreamer::apps

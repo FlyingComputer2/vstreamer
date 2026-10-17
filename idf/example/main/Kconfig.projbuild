@@ -17,4 +17,13 @@ config VSTREAMER_LIVE_TX_SECONDS
     range 0 3600
     depends on VSTREAMER_IDF_LIVE_TX
 
+config VSTREAMER_LIVE_TX_MPLANE_PORT
+    int "Live TX UDP management plane port (0 = off)"
+    default 5090
+    range 0 65535
+    depends on VSTREAMER_IDF_LIVE_TX
+    help
+        get/set <src|pay|snd> <key> [value], get sys stats, nodes. No authentication:
+        anyone on the LAN can reconfigure the stream.
+
 endmenu
