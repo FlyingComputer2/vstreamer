@@ -1260,6 +1260,19 @@ int stream_sender::configure(std::string_view key, std::string_view value)
             return -EINVAL;
         }
         fec_spread_ms.store(static_cast<int>(v), std::memory_order_relaxed);
+        /* Shards already queued under a longer spread would otherwise keep their old release
+         * times: after a huge value they fill the queue for that long and stall the stream even
+         * once the spread is lowered. Pull them in to the new spread; release times stay sorted
+         * because the clamp is monotonic. */
+        {
+            const auto latest = std::chrono::steady_clock::now() + std::chrono::milliseconds(v);
+            std::lock_guard<std::mutex> lock(q_mu);
+            for (auto &q : queue)
+            {
+                q.release = std::min(q.release, latest);
+            }
+        }
+        q_cv.notify_one();
         return 0;
     }
     if ("queue_ms" == key)
