@@ -8,7 +8,8 @@
 #if defined(ESP_PLATFORM) && __has_include("sdkconfig.h")
 #include "sdkconfig.h"
 #endif
-#if defined(CONFIG_SOC_CPU_HAS_PIE) && CONFIG_SOC_CPU_HAS_PIE && defined(__riscv)
+/* CONFIG_VSTREAMER_RS_PIE (idf/vstreamer/Kconfig) also requires SOC_CPU_HAS_PIE. */
+#if defined(CONFIG_VSTREAMER_RS_PIE) && CONFIG_VSTREAMER_RS_PIE && defined(__riscv)
 #define VSTREAMER_RS_PIE 1
 #include "esp_heap_caps.h"
 #include "soc/soc.h"

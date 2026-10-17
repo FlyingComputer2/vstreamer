@@ -1,0 +1,14 @@
+menu "vstreamer"
+
+config VSTREAMER_RS_PIE
+    bool "Reed-Solomon FEC encode with the PIE SIMD kernel"
+    depends on SOC_CPU_HAS_PIE
+    default n
+    help
+        Encode FEC parity with the ESP32-P4 PIE kernel instead of the table path: about 2.8x
+        faster (k=21, 10 parity rows, 1403-byte shards: 2.7 ms vs 7.7 ms), which frees core
+        time at strong FEC. Off by default: with it on, the hardware H.264 encoder slowed from
+        about 28 to 25.5 fps at FEC 21/31 (encode_ms spikes to 41-47 ms) for a reason not yet
+        understood. Turn it on where FEC encode, not the encoder, is the bottleneck.
+
+endmenu
