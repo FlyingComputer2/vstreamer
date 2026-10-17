@@ -578,7 +578,7 @@ int stream_receiver::open()
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
-        recv_thread = spawn_thread(thread_opts {"vs_recv", k_recv_stack_bytes},
+        recv_thread = spawn_thread(recv_place.opts("vs_recv", k_recv_stack_bytes),
                                    &stream_receiver::recv_thread_main, this);
     }
 
@@ -658,6 +658,10 @@ bool parse_on_off(std::string_view value, bool *out)
 
 int stream_receiver::configure(std::string_view key, std::string_view value)
 {
+    if (const int pr = thread_place_configure(&recv_place, "recv", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
     if ("telemetry" == key)
     {
         bool on = false;
@@ -707,6 +711,10 @@ int stream_receiver::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    if (const int pr = thread_place_query(recv_place, "recv", key, value); -ENOTSUP != pr)
+    {
+        return pr;
     }
     int r = port_caps_query(output_ports(), false, key, value);
     if (0 == r || -EINVAL == r)

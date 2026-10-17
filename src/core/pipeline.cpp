@@ -801,7 +801,12 @@ int pipeline::spawn(bool run)
     std::promise<int> started;
     std::future<int>  result = started.get_future();
     /* Every node's open/input/output runs on this thread, so it gets the largest stack. */
-    impl_->thread = spawn_thread(thread_opts {"vs_pipeline", k_pipeline_stack_bytes, impl_->cpu},
+#if defined(ESP_PLATFORM)
+    const int spawn_cpu = impl_->cpu;
+#else
+    const int spawn_cpu = -1; /* thread_main pins it once the nodes are open */
+#endif
+    impl_->thread = spawn_thread(thread_opts {"vs_pipeline", k_pipeline_stack_bytes, spawn_cpu},
                                  &impl::thread_main, impl_.get(), std::move(started),
                                  run ? command_e::RUN : command_e::PAUSE);
     const int r = result.get();

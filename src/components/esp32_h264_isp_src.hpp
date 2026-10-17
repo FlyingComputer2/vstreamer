@@ -19,6 +19,7 @@
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
 #include "core/port_caps.hpp"
+#include "core/thread_spawn.hpp"
 
 namespace vstreamer
 {
@@ -71,6 +72,7 @@ private:
     uint64_t                          backlog_drops_ = 0;
 
     std::thread                       encode_thread_;
+    thread_place                      encode_place_; /* keys encode_cpu / encode_prio */
     std::atomic<bool>                 stop_ {false};
     /* Standard latency queries: camera DQBUF to output() of the last AU. The node's entry is the
      * capture, so node_latency_ms is the same value. */

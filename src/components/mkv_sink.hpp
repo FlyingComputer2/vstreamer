@@ -21,6 +21,7 @@
 #include "core/mkv_writer.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
+#include "core/thread_spawn.hpp"
 
 namespace vstreamer
 {
@@ -101,6 +102,7 @@ private:
     std::condition_variable q_cv;
     std::deque<component_pdu> queue;
     std::thread             mux_thread;
+    thread_place            mux_place; /* keys mux_cpu / mux_prio */
     std::atomic<bool>       mux_stop {false};
     std::atomic<int>        mux_in_flight {0};
 

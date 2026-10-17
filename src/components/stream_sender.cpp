@@ -847,16 +847,8 @@ int stream_sender::open()
         }
 
         send_stop = false;
-        send_thread = spawn_thread(
-#if defined(ESP_PLATFORM)
-            /* Not on the FEC encode's core: that thread (prio 13) runs ~10 ms per block and
-             * starved this one, so shards left up to 130 ms after their release time and a
-             * spread block arrived in lumps. */
-            thread_opts {"vs_send", k_send_stack_bytes, 1, 14},
-#else
-            thread_opts {"vs_send", k_send_stack_bytes},
-#endif
-            &stream_sender::send_thread_main, this);
+        send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
+                                   &stream_sender::send_thread_main, this);
 
         {
             std::lock_guard<std::mutex> plock(peer_mu);
@@ -871,7 +863,7 @@ int stream_sender::open()
         telemetry_stop = false;
         if (telemetry)
         {
-            telemetry_thread = spawn_thread(thread_opts {"vs_telemetry", k_telemetry_stack_bytes},
+            telemetry_thread = spawn_thread(telemetry_place.opts("vs_telemetry", k_telemetry_stack_bytes),
                                             &stream_sender::telemetry_thread_main, this);
         }
 
@@ -1170,6 +1162,14 @@ bool parse_on_off(std::string_view value, bool *out)
 
 int stream_sender::configure(std::string_view key, std::string_view value)
 {
+    if (const int pr = thread_place_configure(&send_place, "send", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
+    if (const int pr = thread_place_configure(&telemetry_place, "telemetry", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
     if ("telemetry" == key)
     {
         bool on = false;
@@ -1364,6 +1364,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    if (const int pr = thread_place_query(send_place, "send", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
+    if (const int pr = thread_place_query(telemetry_place, "telemetry", key, value); -ENOTSUP != pr)
+    {
+        return pr;
     }
 
     int r = port_caps_query(input_ports(), true, key, value);

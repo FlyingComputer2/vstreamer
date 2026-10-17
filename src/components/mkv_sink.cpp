@@ -484,7 +484,7 @@ int mkv_sink::open()
     opened = true;
     mux_stop.store(false, std::memory_order_relaxed);
     /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
-    mux_thread = spawn_thread(thread_opts {"vs_mkv", 8 * 1024}, [this] { mux_thread_main(); });
+    mux_thread = spawn_thread(mux_place.opts("vs_mkv", 8 * 1024), [this] { mux_thread_main(); });
     return 0;
 }
 
@@ -501,6 +501,10 @@ void mkv_sink::close()
 
 int mkv_sink::configure(std::string_view key, std::string_view value)
 {
+    if (const int pr = thread_place_configure(&mux_place, "mux", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
     std::string_view v = value;
 
     std::lock_guard<std::mutex> lock(mu);
@@ -589,6 +593,10 @@ int mkv_sink::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    if (const int pr = thread_place_query(mux_place, "mux", key, value); -ENOTSUP != pr)
+    {
+        return pr;
     }
 
     int r = port_caps_query(input_ports(), true, key, value);

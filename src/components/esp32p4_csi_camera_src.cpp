@@ -595,7 +595,7 @@ int esp32p4_csi_camera_src::open()
     caps_sent_ = false;
     stop_.store(false, std::memory_order_release);
     /* capture_main() waits for mu, so it starts once open() returns. */
-    thread_ = spawn_thread(thread_opts {"vs_csi_cam", 8 * 1024, 0, 12},
+    thread_ = spawn_thread(capture_place_.opts("vs_csi_cam", 8 * 1024),
                            [this] { capture_main(); });
     return 0;
 }
@@ -729,6 +729,10 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
 
 int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view value)
 {
+    if (const int pr = thread_place_configure(&capture_place_, "capture", key, value); -ENOTSUP != pr)
+    {
+        return pr;
+    }
     std::lock_guard<std::mutex> lock(mu);
     if (key == "fps")
     {
@@ -789,6 +793,10 @@ int esp32p4_csi_camera_src::query(std::string_view key, std::string *value) cons
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    if (const int pr = thread_place_query(capture_place_, "capture", key, value); -ENOTSUP != pr)
+    {
+        return pr;
     }
     const int r = port_caps_query(output_ports(), false, key, value);
     if (0 == r || -EINVAL == r)
