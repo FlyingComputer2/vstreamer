@@ -226,7 +226,8 @@ FU-A, capture-time header extension).
 | `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
 | `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
 | `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block after N ms). 0 never flushes: a block leaves only once `fec_k` SDUs fill it |
-| `fec_spread_ms` | C Q | ≥ 0, default 0 (spread each FEC block's shards over N ms). Not capped: keep it under the receiver's head-of-line give-up (`max(3 × fec_timeout_ms, 60)` ms), and keep rate × spread under `queue_byte_limit`, since shards wait in the send queue until due |
+| `fec_spread_ms` | C Q | ≥ 0, default 0 (spread each FEC block's shards over N ms). Not capped. The receiver gives a block up after `max(3 × fec_timeout_ms, 60)` ms with no shard of it, so the gap between a block's shards (≈ spread / n) must stay under that, not the whole spread; a send thread that is starved of CPU breaks this by releasing shards in lumps (see Threading). Shards wait in the send queue until due; `queue_byte_limit` grows with the spread |
+| `send_cpu`, `send_prio`, `telemetry_cpu`, `telemetry_prio` | C Q | thread placement, see Threading |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
 
@@ -242,6 +243,7 @@ one `STREAM_DGRAM` PDU per original datagram.
 | `telemetry_ms` | C Q | 20..5000, default 100, live |
 | `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id`, `rx_bad_header` | Q | reverse-path telemetry; `rx_bad_header` counts dropped invalid stream headers |
 | `max_datagram` | C Q | 64..65507, default 1472; before `open()` |
+| `recv_cpu`, `recv_prio` | C Q | thread placement, see Threading |
 | `udp_packet_received`, `udp_gap_count` | Q | wire counters (pre-FEC) |
 | `fec_packet_received`, `fec_gap_count` | Q | post-FEC counters |
 | `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
@@ -264,6 +266,7 @@ segment.
 |-----|-----|--------|
 | `output` | C Q | path template (empty = stop recording) |
 | `size`, `fps` | C | stream parameters |
+| `mux_cpu`, `mux_prio` | C Q | thread placement, see Threading |
 | `segment`, `stats`, `skipped`, `dropped`, `write_errors` | Q | informational; a write error closes the segment and the next frame starts a new one |
 
 **`sdl_sink`** — NV12 preview through `sdl_nv12_presenter` (OpenGL; the window is owned by the
@@ -280,12 +283,26 @@ thread that opened the sink; with vsync each call can block for up to one displa
 
 Components do not start pipeline threads; the app does. Threads inside components:
 
-| Component | Internal threads |
-|-----------|------------------|
-| `stream_sender` | send thread (pacing, FEC flush timer); telemetry thread (`poll` + link reports on `send_fd`) |
-| `stream_receiver` | receive thread (poll, FEC decode, reverse telemetry `sendto`) |
-| `jpeg_decoder_multicore` | `workers` decode threads |
-| `noise_source` | pregenerate worker (when `pregenerate-frames > 0`) |
+| Component | Internal threads | Placement keys |
+|-----------|------------------|----------------|
+| `stream_sender` | send thread (pacing, FEC flush timer); telemetry thread (`poll` + link reports on `send_fd`) | `send_*`, `telemetry_*` |
+| `stream_receiver` | receive thread (poll, FEC decode, reverse telemetry `sendto`) | `recv_*` |
+| `mkv_sink` | mux thread (`mkv_writer` file I/O) | `mux_*` |
+| `esp32p4_csi_camera_src` | capture thread | `capture_*` |
+| `esp32_h264_isp_src` | encode thread (+ its camera's capture thread) | `encode_*`, `capture_*` |
+| `jpeg_decoder_multicore` | `workers` decode threads | `worker_cpu`, `worker_cpus` |
+| `noise_source` | pregenerate worker (when `pregenerate-frames > 0`) | — |
+
+**Placement is the app's decision.** A component never picks a core or priority itself; it takes
+`<role>_cpu` (−1 = any core) and `<role>_prio` (FreeRTOS priority, −1 = pthread default; ignored
+on Linux), both default −1, and starts the thread with them in `open()`
+(`core/thread_spawn.hpp`: `thread_place`, `spawn_thread`). They can be set only while the component
+is closed (`-EBUSY` while open: ESP-IDF cannot move a running task to another core), so whoever
+configures the nodes stops them first. On Linux the new thread is pinned before it runs and
+threads it starts inherit the pin; the pipeline thread (`set_cpu`) is pinned only after its nodes
+are open. The ESP32-P4 example keeps its whole layout at the top of `idf/example/main/main.cpp`:
+the FEC encode (`vs_isp_tx`) has core 0 with capture, and the send thread is on core 1, since
+sharing a core with the ~10 ms-per-block encode starved it and spread blocks left in lumps.
 
 Lock-order rules are stated next to the mutexes in each header (`stream_sender`,
 `h264_encoder_mpp`, `h264_decoder_mpp`). Shutdown order everywhere: signal → join → close.

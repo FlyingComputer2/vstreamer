@@ -236,7 +236,7 @@ int esp32_h264_isp_src::open()
 
     stop_.store(false, std::memory_order_release);
     std::thread enc_thread =
-        spawn_thread(thread_opts {"vs_isp_enc", k_pipeline_stack, 1, 13}, [this] { encode_main(); });
+        spawn_thread(encode_place_.opts("vs_isp_enc", k_pipeline_stack), [this] { encode_main(); });
     {
         std::lock_guard<std::mutex> lock(mu);
         encode_thread_ = std::move(enc_thread);
@@ -296,6 +296,12 @@ int esp32_h264_isp_src::output(component_pdu &out)
 int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
 {
     std::lock_guard<std::mutex> lock(mu);
+    /* capture_cpu / capture_prio fall through to the camera below. */
+    if (const int pr = thread_place_configure(&encode_place_, "encode", key, value, opened);
+        -ENOTSUP != pr)
+    {
+        return pr;
+    }
     if (opened)
     {
         return -EBUSY;
@@ -369,6 +375,10 @@ int esp32_h264_isp_src::query(std::string_view key, std::string *value) const
     if (nullptr == value)
     {
         return -EINVAL;
+    }
+    if (const int pr = thread_place_query(encode_place_, "encode", key, value); -ENOTSUP != pr)
+    {
+        return pr;
     }
     int r = port_caps_query(output_ports(), false, key, value);
     if (0 == r || -EINVAL == r)

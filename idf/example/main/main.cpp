@@ -71,6 +71,39 @@ namespace
 constexpr int k_datagrams = 300;
 constexpr int k_payload_bytes = 1000;
 
+/* Thread placement on the P4's two cores. Components take it as "<role>_cpu" / "<role>_prio"
+ * keys and default to any core, so every placement lives here. */
+struct place_kv
+{
+    const char *key;
+    const char *value;
+};
+
+/* Live TX: vs_isp_tx runs the RS FEC encode (~10 ms of compute per block) on core 0, so the
+ * send thread sits on core 1; sharing core 0 starved it and spread FEC blocks left in lumps.
+ * The mplane is on core 1 so it answers under load. Measured and not worth it (2026-10-17):
+ * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0). */
+constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13};
+constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
+constexpr place_kv k_live_src_place[] = {
+    {"capture_cpu", "0"}, {"capture_prio", "12"}, {"encode_cpu", "1"}, {"encode_prio", "13"}};
+constexpr place_kv k_live_snd_place[] = {{"send_cpu", "1"}, {"send_prio", "14"}};
+/* Smoke tests. */
+constexpr place_kv k_camera_place[] = {{"capture_cpu", "0"}, {"capture_prio", "12"}};
+constexpr place_kv k_sender_place[] = {{"send_cpu", "0"}, {"send_prio", "12"}};
+
+template <size_t N>
+void apply_place(vstreamer::component &c, const place_kv (&kvs)[N])
+{
+    for (const auto &kv : kvs)
+    {
+        if (c.configure(kv.key, kv.value) < 0)
+        {
+            std::printf("placement %s=%s rejected\n", kv.key, kv.value);
+        }
+    }
+}
+
 void print_heap(const char *when)
 {
     std::printf("heap %-16s internal %u (largest %u), psram %u\n", when,
@@ -330,6 +363,7 @@ int run_camera()
         return -1;
     }
     print_heap("camera start");
+    apply_place(*cam, k_camera_place);
     const int cr = cam->open();
     if (-ENODEV == cr)
     {
@@ -625,6 +659,7 @@ int run_camera_stream()
     (void)src->configure("gop", "30");
     (void)src->configure("qp_min", "20");
     (void)src->configure("qp_max", "51");
+    apply_place(*src, k_live_src_place);
 
     const int cr = src->open();
     if (-ENODEV == cr)
@@ -647,6 +682,7 @@ int run_camera_stream()
     snd->configure("max_kbps", "0");
     snd->configure("telemetry", "off");
     snd->configure("fec", "none");
+    apply_place(*snd, k_live_snd_place);
 
     if (pay->open() < 0 || snd->open() < 0)
     {
@@ -667,7 +703,8 @@ int run_camera_stream()
         return sys_stats_line(&w);
     });
 #endif
-    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT); mr < 0)
+    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT, k_live_mplane_thread);
+        mr < 0)
     {
         std::printf("live TX mplane: bind :%d failed (%d)\n", CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT,
                     mr);
@@ -734,7 +771,7 @@ int run_camera_stream()
     };
 
     auto tx_thread =
-        vstreamer::spawn_thread(vstreamer::thread_opts {"vs_isp_tx", 16 * 1024, 0, 13}, tx_fn);
+        vstreamer::spawn_thread(k_live_tx_thread, tx_fn);
 
     while (!stop.load(std::memory_order_acquire) && esp_timer_get_time() < deadline)
     {
@@ -852,6 +889,7 @@ int run()
     relay.add_sink("out", "stream_sender");
     relay.configure("in", "listen", "127.0.0.1:5600");
     relay.configure("out", "stream", "127.0.0.1:5601");
+    apply_place(*relay.node("out"), k_sender_place);
     relay.link("in", "out");
     /* stream_sender starts with its send gate closed. */
     static_cast<vstreamer::component_sink *>(relay.node("out"))->set_enabled(true, 0);
@@ -865,6 +903,7 @@ int run()
 
     tx->configure("stream", "127.0.0.1:5600");
     tx->configure("max_kbps", "20000");
+    apply_place(*tx, k_sender_place);
     tx->set_enabled(true, 0);
     if (tx->open() < 0)
     {

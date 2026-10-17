@@ -26,6 +26,7 @@
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
+#include "core/thread_spawn.hpp"
 
 namespace vstreamer
 {
@@ -142,8 +143,10 @@ private:
     static constexpr size_t k_queue_min_unpaced_app_bytes = 136 * 1024;
 
     std::thread       send_thread;
+    thread_place      send_place;      /* keys send_cpu / send_prio */
     std::atomic<bool> send_stop {false};
     std::thread       telemetry_thread;
+    thread_place      telemetry_place; /* keys telemetry_cpu / telemetry_prio */
     std::atomic<bool> telemetry_stop {false};
 
     mutable std::mutex peer_mu;

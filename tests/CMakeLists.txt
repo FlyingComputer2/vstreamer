@@ -19,6 +19,7 @@ set(VSTREAMER_TEST_SOURCES
     stream_telemetry_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
+    thread_spawn_test.cpp
     rs_encode_scalar_test.cpp
 )
 

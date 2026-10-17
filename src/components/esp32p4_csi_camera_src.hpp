@@ -18,6 +18,7 @@
 
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
+#include "core/thread_spawn.hpp"
 
 namespace vstreamer
 {
@@ -90,6 +91,7 @@ private:
 
     std::shared_ptr<ring>        ring_;
     std::thread                  thread_;
+    thread_place                 capture_place_; /* keys capture_cpu / capture_prio */
     std::atomic<bool>            stop_ {false};
     /* Standard latency queries: DQBUF to output() of the last frame (the same for a source). */
     std::atomic<double>          latency_ms_ {-1.0};

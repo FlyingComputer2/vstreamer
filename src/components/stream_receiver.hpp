@@ -22,6 +22,7 @@
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
+#include "core/thread_spawn.hpp"
 
 /* lwIP declares sockaddr_in in <sys/socket.h>, not <netinet/in.h>. */
 #include <sys/socket.h>
@@ -124,6 +125,7 @@ private:
     size_t cached_max_raw_sdu = 0;
 
     std::thread       recv_thread;
+    thread_place      recv_place; /* keys recv_cpu / recv_prio */
     std::atomic<bool> recv_stop {false};
 
     std::atomic<bool> telemetry_on {true};
