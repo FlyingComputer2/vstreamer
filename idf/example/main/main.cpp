@@ -85,7 +85,7 @@ struct place_kv
  * The mplane is on core 1 so it answers under load. Measured and not worth it (2026-10-17):
  * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0). */
 constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13};
-constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 12 * 1024, 1, 5};
+constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
 constexpr place_kv k_live_src_place[] = {
     {"capture_cpu", "0"}, {"capture_prio", "12"}, {"encode_cpu", "1"}, {"encode_prio", "13"}};
 constexpr place_kv k_live_snd_place[] = {{"send_cpu", "1"}, {"send_prio", "14"}};
@@ -985,14 +985,33 @@ extern "C" void app_main(void)
     /* pipeline control uses std::this_thread::get_id(), which needs a pthread; app_main is a
      * plain FreeRTOS task. */
     auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 24 * 1024}, [] {
-        for (const int len : {1403, 37})
         {
-            int64_t fast = 0;
-            int64_t table = 0;
-            const int bad = vstreamer::rs_encode_selftest(
-                21, 10, len, 20, [] { return static_cast<int64_t>(esp_timer_get_time()); }, &fast, &table);
-            std::printf("rs selftest k=21 rows=10 len=%d: mismatched rows %d, %" PRId64 " us vs table %" PRId64 " us\n",
-                        len, bad, fast, table);
+            /* RS encode (PIE on the P4) against the table path; also with shards in RTCRAM, where
+             * PIE's 128-bit loads would fault if the kernel passed them through. */
+            struct rs_case
+            {
+                int  k, rows, len;
+                bool rtc;
+            };
+            const auto now = [] { return static_cast<int64_t>(esp_timer_get_time()); };
+            for (const rs_case c : {rs_case {21, 10, 1403, false}, rs_case {21, 10, 37, false},
+                                    rs_case {1, 30, 300, false}, rs_case {2, 29, 300, true},
+                                    rs_case {10, 21, 100, true}})
+            {
+                const size_t bytes = static_cast<size_t>(c.k + 2 * c.rows) * static_cast<size_t>(c.len + 8);
+                auto *arena = c.rtc ? static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_RTCRAM)) : nullptr;
+                if (c.rtc && nullptr == arena)
+                {
+                    std::printf("rs selftest k=%d rows=%d: no RTCRAM for %u bytes\n", c.k, c.rows, static_cast<unsigned>(bytes));
+                    continue;
+                }
+                int64_t   fast = 0;
+                int64_t   table = 0;
+                const int bad = vstreamer::rs_encode_selftest(c.k, c.rows, c.len, 5, now, &fast, &table, arena);
+                std::printf("rs selftest k=%d rows=%d len=%d%s: mismatched rows %d, %" PRId64 " us vs table %" PRId64 " us\n",
+                            c.k, c.rows, c.len, c.rtc ? " rtcram" : "", bad, fast, table);
+                heap_caps_free(arena);
+            }
         }
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
     CONFIG_VSTREAMER_IDF_LIVE_TX

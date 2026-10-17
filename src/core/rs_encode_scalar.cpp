@@ -10,6 +10,8 @@
 #endif
 #if defined(CONFIG_SOC_CPU_HAS_PIE) && CONFIG_SOC_CPU_HAS_PIE && defined(__riscv)
 #define VSTREAMER_RS_PIE 1
+#include "esp_heap_caps.h"
+#include "soc/soc.h"
 #endif
 
 namespace vstreamer
@@ -55,8 +57,6 @@ void mul_row(const uint8_t *t, const uint8_t *in, uint8_t *out, int len)
 
 #ifdef VSTREAMER_RS_PIE
 
-constexpr int k_pie_max_k = 31;
-constexpr int k_pie_max_coef = 240;  // rows * k with k + rows <= 31
 
 /* ESP32-P4 PIE (128-bit q registers; no byte shuffle, so no nibble-table multiply). The product
  * c * x is the xor over the set bits b of x of (c << b). Per 16-byte chunk each source is
@@ -64,9 +64,12 @@ constexpr int k_pie_max_coef = 240;  // rows * k with k + rows <= 31
  * against zero; PIE adds saturate, so there is no cheap shift), shared by every parity row. A
  * row then xors (E_m & broadcast(c << (7 - m))) over all sources and bits, which counts every
  * clear bit instead of every set one; starting the accumulator at xor_j (c_j * 255), the sum of
- * all eight shifted c, turns that back into the product. Each per-row step is 4 PIE ops. */
+ * all eight shifted c, turns that back into the product. Each per-row step is 4 PIE ops.
+ * The PIE load/store forms only encode x8-x15 and x24-x31 as the address, so the pointers are
+ * pinned to a2-a5 (GCC has no constraint for that set). */
 
-alignas(16) const uint8_t k_bit_const[8][16] = {
+/* Not const: keeps it in RAM (.data) rather than flash rodata, for the PIE loads. */
+alignas(16) uint8_t k_bit_const[8][16] = {
     {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80},
     {0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40},
     {0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20},
@@ -83,13 +86,15 @@ alignas(16) const uint8_t k_bit_const[8][16] = {
 
 inline void pie_masks(const uint8_t *src16, uint8_t *masks)
 {
-    const uint8_t *bc = &k_bit_const[0][0];
+    register uint8_t       *m asm("a2") = masks;
+    register const uint8_t *bc asm("a3") = &k_bit_const[0][0];
+    register const uint8_t *s asm("a4") = src16;
     asm volatile(
         "esp.zero.q q7\n"
         "esp.vld.128.ip q0, %[s], 0\n" PIE_MASK PIE_MASK PIE_MASK PIE_MASK PIE_MASK PIE_MASK
             PIE_MASK PIE_MASK
-        : [m] "+r"(masks), [b] "+r"(bc)
-        : [s] "r"(src16)
+        : [m] "+r"(m), [b] "+r"(bc)
+        : [s] "r"(s)
         : "memory");
 }
 
@@ -104,10 +109,11 @@ inline void pie_masks(const uint8_t *src16, uint8_t *masks)
 inline void pie_row(const uint8_t *masks, const uint8_t *coefs, const uint8_t *base, int k,
                     uint8_t *dst16)
 {
-    const uint8_t *m = masks;
-    const uint8_t *c = coefs;
-    int            n = k;
-    uint8_t       *d = dst16;
+    register const uint8_t *m asm("a2") = masks;
+    register const uint8_t *c asm("a3") = coefs;
+    register uint8_t       *d asm("a4") = dst16;
+    register const uint8_t *k0 asm("a5") = base;
+    int                     n = k;
     asm volatile(
         "esp.vldbc.8.ip q0, %[k0], 0\n esp.zero.q q6\n"
         "1:\n" PIE_STEP_A PIE_STEP_B PIE_STEP_A PIE_STEP_B PIE_STEP_A PIE_STEP_B PIE_STEP_A
@@ -115,20 +121,43 @@ inline void pie_row(const uint8_t *masks, const uint8_t *coefs, const uint8_t *b
         "esp.xorq q0, q0, q6\n"
         "esp.vst.128.ip q0, %[d], 0\n"
         : [m] "+r"(m), [c] "+r"(c), [n] "+r"(n), [d] "+r"(d)
-        : [k0] "r"(base)
+        : [k0] "r"(k0)
         : "memory");
 }
 
-/* False when the shape is outside what the on-stack tables hold (caller falls back). */
+/* PIE's 128-bit loads and stores fault on RTCRAM and SPM, which plain malloc also hands out
+ * (MALLOC_CAP_SIMD excludes them); only aligned L2MEM and PSRAM addresses go to PIE directly,
+ * anything else is bounced through the scratch. */
+bool pie_direct(const void *p)
+{
+    const auto a = reinterpret_cast<uintptr_t>(p);
+    return 0 == (a & 15U) && ((a >= SOC_DRAM_LOW && a < SOC_DRAM_HIGH) ||
+                              (a >= SOC_EXTRAM_LOW && a < SOC_EXTRAM_HIGH));
+}
+
+/* Scratch is heap (MALLOC_CAP_SIMD), not stack: the encoder also runs on small-stack threads (a
+ * k/n change on the M-plane thread flushes the pending block), and the tables are up to ~6 KiB.
+ * False when the shape is too small or the allocation fails (caller falls back). */
 bool rs_encode_pie(int len, int k, int rows, const unsigned char *g_tbls,
                    unsigned char *const *data, unsigned char *const *coding)
 {
-    if (k < 1 || k > k_pie_max_k || rows < 1 || rows * k > k_pie_max_coef || len < 16)
+    if (k < 1 || rows < 1 || len < 16)
     {
         return false;
     }
+    const size_t coef_bytes = static_cast<size_t>(rows) * static_cast<size_t>(k) * 8;
+    const size_t mask_bytes = static_cast<size_t>(k) * 128;
+    /* masks | tmp (16) | coefs | base (rows); masks and tmp need 16-byte alignment. */
+    auto *scratch = static_cast<uint8_t *>(
+        heap_caps_aligned_alloc(16, mask_bytes + 16 + coef_bytes + rows, MALLOC_CAP_SIMD));
+    if (nullptr == scratch)
+    {
+        return false;
+    }
+    uint8_t *masks = scratch;
+    uint8_t *tmp = masks + mask_bytes;
     /* coefs[r][j][m] = c(r,j) << (7 - m), straight from the nibble table. */
-    alignas(16) uint8_t coefs[k_pie_max_coef * 8];
+    uint8_t *coefs = tmp + 16;
     for (int rj = 0; rj < rows * k; rj++)
     {
         const uint8_t *t = g_tbls + static_cast<size_t>(rj) * 32;
@@ -142,7 +171,7 @@ bool rs_encode_pie(int len, int k, int rows, const unsigned char *g_tbls,
         o[6] = t[2];
         o[7] = t[1];
     }
-    uint8_t base[k_pie_max_coef];  // per row: xor over sources of c * 255
+    uint8_t *base = coefs + coef_bytes;  // per row: xor over sources of c * 255
     for (int r = 0; r < rows; r++)
     {
         uint8_t v = 0;
@@ -152,16 +181,14 @@ bool rs_encode_pie(int len, int k, int rows, const unsigned char *g_tbls,
         }
         base[r] = v;
     }
-    alignas(16) uint8_t masks[k_pie_max_k * 128];
-    alignas(16) uint8_t tmp[16];
-    const int           chunks = len / 16;
+    const int chunks = len / 16;
     for (int ch = 0; ch < chunks; ch++)
     {
         const int off = ch * 16;
         for (int j = 0; j < k; j++)
         {
             const uint8_t *src = data[j] + off;
-            if (reinterpret_cast<uintptr_t>(src) & 15U)
+            if (!pie_direct(src))
             {
                 std::memcpy(tmp, src, 16);
                 src = tmp;
@@ -171,7 +198,7 @@ bool rs_encode_pie(int len, int k, int rows, const unsigned char *g_tbls,
         for (int r = 0; r < rows; r++)
         {
             uint8_t *dst = coding[r] + off;
-            if (reinterpret_cast<uintptr_t>(dst) & 15U)
+            if (!pie_direct(dst))
             {
                 pie_row(masks, coefs + r * k * 8, base + r, k, tmp);
                 std::memcpy(dst, tmp, 16);
@@ -197,6 +224,7 @@ bool rs_encode_pie(int len, int k, int rows, const unsigned char *g_tbls,
             coding[r][i] = acc;
         }
     }
+    heap_caps_free(scratch);
     return true;
 }
 
@@ -263,7 +291,7 @@ uint8_t gf_mul(uint8_t a, uint8_t b)
 }  // namespace
 
 int rs_encode_selftest(int k, int rows, int len, int iterations, int64_t (*now_us)(), int64_t *us_fast,
-                       int64_t *us_table)
+                       int64_t *us_table, uint8_t *arena)
 {
     std::vector<uint8_t> tbl(static_cast<size_t>(k * rows) * 32);
     uint32_t             rng = 12345;
@@ -278,26 +306,26 @@ int rs_encode_selftest(int k, int rows, int len, int iterations, int64_t (*now_u
         }
     }
     /* odd offsets/lengths on purpose: the kernel must cope with any alignment and tail. */
-    std::vector<std::vector<uint8_t>> src(static_cast<size_t>(k), std::vector<uint8_t>(static_cast<size_t>(len) + 8));
-    std::vector<std::vector<uint8_t>> a(static_cast<size_t>(rows), std::vector<uint8_t>(static_cast<size_t>(len) + 8));
-    std::vector<std::vector<uint8_t>> b(a);
-    std::vector<uint8_t *>            sp, ap, bp;
-    int                               shift = 0;
-    for (auto &v : src)
+    const size_t         stride = static_cast<size_t>(len) + 8;
+    std::vector<uint8_t> own;
+    if (nullptr == arena)
     {
-        for (auto &x : v)
+        own.resize(static_cast<size_t>(k + 2 * rows) * stride);
+        arena = own.data();
+    }
+    std::vector<uint8_t *> sp, ap, bp;
+    for (int i = 0; i < k + 2 * rows; i++)
+    {
+        uint8_t *row = arena + static_cast<size_t>(i) * stride;
+        auto    &dst = i < k ? sp : (i < k + rows ? ap : bp);
+        dst.push_back(row + (i & 3));
+        if (i < k)
         {
-            x = next();
+            for (size_t x = 0; x < stride; x++)
+            {
+                row[x] = next();
+            }
         }
-        sp.push_back(v.data() + (shift++ & 3));
-    }
-    for (auto &v : a)
-    {
-        ap.push_back(v.data() + (shift++ & 3));
-    }
-    for (auto &v : b)
-    {
-        bp.push_back(v.data() + (shift++ & 3));
     }
     const int64_t t0 = now_us();
     for (int i = 0; i < iterations; i++)

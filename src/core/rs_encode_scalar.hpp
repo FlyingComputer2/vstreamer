@@ -25,9 +25,10 @@ void rs_encode_scalar_table(int len, int k, int rows, const unsigned char *g_tbl
 
 /* Encodes random data both ways at misaligned addresses; returns the number of parity rows that
  * differ (0 = identical) and the mean microseconds per call of rs_encode_scalar() and of the
- * table path. now_us supplies a microsecond clock. */
+ * table path. now_us supplies a microsecond clock. The shards live in arena when given
+ * ((k + 2 * rows) * (len + 8) bytes, e.g. a memory region under test), else on the heap. */
 int rs_encode_selftest(int k, int rows, int len, int iterations, int64_t (*now_us)(), int64_t *us_fast,
-                       int64_t *us_table);
+                       int64_t *us_table, uint8_t *arena = nullptr);
 
 }  // namespace vstreamer
 
