@@ -876,3 +876,84 @@ TEST(RsBlockErasureEmitTest, LosslessStreamHasNoFailures)
     EXPECT_EQ(32u, out.size() + tick.size());
     EXPECT_EQ(0u, dec.decode_fail());
 }
+
+namespace
+{
+
+/* Blocks 0..blocks-1 of k=10/n=11 at sdu_base 10*b, tags 10*b + i + 1; each loses data shard 0
+ * and its parity, so none can decode. Then one complete block after them. */
+void feed_undecodable_run(rs_block_erasure &enc, rs_block_erasure &dec, int blocks,
+                          vstreamer::fec_rx_payload_list *out)
+{
+    for (int b = 0; b <= blocks; b++)
+    {
+        std::vector<uint8_t> tags;
+        for (int i = 0; i < 10; i++)
+        {
+            tags.push_back(static_cast<uint8_t>(10 * b + i + 1));
+        }
+        const auto air = encode_block_apps(enc, static_cast<uint16_t>(10 * b), tags);
+        for (const auto &shard : air)
+        {
+            const int idx = fec_shard_index(shard);
+            if (b < blocks && (0 == idx || 10 == idx))
+            {
+                continue;
+            }
+            feed_append(dec, shard, out);
+        }
+    }
+}
+
+void expect_ascending(const vstreamer::fec_rx_payload_list &out)
+{
+    for (size_t i = 1; i < out.size(); i++)
+    {
+        EXPECT_LT(out[i - 1].u8()[0], out[i].u8()[0]) << "emit #" << i;
+    }
+}
+
+}  // namespace
+
+/* Several undecodable blocks behind each other give up one after another without each waiting
+ * for a fresh later shard: the head's own idle time counts, so the run clears in about one
+ * emit_hold instead of piling up until rx_hold expires the blocks. */
+TEST(RsBlockErasureEmitTest, UndecodableRunGivesUpWithinEmitHold)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(10, 11, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    feed_undecodable_run(enc, dec, 4, &out);
+    ASSERT_LT(dec.emit_hold_ms() * 3, dec.rx_hold_ms());
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(dec.emit_hold_ms() * 2);
+    while (std::chrono::steady_clock::now() < until)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        vstreamer::fec_rx_payload_list tick;
+        dec.poll_rx(&tick);
+        out.insert(out.end(), tick.begin(), tick.end());
+    }
+    EXPECT_EQ(4U, dec.given_up_blocks());
+    EXPECT_EQ(0U, dec.evicted_blocks());
+    EXPECT_EQ(4U * 9U + 10U, out.size());
+    expect_ascending(out);
+}
+
+/* Blocks that expire in the same poll are abandoned in ring order from the head, so their
+ * surviving payloads still leave in sequence. */
+TEST(RsBlockErasureEmitTest, ExpiredBlocksEmitInOrder)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(10, 11, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    feed_undecodable_run(enc, dec, 6, &out);
+    std::this_thread::sleep_for(std::chrono::milliseconds(dec.rx_hold_ms() + 20));
+    vstreamer::fec_rx_payload_list flush;
+    dec.poll_rx(&flush);
+    out.insert(out.end(), flush.begin(), flush.end());
+    EXPECT_EQ(6U * 9U + 10U, out.size());
+    expect_ascending(out);
+}
