@@ -8,6 +8,8 @@
 #include <utility>
 #include <vector>
 
+#include "core/thread_spawn.hpp"
+
 namespace vstreamer
 {
 class component;
@@ -38,8 +40,9 @@ public:
     /* A read-only node: "get <name> <key>" calls fn for that key. */
     void add_query(std::string name, std::string key, query_fn fn);
 
-    /* Starts the server thread; 0 or an error from socket()/bind(). Nodes must outlive stop(). */
-    int start(int port);
+    /* Starts the server thread on `thread` (name, stack, core, priority); 0 or an error from
+     * socket()/bind(). Nodes must outlive stop(). */
+    int start(int port, const vstreamer::thread_opts &thread);
     void stop();
 
     std::string handle(std::string_view line);

@@ -143,7 +143,7 @@ live_mplane::~live_mplane()
     stop();
 }
 
-int live_mplane::start(int port)
+int live_mplane::start(int port, const vstreamer::thread_opts &thread_cfg)
 {
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
@@ -165,8 +165,7 @@ int live_mplane::start(int port)
         return err;
     }
     stopping.store(false);
-    thread = vstreamer::spawn_thread(vstreamer::thread_opts {"vs_mplane", 6 * 1024, 0, 5},
-                                     [this] { serve(); });
+    thread = vstreamer::spawn_thread(thread_cfg, [this] { serve(); });
     return 0;
 }
 

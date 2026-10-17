@@ -80,8 +80,11 @@ struct place_kv
 };
 
 /* Live TX: vs_isp_tx runs the RS FEC encode (~10 ms of compute per block) on core 0, so the
- * send thread sits on core 1; sharing core 0 starved it and spread FEC blocks left in lumps. */
+ * send thread sits on core 1; sharing core 0 starved it and spread FEC blocks left in lumps.
+ * The mplane is on core 1 so it answers under load. Measured and not worth it (2026-10-17):
+ * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0). */
 constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13};
+constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
 constexpr place_kv k_live_src_place[] = {
     {"capture_cpu", "0"}, {"capture_prio", "12"}, {"encode_cpu", "1"}, {"encode_prio", "13"}};
 constexpr place_kv k_live_snd_place[] = {{"send_cpu", "1"}, {"send_prio", "14"}};
@@ -700,7 +703,7 @@ int run_camera_stream()
         return sys_stats_line(&w);
     });
 #endif
-    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT); mr < 0)
+    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT, k_live_mplane_thread); mr < 0)
     {
         std::printf("live TX mplane: bind :%d failed (%d)\n", CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT,
                     mr);
