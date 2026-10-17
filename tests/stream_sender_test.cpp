@@ -120,6 +120,18 @@ TEST(StreamSenderTest, QueueByteLimitWithPacing)
     EXPECT_GE(limit, 32768U);
 }
 
+/* Spread holds shards back for up to fec_spread_ms: the queue grows by that much traffic so
+ * spreading does not turn into sender-side SDU rejects. */
+TEST(StreamSenderTest, QueueByteLimitGrowsWithFecSpread)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "max_kbps", "10000"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    const size_t base = query_size_t(sender, "queue_byte_limit");
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "100"));
+    EXPECT_EQ(2U * base, query_size_t(sender, "queue_byte_limit"));
+}
+
 TEST(StreamSenderTest, QueueByteLimitHoldsKeyframeBurstWithFec)
 {
     vstreamer::stream_sender sender;

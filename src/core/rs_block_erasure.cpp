@@ -1,4 +1,5 @@
 #include "core/rs_block_erasure.hpp"
+#include "core/rs_encode_scalar.hpp"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +22,7 @@ extern "C" void vstreamer_ec_encode_data(int len, int k, int rows,
                                          unsigned char** coding);
 #define VSTREAMER_EC_ENCODE vstreamer_ec_encode_data
 #else
-#define VSTREAMER_EC_ENCODE ec_encode_data_base
+#define VSTREAMER_EC_ENCODE vstreamer::rs_encode_scalar
 #endif
 
 namespace

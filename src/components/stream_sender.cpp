@@ -164,8 +164,11 @@ size_t stream_sender::queue_byte_limit() const
                    static_cast<double>(effective_fec_n()) /
                    static_cast<double>(effective_fec_k());
     }
+    /* Spread holds each block's shards back for up to fec_spread_ms on top of the normal
+     * queueing, so the queue holds that much more traffic before it rejects SDUs. */
+    const int    window_ms = queue_ms + fec_spread_ms.load(std::memory_order_relaxed);
     const size_t scaled =
-        static_cast<size_t>(rate_bps * static_cast<double>(queue_ms) / 1000.0);
+        static_cast<size_t>(rate_bps * static_cast<double>(window_ms) / 1000.0);
     if (cap_kbps > 0)
     {
         /* Paced: the cap bounds how stale queued data may get. */

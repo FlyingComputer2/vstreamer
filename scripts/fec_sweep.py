@@ -12,8 +12,8 @@ seconds.
 
 Columns: chan% is the channel's forward drop rate (all models); resid% is RTP packets missing
 after FEC (sequence gaps at the depacketizer) over RTP packets expected; fps is frames presented;
-idr is depacketizer resyncs (waits for an IDR); cpu is the sender's busiest task when it answers
-`get sys stats` (P4 only).
+idr is depacketizer resyncs (waits for an IDR); cpu% is the sender's busiest task (named in `task`), c0%/c1% the busy share of each
+core, when it answers `get sys stats` (P4 only).
 """
 
 from __future__ import annotations
@@ -95,7 +95,9 @@ class result:
     recovered: int
     failures: int
     idr: int
-    cpu: str
+    task: str = ""
+    task_pct: float = 0.0
+    core_busy: tuple[float, ...] = ()
 
 
 def parse_fec(spec: str) -> list[fec_point]:
@@ -144,15 +146,17 @@ def set_channel(chan: tuple[str, int], c: channel_point) -> None:
     ask_ok(chan, f"set link ge_p_gb {p_gb:g}")
 
 
-def busiest_task(sys_stats: str) -> str:
+def cpu_usage(sys_stats: str) -> tuple[str, float, tuple[float, ...]]:
+    """Busiest task, its CPU %, and the busy % of each core (100 - IDLEn)."""
     tasks = [(name, float(pct)) for name, pct in re.findall(r" (\w+)=([\d.]+)%", sys_stats)
              if not name.startswith("IDLE")]
-    idle = re.findall(r"(IDLE\d)=([\d.]+)%", sys_stats)
-    top = max(tasks, key=lambda t: t[1]) if tasks else None
-    s = f"{top[0]} {top[1]:.0f}%" if top else ""
-    if idle:
-        s += " idle " + "/".join(f"{float(p):.0f}" for _, p in sorted(idle))
-    return s
+    idle = sorted((name, float(pct)) for name, pct in re.findall(r"(IDLE\d)=([\d.]+)%", sys_stats))
+    top = max(tasks, key=lambda t: t[1]) if tasks else ("", 0.0)
+    return top[0], top[1], tuple(100.0 - pct for _, pct in idle)
+
+
+def core(r: result, i: int) -> str:
+    return f"{r.core_busy[i]:.0f}" if i < len(r.core_busy) else "-"
 
 
 def measure(args, sender, chan, rcv, f: fec_point, c: channel_point) -> result:
@@ -168,7 +172,7 @@ def measure(args, sender, chan, rcv, f: fec_point, c: channel_point) -> result:
     m1 = receiver_metrics(rcv)
     dt = time.monotonic() - t0
     st = kv(ask_ok(chan, "get link stats"))
-    cpu = busiest_task(ask_ok(sender, "get sys stats")) if sys_ok else ""
+    task, task_pct, core_busy = cpu_usage(ask_ok(sender, "get sys stats")) if sys_ok else ("", 0.0, ())
 
     def d(name: str) -> float:
         return m1.get(name, 0.0) - m0.get(name, 0.0)
@@ -187,7 +191,9 @@ def measure(args, sender, chan, rcv, f: fec_point, c: channel_point) -> result:
         recovered=int(d("stream_receiver.fec_recovered")),
         failures=int(d("stream_receiver.fec_failures")),
         idr=int(d("rtp_h264_depay.need_idr")),
-        cpu=cpu,
+        task=task,
+        task_pct=task_pct,
+        core_busy=core_busy,
     )
 
 
@@ -210,7 +216,7 @@ def main() -> int:
     fecs = parse_fec(args.fec)
     chans = parse_channels(args.loss, args.ge)
 
-    hdr = f"{'fec':>6} {'channel':<36} {'chan%':>6} {'resid%':>7} {'fps':>5} {'recov':>6} {'fail':>5} {'idr':>4}  cpu"
+    hdr = f"{'fec':>6} {'channel':<36} {'chan%':>6} {'resid%':>7} {'fps':>5} {'recov':>6} {'fail':>5} {'idr':>4} {'cpu%':>5} {'c0%':>4} {'c1%':>4}  task"
     print(hdr)
     results: list[result] = []
     try:
@@ -222,7 +228,8 @@ def main() -> int:
                 r = measure(args, sender, chan, rcv, f, c)
                 results.append(r)
                 print(f"{r.fec:>6} {r.channel:<36} {r.chan_pct:6.2f} {r.resid_pct:7.3f} {r.fps:5.1f} "
-                      f"{r.recovered:6d} {r.failures:5d} {r.idr:4d}  {r.cpu}", flush=True)
+                      f"{r.recovered:6d} {r.failures:5d} {r.idr:4d} {r.task_pct:5.0f} "
+                      f"{core(r, 0):>4} {core(r, 1):>4}  {r.task}", flush=True)
     finally:
         set_channel(chan, channel_point("clean"))
 
@@ -230,10 +237,11 @@ def main() -> int:
         with open(args.csv, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["fec", "channel", "chan_pct", "resid_pct", "fps", "recovered", "failures",
-                        "idr", "cpu"])
+                        "idr", "cpu_pct", "core0_pct", "core1_pct", "task"])
             for r in results:
                 w.writerow([r.fec, r.channel, f"{r.chan_pct:.3f}", f"{r.resid_pct:.4f}",
-                            f"{r.fps:.2f}", r.recovered, r.failures, r.idr, r.cpu])
+                            f"{r.fps:.2f}", r.recovered, r.failures, r.idr, f"{r.task_pct:.1f}",
+                            core(r, 0), core(r, 1), r.task])
     return 0
 
 
