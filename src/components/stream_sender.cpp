@@ -849,7 +849,10 @@ int stream_sender::open()
         send_stop = false;
         send_thread = spawn_thread(
 #if defined(ESP_PLATFORM)
-            thread_opts {"vs_send", k_send_stack_bytes, 0, 12},
+            /* Not on the FEC encode's core: that thread (prio 13) runs ~10 ms per block and
+             * starved this one, so shards left up to 130 ms after their release time and a
+             * spread block arrived in lumps. */
+            thread_opts {"vs_send", k_send_stack_bytes, 1, 14},
 #else
             thread_opts {"vs_send", k_send_stack_bytes},
 #endif
