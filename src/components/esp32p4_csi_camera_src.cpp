@@ -729,11 +729,12 @@ int esp32p4_csi_camera_src::wait_output(component_pdu &out, int timeout_ms)
 
 int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view value)
 {
-    if (const int pr = thread_place_configure(&capture_place_, "capture", key, value); -ENOTSUP != pr)
+    std::lock_guard<std::mutex> lock(mu);
+    if (const int pr = thread_place_configure(&capture_place_, "capture", key, value, source_open);
+        -ENOTSUP != pr)
     {
         return pr;
     }
-    std::lock_guard<std::mutex> lock(mu);
     if (key == "fps")
     {
         return parse_int(value, 1, 120, &fps);

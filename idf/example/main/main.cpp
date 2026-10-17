@@ -703,7 +703,8 @@ int run_camera_stream()
         return sys_stats_line(&w);
     });
 #endif
-    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT, k_live_mplane_thread); mr < 0)
+    if (const int mr = mplane.start(CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT, k_live_mplane_thread);
+        mr < 0)
     {
         std::printf("live TX mplane: bind :%d failed (%d)\n", CONFIG_VSTREAMER_LIVE_TX_MPLANE_PORT,
                     mr);

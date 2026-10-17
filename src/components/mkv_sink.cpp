@@ -501,13 +501,14 @@ void mkv_sink::close()
 
 int mkv_sink::configure(std::string_view key, std::string_view value)
 {
-    if (const int pr = thread_place_configure(&mux_place, "mux", key, value); -ENOTSUP != pr)
-    {
-        return pr;
-    }
     std::string_view v = value;
 
     std::lock_guard<std::mutex> lock(mu);
+    if (const int pr = thread_place_configure(&mux_place, "mux", key, value, opened);
+        -ENOTSUP != pr)
+    {
+        return pr;
+    }
 
     if (key == "output")
     {

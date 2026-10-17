@@ -1,9 +1,10 @@
 #ifndef VSTREAMER_CORE_THREAD_SPAWN_HPP
 #define VSTREAMER_CORE_THREAD_SPAWN_HPP
 
-#include <atomic>
 #include <cerrno>
 #include <cstddef>
+
+#include <atomic>
 #include <functional>
 #include <string>
 #include <string_view>
@@ -26,41 +27,37 @@ struct thread_opts
 {
     /* ESP-IDF task name (up to configMAX_TASK_NAME_LEN - 1 chars). */
     const char *name = nullptr;
-    /* ESP-IDF stack size; 0 keeps the pthread default
-     * (CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT, ~3 KB). Linux threads keep the
-     * system default. */
+    /* ESP-IDF stack size; 0 keeps the pthread default (CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT,
+     * ~3 KB). Linux threads keep the system default. */
     size_t stack_bytes = 0;
-    /* Core the thread runs on; -1 = any core. ESP-IDF fixes it at creation
-     * (FreeRTOS cannot move a task later). Linux pins the new thread before it
-     * runs the callable, so threads it starts inherit the pin. */
+    /* Core the thread runs on; -1 = any core. ESP-IDF fixes it at creation (FreeRTOS cannot
+     * move a task later). Linux pins the new thread before it runs the callable, so threads it
+     * starts inherit the pin. */
     int cpu = -1;
-    /* FreeRTOS priority (0..configMAX_PRIORITIES-1); -1 keeps the pthread
-     * default. Ignored on Linux (real-time priorities need privileges). */
+    /* FreeRTOS priority (0..configMAX_PRIORITIES-1); -1 keeps the pthread default. Ignored on
+     * Linux (real-time priorities need privileges). */
     int prio = -1;
 };
 
 /*
- * std::thread with a stack size, name, core and priority on ESP-IDF; on Linux
- * only the core. On ESP-IDF the new thread does not inherit these settings:
- * threads it starts get the defaults.
+ * std::thread with a stack size, name, core and priority on ESP-IDF; on Linux only the core.
+ * On ESP-IDF the new thread does not inherit these settings: threads it starts get the
+ * defaults.
  */
 template <typename... Args>
 [[nodiscard]] std::thread spawn_thread(const thread_opts &opts, Args &&...args)
 {
 #if defined(ESP_PLATFORM)
-    /* esp_pthread_set_cfg() applies to threads the calling thread creates;
-     * restore it after. */
-    esp_pthread_cfg_t prev{};
-    const bool had_prev = esp_pthread_get_cfg(&prev) == ESP_OK;
+    /* esp_pthread_set_cfg() applies to threads the calling thread creates; restore it after. */
+    esp_pthread_cfg_t prev {};
+    const bool        had_prev = esp_pthread_get_cfg(&prev) == ESP_OK;
 
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
     if (opts.stack_bytes > 0)
     {
         cfg.stack_size = opts.stack_bytes;
     }
-    cfg.pin_to_core = (opts.cpu >= 0 && opts.cpu < portNUM_PROCESSORS)
-                          ? opts.cpu
-                          : tskNO_AFFINITY;
+    cfg.pin_to_core = (opts.cpu >= 0 && opts.cpu < portNUM_PROCESSORS) ? opts.cpu : tskNO_AFFINITY;
     if (opts.prio >= 0)
     {
         cfg.prio = static_cast<size_t>(opts.prio);
@@ -97,22 +94,20 @@ template <typename... Args>
 }
 
 /*
- * Placement of a thread a component starts, so the app (not the component)
- * picks the core and priority. The component exposes it as configure()/query()
- * keys "<role>_cpu" and
- * "<role>_prio" (-1 = any core / default priority, the default) and reads it
- * when it starts the thread, so a change applies on the next open().
+ * Placement of a thread a component starts, so the app (not the component) picks the core and
+ * priority. The component exposes it as configure()/query() keys "<role>_cpu" and
+ * "<role>_prio" (-1 = any core / default priority, the default), settable only while the
+ * component is closed, and reads it when open() starts the thread.
  */
 struct thread_place
 {
-    std::atomic<int> cpu{-1};
-    std::atomic<int> prio{-1};
+    std::atomic<int> cpu {-1};
+    std::atomic<int> prio {-1};
 
     [[nodiscard]] thread_opts opts(const char *name, size_t stack_bytes) const
     {
-        return thread_opts{name, stack_bytes,
-                           cpu.load(std::memory_order_relaxed),
-                           prio.load(std::memory_order_relaxed)};
+        return thread_opts {name, stack_bytes, cpu.load(std::memory_order_relaxed),
+                            prio.load(std::memory_order_relaxed)};
     }
 };
 
@@ -121,9 +116,8 @@ namespace detail
 
 /* "<role>_cpu" -> &place->cpu, "<role>_prio" -> &place->prio, else nullptr. */
 template <typename Place>
-auto thread_place_field(Place *place, std::string_view role,
-                        std::string_view key,
-                        bool *is_cpu) -> decltype(&place->cpu)
+auto thread_place_field(Place *place, std::string_view role, std::string_view key, bool *is_cpu)
+    -> decltype(&place->cpu)
 {
     if (key.size() <= role.size() || key.substr(0, role.size()) != role ||
         key[role.size()] != '_')
@@ -146,20 +140,23 @@ auto thread_place_field(Place *place, std::string_view role,
 
 }  // namespace detail
 
-/* Handles "<role>_cpu" / "<role>_prio": 0, -EINVAL (out of range), or -ENOTSUP
- * (other key). */
+/* Handles "<role>_cpu" / "<role>_prio": 0, -EBUSY (the component is open), -EINVAL (out of
+ * range), or -ENOTSUP (another key). */
 inline int thread_place_configure(thread_place *place, std::string_view role,
-                                  std::string_view key, std::string_view value)
+                                  std::string_view key, std::string_view value, bool open)
 {
-    bool is_cpu = false;
+    bool  is_cpu = false;
     auto *field = detail::thread_place_field(place, role, key, &is_cpu);
     if (nullptr == field)
     {
         return -ENOTSUP;
     }
+    if (open)
+    {
+        return -EBUSY;
+    }
 #if defined(ESP_PLATFORM)
-    const int64_t max =
-        is_cpu ? portNUM_PROCESSORS - 1 : configMAX_PRIORITIES - 1;
+    const int64_t max = is_cpu ? portNUM_PROCESSORS - 1 : configMAX_PRIORITIES - 1;
 #else
     const int64_t max = is_cpu ? 1023 : 99;
 #endif
@@ -176,7 +173,7 @@ inline int thread_place_configure(thread_place *place, std::string_view role,
 inline int thread_place_query(const thread_place &place, std::string_view role,
                               std::string_view key, std::string *value)
 {
-    bool is_cpu = false;
+    bool        is_cpu = false;
     const auto *field = detail::thread_place_field(&place, role, key, &is_cpu);
     if (nullptr == field)
     {

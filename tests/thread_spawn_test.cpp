@@ -30,8 +30,8 @@ TEST(ThreadPlaceTest, DefaultsToAnyCoreAndDefaultPrio)
 TEST(ThreadPlaceTest, ConfigureAndQueryRoleKeys)
 {
     thread_place p;
-    EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", "1"), 0);
-    EXPECT_EQ(thread_place_configure(&p, "send", "send_prio", "14"), 0);
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", "1", false), 0);
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_prio", "14", false), 0);
     std::string v;
     EXPECT_EQ(thread_place_query(p, "send", "send_cpu", &v), 0);
     EXPECT_EQ(v, "1");
@@ -39,7 +39,7 @@ TEST(ThreadPlaceTest, ConfigureAndQueryRoleKeys)
     EXPECT_EQ(v, "14");
     EXPECT_EQ(p.opts("vs_send", 0).cpu, 1);
     EXPECT_EQ(p.opts("vs_send", 0).prio, 14);
-    EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", "-1"), 0);
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", "-1", false), 0);
     EXPECT_EQ(p.opts("vs_send", 0).cpu, -1);
 }
 
@@ -50,10 +50,19 @@ TEST(ThreadPlaceTest, OtherKeysAreNotSupported)
     for (const char *key :
          {"send", "send_", "send_cpux", "sendx_cpu", "recv_cpu", "cpu", "_cpu"})
     {
-        EXPECT_EQ(thread_place_configure(&p, "send", key, "0"), -ENOTSUP)
+        EXPECT_EQ(thread_place_configure(&p, "send", key, "0", false), -ENOTSUP)
             << key;
         EXPECT_EQ(thread_place_query(p, "send", key, &v), -ENOTSUP) << key;
     }
+}
+
+TEST(ThreadPlaceTest, BusyWhileOpen)
+{
+    thread_place p;
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", "1", true), -EBUSY);
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_prio", "x", true), -EBUSY);
+    EXPECT_EQ(thread_place_configure(&p, "send", "other", "1", true), -ENOTSUP);
+    EXPECT_EQ(p.opts("t", 0).cpu, -1);
 }
 
 TEST(ThreadPlaceTest, RejectsOutOfRange)
@@ -61,11 +70,11 @@ TEST(ThreadPlaceTest, RejectsOutOfRange)
     thread_place p;
     for (const char *value : {"-2", "x", "", "1024"})
     {
-        EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", value),
+        EXPECT_EQ(thread_place_configure(&p, "send", "send_cpu", value, false),
                   -EINVAL)
             << value;
     }
-    EXPECT_EQ(thread_place_configure(&p, "send", "send_prio", "100"), -EINVAL);
+    EXPECT_EQ(thread_place_configure(&p, "send", "send_prio", "100", false), -EINVAL);
     EXPECT_EQ(p.opts("t", 0).cpu, -1);
 }
 
@@ -123,4 +132,13 @@ TEST(ThreadPlaceTest, StreamSenderExposesSendAndTelemetryKeys)
     EXPECT_EQ(v, "7");
     EXPECT_EQ(snd->query("send_prio", &v), 0);
     EXPECT_EQ(v, "-1");
+
+    ASSERT_EQ(snd->configure("stream", "127.0.0.1:9"), 0);
+    ASSERT_EQ(snd->configure("telemetry", "off"), 0);
+    ASSERT_EQ(snd->open(), 0);
+    EXPECT_EQ(snd->configure("send_cpu", "-1"), -EBUSY);
+    EXPECT_EQ(snd->query("send_cpu", &v), 0);
+    EXPECT_EQ(v, "0");
+    snd->close();
+    EXPECT_EQ(snd->configure("send_cpu", "-1"), 0);
 }

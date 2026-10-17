@@ -295,12 +295,13 @@ int esp32_h264_isp_src::output(component_pdu &out)
 
 int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
 {
+    std::lock_guard<std::mutex> lock(mu);
     /* capture_cpu / capture_prio fall through to the camera below. */
-    if (const int pr = thread_place_configure(&encode_place_, "encode", key, value); -ENOTSUP != pr)
+    if (const int pr = thread_place_configure(&encode_place_, "encode", key, value, opened);
+        -ENOTSUP != pr)
     {
         return pr;
     }
-    std::lock_guard<std::mutex> lock(mu);
     if (opened)
     {
         return -EBUSY;

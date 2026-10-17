@@ -863,8 +863,9 @@ int stream_sender::open()
         telemetry_stop = false;
         if (telemetry)
         {
-            telemetry_thread = spawn_thread(telemetry_place.opts("vs_telemetry", k_telemetry_stack_bytes),
-                                            &stream_sender::telemetry_thread_main, this);
+            telemetry_thread =
+                spawn_thread(telemetry_place.opts("vs_telemetry", k_telemetry_stack_bytes),
+                             &stream_sender::telemetry_thread_main, this);
         }
 
         std::fprintf(stderr, "stream_sender: udp://%s:%d mtu=%d\n", host, port, mtu_local);
@@ -1162,13 +1163,19 @@ bool parse_on_off(std::string_view value, bool *out)
 
 int stream_sender::configure(std::string_view key, std::string_view value)
 {
-    if (const int pr = thread_place_configure(&send_place, "send", key, value); -ENOTSUP != pr)
     {
-        return pr;
-    }
-    if (const int pr = thread_place_configure(&telemetry_place, "telemetry", key, value); -ENOTSUP != pr)
-    {
-        return pr;
+        std::lock_guard<std::mutex> lock(mu);
+        if (const int pr = thread_place_configure(&send_place, "send", key, value, opened);
+            -ENOTSUP != pr)
+        {
+            return pr;
+        }
+        if (const int pr =
+                thread_place_configure(&telemetry_place, "telemetry", key, value, opened);
+            -ENOTSUP != pr)
+        {
+            return pr;
+        }
     }
     if ("telemetry" == key)
     {
@@ -1369,7 +1376,8 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         return pr;
     }
-    if (const int pr = thread_place_query(telemetry_place, "telemetry", key, value); -ENOTSUP != pr)
+    if (const int pr = thread_place_query(telemetry_place, "telemetry", key, value);
+        -ENOTSUP != pr)
     {
         return pr;
     }

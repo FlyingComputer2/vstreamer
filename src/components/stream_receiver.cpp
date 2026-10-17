@@ -658,9 +658,13 @@ bool parse_on_off(std::string_view value, bool *out)
 
 int stream_receiver::configure(std::string_view key, std::string_view value)
 {
-    if (const int pr = thread_place_configure(&recv_place, "recv", key, value); -ENOTSUP != pr)
     {
-        return pr;
+        std::lock_guard<std::mutex> lock(mu);
+        if (const int pr = thread_place_configure(&recv_place, "recv", key, value, opened);
+            -ENOTSUP != pr)
+        {
+            return pr;
+        }
     }
     if ("telemetry" == key)
     {
