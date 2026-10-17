@@ -619,8 +619,11 @@ void vstreamer::rs_block_erasure::maybe_give_up_head(fec_rx_payload_list* out)
         {
             give_up = true;
         }
-        else if (later_block_waiting &&
-                 t - later_block_since > std::chrono::milliseconds(emit_hold_ms()))
+        /* Timed on the head's own idle time, not on when a later block showed up: after a
+         * give-up the next head has usually been idle as long, and restarting the wait for each
+         * one would serialize a run of undecodable blocks until rx_hold expires them. */
+        else if ((later_block_waiting || (newest_set && dist_from_emit(newest) > 0)) &&
+                 t - block.last_seen > std::chrono::milliseconds(emit_hold_ms()))
         {
             give_up = true;
         }
@@ -1374,20 +1377,29 @@ void vstreamer::rs_block_erasure::expire_rx(fec_rx_payload_list* out)
     }
     const auto t = now();
     const auto hold = std::chrono::milliseconds(rx_hold_ms());
-    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
+    /* rx_blocks is unordered: abandon in ring order from the head so the payloads of blocks
+     * expiring together leave in sequence. */
+    std::vector<uint16_t> expired;
+    for (const auto& kv : rx_blocks)
     {
-        if (t - it->second.last_seen > hold)
+        if (t - kv.second.last_seen > hold)
         {
-            evicted_blocks_count++;
-            const uint16_t expired_id = it->first;
-            const rx_block_s block_snap = it->second;
-            it = rx_blocks.erase(it);
-            abandon_partial_block(block_snap, expired_id, out);
+            expired.push_back(kv.first);
         }
-        else
+    }
+    std::sort(expired.begin(), expired.end(), [this](uint16_t a, uint16_t b)
+              { return dist_from_emit(a) < dist_from_emit(b); });
+    for (const uint16_t id : expired)
+    {
+        auto it = rx_blocks.find(id);
+        if (it == rx_blocks.end())
         {
-            ++it;
+            continue;
         }
+        evicted_blocks_count++;
+        const rx_block_s block_snap = it->second;
+        rx_blocks.erase(it);
+        abandon_partial_block(block_snap, id, out);
     }
 }
 
