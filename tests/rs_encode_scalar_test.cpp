@@ -140,3 +140,21 @@ TEST(RsEncodeScalarTest, FasterThanIsalBase)
                 scalar_ms, base_ms / scalar_ms);
     EXPECT_LT(scalar_ms, base_ms);
 }
+
+TEST(RsEncodeScalarTest, SelftestAgreesWithTablePath)
+{
+    const auto now = []() -> int64_t {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    int64_t fast = 0;
+    int64_t table = 0;
+    for (const int len : {1403, 37, 16, 1})
+    {
+        EXPECT_EQ(0, vstreamer::rs_encode_selftest(21, 10, len, 1, now, &fast, &table)) << len;
+    }
+    std::vector<uint8_t> arena(static_cast<size_t>(2 + 2 * 29) * (300 + 8));
+    EXPECT_EQ(0, vstreamer::rs_encode_selftest(2, 29, 300, 1, now, &fast, &table, arena.data()));
+    EXPECT_STREQ("table", vstreamer::rs_encode_scalar_impl());
+}

@@ -89,7 +89,7 @@ const char* vstreamer::rs_block_erasure::impl_name() const
 #ifdef VSTREAMER_ISAL_NEON
     return "isa-l neon";
 #else
-    return "isa-l base";
+    return rs_encode_scalar_impl();
 #endif
 }
 

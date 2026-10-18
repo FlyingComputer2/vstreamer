@@ -29,6 +29,7 @@
 #endif
 #include "core/component_coder.hpp"
 #include "core/component_factory.hpp"
+#include "core/rs_encode_scalar.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/component_pdu.hpp"
 #include "core/component_sink.hpp"
@@ -984,6 +985,28 @@ extern "C" void app_main(void)
     /* pipeline control uses std::this_thread::get_id(), which needs a pthread; app_main is a
      * plain FreeRTOS task. */
     auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 24 * 1024}, [] {
+        {
+            /* FEC encode check: the fast path (PIE on the P4) against the table path, misaligned
+             * shards, with and without a tail. A mismatch turns the fast path off. */
+            const auto now = [] { return static_cast<int64_t>(esp_timer_get_time()); };
+            for (const int len : {1403, 37})
+            {
+                int64_t   fast = 0;
+                int64_t   table = 0;
+                const int bad = vstreamer::rs_encode_selftest(21, 10, len, 2, now, &fast, &table);
+                if (bad > 0)
+                {
+                    std::printf("RS ENCODE SELFTEST FAILED (len %d, %d parity rows differ): FEC encode "
+                                "falls back to the table path\n",
+                                len, bad);
+                }
+                else
+                {
+                    std::printf("rs selftest len=%d ok: %s %" PRId64 " us, table %" PRId64 " us\n", len,
+                                vstreamer::rs_encode_scalar_impl(), fast, table);
+                }
+            }
+        }
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
     CONFIG_VSTREAMER_IDF_LIVE_TX
         while (true)
