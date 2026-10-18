@@ -764,10 +764,22 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("fec_spread_est_ms" == key || "fec_jitter_est_ms" == key)
+    {
+        /* The sender's spread and arrival jitter measured from receive times; the spread is the
+         * cap (rs_block_erasure::k_spread_cap_ms) until two blocks have been fitted. */
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.1f",
+                      "fec_spread_est_ms" == key ? fec.spread_estimate_ms()
+                                                 : fec.jitter_estimate_ms());
+        *value = buf;
+        return 0;
+    }
     if ("fec_recovered" == key || "fec_failures" == key || "fec_hdr_errors" == key ||
         "fec_kn_mismatch" == key || "fec_evicted_blocks" == key || "fec_rs_failures" == key ||
         "fec_missing_shards" == key || "fec_late_blocks" == key ||
-        "fec_given_up_blocks" == key)
+        "fec_given_up_blocks" == key || "fec_new_references" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         char           buf[32];
@@ -803,6 +815,10 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         else if ("fec_given_up_blocks" == key)
         {
             n = fec.given_up_blocks();
+        }
+        else if ("fec_new_references" == key)
+        {
+            n = fec.new_references();
         }
         else
         {

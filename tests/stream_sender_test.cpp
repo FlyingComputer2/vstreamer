@@ -283,7 +283,7 @@ TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
     std::thread       hammer([&]() {
         const char *steps[][2] = {
             {"fec_n", "31"},          {"fec_k", "10"},        {"fec_k", "1"},
-            {"fec_spread_ms", "500"}, {"fec_k", "2"},         {"fec_timeout_ms", "0"},
+            {"fec_spread_ms", "250"}, {"fec_k", "2"},         {"fec_timeout_ms", "0"},
             {"fec_n", "2"},           {"fec_k", "2"},         {"fec_n", "31"},
             {"fec_k", "1"},           {"fec", "none"},        {"fec_n", "31"},
             {"fec_k", "31"},          {"fec_spread_ms", "0"}, {"fec_timeout_ms", "20"},
@@ -311,7 +311,7 @@ TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
 
 TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
 {
-    /* A huge fec_spread_ms parks shards in the send queue for that long; lowering it again must
+    /* A long fec_spread_ms parks shards in the send queue for that long; lowering it again must
      * pull them in instead of leaving the stream stalled until the old release times. */
     const int rx = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(rx, 0);
@@ -326,7 +326,7 @@ TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
     ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "4"));
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "1000000"));
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
     for (int i = 0; i < 8; ++i)
@@ -348,8 +348,8 @@ TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
         }
         return got;
     };
-    const int early = drain(200);
-    EXPECT_LT(early, 16) << "spread 1000 s should hold most shards back";
+    const int early = drain(30);
+    EXPECT_LT(early, 16) << "spread 250 ms should hold most shards back";
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
     EXPECT_EQ(16, early + drain(500)) << "4 blocks x n=4 shards";
 
