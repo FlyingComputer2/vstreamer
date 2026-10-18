@@ -264,6 +264,99 @@ TEST(StreamSenderTest, MaxKbpsReconfigureWhileSending)
     receiver.close();
 }
 
+TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
+{
+    /* M-plane misconfiguration must never crash the sender: k/n (1/31 is a 31x amplification),
+     * spread and timeout change from another thread while full-size PDUs stream through. */
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+
+    vstreamer::stream_sender sender;
+    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
+    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+
+    std::atomic<bool> stop {false};
+    std::thread       hammer([&]() {
+        const char *steps[][2] = {
+            {"fec_n", "31"},          {"fec_k", "10"},        {"fec_k", "1"},
+            {"fec_spread_ms", "500"}, {"fec_k", "2"},         {"fec_timeout_ms", "0"},
+            {"fec_n", "2"},           {"fec_k", "2"},         {"fec_n", "31"},
+            {"fec_k", "1"},           {"fec", "none"},        {"fec_n", "31"},
+            {"fec_k", "31"},          {"fec_spread_ms", "0"}, {"fec_timeout_ms", "20"},
+            {"fec_k", "21"},
+        };
+        while (!stop.load())
+        {
+            for (const auto &st : steps)
+            {
+                (void)cfg(sender, st[0], st[1]);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+        }
+    });
+
+    for (int i = 0; i < 4000; ++i)
+    {
+        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 1200);
+        (void)sender.input(std::move(pkt));
+    }
+    stop = true;
+    hammer.join();
+    sender.close();
+}
+
+TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
+{
+    /* A huge fec_spread_ms parks shards in the send queue for that long; lowering it again must
+     * pull them in instead of leaving the stream stalled until the old release times. */
+    const int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(rx, 0);
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(0, bind(rx, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+    socklen_t alen = sizeof(addr);
+    ASSERT_EQ(0, getsockname(rx, reinterpret_cast<sockaddr *>(&addr), &alen));
+
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "4"));
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "1000000"));
+    ASSERT_EQ(0, sender.open());
+    ASSERT_EQ(0, sender.set_enabled(true, 0));
+    for (int i = 0; i < 8; ++i)
+    {
+        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 200)));
+    }
+
+    const auto drain = [rx](int ms) {
+        int got = 0;
+        pollfd pfd {rx, POLLIN, 0};
+        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < end)
+        {
+            if (poll(&pfd, 1, 10) > 0)
+            {
+                uint8_t b[2048];
+                got += recv(rx, b, sizeof(b), 0) > 0 ? 1 : 0;
+            }
+        }
+        return got;
+    };
+    const int early = drain(200);
+    EXPECT_LT(early, 16) << "spread 1000 s should hold most shards back";
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
+    EXPECT_EQ(16, early + drain(500)) << "4 blocks x n=4 shards";
+
+    sender.close();
+    close(rx);
+}
+
 namespace
 {
 
