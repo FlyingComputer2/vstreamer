@@ -340,9 +340,11 @@ TEST(RsBlockErasureEmitTest, RestartBehindWithinLoIgnoredAsLate)
     {
         feed_append(dec, encode_one(enc, static_cast<uint16_t>(i), 1), &out);
     }
+    /* 120 behind: within lo, and older than the recently released ids (whose shards would be
+     * dropped as redundant without counting). */
     for (int i = 0; i < 10; i++)
     {
-        feed_append(dec, encode_one(enc, static_cast<uint16_t>(250 + i), 2), &out);
+        feed_append(dec, encode_one(enc, static_cast<uint16_t>(180 + i), 2), &out);
     }
     EXPECT_EQ(300u, out.size());
     EXPECT_EQ(10u, dec.late_blocks());
@@ -1222,6 +1224,24 @@ TEST(RsBlockErasureEmitTest, MissingBlockSkippedAfterNextBlockSpread)
 }
 
 /* Behind by at most lo: ignored; behind by more, or ahead by more than hi: new reference. */
+/* Parity arriving after its block was released from its first k shards is not a late block. */
+TEST(RsBlockErasureEmitTest, RedundantParityNotCountedLate)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    for (uint16_t b = 0; b < 8; b++)
+    {
+        for (const auto &shard : encode_block_apps(enc, static_cast<uint16_t>(4 * b), {1, 2, 3, 4}))
+        {
+            feed_append(dec, shard, &out);
+        }
+    }
+    EXPECT_EQ(32u, out.size());
+    EXPECT_EQ(0u, dec.late_blocks());
+}
+
 TEST(RsBlockErasureEmitTest, SequencerDeviationBounds)
 {
     rs_block_erasure enc;

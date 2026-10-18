@@ -153,26 +153,53 @@ double vstreamer::rs_block_erasure::jitter_estimate_ms() const
     return have_spread_estimate() ? jitter_est_s * 1000.0 : 0.;
 }
 
-/* Earliest start implied by any received shard: the least delayed one bounds when the block
- * left the sender. */
+/* The block's start as its received shards imply it (arrival minus position x interval), taking
+ * the median so one early or late shard does not move it. */
 std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::block_start(
+    const rx_block_s& block) const
+{
+    if (block.arrivals.empty())
+    {
+        return block.last_seen;
+    }
+    const int                           count = std::max(1, air_count(block.k, block.n, block.sdu_n));
+    const auto                          spread = spread_now();
+    std::vector<clock_type::time_point> starts;
+    starts.reserve(block.arrivals.size());
+    for (const auto& [pos, at] : block.arrivals)
+    {
+        starts.push_back(at - spread * pos / count);
+    }
+    const size_t mid = starts.size() / 2;
+    std::nth_element(starts.begin(), starts.begin() + static_cast<std::ptrdiff_t>(mid),
+                     starts.end());
+    return starts[mid];
+}
+
+/* When the block's last shard is due, plus the margin: from its fitted start, and never before
+ * the highest-position shard received so far plus the positions still to come (a block the
+ * link delayed as a whole keeps its time). */
+std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::block_deadline(
     const rx_block_s& block) const
 {
     const int  count = std::max(1, air_count(block.k, block.n, block.sdu_n));
     const auto spread = spread_now();
-    auto       start = clock_type::time_point::max();
+    auto       last_due = block_start(block) + spread * (count - 1) / count;
+    int        top = -1;
+    auto       top_at = block.last_seen;
     for (const auto& [pos, at] : block.arrivals)
     {
-        start = std::min(start, at - spread * pos / count);
+        if (pos > top)
+        {
+            top = pos;
+            top_at = at;
+        }
     }
-    return block.arrivals.empty() ? block.last_seen : start;
-}
-
-std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::block_deadline(
-    const rx_block_s& block) const
-{
-    const int count = std::max(1, air_count(block.k, block.n, block.sdu_n));
-    return block_start(block) + spread_now() * (count - 1) / count + margin_now();
+    if (top >= 0)
+    {
+        last_due = std::max(last_due, top_at + spread * (count - 1 - top) / count);
+    }
+    return last_due + margin_now();
 }
 
 /* Theil-Sen over the block's arrivals: the median of the pairwise slopes is the per-position
@@ -253,13 +280,26 @@ void vstreamer::rs_block_erasure::new_reference(uint16_t sdu_base)
     }
     rx_blocks.clear();
     ready_blocks.clear();
+    recent_released.clear();
     emit_next = sdu_base;
     new_references_count++;
 }
 
 void vstreamer::rs_block_erasure::advance_head(int sdu_n)
 {
+    note_released(emit_next);
     emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(sdu_n));
+}
+
+/* Ids of blocks already released (or already counted late), so the remaining parity of a
+ * block delivered from its first k shards is not counted as a late block. */
+void vstreamer::rs_block_erasure::note_released(uint16_t sdu_base)
+{
+    recent_released.push_back(sdu_base);
+    if (recent_released.size() > k_recent_released_max)
+    {
+        recent_released.pop_front();
+    }
 }
 
 void vstreamer::rs_block_erasure::try_stream_head_systematic(rx_block_s& block,
@@ -504,7 +544,12 @@ void vstreamer::rs_block_erasure::push_air(bfc::shared_sized_buffer shard,
     }
     else if (d < 0)
     {
-        late_blocks_count++;
+        if (std::find(recent_released.begin(), recent_released.end(), sdu_base) ==
+            recent_released.end())
+        {
+            late_blocks_count++;
+            note_released(sdu_base);
+        }
         run_emit_engine(out);
         return;
     }

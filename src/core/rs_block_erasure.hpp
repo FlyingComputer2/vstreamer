@@ -156,7 +156,8 @@ public:
     {
         return missing_shards_count;
     }
-    /* Shards of blocks behind the reference (already delivered or given up), ignored. */
+    /* Blocks behind the reference that were never released here (each counted once); the
+     * redundant shards of blocks already delivered are dropped silently. */
     uint64_t late_blocks() const
     {
         return late_blocks_count;
@@ -257,6 +258,7 @@ private:
     /* Flushes the data shards the block has (in order) and returns how many SDUs are lost. */
     int abandon_partial_block(const rx_block_s& block, fec_rx_payload_list* out);
     void advance_head(int sdu_n);
+    void note_released(uint16_t sdu_base);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
     void run_emit_engine(fec_rx_payload_list* out);
     bool try_decode_block(uint16_t sdu_base, rx_block_s* block, fec_rx_payload_list* out);
@@ -281,6 +283,8 @@ private:
 
     std::unordered_map<uint16_t, rx_block_s> rx_blocks;
     std::unordered_map<uint16_t, ready_block_s> ready_blocks;
+    static constexpr size_t                   k_recent_released_max = 64;
+    std::deque<uint16_t>                      recent_released;
     bool                                      emit_base_set = false;
     uint16_t                                  emit_next = 0;
 
