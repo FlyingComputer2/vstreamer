@@ -21,6 +21,12 @@ if(IDF_TARGET STREQUAL "esp32p4")
                                   src/components/esp32_h264_isp_src.cpp)
 endif()
 list(TRANSFORM VSTREAMER_SOURCES PREPEND ${VSTREAMER_ROOT}/)
+# IDF-only helpers (include/vstreamer_idf): the live TX management plane, and live TX itself
+# where the camera and hardware encoder exist.
+list(APPEND VSTREAMER_SOURCES src/live_mplane.cpp)
+if(IDF_TARGET STREQUAL "esp32p4")
+    list(APPEND VSTREAMER_SOURCES src/live_tx.cpp)
+endif()
 
 # ISA-L's portable erasure code; not fetched during IDF's early requirement scan.
 set(VSTREAMER_IDF_ISAL_SOURCES)
@@ -45,12 +51,13 @@ idf_component_register(
     SRCS ${VSTREAMER_SOURCES}
          ${VSTREAMER_IDF_ISAL_SOURCES}
     INCLUDE_DIRS ${VSTREAMER_ROOT}/src
+                 include
                  ${CMAKE_CURRENT_BINARY_DIR}/generated
                  ${VSTREAMER_IDF_BFC_INCLUDES}
     PRIV_INCLUDE_DIRS compat
                       ${VSTREAMER_IDF_ISAL_INCLUDES}
     REQUIRES lwip pthread
-    PRIV_REQUIRES vfs esp_timer
+    PRIV_REQUIRES vfs esp_timer esp_pm
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
