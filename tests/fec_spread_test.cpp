@@ -1,5 +1,6 @@
 #include "components/stream_receiver.hpp"
 #include "components/stream_sender.hpp"
+#include "components/stream_sender_pace.hpp"
 #include "core/fec_spread.hpp"
 #include "core/rs_block_erasure.hpp"
 #include <bfc/shared_sized_buffer.hpp>
@@ -25,6 +26,9 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <deque>
+#include <unordered_map>
 #include <vector>
 
 using vstreamer::rs_block_erasure;
@@ -231,12 +235,14 @@ TEST(FecSpreadTest, ConfigRangeAndQuery)
     vstreamer::stream_sender sender;
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "40"));
-    EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "500"));
+    EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
+    /* Capped at the spread the receiver assumes before it has measured one. */
+    EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "251"));
     EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "-1"));
     EXPECT_EQ(-EINVAL, cfg(sender, "fec_spread_ms", "x"));
     std::string v;
     ASSERT_EQ(0, sender.query("fec_spread_ms", &v));
-    EXPECT_EQ("500", v);
+    EXPECT_EQ("250", v);
 }
 
 /* spread 0 is today's behaviour: a whole block leaves back to back. */
@@ -414,7 +420,7 @@ TEST(FecSpreadTest, ReceiverDecodesInterleavedBlocks)
 
 /* Start-up edge case, the same with or without spreading: a fresh receiver anchors in-order
  * delivery on the first shard it sees. If the earlier block's first shard is lost and a later
- * block's arrives first, the earlier block is treated as late and delivered after it. */
+ * block's arrives first, the earlier block is behind the reference: late, and ignored. */
 TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
 {
     rs_block_erasure enc;
@@ -430,7 +436,8 @@ TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
     std::vector<bool> lost(wire.size(), false);
     lost[0] = true;  // A data 0: B data 0 is the first shard this receiver sees
     rs_block_erasure dec;
-    EXPECT_EQ((std::vector<uint8_t> {5, 6, 7, 8, 1, 2, 3, 4}), decode_order(dec, wire, lost));
+    EXPECT_EQ((std::vector<uint8_t> {5, 6, 7, 8}), decode_order(dec, wire, lost));
+    EXPECT_GT(dec.late_blocks(), 0u);
 }
 
 /* A burst of 4 consecutive wire losses: sent back to back it takes 4 shards of one 4/6 block
@@ -534,4 +541,65 @@ TEST(FecSpreadTest, TimeoutFlushOnTimeWhenIdle)
     }
     EXPECT_LT(worst_ms, 30.0) << "timeout is 20 ms";
     sender.close();
+}
+
+namespace
+{
+struct pace_entry
+{
+    std::chrono::steady_clock::time_point release;
+    uint32_t                              block;
+    std::chrono::microseconds             gap;
+};
+}  // namespace
+
+/* A send thread that wakes late finds a whole spread block due at once: it still sends the
+ * block's shards one gap apart, and other blocks' due datagrams in between. */
+TEST(FecSpreadTest, LateSendThreadKeepsBlockSpacing)
+{
+    using std::chrono::microseconds;
+    using std::chrono::milliseconds;
+    const auto t0 = std::chrono::steady_clock::time_point {} + std::chrono::hours(1);
+    std::deque<pace_entry> q;
+    const microseconds     gap(5000);
+    for (int j = 0; j < 4; j++)
+    {
+        q.push_back({t0 + gap * j, 7, gap}); /* block 7 at spread 20 ms */
+    }
+    q.push_back({t0 + microseconds(1), 0xFFFFFFFFU, microseconds(0)}); /* unpaced datagram */
+    std::sort(q.begin(), q.end(), [](const pace_entry &a, const pace_entry &b)
+              { return a.release < b.release; });
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> last;
+
+    /* The thread wakes 50 ms late: everything is past its release time. */
+    auto       t = t0 + milliseconds(50);
+    std::vector<std::chrono::steady_clock::time_point> sent_block7;
+    int        unpaced = 0;
+    while (!q.empty())
+    {
+        auto until = t + milliseconds(100);
+        auto it = vstreamer::detail::pick_due(q, last, t, &until);
+        if (it == q.end())
+        {
+            ASSERT_GT(until, t);
+            t = until;
+            continue;
+        }
+        if (it->gap.count() > 0)
+        {
+            last[it->block] = t;
+            sent_block7.push_back(t);
+        }
+        else
+        {
+            unpaced++;
+        }
+        q.erase(it);
+    }
+    EXPECT_EQ(1, unpaced);
+    ASSERT_EQ(4u, sent_block7.size());
+    for (size_t i = 1; i < sent_block7.size(); i++)
+    {
+        EXPECT_GE(sent_block7[i] - sent_block7[i - 1], gap) << i;
+    }
 }

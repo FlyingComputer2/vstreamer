@@ -15,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 /* lwIP declares sockaddr_in in <sys/socket.h>, not <netinet/in.h>. */
 #include <sys/socket.h>
@@ -41,6 +42,11 @@ enum class fec_mode_e
 class stream_sender : public component_sink
 {
 public:
+    /* Largest fec_spread_ms: the receiver assumes this spread until it has measured one. */
+    static constexpr int k_fec_spread_max_ms = rs_block_erasure::k_spread_cap_ms;
+    /* queued_wire::block of datagrams that are not paced against their block. */
+    static constexpr uint32_t k_no_block = 0xFFFFFFFFU;
+
     stream_sender();
     ~stream_sender() override;
 
@@ -77,12 +83,16 @@ private:
     void telemetry_thread_main();
     void handle_link_report(const stream_link_report &report);
     void pace_wire_send(size_t bytes, send_thread_wdt *wdt = nullptr);
+    /* gap: for a spread FEC block, the spacing to keep after the block's previous shard
+     * (spread / shards on air); 0 = none. */
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                           std::chrono::steady_clock::time_point release);
+                           std::chrono::steady_clock::time_point release,
+                           std::chrono::microseconds gap = std::chrono::microseconds(0));
     /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */
-    [[nodiscard]] int try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                            std::chrono::steady_clock::time_point release,
-                                            bool force = false);
+    [[nodiscard]] int try_enqueue_wire_copy(
+        const uint8_t *data, size_t len, bool is_fec_shard,
+        std::chrono::steady_clock::time_point release, bool force = false,
+        std::chrono::microseconds gap = std::chrono::microseconds(0));
     /* True when the queue has room for every wire packet one app SDU can produce. */
     [[nodiscard]] bool queue_has_room_for_sdu() const;
     void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
@@ -127,6 +137,10 @@ private:
     {
         bfc::shared_sized_buffer                   buf;
         std::chrono::steady_clock::time_point release {};
+        /* Spread FEC shard: its block (sdu_base) and the spacing to keep after the block's
+         * previous shard, so a send thread that fell behind does not flush a block in a lump. */
+        uint32_t                  block = k_no_block;
+        std::chrono::microseconds gap {0};
     };
 
     mutable std::mutex      q_mu;
@@ -182,6 +196,10 @@ private:
      * past queue_byte_limit() the queue evicts or refuses input. Past the receiver's head-of-line
      * give-up (max(3 x fec_timeout_ms, 60) ms) it abandons blocks whose last shards are late. */
     std::atomic<int> fec_spread_ms {0};
+    /* Send thread only: when each spread block last put a shard on the wire. */
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> pace_block_last;
+    /* Largest delay of a datagram past its release time since the last query (us). */
+    mutable std::atomic<int64_t> send_late_max_us {0};
 
     /* Guards fec (touched by input(), the send thread and configure()).
      * Lock order: mu -> fec_mu; never hold fec_mu while taking mu/q_mu. */

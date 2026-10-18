@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <random>
@@ -60,6 +61,29 @@ bool out_has_app_tag(const vstreamer::fec_rx_payload_list &rows, uint8_t tag)
     return false;
 }
 
+/* Drives rs_block_erasure's clock: deadlines are tested by advancing it, not by sleeping. */
+struct fake_clock
+{
+    std::chrono::steady_clock::time_point t =
+        std::chrono::steady_clock::time_point {} + std::chrono::hours(1);
+    void attach(rs_block_erasure &dec)
+    {
+        dec.set_clock([this] { return t; });
+    }
+    void advance(int ms)
+    {
+        t += std::chrono::milliseconds(ms);
+    }
+    void advance_us(int64_t us)
+    {
+        t += std::chrono::microseconds(us);
+    }
+};
+
+/* Past any deadline set before a spread estimate exists (spread cap + margin). */
+constexpr int k_past_deadline_ms =
+    rs_block_erasure::k_spread_cap_ms + rs_block_erasure::k_deadline_margin_min_ms + 10;
+
 void feed_append(rs_block_erasure &dec, const std::vector<uint8_t> &shard,
                  vstreamer::fec_rx_payload_list *accum)
 {
@@ -74,6 +98,8 @@ void feed_append(rs_block_erasure &dec, const std::vector<uint8_t> &shard,
 TEST(RsBlockErasureEmitTest, SplitCountersHdrAndKnMismatch)
 {
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     const uint8_t                     short_buf[2] = {0, 0};
     dec.push_air(short_buf, sizeof(short_buf), &out);
@@ -99,6 +125,8 @@ TEST(RsBlockErasureEmitTest, MissingShardsOnRingEvict)
     rs_block_erasure enc_fill;
     ASSERT_TRUE(enc_fill.init(1, 1, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     /* Hold far longer than the test: the partial block must leave through ring eviction. With
      * the default 60 ms head-of-line hold, a slow run (Debug, loaded host) gives it up first and
      * counts it as given_up instead. */
@@ -130,26 +158,33 @@ TEST(RsBlockErasureEmitTest, InitRejectsInvalidPreservesConfig)
     EXPECT_EQ(enc.n(), 8);
 }
 
-TEST(RsBlockErasureEmitTest, WrapLateBlockDeliveredImmediately)
+/* Across the u16 wrap: a head block that arrives after its successors releases them in order. */
+TEST(RsBlockErasureEmitTest, WrapLateHeadReleasesQueue)
 {
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(1, 1, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
 
     vstreamer::fec_rx_payload_list all;
-    for (uint16_t id = 250; id <= 253; ++id)
+    for (uint16_t id = 65530; id <= 65533; ++id)
     {
         feed_append(dec, encode_one(enc, id, static_cast<uint8_t>(id)), &all);
     }
-    feed_append(dec, encode_one(enc, 255, 255), &all);
-    feed_append(dec, encode_one(enc, 0, 0), &all);
-    feed_append(dec, encode_one(enc, 1, 1), &all);
-    feed_append(dec, encode_one(enc, 2, 2), &all);
-
-    const std::vector<uint8_t> late_shard = encode_one(enc, 254, 254);
+    for (const uint16_t id : {uint16_t {65535}, uint16_t {0}, uint16_t {1}})
+    {
+        feed_append(dec, encode_one(enc, id, static_cast<uint8_t>(id)), &all);
+    }
+    EXPECT_EQ(4u, all.size());
     vstreamer::fec_rx_payload_list late_step;
+    const std::vector<uint8_t>     late_shard = encode_one(enc, 65534, 0xfe);
     dec.push_air(late_shard.data(), late_shard.size(), &late_step);
-    EXPECT_TRUE(out_has_app_tag(late_step, 254));
+    ASSERT_EQ(4u, late_step.size());
+    EXPECT_EQ(0xfe, late_step[0].u8()[0]);
+    EXPECT_EQ(0xff, late_step[1].u8()[0]);
+    EXPECT_EQ(0x00, late_step[2].u8()[0]);
+    EXPECT_EQ(0x01, late_step[3].u8()[0]);
 }
 
 TEST(RsBlockErasureEmitTest, WrapInOrderNoLoss)
@@ -157,6 +192,8 @@ TEST(RsBlockErasureEmitTest, WrapInOrderNoLoss)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(1, 1, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     std::mt19937                    rng(42);
     std::vector<std::vector<uint8_t>> shards;
     for (int i = 0; i < 1000; i++)
@@ -196,6 +233,8 @@ TEST(RsBlockErasureEmitTest, HeadOfLineStreaming)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto       air = encode_block_apps(enc, 10, {10, 11, 12, 13});
     vstreamer::fec_rx_payload_list out;
     for (size_t i = 0; i < air.size(); i++)
@@ -216,13 +255,12 @@ TEST(RsBlockErasureEmitTest, HeadOfLineStreaming)
     EXPECT_FALSE(out_has_app_tag(out, 12));
     EXPECT_FALSE(out_has_app_tag(out, 13));
 
-    /* Later block data starts emit_hold timer (plan rule 5a). */
+    /* A later block is held behind the incomplete head until the head's deadline. */
     const auto later = encode_block_apps(enc, 11, {14, 15, 16, 17});
     feed_append(dec, later[0], &out);
     EXPECT_FALSE(out_has_app_tag(out, 14));
 
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     out.insert(out.end(), tick.begin(), tick.end());
@@ -235,6 +273,8 @@ TEST(RsBlockErasureEmitTest, RecoveredStillInOrder)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto       air = encode_block_apps(enc, 20, {20, 21, 22, 23});
     vstreamer::fec_rx_payload_list out;
     for (size_t i = 0; i < air.size(); i++)
@@ -256,9 +296,13 @@ TEST(RsBlockErasureEmitTest, RecoveredStillInOrder)
     }
 }
 
+/* A restarted sender whose random start lands more than k_max_lo_block_id_deviation behind the
+ * reference starts a new reference at once. */
 TEST(RsBlockErasureEmitTest, PeerRestartResync)
 {
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     rs_block_erasure enc_a;
     rs_block_erasure enc_b;
     ASSERT_TRUE(enc_a.init(1, 1, 20));
@@ -270,27 +314,53 @@ TEST(RsBlockErasureEmitTest, PeerRestartResync)
         feed_append(dec, encode_one(enc_a, static_cast<uint16_t>(i), static_cast<uint8_t>(i & 0xFF)),
                     &out);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    clk.advance(300);
     for (int i = 0; i < 10; i++)
     {
-        feed_append(dec, encode_one(enc_b, static_cast<uint16_t>(250 + i),
-                                    static_cast<uint8_t>((250 + i) & 0xFF)),
+        feed_append(dec, encode_one(enc_b, static_cast<uint16_t>(100 + i),
+                                    static_cast<uint8_t>((100 + i) & 0xFF)),
                     &out);
     }
     vstreamer::fec_rx_payload_list flush;
     dec.poll_rx(&flush);
     out.insert(out.end(), flush.begin(), flush.end());
     EXPECT_GE(out.size(), 310u);
+    EXPECT_EQ(1u, dec.new_references());
 }
 
-/* Restarted peer whose random start id lands far *ahead* of emit_next (resync, forward).
- * The new blocks must be delivered on arrival: holding them for emit_hold_ms while the ids
- * cross the half ring made the backward rebase discard them (loopback SenderRestartMidStream). */
+/* The accepted corner: a restart landing behind but within k_max_lo_block_id_deviation reads as
+ * late shards and is ignored (odds per restart lo / 65536). */
+TEST(RsBlockErasureEmitTest, RestartBehindWithinLoIgnoredAsLate)
+{
+    rs_block_erasure dec;
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(1, 1, 20));
+    vstreamer::fec_rx_payload_list out;
+    for (int i = 0; i < 300; i++)
+    {
+        feed_append(dec, encode_one(enc, static_cast<uint16_t>(i), 1), &out);
+    }
+    /* 120 behind: within lo, and older than the recently released ids (whose shards would be
+     * dropped as redundant without counting). */
+    for (int i = 0; i < 10; i++)
+    {
+        feed_append(dec, encode_one(enc, static_cast<uint16_t>(180 + i), 2), &out);
+    }
+    EXPECT_EQ(300u, out.size());
+    EXPECT_EQ(10u, dec.late_blocks());
+    EXPECT_EQ(0u, dec.new_references());
+}
+
+/* A restarted sender whose start lands ahead of the reference but within
+ * k_max_hi_block_id_deviation reads as the same session with a gap: the gap is skipped at its
+ * deadline, then the new blocks flow in order. */
 TEST(RsBlockErasureEmitTest, PeerRestartResyncForwardJump)
 {
     for (const int offset : {10, 80, 120})
     {
         rs_block_erasure dec;
+        fake_clock       clk;
+        clk.attach(dec);
         rs_block_erasure enc_a;
         rs_block_erasure enc_b;
         ASSERT_TRUE(enc_a.init(6, 8, 20));
@@ -300,34 +370,36 @@ TEST(RsBlockErasureEmitTest, PeerRestartResyncForwardJump)
         uint16_t                       tx_base = 0;
         for (int i = 0; i < 67; i++)
         {
-            for (const auto &shard :
-                 encode_block_apps(enc_a, tx_base, {1, 1, 1, 1, 1, 1}))
+            for (const auto &shard : encode_block_apps(enc_a, tx_base, {1, 1, 1, 1, 1, 1}))
             {
                 feed_append(dec, shard, &out);
             }
             tx_base = static_cast<uint16_t>(tx_base + 6);
         }
         ASSERT_EQ(out.size(), 67u * 6u);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        clk.advance(300);
 
         const uint16_t start = static_cast<uint16_t>(66 * 6 + offset);
         for (int i = 0; i < 20; i++)
         {
             const uint16_t id = static_cast<uint16_t>(start + static_cast<uint16_t>(i * 6));
             const uint8_t  tag = static_cast<uint8_t>(100 + i);
-            vstreamer::fec_rx_payload_list step;
-            for (const auto &shard : encode_block_apps(enc_b, id,
-                                                       {tag, tag, tag, tag, tag, tag}))
+            for (const auto &shard :
+                 encode_block_apps(enc_b, id, {tag, tag, tag, tag, tag, tag}))
             {
-                feed_append(dec, shard, &step);
-            }
-            ASSERT_EQ(step.size(), 6u) << "offset " << offset << ": restart block " << i
-                                       << " (id " << id << ") not delivered on arrival";
-            for (const auto &row : step)
-            {
-                EXPECT_EQ(row.u8()[0], tag);
+                feed_append(dec, shard, &out);
             }
         }
+        clk.advance(k_past_deadline_ms);
+        vstreamer::fec_rx_payload_list tick;
+        dec.poll_rx(&tick);
+        out.insert(out.end(), tick.begin(), tick.end());
+        ASSERT_EQ(out.size(), 67u * 6u + 20u * 6u) << "offset " << offset;
+        for (int i = 0; i < 20; i++)
+        {
+            EXPECT_EQ(out[67u * 6u + static_cast<size_t>(i) * 6u].u8()[0], 100 + i);
+        }
+        EXPECT_EQ(0u, dec.new_references());
     }
 }
 
@@ -338,6 +410,8 @@ TEST(RsBlockErasureEmitTest, RingEvictsStalePartial)
     rs_block_erasure enc_fill;
     ASSERT_TRUE(enc_fill.init(1, 1, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto air = encode_block_apps(enc, 5, {55, 56, 57, 58});
     const std::vector<uint8_t> partial = air[0];
     vstreamer::fec_rx_payload_list out;
@@ -383,6 +457,8 @@ TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto b0 = encode_block_apps(enc, 0, {1, 2, 3, 4});
     const auto b1 = encode_block_apps(enc, 4, {5, 6, 7, 8});
     vstreamer::fec_rx_payload_list out;
@@ -397,14 +473,15 @@ TEST(RsBlockErasureEmitTest, LateParityOfReadyBlockNotCountedLost)
     }
     for (int round = 0; round < 2; round++)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        clk.advance(400);
         vstreamer::fec_rx_payload_list flush;
         dec.poll_rx(&flush);
         out.insert(out.end(), flush.begin(), flush.end());
     }
     EXPECT_EQ(5U, out.size());
     EXPECT_EQ(3U, dec.take_fail_lost_app_pkts());
-    EXPECT_EQ(1U, dec.take_evicted_blocks()); /* block 0 expires; no phantom block 1 */
+    EXPECT_EQ(1U, dec.given_up_blocks()); /* block 0 flushed at its deadline */
+    EXPECT_EQ(0U, dec.take_evicted_blocks()); /* no phantom block 1 */
 }
 
 TEST(RsBlockErasureEmitTest, Kn31RoundTripMaxErasures)
@@ -412,6 +489,8 @@ TEST(RsBlockErasureEmitTest, Kn31RoundTripMaxErasures)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(31, 31, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     std::vector<uint8_t> tags;
     for (int i = 0; i < 31; i++)
     {
@@ -435,6 +514,8 @@ TEST(RsBlockErasureEmitTest, Kn20N31MaxErasuresRoundTrip)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(20, 31, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     std::vector<uint8_t> tags(20);
     for (int i = 0; i < 20; i++)
     {
@@ -461,6 +542,8 @@ TEST(RsBlockErasureEmitTest, Kn20N31PartialThenFullNoFalseGap)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(20, 31, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     std::vector<uint8_t> partial_tags(3, 7);
     const auto           partial_air = encode_block_apps(enc, 50, partial_tags);
     std::vector<uint8_t> full_tags(20, 8);
@@ -486,6 +569,8 @@ TEST(RsBlockErasureEmitTest, WholeBlockLostCountsSduN)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto a = encode_block_apps(enc, 0, {1, 2, 3, 4});
     const auto c = encode_block_apps(enc, 8, {9, 10, 11, 12});
     vstreamer::fec_rx_payload_list out;
@@ -497,8 +582,7 @@ TEST(RsBlockErasureEmitTest, WholeBlockLostCountsSduN)
     {
         feed_append(dec, s, &out);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     out.insert(out.end(), tick.begin(), tick.end());
@@ -511,6 +595,8 @@ TEST(RsBlockErasureEmitTest, ConsecutiveBlocksLostCountsSumSduN)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(2, 4, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto a = encode_block_apps(enc, 0, {1, 2});
     const auto d = encode_block_apps(enc, 8, {9, 10});
     vstreamer::fec_rx_payload_list out;
@@ -522,8 +608,7 @@ TEST(RsBlockErasureEmitTest, ConsecutiveBlocksLostCountsSumSduN)
     {
         feed_append(dec, s, &out);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 6u);
@@ -558,12 +643,14 @@ TEST(RsBlockErasureEmitTest, PeerRestartSilenceNoGapCounted)
     rs_block_erasure enc_a;
     rs_block_erasure enc_b;
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     ASSERT_TRUE(enc_a.init(2, 4, 20));
     ASSERT_TRUE(enc_b.init(2, 4, 20));
     vstreamer::fec_rx_payload_list out;
     feed_append(dec, encode_block_apps(enc_a, 0, {1, 2})[0], &out);
     feed_append(dec, encode_block_apps(enc_a, 2, {3, 4})[0], &out);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    clk.advance(300);
     feed_append(dec, encode_block_apps(enc_b, 5000, {5, 6})[0], &out);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
 }
@@ -573,6 +660,8 @@ TEST(RsBlockErasureEmitTest, QuickForwardRestartNoPhantomLoss)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto block0 = encode_block_apps(enc, 0, {1, 2, 3, 4});
     const auto block_far = encode_block_apps(enc, 20000, {9, 10, 11, 12});
     vstreamer::fec_rx_payload_list discard;
@@ -580,15 +669,13 @@ TEST(RsBlockErasureEmitTest, QuickForwardRestartNoPhantomLoss)
     {
         feed_append(dec, s, &discard);
     }
+    vstreamer::fec_rx_payload_list out;
     for (const auto &s : block_far)
     {
-        feed_append(dec, s, &discard);
+        feed_append(dec, s, &out);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
-    vstreamer::fec_rx_payload_list out;
-    dec.poll_rx(&out);
     EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+    EXPECT_EQ(1u, dec.new_references());
     for (uint8_t tag : {9, 10, 11, 12})
     {
         EXPECT_TRUE(out_has_app_tag(out, tag));
@@ -600,8 +687,11 @@ TEST(RsBlockErasureEmitTest, LargeButRealHoleStillCounted)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(6, 8, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto block0 = encode_block_apps(enc, 0, {1, 2, 3, 4, 5, 6});
-    const uint16_t far_base = static_cast<uint16_t>(6U + 2042U);
+    /* Within k_max_hi_block_id_deviation: a real hole in the same session. */
+    const uint16_t far_base = static_cast<uint16_t>(6U + 1000U);
     const auto block_far = encode_block_apps(enc, far_base, {9, 10, 11, 12, 13, 14});
     vstreamer::fec_rx_payload_list discard;
     for (const auto &s : block0)
@@ -612,11 +702,11 @@ TEST(RsBlockErasureEmitTest, LargeButRealHoleStillCounted)
     {
         feed_append(dec, s, &discard);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list out;
     dec.poll_rx(&out);
-    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 2042u);
+    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 1000u);
+    EXPECT_EQ(0u, dec.new_references());
 }
 
 TEST(RsBlockErasureEmitTest, SduSeqWrapNoLoss)
@@ -624,6 +714,8 @@ TEST(RsBlockErasureEmitTest, SduSeqWrapNoLoss)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(1, 1, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     for (int i = 0; i < 8; i++)
     {
@@ -642,6 +734,8 @@ TEST(RsBlockErasureEmitTest, LateBlockAfterJumpNotUndone)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(2, 4, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto a = encode_block_apps(enc, 0, {1, 2});
     const auto c = encode_block_apps(enc, 4, {5, 6});
     vstreamer::fec_rx_payload_list out;
@@ -653,8 +747,7 @@ TEST(RsBlockErasureEmitTest, LateBlockAfterJumpNotUndone)
     {
         feed_append(dec, s, &out);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 10)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     out.insert(out.end(), tick.begin(), tick.end());
@@ -674,6 +767,8 @@ TEST(RsBlockErasureEmitTest, HeadHoleJumpCountsPartialBlockOnce)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto block_a = encode_block_apps(enc, 0, {1, 2, 3, 4});
     const auto block_b = encode_block_apps(enc, 4, {11, 12, 13, 14});
     const auto block_c = encode_block_apps(enc, 8, {21, 22, 23, 24});
@@ -686,13 +781,11 @@ TEST(RsBlockErasureEmitTest, HeadHoleJumpCountsPartialBlockOnce)
     {
         feed_append(dec, s, &discard);
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list step;
     dec.poll_rx(&step);
     out.insert(out.end(), step.begin(), step.end());
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.rx_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     dec.poll_rx(&step);
     out.insert(out.end(), step.begin(), step.end());
 
@@ -737,6 +830,8 @@ void expect_quick_restart_clean(uint16_t old_base, uint16_t new_base, int new_bl
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     feed_tagged_block(enc, dec, old_base, 1, &out);
     feed_tagged_block(enc, dec, static_cast<uint16_t>(old_base + 4), 2, &out);
@@ -746,13 +841,12 @@ void expect_quick_restart_clean(uint16_t old_base, uint16_t new_base, int new_bl
         const uint8_t tag = static_cast<uint8_t>(10 + b);
         feed_tagged_block(enc, dec, static_cast<uint16_t>(new_base + 4 * b), tag, &out);
         want.insert(want.end(), 4, tag);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        clk.advance(5);
         vstreamer::fec_rx_payload_list step;
         dec.poll_rx(&step);
         out.insert(out.end(), step.begin(), step.end());
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list step;
     dec.poll_rx(&step);
     out.insert(out.end(), step.begin(), step.end());
@@ -788,11 +882,16 @@ TEST(RsBlockErasureEmitTest, QuickRestartRandomBases)
     }
 }
 
-TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncIgnored)
+/* A stray old-session shard arriving after a restart is more than k_max_lo_block_id_deviation
+ * behind the new reference, so by the rule it is taken as a new reference too (its SDUs leave),
+ * and the next new-session block takes the reference back. */
+TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncTakesReference)
 {
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     feed_tagged_block(enc, dec, 0, 1, &out);
     const auto stray = encode_block_apps(enc, 4, {2, 2, 2, 2});
@@ -804,17 +903,13 @@ TEST(RsBlockErasureEmitTest, StrayOldShardAfterResyncIgnored)
         want.insert(want.end(), 4, tag);
         if (20 == b)
         {
-            /* Late shards of the old session, reordered past the resync. */
             feed_append(dec, stray[0], &out);
             feed_append(dec, stray[1], &out);
+            want.insert(want.end(), 2, 2);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        vstreamer::fec_rx_payload_list step;
-        dec.poll_rx(&step);
-        out.insert(out.end(), step.begin(), step.end());
     }
     EXPECT_EQ(app_tags(out), want);
-    EXPECT_EQ(dec.take_fail_lost_app_pkts(), 0u);
+    EXPECT_EQ(3u, dec.new_references());
 }
 
 /* A head block given up with an SDU still missing is a failed block: the depayloader sees the
@@ -824,6 +919,8 @@ TEST(RsBlockErasureEmitTest, HeadGiveUpWithMissingSduCountsAsFailure)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     const auto       air = encode_block_apps(enc, 10, {10, 11, 12, 13});
     vstreamer::fec_rx_payload_list out;
     for (size_t i = 0; i < air.size(); i++)
@@ -835,11 +932,12 @@ TEST(RsBlockErasureEmitTest, HeadGiveUpWithMissingSduCountsAsFailure)
         }
         feed_append(dec, air[i], &out);
     }
-    const auto later = encode_block_apps(enc, 14, {14, 15, 16, 17});
-    feed_append(dec, later[0], &out);
+    for (const auto &shard : encode_block_apps(enc, 14, {14, 15, 16, 17}))
+    {
+        feed_append(dec, shard, &out); /* the later block arrives complete */
+    }
 
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     out.insert(out.end(), tick.begin(), tick.end());
@@ -856,6 +954,8 @@ TEST(RsBlockErasureEmitTest, LosslessStreamHasNoFailures)
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(4, 6, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     for (uint16_t b = 0; b < 8; b++)
     {
@@ -869,8 +969,7 @@ TEST(RsBlockErasureEmitTest, LosslessStreamHasNoFailures)
             feed_append(dec, shard, &out);
         }
     }
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(static_cast<unsigned>(dec.emit_hold_ms() + 5)));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list tick;
     dec.poll_rx(&tick);
     EXPECT_EQ(32u, out.size() + tick.size());
@@ -915,45 +1014,281 @@ void expect_ascending(const vstreamer::fec_rx_payload_list &out)
 
 }  // namespace
 
-/* Several undecodable blocks behind each other give up one after another without each waiting
- * for a fresh later shard: the head's own idle time counts, so the run clears in about one
- * emit_hold instead of piling up until rx_hold expires the blocks. */
-TEST(RsBlockErasureEmitTest, UndecodableRunGivesUpWithinEmitHold)
+/* Several undecodable blocks behind each other are flushed at their own deadlines in one pass,
+ * in order, then the complete block after them is released. */
+TEST(RsBlockErasureEmitTest, UndecodableRunFlushedAtDeadlines)
 {
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(10, 11, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     feed_undecodable_run(enc, dec, 4, &out);
-    ASSERT_LT(dec.emit_hold_ms() * 3, dec.rx_hold_ms());
-    const auto until = std::chrono::steady_clock::now() +
-                       std::chrono::milliseconds(dec.emit_hold_ms() * 2);
-    while (std::chrono::steady_clock::now() < until)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        vstreamer::fec_rx_payload_list tick;
-        dec.poll_rx(&tick);
-        out.insert(out.end(), tick.begin(), tick.end());
-    }
+    clk.advance(k_past_deadline_ms);
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    out.insert(out.end(), tick.begin(), tick.end());
     EXPECT_EQ(4U, dec.given_up_blocks());
     EXPECT_EQ(0U, dec.evicted_blocks());
     EXPECT_EQ(4U * 9U + 10U, out.size());
     expect_ascending(out);
 }
 
-/* Blocks that expire in the same poll are abandoned in ring order from the head, so their
+/* Blocks whose deadlines pass in the same poll are flushed in order from the head, so their
  * surviving payloads still leave in sequence. */
 TEST(RsBlockErasureEmitTest, ExpiredBlocksEmitInOrder)
 {
     rs_block_erasure enc;
     ASSERT_TRUE(enc.init(10, 11, 20));
     rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
     vstreamer::fec_rx_payload_list out;
     feed_undecodable_run(enc, dec, 6, &out);
-    std::this_thread::sleep_for(std::chrono::milliseconds(dec.rx_hold_ms() + 20));
+    clk.advance(k_past_deadline_ms);
     vstreamer::fec_rx_payload_list flush;
     dec.poll_rx(&flush);
     out.insert(out.end(), flush.begin(), flush.end());
     EXPECT_EQ(6U * 9U + 10U, out.size());
     expect_ascending(out);
+}
+
+namespace
+{
+
+/* Sends a k/n block the way stream_sender spreads it: air position p of c at t0 + p*spread/c.
+ * `skip` lists shard indices lost on the way; `late_ms` delays shard index `late_idx`. */
+void feed_spread_block(rs_block_erasure &enc, rs_block_erasure &dec, fake_clock &clk,
+                       uint16_t base, int sdus, int spread_ms,
+                       vstreamer::fec_rx_payload_list *out, std::vector<int> skip = {},
+                       int late_idx = -1, int late_ms = 0)
+{
+    std::vector<uint8_t> tags;
+    for (int i = 0; i < sdus; i++)
+    {
+        tags.push_back(static_cast<uint8_t>(base + i));
+    }
+    const auto air = encode_block_apps(enc, base, tags);
+    const auto t0 = clk.t;
+    std::vector<std::pair<std::chrono::steady_clock::time_point, size_t>> sched;
+    for (size_t p = 0; p < air.size(); p++)
+    {
+        auto at = t0 + std::chrono::microseconds(static_cast<int64_t>(spread_ms) * 1000 *
+                                                 static_cast<int64_t>(p) /
+                                                 static_cast<int64_t>(air.size()));
+        if (fec_shard_index(air[p]) == late_idx)
+        {
+            at += std::chrono::milliseconds(late_ms);
+        }
+        sched.emplace_back(at, p);
+    }
+    std::sort(sched.begin(), sched.end());
+    for (const auto &[at, p] : sched)
+    {
+        if (std::find(skip.begin(), skip.end(), fec_shard_index(air[p])) != skip.end())
+        {
+            continue;
+        }
+        if (at > clk.t)
+        {
+            clk.t = at;
+        }
+        feed_append(dec, air[p], out);
+    }
+    clk.t = std::max(clk.t, t0 + std::chrono::milliseconds(spread_ms));
+}
+
+}  // namespace
+
+/* The spread is estimated from receive times after two blocks, from all their shards. */
+TEST(RsBlockErasureEmitTest, SpreadEstimatedFromArrivals)
+{
+    for (const int spread : {0, 20, 75, 150, 240})
+    {
+        rs_block_erasure enc;
+        ASSERT_TRUE(enc.init(10, 14, 20));
+        rs_block_erasure dec;
+        fake_clock       clk;
+        clk.attach(dec);
+        vstreamer::fec_rx_payload_list out;
+        EXPECT_FALSE(dec.have_spread_estimate());
+        EXPECT_DOUBLE_EQ(dec.spread_estimate_ms(), rs_block_erasure::k_spread_cap_ms);
+        feed_spread_block(enc, dec, clk, 0, 10, spread, &out, {3, 11});
+        EXPECT_FALSE(dec.have_spread_estimate()) << spread;
+        feed_spread_block(enc, dec, clk, 10, 10, spread, &out, {0, 12});
+        ASSERT_TRUE(dec.have_spread_estimate()) << spread;
+        EXPECT_NEAR(dec.spread_estimate_ms(), spread, 0.5) << spread;
+        EXPECT_EQ(20u, out.size());
+    }
+}
+
+/* One delayed shard does not move the estimate (median of pairwise slopes). */
+TEST(RsBlockErasureEmitTest, SpreadEstimateRobustToOneLateShard)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(10, 14, 20));
+    rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
+    vstreamer::fec_rx_payload_list out;
+    feed_spread_block(enc, dec, clk, 0, 10, 70, &out, {}, 4, 40);
+    feed_spread_block(enc, dec, clk, 10, 10, 70, &out, {}, 2, 40);
+    ASSERT_TRUE(dec.have_spread_estimate());
+    EXPECT_NEAR(dec.spread_estimate_ms(), 70, 3);
+}
+
+/* The estimate follows the sender when it changes its spread. */
+TEST(RsBlockErasureEmitTest, SpreadEstimateTracksChanges)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(10, 14, 20));
+    rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
+    vstreamer::fec_rx_payload_list out;
+    uint16_t base = 0;
+    for (int b = 0; b < 4; b++, base = static_cast<uint16_t>(base + 10))
+    {
+        feed_spread_block(enc, dec, clk, base, 10, 150, &out);
+    }
+    EXPECT_NEAR(dec.spread_estimate_ms(), 150, 1);
+    for (int b = 0; b < 12; b++, base = static_cast<uint16_t>(base + 10))
+    {
+        feed_spread_block(enc, dec, clk, base, 10, 30, &out);
+    }
+    EXPECT_NEAR(dec.spread_estimate_ms(), 30, 5);
+    EXPECT_EQ(16u * 10u, out.size());
+}
+
+/* Before an estimate the head waits up to the spread cap; with one, only the spread. */
+TEST(RsBlockErasureEmitTest, DeadlineFollowsEstimate)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    {
+        rs_block_erasure dec;
+        fake_clock       clk;
+        clk.attach(dec);
+        vstreamer::fec_rx_payload_list out;
+        const auto air = encode_block_apps(enc, 0, {1, 2, 3, 4});
+        feed_append(dec, air[0], &out); /* only the first data shard */
+        /* Last of 6 air positions due at 5/6 of the assumed spread, plus the margin. */
+        const int due = rs_block_erasure::k_spread_cap_ms * 5 / 6 +
+                        rs_block_erasure::k_deadline_margin_min_ms;
+        clk.advance(due - 5);
+        dec.poll_rx(&out);
+        EXPECT_EQ(0u, dec.given_up_blocks());
+        clk.advance(10);
+        dec.poll_rx(&out);
+        EXPECT_EQ(1u, dec.given_up_blocks());
+    }
+    {
+        rs_block_erasure dec;
+        fake_clock       clk;
+        clk.attach(dec);
+        vstreamer::fec_rx_payload_list out;
+        feed_spread_block(enc, dec, clk, 0, 4, 40, &out);
+        feed_spread_block(enc, dec, clk, 4, 4, 40, &out);
+        ASSERT_TRUE(dec.have_spread_estimate());
+        const auto air = encode_block_apps(enc, 8, {9, 10, 11, 12});
+        feed_append(dec, air[0], &out);
+        clk.advance(30);
+        dec.poll_rx(&out);
+        EXPECT_EQ(0u, dec.given_up_blocks()) << "flushed before the spread had passed";
+        clk.advance(20);
+        dec.poll_rx(&out);
+        EXPECT_EQ(1u, dec.given_up_blocks()) << "still waiting for the spread cap";
+    }
+}
+
+/* A block never seen at all is skipped once the next block shows the sender is past it. */
+TEST(RsBlockErasureEmitTest, MissingBlockSkippedAfterNextBlockSpread)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
+    vstreamer::fec_rx_payload_list out;
+    feed_spread_block(enc, dec, clk, 0, 4, 40, &out);
+    feed_spread_block(enc, dec, clk, 4, 4, 40, &out);
+    encode_block_apps(enc, 8, {0, 0, 0, 0}); /* block 8 lost entirely */
+    feed_spread_block(enc, dec, clk, 12, 4, 40, &out);
+    EXPECT_EQ(8u, out.size());
+    clk.advance(50);
+    vstreamer::fec_rx_payload_list tick;
+    dec.poll_rx(&tick);
+    EXPECT_EQ(4u, tick.size());
+    EXPECT_EQ(4u, dec.take_fail_lost_app_pkts());
+}
+
+/* Behind by at most lo: ignored; behind by more, or ahead by more than hi: new reference. */
+/* Parity arriving after its block was released from its first k shards is not a late block. */
+TEST(RsBlockErasureEmitTest, RedundantParityNotCountedLate)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    for (uint16_t b = 0; b < 8; b++)
+    {
+        for (const auto &shard : encode_block_apps(enc, static_cast<uint16_t>(4 * b), {1, 2, 3, 4}))
+        {
+            feed_append(dec, shard, &out);
+        }
+    }
+    EXPECT_EQ(32u, out.size());
+    EXPECT_EQ(0u, dec.late_blocks());
+}
+
+TEST(RsBlockErasureEmitTest, SequencerDeviationBounds)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(1, 1, 20));
+    const int lo = rs_block_erasure::k_max_lo_block_id_deviation;
+    const int hi = rs_block_erasure::k_max_hi_block_id_deviation;
+    rs_block_erasure dec;
+    vstreamer::fec_rx_payload_list out;
+    const uint16_t ref = 30000;
+    feed_append(dec, encode_one(enc, ref, 1), &out); /* reference -> 30001 */
+    feed_append(dec, encode_one(enc, static_cast<uint16_t>(ref + 1 - lo), 2), &out);
+    EXPECT_EQ(1u, dec.late_blocks());
+    EXPECT_EQ(0u, dec.new_references());
+    feed_append(dec, encode_one(enc, static_cast<uint16_t>(ref + 1 - lo - 1), 3), &out);
+    EXPECT_EQ(1u, dec.new_references());
+    const uint16_t r2 = static_cast<uint16_t>(ref + 1 - lo); /* next after the new block */
+    feed_append(dec, encode_one(enc, static_cast<uint16_t>(r2 + hi), 4), &out);
+    EXPECT_EQ(1u, dec.new_references()) << "ahead by hi is still the same session";
+    feed_append(dec, encode_one(enc, static_cast<uint16_t>(r2 + hi + 1 + 1), 5), &out);
+    EXPECT_EQ(2u, dec.new_references());
+    EXPECT_TRUE(out_has_app_tag(out, 5));
+    EXPECT_FALSE(out_has_app_tag(out, 2));
+}
+
+/* A later block that fails RS decode keeps its surviving messages in sequence. */
+TEST(RsBlockErasureEmitTest, RsFailureOfLaterBlockStillInOrder)
+{
+    rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 20));
+    rs_block_erasure dec;
+    fake_clock       clk;
+    clk.attach(dec);
+    vstreamer::fec_rx_payload_list out;
+    const auto a = encode_block_apps(enc, 0, {1, 2, 3, 4});
+    const auto b = encode_block_apps(enc, 4, {5, 6, 7, 8});
+    feed_append(dec, a[0], &out); /* head incomplete */
+    for (size_t i = 0; i < b.size(); i++)
+    {
+        feed_append(dec, b[i], &out); /* b decodes and waits behind a */
+    }
+    EXPECT_EQ(1u, out.size());
+    feed_append(dec, a[1], &out);
+    feed_append(dec, a[2], &out);
+    feed_append(dec, a[3], &out);
+    ASSERT_EQ(8u, out.size());
+    for (size_t i = 0; i < out.size(); i++)
+    {
+        EXPECT_EQ(out[i].u8()[0], i + 1);
+    }
 }

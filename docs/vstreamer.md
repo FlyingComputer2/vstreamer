@@ -226,10 +226,11 @@ FU-A, capture-time header extension).
 | `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
 | `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
 | `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block after N ms). 0 never flushes: a block leaves only once `fec_k` SDUs fill it |
-| `fec_spread_ms` | C Q | ≥ 0, default 0 (spread each FEC block's shards over N ms). Not capped. The receiver gives a block up after `max(3 × fec_timeout_ms, 60)` ms with no shard of it, so the gap between a block's shards (≈ spread / n) must stay under that, not the whole spread; a send thread that is starved of CPU breaks this by releasing shards in lumps (see Threading). Shards wait in the send queue until due; `queue_byte_limit` grows with the spread. Lowering it pulls already-queued shards in to the new spread, so a mistyped huge value does not stall the stream for that long. On the ESP32-P4 the PIE FEC encoder (`CONFIG_VSTREAMER_RS_PIE`, default on) sends parity in tighter bursts that compete with the H.264 encoder for PSRAM: about 1 encoder fps lost at spread 0, 0.1–0.3 fps at 25 ms or more |
+| `fec_spread_ms` | C Q | 0..250, default 0 (spread each FEC block's shards over N ms: air position p of c at t0 + p × spread / c). Capped at 250: the receiver assumes that spread until it has measured one. The receiver measures the spread from arrival times and sets each block's deadline from it (see `stream_receiver`). Shards of one block keep their spacing on the wire even when the send thread falls behind (it sends other due datagrams meanwhile instead of flushing the block in a lump); `send_late_max_ms` shows how late datagrams left. Shards wait in the send queue until due; `queue_byte_limit` grows with the spread. Lowering it pulls already-queued shards in to the new spread. On the ESP32-P4 the PIE FEC encoder (`CONFIG_VSTREAMER_RS_PIE`, default on) sends parity in tighter bursts that compete with the H.264 encoder for PSRAM: about 1 encoder fps lost at spread 0, 0.1–0.3 fps at 25 ms or more |
 | `send_cpu`, `send_prio`, `telemetry_cpu`, `telemetry_prio` | C Q | thread placement, see Threading |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
+| `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
 
 `set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
 
@@ -246,14 +247,32 @@ one `STREAM_DGRAM` PDU per original datagram.
 | `recv_cpu`, `recv_prio` | C Q | thread placement, see Threading |
 | `udp_packet_received`, `udp_gap_count` | Q | wire counters (pre-FEC) |
 | `fec_packet_received`, `fec_gap_count` | Q | post-FEC counters |
-| `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
+| `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_given_up_blocks`, `fec_late_blocks`, `fec_new_references`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
+| `fec_spread_est_ms`, `fec_jitter_est_ms` | Q | sender spread and arrival jitter measured from receive times (spread = 250 until two blocks are fitted) |
 
 `link_counters_snapshot()` returns the four link counters at once for metrics code.
-After `rx_hold_ms` (≥ 250 ms) without any shard, the next shard rebases the FEC receiver to its
-block, so a restarted sender resumes immediately whatever its random start `sdu_base`. A quicker
-restart is recognised by distance: a base more than 2048 SDUs ahead of the emit position, or a
-held shard that far behind once the old session has been silent for `emit_hold_ms`, resyncs to
-the new session without counting the jump as loss.
+
+FEC receive sequencing (`rs_block_erasure`). One reference, the next block id (`sdu_base`, in
+SDUs) to deliver:
+
+| Block id vs reference | Action |
+|---|---|
+| behind by ≤ 128 | late: ignored (`fec_late_blocks`) |
+| behind by > 128, or ahead by > 1024 | new reference: a new sender session; old state dropped (`fec_new_references`) |
+| ahead by ≤ 1024 | same session; ids in between are waited for |
+
+Every message that can go out in sequence goes out at once: the head block's data shards as they
+arrive, the rest when FEC recovers it, then the following blocks' ready prefixes. A head block
+that cannot be completed is flushed (the data shards it has) at its deadline
+(`fec_given_up_blocks`); a run of ids never seen is skipped once the next block shows the sender
+is past them. Deadlines come only from receive times and the measured spread: each block's
+arrivals are fitted against their air position (median of pairwise slopes, so one late shard
+does not skew it), two blocks give the first estimate, and later blocks update it weighted by how
+many shards they had. A block's deadline is its fitted start plus (c − 1) / c of the spread plus
+a margin (3 × the fit's residual jitter, at least 5 ms). Before an estimate the spread is taken as
+250 ms. A restarted sender landing within 128 behind the reference is read as late until its ids
+pass it (odds 128 / 65536 per restart); a stray old-session shard more than 128 behind after a
+restart is taken as a new reference too, and the next new-session block takes it back.
 
 **`mkv_sink`** — MJPEG or H.264 (Annex-B AUs) → Matroska through `core/mkv_writer` (stdio, no
 libav). Clusters of ~1 s start on keyframes and are flushed and fsync'ed as they close; the

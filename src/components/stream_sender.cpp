@@ -1,4 +1,5 @@
 #include "components/stream_sender.hpp"
+#include "components/stream_sender_pace.hpp"
 
 #include "core/fec_spread.hpp"
 #include "core/host_util.hpp"
@@ -254,9 +255,23 @@ bool stream_sender::queue_has_room_for_sdu() const
     return queue_bytes + pkts * pkt_bytes <= limit && queue.size() + pkts <= k_queue_packet_cap;
 }
 
+namespace
+{
+/* Block id of a spread FEC shard (its sdu_base), or k_no_block. */
+uint32_t pace_block_of(const uint8_t *data, size_t len, bool is_fec_shard,
+                       std::chrono::microseconds gap)
+{
+    if (!is_fec_shard || gap.count() <= 0 || len < 2)
+    {
+        return stream_sender::k_no_block;
+    }
+    return (static_cast<uint32_t>(data[0]) << 8) | data[1];
+}
+}  // namespace
+
 int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                                          std::chrono::steady_clock::time_point release,
-                                         bool force)
+                                         bool force, std::chrono::microseconds gap)
 {
     if (nullptr == data || 0 == len)
     {
@@ -311,14 +326,16 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
         {
             --pos;
         }
-        queue.insert(pos, queued_wire {std::move(buf), release});
+        queue.insert(pos, queued_wire {std::move(buf), release,
+                                       pace_block_of(data, len, is_fec_shard, gap), gap});
     }
     q_cv.notify_one();
     return 0;
 }
 
 void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                      std::chrono::steady_clock::time_point release)
+                                      std::chrono::steady_clock::time_point release,
+                                      std::chrono::microseconds gap)
 {
     if (nullptr == data || 0 == len)
     {
@@ -376,7 +393,8 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         {
             --pos;
         }
-        queue.insert(pos, queued_wire {std::move(buf), release});
+        queue.insert(pos, queued_wire {std::move(buf), release,
+                                       pace_block_of(data, len, is_fec_shard, gap), gap});
     }
     if (evicted)
     {
@@ -394,11 +412,12 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
     }
     const auto t0 = std::chrono::steady_clock::now();
     const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
+    const auto gap = fec_spread_offset(1, air->size(), spread);
     for (size_t j = 0; j < air->size(); j++)
     {
         auto &pkt = (*air)[j];
         enqueue_wire_copy(pkt.data(), pkt.size(), true,
-                          t0 + fec_spread_offset(j, air->size(), spread));
+                          t0 + fec_spread_offset(j, air->size(), spread), gap);
     }
 }
 
@@ -642,12 +661,17 @@ void stream_sender::send_thread_main()
 
         bfc::shared_sized_buffer wire_buf;
         {
-            /* Wake for the earliest release, a new enqueue, or the next FEC tick. */
+            /* Wake for the earliest due datagram (detail::pick_due: release time, and spread
+             * shards keep their spacing within a block), a new enqueue, or the next FEC tick. */
             std::unique_lock<std::mutex> lock(q_mu);
             const auto tick_at =
                 std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_ms);
+            auto pick = queue.end();
             for (;;)
             {
+                /* Fresh each pass, before any exit: an enqueue while waiting invalidates deque
+                 * iterators. */
+                pick = queue.end();
                 wdt.feed();
                 if (send_stop)
                 {
@@ -659,18 +683,11 @@ void stream_sender::send_thread_main()
                     break;
                 }
                 const auto t = std::chrono::steady_clock::now();
-                if (!queue.empty() && queue.front().release <= t)
+                auto       until = tick_at;
+                pick = detail::pick_due(queue, pace_block_last, t, &until);
+                if (pick != queue.end() || t >= tick_at)
                 {
                     break;
-                }
-                if (t >= tick_at)
-                {
-                    break;
-                }
-                auto until = tick_at;
-                if (!queue.empty() && queue.front().release < until)
-                {
-                    until = queue.front().release;
                 }
                 q_cv.wait_until(lock, until);
             }
@@ -678,13 +695,32 @@ void stream_sender::send_thread_main()
             {
                 break;
             }
-            if (queue.empty() || queue.front().release > std::chrono::steady_clock::now())
+            if (pick == queue.end())
             {
                 continue;
             }
-            wire_buf = std::move(queue.front().buf);
+            const auto t = std::chrono::steady_clock::now();
+            const int64_t late_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(t - pick->release).count();
+            if (late_us > send_late_max_us.load(std::memory_order_relaxed))
+            {
+                send_late_max_us.store(late_us, std::memory_order_relaxed);
+            }
+            if (pick->gap.count() > 0)
+            {
+                if (pace_block_last.size() > 256)
+                {
+                    for (auto it = pace_block_last.begin(); it != pace_block_last.end();)
+                    {
+                        it = t - it->second > std::chrono::seconds(1) ? pace_block_last.erase(it)
+                                                                      : std::next(it);
+                    }
+                }
+                pace_block_last[pick->block] = t;
+            }
+            wire_buf = std::move(pick->buf);
             queue_bytes -= wire_packet_bytes(wire_buf);
-            queue.pop_front();
+            queue.erase(pick);
         }
 
         if (wire_buf.empty())
@@ -967,6 +1003,7 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
             {
                 const auto t0 = std::chrono::steady_clock::now();
                 const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
+                const auto gap = fec_spread_offset(1, air.size(), spread);
                 for (size_t j = 0; j < air.size(); j++)
                 {
                     auto &pkt = air[j];
@@ -974,7 +1011,7 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
                      * which drops only this shard and is counted in dropped. */
                     (void)try_enqueue_wire_copy(pkt.data(), pkt.size(), true,
                                                 t0 + fec_spread_offset(j, air.size(), spread),
-                                                true);
+                                                true, gap);
                 }
             }
             else
@@ -1252,7 +1289,8 @@ int stream_sender::configure(std::string_view key, std::string_view value)
     if ("fec_spread_ms" == key)
     {
         int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 0 || v > INT_MAX || value.size() > 31)
+        if (key_parse_i64(value, &v) < 0 || v < 0 || v > k_fec_spread_max_ms ||
+            value.size() > 31)
         {
             return -EINVAL;
         }
@@ -1671,6 +1709,15 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", fec_spread_ms.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("send_late_max_ms" == key)
+    {
+        /* Since the previous query: how far past its release time a datagram left. */
+        const int64_t us = send_late_max_us.exchange(0, std::memory_order_relaxed);
+        char          buf[24];
+        std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(us) / 1000.0);
         *value = buf;
         return 0;
     }

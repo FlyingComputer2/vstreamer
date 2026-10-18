@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <stddef.h>
 #include <stdint.h>
 #include <unordered_map>
@@ -37,15 +38,42 @@ public:
     static constexpr size_t k_done_max = 128;
     static constexpr size_t k_block_max = 256;
 
-    // Incomplete RX block TTL, and finished-id TTL (duplicate-shard
-    // suppression). done_hold is longer so a late shard of a completed block
-    // is still dropped, but short enough that a peer restart which reuses
-    // sdu_base from 0 is accepted after the old ids age out.
-    int rx_hold_ms() const;
-    int done_hold_ms() const;
-    // Max time a decoded block waits in the in-order emit queue for an
-    // earlier sdu_base before the queue advances past the hole.
-    int emit_hold_ms() const;
+    /*
+     * Receive sequencing. One reference: the next block id (sdu_base) to deliver. A shard whose
+     * block id is behind it by at most k_max_lo_block_id_deviation is late and ignored; behind by
+     * more, or ahead by more than k_max_hi_block_id_deviation, it starts a new reference (a new
+     * sender session: old state is dropped). Ids count SDUs.
+     *
+     * Every message that can go out in sequence goes out at once: the head block's data shards
+     * as they arrive, the rest when FEC recovers it, then the next blocks' ready prefixes. A head
+     * block that cannot be completed is flushed (the data shards it has) at its deadline.
+     *
+     * Deadlines come only from receive times and the estimated sender spread: the sender
+     * releases air position p of a c-shard block at t0 + p * spread / c, so each block's arrivals
+     * are fitted against position (robust slope, Theil-Sen) and the per-block fits feed a running
+     * spread estimate (weighted by shard count). A block's deadline is its fitted start plus
+     * (c - 1) * spread / c plus a margin from the fit residuals. Until two blocks have been
+     * fitted the spread is taken as k_spread_cap_ms (the sender's cap).
+     */
+    static constexpr int k_max_lo_block_id_deviation = 128;
+    static constexpr int k_max_hi_block_id_deviation = 1024;
+    static constexpr int k_spread_cap_ms = 250;
+    /* Floor of the deadline margin: scheduling jitter on top of the measured arrival jitter. */
+    static constexpr int k_deadline_margin_min_ms = 5;
+
+    using clock_fn = std::function<std::chrono::steady_clock::time_point()>;
+    /* Replaces steady_clock::now() (tests). */
+    void set_clock(clock_fn fn)
+    {
+        clock = std::move(fn);
+    }
+    [[nodiscard]] bool have_spread_estimate() const
+    {
+        return fitted_blocks >= 2;
+    }
+    /* Estimated sender spread and arrival jitter (ms); the cap / 0 before an estimate. */
+    [[nodiscard]] double spread_estimate_ms() const;
+    [[nodiscard]] double jitter_estimate_ms() const;
 
     rs_block_erasure();
 
@@ -87,9 +115,8 @@ public:
     void on_tick(std::vector<std::vector<uint8_t>>* out);
     /* Next partial-block flush time; false if no pending TX deadline. */
     [[nodiscard]] bool next_deadline(std::chrono::steady_clock::time_point* out) const;
-    // RX tick: expire stale blocks and release payloads held in the
-    // in-order emit queue whose head-of-line wait has elapsed. Call
-    // periodically even when no datagram arrives.
+    // RX tick: flush the head block once its deadline has passed and release what follows
+    // in sequence. Call periodically even when no datagram arrives.
     void poll_rx(fec_rx_payload_list* out);
 
     // Air datagram (full 5-byte FEC shard header + body). Zero-copy RX stores the
@@ -129,11 +156,18 @@ public:
     {
         return missing_shards_count;
     }
+    /* Blocks behind the reference that were never released here (each counted once); the
+     * redundant shards of blocks already delivered are dropped silently. */
     uint64_t late_blocks() const
     {
         return late_blocks_count;
     }
-    /* Head-of-line blocks released after the emit hold with SDUs still missing. */
+    /* New references taken (sender session changes / out-of-window jumps). */
+    uint64_t new_references() const
+    {
+        return new_references_count;
+    }
+    /* Head blocks flushed at their deadline with SDUs still missing. */
     uint64_t given_up_blocks() const
     {
         return given_up_blocks_count;
@@ -177,11 +211,6 @@ public:
                               int* index, int* k, int* n, int* sdu_n);
 
 private:
-    /* SDU-sequence distance; ~64 max-size blocks at k≈31 stays under half the u16 ring. */
-    static constexpr int k_ring_evict_sdus = 2048;
-    /* Cap on shards held while deciding whether a new sender session started behind. */
-    static constexpr size_t k_far_behind_hold_max = 1024;
-
     struct rx_block_s
     {
         int                                              k = 0;
@@ -189,21 +218,19 @@ private:
         int                                              sdu_n = 0;
         int                                              released = 0;
         std::unordered_map<int, bfc::shared_sized_buffer>     frags;
-        std::chrono::steady_clock::time_point            first_seen{};
+        /* (air position, arrival time) of every shard received, for the spread fit. */
+        std::vector<std::pair<int, std::chrono::steady_clock::time_point>> arrivals;
         std::chrono::steady_clock::time_point            last_seen{};
-    };
-
-    struct held_shard_s
-    {
-        std::chrono::steady_clock::time_point at{};
-        bfc::shared_sized_buffer                   shard;
     };
 
     struct ready_block_s
     {
+        /* Empty buffer = message not recovered (RS failure); skipped on release. */
         fec_rx_payload_list payloads;
         int                               released = 0;
         int                               sdu_n = 0;
+        /* Fitted time of the block's first air shard (gap deadlines behind it). */
+        std::chrono::steady_clock::time_point start{};
     };
 
     void account_missing_shards(const rx_block_s& block);
@@ -214,29 +241,25 @@ private:
     int        dist_from_emit(uint16_t sdu_base) const;
     void       note_head_hole_sdus(int gap_sdus);
 
-    void record_payload_emit();
     void emit_payload(fec_rx_payload_list* out, bfc::shared_sized_buffer&& app);
     static bool frag_to_app(const bfc::shared_sized_buffer& shard, bfc::shared_sized_buffer* app);
 
-    /* Emits what the block has and returns how many of its SDUs could not be delivered. */
-    int abandon_partial_block(const rx_block_s& block, uint16_t sdu_base, fec_rx_payload_list* out);
-    void expire_rx(fec_rx_payload_list* out);
-    void expire_done();
-    void mark_done(uint16_t sdu_base);
-    void note_emit_base(uint16_t sdu_base);
-    void touch_newest(uint16_t sdu_base);
-    void ring_evict_stale(fec_rx_payload_list* out);
-    void maybe_resync_on_late_shard(uint16_t sdu_base);
-    void maybe_rebase_after_silence(uint16_t sdu_base);
-    void clear_state_behind(uint16_t base);
-    void keep_state_ahead_of(uint16_t base);
-    bool hold_far_behind_shard(uint16_t sdu_base, const bfc::shared_sized_buffer& shard,
-                               fec_rx_payload_list* out);
-    void maybe_resync_to_held(fec_rx_payload_list* out);
+    /* Air position of shard `index` (data shards first, then parity) and shards on air. */
+    static int air_pos(int index, int k, int sdu_n);
+    static int air_count(int k, int n, int sdu_n);
+    std::chrono::nanoseconds spread_now() const;
+    std::chrono::nanoseconds margin_now() const;
+    std::chrono::steady_clock::time_point block_start(const rx_block_s& block) const;
+    std::chrono::steady_clock::time_point block_deadline(const rx_block_s& block) const;
+    /* Fits the block's arrivals and folds the result into the spread estimate. */
+    void learn_spread(const rx_block_s& block);
+
+    void new_reference(uint16_t sdu_base);
+    /* Flushes the data shards the block has (in order) and returns how many SDUs are lost. */
+    int abandon_partial_block(const rx_block_s& block, fec_rx_payload_list* out);
+    void advance_head(int sdu_n);
+    void note_released(uint16_t sdu_base);
     void try_stream_head_systematic(rx_block_s& block, fec_rx_payload_list* out);
-    void on_block_decoded(uint16_t sdu_base, int released_before, fec_rx_payload_list payloads,
-                          int sdu_n, fec_rx_payload_list* out);
-    void maybe_give_up_head(fec_rx_payload_list* out);
     void run_emit_engine(fec_rx_payload_list* out);
     bool try_decode_block(uint16_t sdu_base, rx_block_s* block, fec_rx_payload_list* out);
 
@@ -259,22 +282,17 @@ private:
     uint16_t sdu_seq = 0;
 
     std::unordered_map<uint16_t, rx_block_s> rx_blocks;
-    std::deque<uint16_t> done_order;
-    std::unordered_map<uint16_t, std::chrono::steady_clock::time_point> done;
-
     std::unordered_map<uint16_t, ready_block_s> ready_blocks;
+    static constexpr size_t                   k_recent_released_max = 64;
+    std::deque<uint16_t>                      recent_released;
     bool                                      emit_base_set = false;
     uint16_t                                  emit_next = 0;
-    uint16_t                                  newest = 0;
-    bool                                      newest_set = false;
-    std::chrono::steady_clock::time_point     last_payload_emit{};
-    bool                                      have_payload_emit = false;
-    std::chrono::steady_clock::time_point     last_shard_rx{};
-    bool                                      have_shard_rx = false;
-    std::chrono::steady_clock::time_point     last_in_window_rx{};
-    std::deque<held_shard_s>                  far_behind_held;
-    std::chrono::steady_clock::time_point     later_block_since{};
-    bool                                      later_block_waiting = false;
+
+    clock_fn clock;
+    /* Running spread / jitter estimate, seconds; valid once fitted_blocks >= 2. */
+    double spread_est_s = 0.;
+    double jitter_est_s = 0.;
+    int    fitted_blocks = 0;
 
     uint64_t recovered_count = 0;
     uint64_t recovered_seen = 0;
@@ -295,6 +313,7 @@ private:
     uint64_t late_blocks_count = 0;
     uint64_t late_blocks_seen = 0;
     uint64_t given_up_blocks_count = 0;
+    uint64_t new_references_count = 0;
     uint64_t oversized_count = 0;
 
     size_t max_shard_bytes = 1470;
