@@ -404,48 +404,45 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
 
 void stream_sender::pace_wire_send(size_t bytes, send_thread_wdt *wdt)
 {
-    const int cap_kbps = max_wire_kbps.load(std::memory_order_relaxed);
-    if (cap_kbps <= 0)
-    {
-        return;
-    }
-
-    const double max_bps = static_cast<double>(cap_kbps) * 1000.0;
-    const double max_bytes_per_sec = max_bps / 8.0;
-    const double burst_bytes = max_bytes_per_sec * 0.25;
-
     while (!send_stop.load(std::memory_order_relaxed))
     {
         if (nullptr != wdt)
         {
             wdt->feed();
         }
+        /* Re-read every pass: lifting or changing the cap while a datagram waits takes effect
+         * at once instead of after the old rate pays it off. */
+        const int cap_kbps = max_wire_kbps.load(std::memory_order_relaxed);
+        if (cap_kbps <= 0)
+        {
+            return;
+        }
+        if (pace_reset.exchange(false, std::memory_order_relaxed))
+        {
+            pace_last_sec = 0.;
+        }
+        const double max_bytes_per_sec = static_cast<double>(cap_kbps) * 1000.0 / 8.0;
+        /* At least one datagram, or a cap below ~47 kbit/s could never pass a full one. */
+        const double burst_bytes = std::max(max_bytes_per_sec * 0.25, static_cast<double>(bytes));
+
         const double now = now_sec();
         if (pace_last_sec <= 0.)
         {
             pace_last_sec = now;
             pace_bucket_bytes = burst_bytes;
         }
-        const double dt = now - pace_last_sec;
+        pace_bucket_bytes =
+            std::min(burst_bytes, pace_bucket_bytes + (now - pace_last_sec) * max_bytes_per_sec);
         pace_last_sec = now;
-        pace_bucket_bytes += dt * max_bytes_per_sec;
-        if (pace_bucket_bytes > burst_bytes)
-        {
-            pace_bucket_bytes = burst_bytes;
-        }
         if (pace_bucket_bytes >= static_cast<double>(bytes))
         {
             pace_bucket_bytes -= static_cast<double>(bytes);
             return;
         }
-        const double deficit = static_cast<double>(bytes) - pace_bucket_bytes;
-        pace_bucket_bytes = 0.;
-        const double sleep_s = deficit / max_bytes_per_sec;
-        if (sleep_s > 0.)
-        {
-            std::this_thread::sleep_for(
-                std::chrono::duration<double>(std::min(sleep_s, 0.05)));
-        }
+        /* Keep the credit already earned and sleep only for the rest. */
+        const double sleep_s =
+            (static_cast<double>(bytes) - pace_bucket_bytes) / max_bytes_per_sec;
+        std::this_thread::sleep_for(std::chrono::duration<double>(std::min(sleep_s, 0.05)));
     }
 }
 
