@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <cstring>
 #include <vector>
 
@@ -57,7 +58,6 @@ void mul_row(const uint8_t *t, const uint8_t *in, uint8_t *out, int len)
 }
 
 #ifdef VSTREAMER_RS_PIE
-
 
 /* ESP32-P4 PIE (128-bit q registers; no byte shuffle, so no nibble-table multiply). The product
  * c * x is the xor over the set bits b of x of (c << b). Per 16-byte chunk each source is
@@ -255,16 +255,33 @@ void rs_encode_scalar_table(int len, int k, int rows, const unsigned char *g_tbl
 }
 
 
+#ifdef VSTREAMER_RS_PIE
+namespace
+{
+/* Cleared by rs_encode_selftest() when the PIE kernel disagrees with the table path. */
+std::atomic<bool> g_pie_enabled {true};
+}  // namespace
+#endif
+
 void rs_encode_scalar(int len, int k, int rows, const unsigned char *g_tbls,
                       unsigned char *const *data, unsigned char *const *coding)
 {
 #ifdef VSTREAMER_RS_PIE
-    if (rs_encode_pie(len, k, rows, g_tbls, data, coding))
+    if (g_pie_enabled.load(std::memory_order_relaxed) && rs_encode_pie(len, k, rows, g_tbls, data, coding))
     {
         return;
     }
 #endif
     rs_encode_scalar_table(len, k, rows, g_tbls, data, coding);
+}
+
+const char *rs_encode_scalar_impl()
+{
+#ifdef VSTREAMER_RS_PIE
+    return g_pie_enabled.load(std::memory_order_relaxed) ? "pie" : "table";
+#else
+    return "table";
+#endif
 }
 
 
@@ -346,6 +363,14 @@ int rs_encode_selftest(int k, int rows, int len, int iterations, int64_t (*now_u
     {
         bad += std::memcmp(ap[static_cast<size_t>(r)], bp[static_cast<size_t>(r)], static_cast<size_t>(len)) != 0;
     }
+#ifdef VSTREAMER_RS_PIE
+    if (bad > 0)
+    {
+        /* Wrong parity would make every receiver rebuild lost packets wrongly, with nothing in
+         * the stats to show it: fall back to the table path for the rest of the run. */
+        g_pie_enabled.store(false, std::memory_order_relaxed);
+    }
+#endif
     return bad;
 }
 

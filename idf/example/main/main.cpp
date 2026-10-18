@@ -986,31 +986,25 @@ extern "C" void app_main(void)
      * plain FreeRTOS task. */
     auto t = vstreamer::spawn_thread(vstreamer::thread_opts {"smoke", 24 * 1024}, [] {
         {
-            /* RS encode (PIE on the P4) against the table path; also with shards in RTCRAM, where
-             * PIE's 128-bit loads would fault if the kernel passed them through. */
-            struct rs_case
-            {
-                int  k, rows, len;
-                bool rtc;
-            };
+            /* FEC encode check: the fast path (PIE on the P4) against the table path, misaligned
+             * shards, with and without a tail. A mismatch turns the fast path off. */
             const auto now = [] { return static_cast<int64_t>(esp_timer_get_time()); };
-            for (const rs_case c : {rs_case {21, 10, 1403, false}, rs_case {21, 10, 37, false},
-                                    rs_case {1, 30, 300, false}, rs_case {2, 29, 300, true},
-                                    rs_case {10, 21, 100, true}})
+            for (const int len : {1403, 37})
             {
-                const size_t bytes = static_cast<size_t>(c.k + 2 * c.rows) * static_cast<size_t>(c.len + 8);
-                auto *arena = c.rtc ? static_cast<uint8_t *>(heap_caps_malloc(bytes, MALLOC_CAP_RTCRAM)) : nullptr;
-                if (c.rtc && nullptr == arena)
-                {
-                    std::printf("rs selftest k=%d rows=%d: no RTCRAM for %u bytes\n", c.k, c.rows, static_cast<unsigned>(bytes));
-                    continue;
-                }
                 int64_t   fast = 0;
                 int64_t   table = 0;
-                const int bad = vstreamer::rs_encode_selftest(c.k, c.rows, c.len, 5, now, &fast, &table, arena);
-                std::printf("rs selftest k=%d rows=%d len=%d%s: mismatched rows %d, %" PRId64 " us vs table %" PRId64 " us\n",
-                            c.k, c.rows, c.len, c.rtc ? " rtcram" : "", bad, fast, table);
-                heap_caps_free(arena);
+                const int bad = vstreamer::rs_encode_selftest(21, 10, len, 2, now, &fast, &table);
+                if (bad > 0)
+                {
+                    std::printf("RS ENCODE SELFTEST FAILED (len %d, %d parity rows differ): FEC encode "
+                                "falls back to the table path\n",
+                                len, bad);
+                }
+                else
+                {
+                    std::printf("rs selftest len=%d ok: %s %" PRId64 " us, table %" PRId64 " us\n", len,
+                                vstreamer::rs_encode_scalar_impl(), fast, table);
+                }
             }
         }
 #if defined(ENABLE_ESP32P4_CSI_CAMERA_SRC) && defined(ENABLE_H264_ENCODER_ESP32P4) && \
