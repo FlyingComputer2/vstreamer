@@ -58,6 +58,8 @@ private:
     void encode_main();
     int  push_encoder_input(component_pdu &in);
     void drain_encoder_output();
+    /* configure() while open (mu held): the encoder keys the running encoder takes. */
+    int configure_live_locked(std::string_view key, std::string_view value);
 
     std::unique_ptr<esp32p4_csi_camera_src> cam_;
     std::unique_ptr<h264_encoder_esp32p4>     enc_;

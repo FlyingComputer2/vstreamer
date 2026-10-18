@@ -486,6 +486,12 @@ answer `latency_ms` and `node_latency_ms` as component queries (`-ENODATA` until
 For the two sources the entry is the capture (V4L2 DQBUF), so both keys are the same value; the
 encoder's node runs from the first `input()` attempt to the AU out.
 
+While `esp32_h264_isp_src` streams, `bitrate` and `gop` apply at once (a GOP change starts with
+an IDR) and `idr` asks for an IDR; the values are kept for the next `open()`. Other keys answer
+`-EBUSY` until the source is closed: the camera's (`fps`, `buffers`, sensor settings) and
+`qp_min` / `qp_max`, which would make the encoder reopen, and at 1080p that reopen cannot get its
+reference frames while in-flight AUs hold the old encoder's buffers.
+
 Entry is the first `input()` attempt, so time spent retrying on `-EAGAIN` (backpressure) counts
 toward the node. On the TX side `encoder_queue` ends where `enc` starts, so the two add up to the
 time from JPEG output to encoded AU. JPEG decoder, encoder and decoder hold several frames at
