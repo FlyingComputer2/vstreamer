@@ -293,6 +293,48 @@ int esp32_h264_isp_src::output(component_pdu &out)
     return 0;
 }
 
+/* While streaming, the encoder keys the running esp_h264 takes in place are passed through:
+ * bitrate and gop apply at once (a GOP change starts with an IDR), idr asks for an IDR; they are
+ * also kept here for the next open(). Everything else answers -EBUSY: the camera's keys (fps,
+ * buffers, sensor settings), and qp_min / qp_max, which make the encoder reopen itself; at 1080p
+ * that reopen cannot allocate its reference frames while in-flight AUs still hold the old
+ * encoder's output buffers, and every following frame fails. */
+int esp32_h264_isp_src::configure_live_locked(std::string_view key, std::string_view value)
+{
+    if (key == "idr")
+    {
+        return enc_->configure(key, value);
+    }
+    int64_t n = 0;
+    if (key == "bitrate" || key == "bps")
+    {
+        if (key_parse_i64(value, &n) < 0 || n < 25000)
+        {
+            return -EINVAL;
+        }
+        const int r = enc_->configure("bitrate", value);
+        if (0 == r)
+        {
+            bitrate = static_cast<uint32_t>(n);
+        }
+        return r;
+    }
+    if (key == "gop")
+    {
+        if (key_parse_i64(value, &n) < 0 || n < 1 || n > 255)
+        {
+            return -EINVAL;
+        }
+        const int r = enc_->configure(key, value);
+        if (0 == r)
+        {
+            gop = static_cast<int>(n);
+        }
+        return r;
+    }
+    return -EBUSY;
+}
+
 int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
 {
     std::lock_guard<std::mutex> lock(mu);
@@ -304,7 +346,7 @@ int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
     }
     if (opened)
     {
-        return -EBUSY;
+        return configure_live_locked(key, value);
     }
     if (key == "fps")
     {
