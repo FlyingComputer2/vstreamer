@@ -300,7 +300,7 @@ on Linux), both default −1, and starts the thread with them in `open()`
 is closed (`-EBUSY` while open: ESP-IDF cannot move a running task to another core), so whoever
 configures the nodes stops them first. On Linux the new thread is pinned before it runs and
 threads it starts inherit the pin; the pipeline thread (`set_cpu`) is pinned only after its nodes
-are open. The ESP32-P4 example keeps its whole layout at the top of `idf/example/main/main.cpp`:
+are open. The ESP32-P4 live TX layout is at the top of `idf/vstreamer/src/live_tx.cpp`:
 the FEC encode (`vs_isp_tx`) has core 0 with capture, and the send thread is on core 1, since
 sharing a core with the ~10 ms-per-block encode starved it and spread blocks left in lumps.
 
@@ -556,7 +556,11 @@ SDL/Mesa from `cmake/lsan_suppressions.txt`.
 **ESP-IDF.** `idf/vstreamer` is an ESP-IDF component with the core and `mkv_sink`,
 `stream_sender`, `stream_receiver`, `rtp_h264_pay`, `rtp_h264_depay`, plus `h264_encoder_esp32p4`
 on the esp32p4 target (pulls `espressif/esp_h264`); no apps. Add it to `EXTRA_COMPONENT_DIRS`.
-`idf/example` is an esp32p4 smoke test (UDP loopback through a pipeline, hardware encode, a
+On esp32p4 it also has live TX (`vstreamer_idf/live_tx.hpp`): `vstreamer::idf::run_live_tx(cfg)`
+runs camera → ISP + hardware H.264 → `rtp_h264_pay` → `stream_sender` to `cfg.peer` with the P4
+thread layout and an optional UDP management plane (`vstreamer_idf/live_mplane.hpp`;
+`get/set src|pay|snd <key>`, `get sys stats`), taking each component's settings as key/value
+lists. `idf/example` is an esp32p4 smoke test (UDP loopback through a pipeline, hardware encode, a
 base64 clip dump). On ESP-IDF, pipeline control must come from a pthread (`std::thread`), not
 `app_main`; `stream_sender` sends only after `set_enabled(true, …)`; raise
 `CONFIG_LWIP_UDP_RECVMBOX_SIZE` (default 6) for video-rate bursts.

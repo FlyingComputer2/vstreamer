@@ -16,9 +16,9 @@ class component;
 }
 
 /*
- * UDP management plane for the live TX example, in the grammar of the Linux vstreamer app: one
- * request per datagram, replies end in '\n', success is "ok" or "ok <value>", failure
- * "err <errno> <NAME>".
+ * UDP management plane for live TX (vstreamer::idf::run_live_tx), in the grammar of the Linux
+ * vstreamer app: one request per datagram, replies end in '\n', success is "ok" or "ok <value>",
+ * failure "err <errno> <NAME>".
  *
  *   get <node> <key>
  *   set <node> <key> <value...>
