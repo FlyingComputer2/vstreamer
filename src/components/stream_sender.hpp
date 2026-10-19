@@ -44,6 +44,8 @@ class stream_sender : public component_sink
 public:
     /* Largest fec_spread_ms: the receiver assumes this spread until it has measured one. */
     static constexpr int k_fec_spread_max_ms = rs_block_erasure::k_spread_cap_ms;
+    /* Fixed UDP payload ceiling (winject MPDU path). Pay/encoder must packetize within this. */
+    static constexpr int k_wire_datagram_bytes = 1476;
 
     stream_sender();
     ~stream_sender() override;
@@ -80,7 +82,6 @@ private:
     void stop_io_reactor();
     void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
-    void pace_wire_send(size_t bytes, send_thread_wdt *wdt = nullptr);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                            std::chrono::steady_clock::time_point release);
     /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */
@@ -113,7 +114,6 @@ private:
     std::string stream_spec;
     bool        telemetry_on = true;
     int         mtu = 1400;
-    int         max_datagram = 1472;
 
     int         send_fd = -1;
     sockaddr_in dst_addr {};
@@ -141,7 +141,6 @@ private:
      * than whatever the send thread is sleeping toward, so the thread must recompute it. */
     bool                    fec_deadline_changed = false;
     static constexpr size_t k_queue_packet_cap = 1024;
-    static constexpr size_t k_queue_min_paced_bytes = 32 * 1024;
     /* App-byte budget for a 1080p keyframe at k=8 n=15; unpaced wire minimum scales by n/k. */
     static constexpr size_t k_queue_min_unpaced_app_bytes = 136 * 1024;
 
@@ -174,10 +173,6 @@ private:
     uint64_t ingress_rate_bytes = 0;
     float    ingress_kbps = 0.f;
 
-    std::atomic<int>  max_wire_kbps {0};
-    std::atomic<bool> pace_reset {false};
-    double            pace_bucket_bytes = 0.;
-    double            pace_last_sec = 0.;
     int               queue_ms = 100;
     /* FEC block spreading: a block's shards are released evenly over this window instead of
      * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the wire.

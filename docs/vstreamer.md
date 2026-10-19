@@ -209,7 +209,7 @@ FU-A, capture-time header extension).
 | `au_dropped`, `nal_dropped`, `loss`, `need_idr`, `rtp_reordered` | Q | counters |
 | `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
-**`stream_sender`** — UDP egress with RS block-erasure FEC, pacing and a bounded queue. Threads:
+**`stream_sender`** — UDP egress with RS block-erasure FEC and a bounded queue. Threads:
 `input()` (caller), the send thread, a `default_io_reactor` thread for reverse telemetry
 recv when `telemetry` is on, and `configure()`. Lock order `mu` → `fec_mu`.
 
@@ -217,10 +217,9 @@ recv when `telemetry` is on, and `configure()`. Lock order `mu` → `fec_mu`.
 |-----|-----|------------------|
 | `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
-| `mtu` | C | 200..1500, default 1400 |
-| `max_datagram` | C Q | 64..65507, default 1472 (UDP payload incl. headers), live |
-| `max_input` | Q | largest `input()` SDU: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
-| `max_kbps` | C | wire pace 0..500 000 (0 = off), live |
+| `mtu` | C | 200..1500, default 1400 (diagnostic; packetization is upstream) |
+| `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
+| `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
 | `queue_ms` | C Q | 10..2000, default 100 |
 | `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
 | `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
@@ -339,8 +338,9 @@ Production-style binaries live under `src/apps/` (built when `VSTREAMER_APP_TX_O
 | `sdl_stream_receiver` | `--listen 0.0.0.0:5001` | `127.0.0.1:5091` | RX: `stream_receiver`, depay, MPP decode, SDL/kmsdrm |
 | `stream_sdl_test` | loopback + channel emulator | `127.0.0.1:5090` | both halves + link bench |
 
-One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Match
-`max_datagram` (1476 on winject paths). Telemetry defaults on; sender `peer_*` metrics come from
+One host: start `sdl_stream_receiver`, then `uvc_stream_sender --peer HOST:5001`. Size RTP on the
+payloader (`mtu` / encoder); receiver `max_datagram` should match the path (1476 on winject).
+Telemetry defaults on; sender `peer_*` metrics come from
 reverse reports (`peer_report_age_ms` for `scripts/cbr_controller.py`).
 
 **Latency on `sdl_stream_receiver` (`:5091`):** stages are timed from the capture timestamp

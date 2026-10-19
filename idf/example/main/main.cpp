@@ -490,7 +490,6 @@ int run()
     }
 
     tx->configure("stream", "127.0.0.1:5600");
-    tx->configure("max_kbps", "20000");
     apply_place(*tx, k_sender_place);
     tx->set_enabled(true, 0);
     if (tx->open() < 0)

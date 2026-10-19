@@ -43,7 +43,6 @@ void usage(const char *prog)
                  "  --fps N             default 30\n"
                  "  --cbr KBPS          default 4000\n"
                  "  --gop N             default fps\n"
-                 "  --max-datagram N    default 1476\n"
                  "  --fec-spread-ms N   spread each FEC block over N ms (>=0, default 0)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
@@ -71,7 +70,6 @@ int main(int argc, char **argv)
     int         fps = 30;
     int         cbr_kbps = 4000;
     int         gop = 0;
-    int         max_datagram = 1476;
     int         fec_spread_ms = 0;
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
@@ -121,11 +119,6 @@ int main(int argc, char **argv)
         if (0 == std::strcmp(argv[i], "--gop") && i + 1 < argc)
         {
             gop = std::atoi(argv[++i]);
-            continue;
-        }
-        if (0 == std::strcmp(argv[i], "--max-datagram") && i + 1 < argc)
-        {
-            max_datagram = std::atoi(argv[++i]);
             continue;
         }
         if (0 == std::strcmp(argv[i], "--fec-spread-ms") && i + 1 < argc)
@@ -253,9 +246,6 @@ int main(int argc, char **argv)
     {
         cfg(sender, "telemetry", "off");
     }
-    char maxdg[16];
-    std::snprintf(maxdg, sizeof(maxdg), "%d", max_datagram);
-    cfg(sender, "max_datagram", maxdg);
     char spread_buf[16];
     std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
     if (cfg(sender, "fec_spread_ms", spread_buf) < 0)

@@ -313,7 +313,6 @@ TEST(LoopbackTest, FecK6N8InOrder)
             ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
             ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
             ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         nullptr);
 }
@@ -326,7 +325,6 @@ TEST(LoopbackTest, RuntimeFecNRejectedThenAccepted)
             ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
             ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
             ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         [](vstreamer::stream_sender &sender, int packets_sent) {
             if (packets_sent == 500)
@@ -342,12 +340,10 @@ TEST(LoopbackTest, MaxDatagram600InOrder)
     run_link(
         2000,
         [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &receiver) {
-            ASSERT_EQ(0, cfg_str(sender, "max_datagram", "600"));
             ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "600"));
             ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
             ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
             ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         nullptr,
         [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
@@ -367,7 +363,6 @@ TEST(LoopbackTest, MaxInputOversizedNotSent)
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
-    ASSERT_EQ(0, cfg_str(sender, "max_datagram", "600"));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "600"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
@@ -401,7 +396,6 @@ TEST(LoopbackTest, FecNoneFromStart)
         2000,
         [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
             ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         nullptr);
 }
@@ -414,7 +408,6 @@ TEST(LoopbackTest, FecModeSwitchMidStream)
             ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
             ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
             ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         [](vstreamer::stream_sender &sender, int packets_sent) {
             if (packets_sent == 600)
@@ -464,7 +457,6 @@ TEST(LoopbackTest, SenderRestartMidStream)
         ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
         ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
         ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         ASSERT_EQ(0, sender.open());
         ASSERT_EQ(0, sender.set_enabled(true, 0));
         const uint32_t end_counter = static_cast<uint32_t>(start_counter + n_packets);
@@ -522,7 +514,6 @@ TEST(LoopbackTest, SenderRestartMidStream)
         ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
         ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
         ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         ASSERT_EQ(0, sender.open());
         ASSERT_EQ(0, sender.set_enabled(true, 0));
         t_restart = std::chrono::steady_clock::now();
@@ -568,7 +559,6 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
     ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -619,7 +609,6 @@ TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_n", "31"));
     ASSERT_EQ(0, cfg_str(sender, "fec_k", "31"));
-    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -668,7 +657,6 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
     ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -739,10 +727,8 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
-    ASSERT_EQ(0, cfg_str(sender, "max_datagram", "1476"));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "1476"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -799,7 +785,6 @@ TEST(LoopbackTest, FecBlockNoneBlockNoExtraGap)
             ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
             ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
             ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-            ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
         },
         [](vstreamer::stream_sender &sender, int packets_sent) {
             if (100 == packets_sent)
@@ -838,7 +823,6 @@ TEST(LoopbackTest, WholeBlockLossViaBurstDrop)
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
     ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-    ASSERT_EQ(0, cfg_str(sender, "max_kbps", "0"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());

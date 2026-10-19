@@ -177,13 +177,12 @@ size_t query_size_t(const vstreamer::stream_sender &sender, const char *key)
 
 }  // namespace
 
-TEST(StreamSenderTest, QueueByteLimitWithPacing)
+TEST(StreamSenderTest, QueueByteLimitUnpacedFloor)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "1000"));
     ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
     const size_t limit = query_size_t(sender, "queue_byte_limit");
-    EXPECT_GE(limit, 32768U);
+    EXPECT_GE(limit, 256U * 1024U);
 }
 
 /* Spread holds shards back for up to fec_spread_ms: the queue grows by that much traffic so
@@ -191,7 +190,6 @@ TEST(StreamSenderTest, QueueByteLimitWithPacing)
 TEST(StreamSenderTest, QueueByteLimitGrowsWithFecSpread)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "10000"));
     ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
     const size_t base = query_size_t(sender, "queue_byte_limit");
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "100"));
@@ -251,7 +249,7 @@ TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
     sender.close();
 }
 
-TEST(StreamSenderTest, QueueByteCapReturnsEagainUnderPacing)
+TEST(StreamSenderTest, QueueByteCapReturnsEagainWhenSpreadBacksQueue)
 {
     const int port = ephemeral_udp_port();
     ASSERT_GT(port, 0);
@@ -260,8 +258,9 @@ TEST(StreamSenderTest, QueueByteCapReturnsEagainUnderPacing)
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "stream", host_port));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "100"));
-    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "50"));
+    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
 
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
@@ -290,44 +289,6 @@ TEST(StreamSenderTest, QueueByteCapReturnsEagainUnderPacing)
     EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
 
     sender.close();
-}
-
-TEST(StreamSenderTest, MaxKbpsReconfigureWhileSending)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::stream_sender   sender;
-    vstreamer::stream_receiver receiver;
-    const std::string          host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
-    ASSERT_EQ(0, cfg(receiver, "listen", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "500"));
-
-    ASSERT_EQ(0, receiver.open());
-    ASSERT_EQ(0, sender.open());
-    ASSERT_EQ(0, sender.set_enabled(true, 0));
-
-    std::atomic<bool> stop {false};
-    std::thread       hammer([&]() {
-        for (int kbps = 100; kbps <= 2000 && !stop.load(); kbps += 50)
-        {
-            (void)cfg(sender, "max_kbps", std::to_string(kbps));
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    });
-
-    for (int i = 0; i < 500; ++i)
-    {
-        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 128);
-        (void)sender.input(std::move(pkt));
-    }
-    stop = true;
-    hammer.join();
-
-    sender.close();
-    receiver.close();
 }
 
 TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
@@ -423,89 +384,11 @@ TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
     close(rx);
 }
 
-TEST(StreamSenderTest, MaxKbpsPacesNearTheCapAndLiftingItReleases)
+TEST(StreamSenderTest, WirePaceAndMaxDatagramConfigureRejected)
 {
-    const int rx = socket(AF_INET, SOCK_DGRAM, 0);
-    ASSERT_GE(rx, 0);
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ASSERT_EQ(0, bind(rx, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
-    socklen_t alen = sizeof(addr);
-    ASSERT_EQ(0, getsockname(rx, reinterpret_cast<sockaddr *>(&addr), &alen));
-    int rcvbuf = 4 << 20;
-    setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "2000"));
-    ASSERT_EQ(0, sender.open());
-    ASSERT_EQ(0, sender.set_enabled(true, 0));
-
-    std::atomic<bool> stop {false};
-    std::thread       feeder([&]() {
-        uint32_t i = 0;
-        while (!stop.load())
-        {
-            if (sender.input(vstreamer::test_pdu::make_stream_dgram(i, 1400)) == 0)
-            {
-                ++i;
-            }
-            else
-            {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        }
-    });
-    /* Bytes and datagrams that arrive within ms. */
-    const auto drain = [rx](int ms, size_t *bytes) {
-        int        got = 0;
-        pollfd     pfd {rx, POLLIN, 0};
-        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-        while (std::chrono::steady_clock::now() < end)
-        {
-            if (poll(&pfd, 1, 5) > 0)
-            {
-                uint8_t       b[2048];
-                const ssize_t n = recv(rx, b, sizeof(b), 0);
-                if (n > 0)
-                {
-                    ++got;
-                    *bytes += static_cast<size_t>(n);
-                }
-            }
-        }
-        return got;
-    };
-
-    /* The token bucket used to drop the credit it had earned whenever a datagram did not fit,
-     * so a 2000 kbit/s cap delivered a fraction of that. */
-    size_t bytes = 0;
-    drain(500, &bytes);
-    bytes = 0;
-    drain(2000, &bytes);
-    const double kbps = static_cast<double>(bytes) * 8.0 / 2.0 / 1000.0;
-    EXPECT_GT(kbps, 2000 * 0.8);
-    EXPECT_LT(kbps, 2000 * 1.15);
-
-    /* Below one datagram per burst window (~47 kbit/s) a full datagram must still pass. */
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "20"));
-    drain(300, &bytes);
-    EXPECT_GE(drain(1500, &bytes), 1);
-
-    /* At 1 kbit/s the send thread waits on one datagram for ~12 s; lifting the cap releases it
-     * and the queue at once instead of after the old rate is paid off. */
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "1"));
-    drain(300, &bytes);
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "0"));
-    EXPECT_GT(drain(300, &bytes), 20);
-
-    stop = true;
-    feeder.join();
-    sender.close();
-    close(rx);
+    EXPECT_EQ(-ENOTSUP, cfg(sender, "max_kbps", "1000"));
+    EXPECT_EQ(-ENOTSUP, cfg(sender, "max_datagram", "600"));
 }
 
 namespace
@@ -774,24 +657,24 @@ TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
 
 TEST(StreamSenderTest, MaxInputRawAndFecModes)
 {
+    constexpr size_t k_dg = static_cast<size_t>(vstreamer::stream_sender::k_wire_datagram_bytes);
+
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "max_datagram", "1472"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
     ASSERT_EQ(0, sender.open());
     const size_t fec_in = query_size_t(sender, "max_input");
-    EXPECT_EQ(1472U - 11U, fec_in);
+    EXPECT_EQ(k_dg - 11U, fec_in);
     sender.close();
 
     vstreamer::stream_sender raw;
     ASSERT_EQ(0, cfg(raw, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(raw, "max_datagram", "1472"));
     ASSERT_EQ(0, cfg(raw, "fec", "none"));
     ASSERT_EQ(0, raw.open());
     const size_t raw_in = query_size_t(raw, "max_input");
-    EXPECT_EQ(1472U - 4U, raw_in);
+    EXPECT_EQ(k_dg - 4U, raw_in);
     raw.close();
 }
 
@@ -952,15 +835,17 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "stream", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "10"));
-    ASSERT_EQ(0, cfg(sender, "queue_ms", "200"));
+    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
+    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "50"));
+    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 
-    std::vector<uint8_t> payload(256, 0x5A);
+    std::vector<uint8_t> payload(1000, 0x5A);
     bool                 saw_eagain = false;
-    for (int i = 0; i < 800; ++i)
+    for (int i = 0; i < 400; ++i)
     {
         vstreamer::component_pdu pdu;
         pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
@@ -976,8 +861,8 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
     }
     EXPECT_TRUE(saw_eagain);
 
-    /* The pacer keeps sending, so a slot can free between the EAGAIN above and this push;
-     * the push then succeeds and refills the queue. Retry until one is refused. */
+    /* The send thread may drain a slot between the EAGAIN above and this push; retry until one is
+     * refused. */
     bool refused = false;
     for (int attempt = 0; attempt < 50 && !refused; ++attempt)
     {
@@ -1015,8 +900,9 @@ TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
     ASSERT_EQ(0, cfg(sender, "stream", host_port));
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
-    ASSERT_EQ(0, cfg(sender, "max_kbps", "10"));
-    ASSERT_EQ(0, cfg(sender, "queue_ms", "100"));
+    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
+    ASSERT_EQ(0, cfg(sender, "queue_ms", "50"));
+    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, sender.open());
     ASSERT_EQ(0, sender.set_enabled(true, 0));
 

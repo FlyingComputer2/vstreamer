@@ -571,18 +571,7 @@ int main(int argc, char **argv)
     cfg_str(sender, "stream", stream_buf);
     cfg_str(sender, "mtu", mtu_buf);
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
-    cfg_str(sender, "max_datagram", "1476");
     cfg_str(rcv, "max_datagram", "1476");
-    if (const char *pace = std::getenv("VSTREAMER_WIRE_PACE_KBPS");
-        nullptr != pace && pace[0] != '\0' && 0 != std::strcmp(pace, "0"))
-    {
-        if (cfg_str(sender, "max_kbps", pace) < 0)
-        {
-            return 1;
-        }
-        std::fprintf(stderr, "%s: UDP wire pace %s kb/s (VSTREAMER_WIRE_PACE_KBPS)\n", app_label,
-                     pace);
-    }
     cfg_str(rcv, "listen", listen_buf);
     if (!telemetry)
     {

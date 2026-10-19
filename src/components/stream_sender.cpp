@@ -127,37 +127,29 @@ stream_sender::stream_sender()
 size_t stream_sender::queue_byte_limit() const
 {
     std::lock_guard<std::mutex> lock(mu);
-    const int cap_kbps = max_wire_kbps.load(std::memory_order_relaxed);
-    double    rate_bps = 0.;
-    if (cap_kbps > 0)
-    {
-        rate_bps = static_cast<double>(cap_kbps) * 125.0;
-    }
-    else
-    {
-        /* ingress_kbps is the app rate; parity adds n/k on the wire. */
-        rate_bps = static_cast<double>(ingress_kbps) * 125.0 *
-                   static_cast<double>(effective_fec_n()) /
-                   static_cast<double>(effective_fec_k());
-    }
+    /* ingress_kbps is the app rate; parity adds n/k on the wire. */
+    const double rate_bps = static_cast<double>(ingress_kbps) * 125.0 *
+                            static_cast<double>(effective_fec_n()) /
+                            static_cast<double>(effective_fec_k());
     /* Spread holds each block's shards back for up to fec_spread_ms on top of the normal
      * queueing, so the queue holds that much more traffic before it rejects SDUs. */
     const int    window_ms = queue_ms + fec_spread_ms.load(std::memory_order_relaxed);
     const size_t scaled =
         static_cast<size_t>(rate_bps * static_cast<double>(window_ms) / 1000.0);
-    if (cap_kbps > 0)
-    {
-        /* Paced: the cap bounds how stale queued data may get. */
-        return std::max<size_t>(k_queue_min_paced_bytes, scaled);
-    }
-    /* Unpaced: the queue only absorbs bursts. A keyframe and all of its parity are enqueued
-     * before the send thread runs; evicting from the head then drops unsent data shards of a
-     * block whose first shards are already on the wire, and the receiver rebuilds them from
-     * parity only after later packets, which the depayloader sees as reordering. */
+    /* The queue absorbs bursts. A keyframe and all of its parity are enqueued before the send
+     * thread runs; evicting from the head then drops unsent data shards of a block whose first
+     * shards are already on the wire, and the receiver rebuilds them from parity only after
+     * later packets, which the depayloader sees as reordering. */
     const size_t unpaced_min =
         k_queue_min_unpaced_app_bytes * static_cast<size_t>(effective_fec_n()) /
         static_cast<size_t>(effective_fec_k());
-    const size_t wire_min = std::max<size_t>(256U * 1024U, unpaced_min);
+    size_t wire_min = std::max<size_t>(256U * 1024U, unpaced_min);
+    const int spread_ms = fec_spread_ms.load(std::memory_order_relaxed);
+    if (spread_ms > 0 && queue_ms > 0)
+    {
+        wire_min = wire_min * static_cast<size_t>(queue_ms + spread_ms) /
+                   static_cast<size_t>(queue_ms);
+    }
     return std::max<size_t>(wire_min, scaled);
 }
 
@@ -182,13 +174,13 @@ int stream_sender::effective_fec_n() const
 size_t stream_sender::max_fec_shard_bytes() const
 {
     std::lock_guard<std::mutex> lock(mu);
-    return stream_max_fec_shard(static_cast<size_t>(max_datagram));
+    return stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes));
 }
 
 size_t stream_sender::max_raw_sdu_bytes() const
 {
     std::lock_guard<std::mutex> lock(mu);
-    return stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+    return stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
 }
 
 stream_sender::~stream_sender()
@@ -211,14 +203,14 @@ bool stream_sender::queue_has_room_for_sdu() const
         std::lock_guard<std::mutex> lock(mu);
         if (fec_mode_e::none == fec_mode)
         {
-            pkt_bytes = k_stream_header_len + stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+            pkt_bytes = k_stream_header_len + stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
         }
         else
         {
             /* One SDU can close a block: its data shard plus all of the block's parity. */
             pkts = static_cast<size_t>(std::max(1, fec_n - fec_k + 1));
             pkt_bytes =
-                k_stream_header_len + stream_max_fec_shard(static_cast<size_t>(max_datagram));
+                k_stream_header_len + stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes));
         }
     }
     const size_t limit = queue_byte_limit();
@@ -242,8 +234,8 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
     {
         std::lock_guard<std::mutex> lock(mu);
         payload_max =
-            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(max_datagram))
-                         : stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))
+                         : stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
     }
     if (0 == payload_max || len > payload_max)
     {
@@ -304,8 +296,8 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     {
         std::lock_guard<std::mutex> lock(mu);
         payload_max =
-            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(max_datagram))
-                         : stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))
+                         : stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
     }
     if (0 == payload_max || len > payload_max)
     {
@@ -375,50 +367,6 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
         auto &pkt = (*air)[j];
         enqueue_wire_copy(pkt.data(), pkt.size(), true,
                           t0 + fec_spread_offset(j, air->size(), spread));
-    }
-}
-
-void stream_sender::pace_wire_send(size_t bytes, send_thread_wdt *wdt)
-{
-    while (!send_stop.load(std::memory_order_relaxed))
-    {
-        if (nullptr != wdt)
-        {
-            wdt->feed();
-        }
-        /* Re-read every pass: lifting or changing the cap while a datagram waits takes effect
-         * at once instead of after the old rate pays it off. */
-        const int cap_kbps = max_wire_kbps.load(std::memory_order_relaxed);
-        if (cap_kbps <= 0)
-        {
-            return;
-        }
-        if (pace_reset.exchange(false, std::memory_order_relaxed))
-        {
-            pace_last_sec = 0.;
-        }
-        const double max_bytes_per_sec = static_cast<double>(cap_kbps) * 1000.0 / 8.0;
-        /* At least one datagram, or a cap below ~47 kbit/s could never pass a full one. */
-        const double burst_bytes = std::max(max_bytes_per_sec * 0.25, static_cast<double>(bytes));
-
-        const double now = now_sec();
-        if (pace_last_sec <= 0.)
-        {
-            pace_last_sec = now;
-            pace_bucket_bytes = burst_bytes;
-        }
-        pace_bucket_bytes =
-            std::min(burst_bytes, pace_bucket_bytes + (now - pace_last_sec) * max_bytes_per_sec);
-        pace_last_sec = now;
-        if (pace_bucket_bytes >= static_cast<double>(bytes))
-        {
-            pace_bucket_bytes -= static_cast<double>(bytes);
-            return;
-        }
-        /* Keep the credit already earned and sleep only for the rest. */
-        const double sleep_s =
-            (static_cast<double>(bytes) - pace_bucket_bytes) / max_bytes_per_sec;
-        std::this_thread::sleep_for(std::chrono::duration<double>(std::min(sleep_s, 0.05)));
     }
 }
 
@@ -574,11 +522,6 @@ void stream_sender::send_thread_main()
     while (!send_stop)
     {
         wdt.feed();
-        if (pace_reset.exchange(false, std::memory_order_relaxed))
-        {
-            pace_bucket_bytes = 0.;
-            pace_last_sec = 0.;
-        }
 
         int wait_ms = 50;
         {
@@ -689,7 +632,6 @@ void stream_sender::send_thread_main()
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
             stream_header_stamp_sequence(wire_buf.u8(), seq);
         }
-        pace_wire_send(wire_buf.size(), &wdt);
         const ssize_t n = sendto(send_fd, wire_buf.u8(), wire_buf.size(), 0,
                                     reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
         if (n < 0)
@@ -1211,30 +1153,6 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
-    if ("max_datagram" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 64 || v > 65507 || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            max_datagram = static_cast<int>(v);
-        }
-        return reinit_fec_if_active();
-    }
-    if ("max_kbps" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 0 || v > 500'000 || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        max_wire_kbps.store(static_cast<int>(v), std::memory_order_relaxed);
-        pace_reset.store(true, std::memory_order_relaxed);
-        return 0;
-    }
     if ("fec_spread_ms" == key)
     {
         int64_t v = 0;
@@ -1492,21 +1410,19 @@ int stream_sender::query(std::string_view key, std::string *value) const
     }
     if ("max_datagram" == key)
     {
-        std::lock_guard<std::mutex> lock(mu);
         char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", max_datagram);
+        std::snprintf(buf, sizeof(buf), "%d", k_wire_datagram_bytes);
         *value = buf;
         return 0;
     }
     if ("max_input" == key)
     {
         fec_mode_e mode = fec_mode_e::block;
-        int        dg = 0;
         {
             std::lock_guard<std::mutex> lock(mu);
             mode = fec_mode;
-            dg = max_datagram;
         }
+        const int dg = k_wire_datagram_bytes;
         size_t max_in = 0;
         if (fec_mode_e::none == mode)
         {
