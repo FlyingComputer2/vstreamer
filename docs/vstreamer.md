@@ -217,7 +217,6 @@ recv when `telemetry` is on, and `configure()`. Lock order `mu` → `fec_mu`.
 |-----|-----|------------------|
 | `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
-| `mtu` | C | 200..1500, default 1400 (diagnostic; packetization is upstream) |
 | `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
 | `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
 | `queue_ms` | C Q | 10..2000, default 100 |

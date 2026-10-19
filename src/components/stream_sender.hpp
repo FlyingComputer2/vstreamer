@@ -113,7 +113,6 @@ private:
 
     std::string stream_spec;
     bool        telemetry_on = true;
-    int         mtu = 1400;
 
     int         send_fd = -1;
     sockaddr_in dst_addr {};

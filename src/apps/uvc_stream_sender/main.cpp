@@ -240,7 +240,6 @@ int main(int argc, char **argv)
     cfg(enc, "gop", gop_buf);
     cfg(pay, "fps", fps_buf);
     cfg(pay, "mtu", mtu_buf);
-    cfg(sender, "mtu", mtu_buf);
     cfg(sender, "stream", stream_buf);
     if (no_telemetry)
     {

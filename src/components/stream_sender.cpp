@@ -649,7 +649,6 @@ int stream_sender::open()
     int         k = 0;
     int         n = 0;
     int         timeout_ms = 0;
-    int         mtu_local = 0;
     {
         std::lock_guard<std::mutex> lock(mu);
         if (opened)
@@ -664,7 +663,6 @@ int stream_sender::open()
         k = effective_fec_k();
         n = effective_fec_n();
         timeout_ms = fec_timeout_ms;
-        mtu_local = mtu;
     }
     const size_t shard_bytes = max_fec_shard_bytes();
     const bool   raw_mode = (fec_mode == fec_mode_e::none);
@@ -816,7 +814,7 @@ int stream_sender::open()
             }
         }
 
-        std::fprintf(stderr, "stream_sender: udp://%s:%d mtu=%d\n", host, port, mtu_local);
+        std::fprintf(stderr, "stream_sender: udp://%s:%d\n", host, port);
     }
     return 0;
 }
@@ -1137,20 +1135,6 @@ int stream_sender::configure(std::string_view key, std::string_view value)
     {
         std::lock_guard<std::mutex> lock(mu);
         stream_spec.assign(value.data(), value.size());
-        return 0;
-    }
-    if ("mtu" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 200 || v > 1500 ||
-            value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            mtu = static_cast<int>(v);
-        }
         return 0;
     }
     if ("fec_spread_ms" == key)

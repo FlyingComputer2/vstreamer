@@ -133,8 +133,8 @@ TEST(StreamSenderTest, BogusHostnameReturnsQuickly)
 TEST(StreamSenderTest, ConfigureLongValueRejected)
 {
     vstreamer::stream_sender sender;
-    const std::string        long_mtu(200, '9');
-    EXPECT_LT(cfg(sender, "mtu", long_mtu), 0);
+    const std::string        long_ms(200, '9');
+    EXPECT_LT(cfg(sender, "queue_ms", long_ms), 0);
 }
 
 namespace
@@ -384,11 +384,12 @@ TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
     close(rx);
 }
 
-TEST(StreamSenderTest, WirePaceAndMaxDatagramConfigureRejected)
+TEST(StreamSenderTest, RemovedEgressKnobsConfigureRejected)
 {
     vstreamer::stream_sender sender;
     EXPECT_EQ(-ENOTSUP, cfg(sender, "max_kbps", "1000"));
     EXPECT_EQ(-ENOTSUP, cfg(sender, "max_datagram", "600"));
+    EXPECT_EQ(-ENOTSUP, cfg(sender, "mtu", "1400"));
 }
 
 namespace

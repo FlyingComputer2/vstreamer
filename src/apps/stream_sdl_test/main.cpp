@@ -569,7 +569,6 @@ int main(int argc, char **argv)
     cfg_str(depay, "fps", fps_buf);
     cfg_str(pay, "mtu", mtu_buf);
     cfg_str(sender, "stream", stream_buf);
-    cfg_str(sender, "mtu", mtu_buf);
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
     cfg_str(rcv, "max_datagram", "1476");
     cfg_str(rcv, "listen", listen_buf);
