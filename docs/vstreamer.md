@@ -210,12 +210,12 @@ FU-A, capture-time header extension).
 | `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
 **`stream_sender`** — UDP egress with RS block-erasure FEC, pacing and a bounded queue. Threads:
-`input()` (caller), the send thread, and `configure()`. Lock order `mu` → `fec_mu`.
+`input()` (caller), the send thread, a `default_io_reactor` thread for reverse telemetry
+recv when `telemetry` is on, and `configure()`. Lock order `mu` → `fec_mu`.
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
-| `local` | C Q | bind `[host:]port` before `open()`, port 0 = ephemeral (default `0.0.0.0:0`); `query("local")` returns the bound address once open |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
 | `mtu` | C | 200..1500, default 1400 |
 | `max_datagram` | C Q | 64..65507, default 1472 (UDP payload incl. headers), live |
@@ -227,7 +227,7 @@ FU-A, capture-time header extension).
 | `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ n ≤ 31, default 10 / 12, live (`sdu_base` keeps counting) |
 | `fec_timeout_ms` | C | 0..60 000, default 20 (flush a partial block after N ms). 0 never flushes: a block leaves only once `fec_k` SDUs fill it |
 | `fec_spread_ms` | C Q | 0..250, default 0 (spread each FEC block's shards over N ms: air position p of c at t0 + p × spread / c). Capped at 250: the receiver assumes that spread until it has measured one. The receiver measures the spread from arrival times and sets each block's deadline from it (see `stream_receiver`). Each shard leaves at its release time; a send thread that fell behind sends the shards already due back to back until it is on schedule again. `send_late_max_ms` shows how late datagrams left. Shards wait in the send queue until due; `queue_byte_limit` grows with the spread. Lowering it pulls already-queued shards in to the new spread. On the ESP32-P4 the PIE FEC encoder (`CONFIG_VSTREAMER_RS_PIE`, default on) sends parity in tighter bursts that compete with the H.264 encoder for PSRAM: about 1 encoder fps lost at spread 0, 0.1–0.3 fps at 25 ms or more |
-| `send_cpu`, `send_prio`, `telemetry_cpu`, `telemetry_prio` | C Q | thread placement, see Threading |
+| `send_cpu`, `send_prio` | C Q | send-thread placement, see Threading |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
 | `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
 | `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
@@ -526,16 +526,15 @@ that same socket (NAT-style return path).
 
 | Side | winject mode | Works | Configure |
 |------|--------------|-------|-----------|
-| Rover (`stream_sender`) | server (`rx` only) | yes | `stream=<winject rx>`; `local` any |
-| Rover | static (`rx` + `tx`) | yes only with fixed sender port | `local=<ip:port>` = winject `tx` |
+| Rover (`stream_sender`) | server (`rx` only) | yes | `stream=<winject rx>` (ephemeral source port) |
+| Rover | static (`rx` + `tx`) | use server mode or colocated queue path | fixed source port not configured on sender |
 | Rover | client (`tx` only) | no | — |
 | Ground (`stream_receiver`) | client (`tx` only) | yes | `listen=<winject tx>` |
 | Ground | static | yes | `listen=<winject tx>` |
 | Ground | server (`rx` only) | no | — |
 
-Sender `configure("local", "[host:]port")` fixes the source port for winject **static** on the
-rover. The upstream's `txbus`/`rxbus` must pair in both directions on both managers, or the
-reports are not carried back. In **server** mode winject replies to the last app that sent to its
+The sender binds `0.0.0.0:0` (ephemeral port). The upstream's `txbus`/`rxbus` must pair in both
+directions on both managers, or the reports are not carried back. In **server** mode winject replies to the last app that sent to its
 `rx` port, so another app sending there takes over the return path until `stream_sender` sends
 again (within one frame while media flows). winject's upstream FEC passes the 48-byte reports
 through unchanged. The return path costs about 3.8 kbit/s at the default 100 ms interval.

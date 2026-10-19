@@ -45,7 +45,6 @@ void usage(const char *prog)
                  "  --gop N             default fps\n"
                  "  --max-datagram N    default 1476\n"
                  "  --fec-spread-ms N   spread each FEC block over N ms (>=0, default 0)\n"
-                 "  --local [HOST:]PORT stream_sender bind (winject static)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
                  "  --noise-bandwidth N 0..100 (default 100)\n"
@@ -74,7 +73,6 @@ int main(int argc, char **argv)
     int         gop = 0;
     int         max_datagram = 1476;
     int         fec_spread_ms = 0;
-    const char *local_bind = nullptr;
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
     int         pregenerate = 30;
@@ -133,11 +131,6 @@ int main(int argc, char **argv)
         if (0 == std::strcmp(argv[i], "--fec-spread-ms") && i + 1 < argc)
         {
             fec_spread_ms = std::atoi(argv[++i]);
-            continue;
-        }
-        if (0 == std::strcmp(argv[i], "--local") && i + 1 < argc)
-        {
-            local_bind = argv[++i];
             continue;
         }
         if (0 == std::strcmp(argv[i], "--console") && i + 1 < argc)
@@ -256,10 +249,6 @@ int main(int argc, char **argv)
     cfg(pay, "mtu", mtu_buf);
     cfg(sender, "mtu", mtu_buf);
     cfg(sender, "stream", stream_buf);
-    if (nullptr != local_bind)
-    {
-        cfg(sender, "local", local_bind);
-    }
     if (no_telemetry)
     {
         cfg(sender, "telemetry", "off");

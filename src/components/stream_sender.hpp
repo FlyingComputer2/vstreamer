@@ -23,6 +23,7 @@
 #include "core/component_sink.hpp"
 #include "core/buffer_pool.hpp"
 #include "core/component_input.hpp"
+#include "core/default_io_reactor.hpp"
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
@@ -76,8 +77,8 @@ private:
     struct send_thread_wdt;
     void send_thread_main();
     void stop_send_thread();
-    void stop_telemetry_thread();
-    void telemetry_thread_main();
+    void stop_io_reactor();
+    void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
     void pace_wire_send(size_t bytes, send_thread_wdt *wdt = nullptr);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
@@ -110,7 +111,6 @@ private:
     bool               opened = false;
 
     std::string stream_spec;
-    std::string local_spec = "0.0.0.0:0";
     bool        telemetry_on = true;
     int         mtu = 1400;
     int         max_datagram = 1472;
@@ -148,9 +148,9 @@ private:
     std::thread       send_thread;
     thread_place      send_place;      /* keys send_cpu / send_prio */
     std::atomic<bool> send_stop {false};
-    std::thread       telemetry_thread;
-    thread_place      telemetry_place; /* keys telemetry_cpu / telemetry_prio */
-    std::atomic<bool> telemetry_stop {false};
+    default_io_reactor io_reactor_;
+    std::thread        io_reactor_thread_;
+    bool               io_reactor_running = false;
 
     mutable std::mutex peer_mu;
     bool               peer_have = false;

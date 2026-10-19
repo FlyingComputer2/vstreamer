@@ -35,6 +35,72 @@ int cfg(vstreamer::component &c, std::string_view key, std::string_view value)
     return c.configure(key, value);
 }
 
+/* Opens sender to a loopback sink, sends one datagram, returns the bound source address for
+ * reverse telemetry injection. */
+bool open_sender_with_reply_addr(vstreamer::stream_sender &sender, sockaddr_in *reply_dst)
+{
+    if (nullptr == reply_dst)
+    {
+        return false;
+    }
+    const int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    if (rx < 0)
+    {
+        return false;
+    }
+    sockaddr_in bind_addr {};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(rx, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
+    {
+        close(rx);
+        return false;
+    }
+    socklen_t len = sizeof(bind_addr);
+    if (getsockname(rx, reinterpret_cast<sockaddr *>(&bind_addr), &len) < 0)
+    {
+        close(rx);
+        return false;
+    }
+    const std::string stream =
+        "127.0.0.1:" + std::to_string(ntohs(bind_addr.sin_port));
+    if (0 != cfg(sender, "stream", stream) || 0 != cfg(sender, "fec", "none") ||
+        0 != sender.open() || 0 != sender.set_enabled(true, 0))
+    {
+        close(rx);
+        return false;
+    }
+    if (0 != sender.input(vstreamer::test_pdu::make_stream_dgram(0, 16)))
+    {
+        sender.close();
+        close(rx);
+        return false;
+    }
+    uint8_t buf[256];
+    sockaddr_in from {};
+    from.sin_family = AF_INET;
+    len = sizeof(from);
+    pollfd pfd {rx, POLLIN, 0};
+    bool   got = false;
+    for (int i = 0; i < 50; ++i)
+    {
+        if (poll(&pfd, 1, 20) > 0 &&
+            recvfrom(rx, buf, sizeof(buf), 0, reinterpret_cast<sockaddr *>(&from), &len) > 0)
+        {
+            got = true;
+            break;
+        }
+    }
+    close(rx);
+    if (!got)
+    {
+        sender.close();
+        return false;
+    }
+    *reply_dst = from;
+    return true;
+}
+
 }  // namespace
 
 TEST(StreamSenderTest, OpenWithHostnameDoesNotHang)
@@ -473,26 +539,9 @@ vstreamer::stream_link_report make_report(uint32_t session, uint16_t seq, uint64
 
 TEST(StreamSenderTest, PeerLinkReportSnapshot)
 {
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, sender.open());
-
-    std::string local;
-    ASSERT_EQ(0, sender.query("local", &local));
-    EXPECT_FALSE(local.empty());
-
-    char          host[64];
-    int           bound_port = 0;
-    ASSERT_EQ(2, std::sscanf(local.c_str(), "%63[^:]:%d", host, &bound_port));
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(bound_port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    sockaddr_in              dst {};
+    ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
 
     const int s = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(s, 0);
@@ -521,73 +570,11 @@ TEST(StreamSenderTest, PeerLinkReportSnapshot)
     sender.close();
 }
 
-TEST(StreamSenderTest, LocalBindFixesSourcePort)
-{
-    const int free_port = ephemeral_udp_port();
-    ASSERT_GT(free_port, 0);
-    const int rx_port = ephemeral_udp_port();
-    ASSERT_GT(rx_port, 0);
-
-    const std::string local = "127.0.0.1:" + std::to_string(free_port);
-    const std::string rx = "127.0.0.1:" + std::to_string(rx_port);
-
-    vstreamer::stream_sender   sender;
-    vstreamer::stream_receiver receiver;
-    ASSERT_EQ(0, cfg(sender, "local", local));
-    ASSERT_EQ(0, cfg(sender, "stream", rx));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, cfg(receiver, "listen", rx));
-
-    ASSERT_EQ(0, receiver.open());
-    ASSERT_EQ(0, sender.open());
-    ASSERT_EQ(0, sender.set_enabled(true, 0));
-
-    auto pkt = vstreamer::test_pdu::make_stream_dgram(0, 64);
-    ASSERT_EQ(0, sender.input(std::move(pkt)));
-
-    std::string qlocal;
-    ASSERT_EQ(0, sender.query("local", &qlocal));
-    EXPECT_EQ(local, qlocal);
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    std::string peer;
-    while (peer.empty() && std::chrono::steady_clock::now() < deadline)
-    {
-        (void)receiver.query("telemetry_peer", &peer);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    EXPECT_EQ(local, peer);
-
-    vstreamer::stream_sender sender2;
-    ASSERT_EQ(0, cfg(sender2, "local", local));
-    ASSERT_EQ(0, cfg(sender2, "stream", rx));
-    ASSERT_EQ(0, cfg(sender2, "fec", "none"));
-    EXPECT_LT(sender2.open(), 0);
-
-    sender.close();
-    receiver.close();
-}
-
 TEST(StreamSenderTest, PeerReportSeqGapAndReject)
 {
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, sender.open());
-
-    std::string local;
-    ASSERT_EQ(0, sender.query("local", &local));
-    char host[64];
-    int  bound_port = 0;
-    ASSERT_EQ(2, std::sscanf(local.c_str(), "%63[^:]:%d", host, &bound_port));
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(bound_port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    sockaddr_in              dst {};
+    ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
 
     const int s = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(s, 0);
@@ -613,24 +600,9 @@ TEST(StreamSenderTest, PeerReportSeqGapAndReject)
 
 TEST(StreamSenderTest, PeerReportNewSession)
 {
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, sender.open());
-
-    std::string local;
-    ASSERT_EQ(0, sender.query("local", &local));
-    char host[64];
-    int  bound_port = 0;
-    ASSERT_EQ(2, std::sscanf(local.c_str(), "%63[^:]:%d", host, &bound_port));
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(bound_port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    sockaddr_in              dst {};
+    ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
 
     const int s = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(s, 0);
@@ -653,24 +625,9 @@ TEST(StreamSenderTest, PeerReportNewSession)
 
 TEST(StreamSenderTest, PeerReportRejectsGarbage)
 {
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, sender.open());
-
-    std::string local;
-    ASSERT_EQ(0, sender.query("local", &local));
-    char host[64];
-    int  bound_port = 0;
-    ASSERT_EQ(2, std::sscanf(local.c_str(), "%63[^:]:%d", host, &bound_port));
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(bound_port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    sockaddr_in              dst {};
+    ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
 
     const int s = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(s, 0);
@@ -697,20 +654,8 @@ TEST(StreamSenderTest, PeerReportRejectsGarbage)
 TEST(StreamSenderTest, PeerReportAgeGrows)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    ASSERT_EQ(0, sender.open());
-
-    std::string local;
-    ASSERT_EQ(0, sender.query("local", &local));
-    char host[64];
-    int  bound_port = 0;
-    ASSERT_EQ(2, std::sscanf(local.c_str(), "%63[^:]:%d", host, &bound_port));
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(bound_port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
+    sockaddr_in              dst {};
+    ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
 
     const int s = socket(AF_INET, SOCK_DGRAM, 0);
     ASSERT_GE(s, 0);
@@ -744,8 +689,6 @@ TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
 {
     vstreamer::stream_sender sender;
     std::string               val;
-    ASSERT_EQ(0, sender.query("local", &val));
-    EXPECT_EQ("0.0.0.0:0", val);
     ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
     ASSERT_EQ(0, sender.open());
     for (const char *key : {"peer_udp_packet_received", "peer_fec_packet_received",
@@ -758,40 +701,6 @@ TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
     ASSERT_EQ(0, sender.query("peer_report_age_ms", &val));
     EXPECT_EQ("-1", val);
     sender.close();
-}
-
-/* local = [host:]port, validated at configure(); port 0 = ephemeral. */
-TEST(StreamSenderTest, LocalSpecForms)
-{
-    {
-        vstreamer::stream_sender sender;
-        EXPECT_EQ(-EINVAL, sender.configure("local", "junk"));
-        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:70000"));
-        EXPECT_EQ(-EINVAL, sender.configure("local", "127.0.0.1:"));
-    }
-    {
-        const int port = ephemeral_udp_port();
-        ASSERT_GT(port, 0);
-        vstreamer::stream_sender sender;
-        ASSERT_EQ(0, sender.configure("local", std::to_string(port)));
-        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
-        ASSERT_EQ(0, sender.open());
-        std::string val;
-        ASSERT_EQ(0, sender.query("local", &val));
-        EXPECT_EQ("0.0.0.0:" + std::to_string(port), val);
-        sender.close();
-    }
-    {
-        vstreamer::stream_sender sender;
-        ASSERT_EQ(0, sender.configure("local", "127.0.0.1:0"));
-        ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
-        ASSERT_EQ(0, sender.open());
-        std::string val;
-        ASSERT_EQ(0, sender.query("local", &val));
-        EXPECT_EQ(0U, val.rfind("127.0.0.1:", 0)) << val;
-        EXPECT_NE("127.0.0.1:0", val);
-        sender.close();
-    }
 }
 
 namespace

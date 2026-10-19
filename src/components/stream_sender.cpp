@@ -15,8 +15,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <iterator>
-#include <poll.h>
+#include <memory>
 #include <random>
 #include <thread>
 #include <vector>
@@ -36,7 +37,7 @@ namespace
 
 /* Thread stacks on ESP-IDF; ignored on Linux. */
 constexpr size_t k_send_stack_bytes = 12 * 1024;
-constexpr size_t k_telemetry_stack_bytes = 4 * 1024;
+constexpr size_t k_io_reactor_stack_bytes = 4 * 1024;
 
 double now_sec()
 {
@@ -65,31 +66,6 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
 size_t wire_packet_bytes(const bfc::shared_sized_buffer &buf)
 {
     return buf.size();
-}
-
-/* `local` = [host:]port, port 0..65535 (0 = ephemeral). Empty = 0.0.0.0:0. */
-int parse_local_spec(std::string_view spec, std::string *host, int *port)
-{
-    if (spec.empty())
-    {
-        *host = "0.0.0.0";
-        *port = 0;
-        return 0;
-    }
-    const size_t colon = spec.rfind(':');
-    const std::string_view port_str =
-        (std::string_view::npos == colon) ? spec : spec.substr(colon + 1);
-    const std::string_view host_str =
-        (std::string_view::npos == colon) ? std::string_view {} : spec.substr(0, colon);
-    int64_t p = 0;
-    if (port_str.empty() || port_str.size() > 5 || key_parse_i64(port_str, &p) < 0 || p < 0 ||
-        p > 65535 || host_str.size() >= 128)
-    {
-        return -EINVAL;
-    }
-    *host = host_str.empty() ? "0.0.0.0" : std::string(host_str);
-    *port = static_cast<int>(p);
-    return 0;
 }
 
 }  // namespace
@@ -457,13 +433,64 @@ void stream_sender::stop_send_thread()
     }
 }
 
-void stream_sender::stop_telemetry_thread()
+void stream_sender::stop_io_reactor()
 {
-    if (telemetry_thread.joinable())
+    if (!io_reactor_running)
     {
-        telemetry_stop = true;
-        telemetry_thread.join();
-        telemetry_stop = false;
+        return;
+    }
+    const int fd = send_fd;
+    if (fd >= 0)
+    {
+        (void)io_reactor_.rem_read_rdy(fd);
+    }
+    io_reactor_.stop();
+    if (io_reactor_thread_.joinable())
+    {
+        io_reactor_thread_.join();
+    }
+    io_reactor_running = false;
+}
+
+void stream_sender::on_telemetry_socket_read()
+{
+    uint8_t buf[512];
+    const int fd = send_fd;
+    if (fd < 0)
+    {
+        return;
+    }
+    for (;;)
+    {
+        const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT | MSG_TRUNC);
+        if (n <= 0)
+        {
+            break;
+        }
+        stream_header hdr {};
+        const uint8_t *payload = nullptr;
+        size_t         payload_len = 0;
+        if (stream_header_parse(buf, static_cast<size_t>(n), &hdr, &payload, &payload_len) < 0)
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        if (hdr.is_fec || hdr.is_stream_data)
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        stream_link_report rep {};
+        if (stream_link_report_decode(payload, payload_len, &rep) < 0)
+        {
+            std::lock_guard<std::mutex> lock(peer_mu);
+            peer_reports_rejected++;
+            continue;
+        }
+        rep.report_seq = hdr.sequence_number;
+        handle_link_report(rep);
     }
 }
 
@@ -506,67 +533,6 @@ void stream_sender::handle_link_report(const stream_link_report &report)
     peer_have = true;
     peer_report_at = std::chrono::steady_clock::now();
     peer_reports_received++;
-}
-
-void stream_sender::telemetry_thread_main()
-{
-    uint8_t buf[512];
-    while (!telemetry_stop.load(std::memory_order_relaxed))
-    {
-        int fd = -1;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            fd = send_fd;
-        }
-        if (fd < 0)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-
-        pollfd pfd {};
-        pfd.fd = fd;
-        pfd.events = POLLIN;
-        const int pr = poll(&pfd, 1, 50);
-        if (telemetry_stop.load(std::memory_order_relaxed))
-        {
-            break;
-        }
-        if (pr <= 0)
-        {
-            continue;
-        }
-
-        const ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT | MSG_TRUNC);
-        if (n <= 0)
-        {
-            continue;
-        }
-        stream_header hdr {};
-        const uint8_t *payload = nullptr;
-        size_t         payload_len = 0;
-        if (stream_header_parse(buf, static_cast<size_t>(n), &hdr, &payload, &payload_len) < 0)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        if (hdr.is_fec || hdr.is_stream_data)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        stream_link_report rep {};
-        if (stream_link_report_decode(payload, payload_len, &rep) < 0)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        rep.report_seq = hdr.sequence_number;
-        handle_link_report(rep);
-    }
 }
 
 stream_peer_link stream_sender::peer_link_snapshot() const
@@ -768,11 +734,9 @@ int stream_sender::open()
         return -EINVAL;
     }
 
-    std::string local_copy;
-    bool        telemetry = true;
+    bool telemetry = true;
     {
         std::lock_guard<std::mutex> lock(mu);
-        local_copy = local_spec;
         telemetry = telemetry_on;
     }
 
@@ -787,17 +751,12 @@ int stream_sender::open()
 
     sockaddr_in bind_addr {};
     bind_addr.sin_family = AF_INET;
+    if (resolve_ipv4_bind_addr("0.0.0.0", true, &bind_addr.sin_addr) < 0)
     {
-        std::string local_host;
-        int         local_port = 0;
-        if (parse_local_spec(local_copy, &local_host, &local_port) < 0 ||
-            resolve_ipv4_bind_addr(local_host.c_str(), true, &bind_addr.sin_addr) < 0)
-        {
-            ::close(fd);
-            return -EINVAL;
-        }
-        bind_addr.sin_port = htons(static_cast<uint16_t>(local_port));
+        ::close(fd);
+        return -EINVAL;
     }
+    bind_addr.sin_port = 0;
     if (bind(fd, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
     {
         const int err = errno;
@@ -864,12 +823,55 @@ int stream_sender::open()
             peer_reports_lost = 0;
             peer_reports_rejected = 0;
         }
-        telemetry_stop = false;
         if (telemetry)
         {
-            telemetry_thread =
-                spawn_thread(telemetry_place.opts("vs_telemetry", k_telemetry_stack_bytes),
-                             &stream_sender::telemetry_thread_main, this);
+            if (!io_reactor_.add_read_rdy(
+                    send_fd,
+                    [this]()
+                    {
+                        on_telemetry_socket_read();
+                    }))
+            {
+                send_stop = true;
+                stop_send_thread();
+                ::close(send_fd);
+                send_fd = -1;
+                have_dst = false;
+                opened = false;
+                return -EIO;
+            }
+            io_reactor_running = true;
+            const auto started = std::make_shared<std::promise<void>>();
+            const std::future<void> started_fut = started->get_future();
+            io_reactor_thread_ = spawn_thread(
+                thread_opts {"vs_io", k_io_reactor_stack_bytes},
+                [this, started]()
+                {
+                    /* Queue before run() so the callback runs only after run() sets
+                     * m_running; open() waits on this before returning. */
+                    io_reactor_.wake_up(
+                        [started]()
+                        {
+                            started->set_value();
+                        });
+                    io_reactor_.run();
+                });
+            if (started_fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+            {
+                io_reactor_.stop();
+                if (io_reactor_thread_.joinable())
+                {
+                    io_reactor_thread_.join();
+                }
+                io_reactor_running = false;
+                send_stop = true;
+                stop_send_thread();
+                ::close(send_fd);
+                send_fd = -1;
+                have_dst = false;
+                opened = false;
+                return -ETIMEDOUT;
+            }
         }
 
         std::fprintf(stderr, "stream_sender: udp://%s:%d mtu=%d\n", host, port, mtu_local);
@@ -879,8 +881,7 @@ int stream_sender::open()
 
 void stream_sender::close()
 {
-    telemetry_stop = true;
-    stop_telemetry_thread();
+    stop_io_reactor();
     stop_send_thread();
     disable_fec();
 
@@ -1174,12 +1175,6 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         {
             return pr;
         }
-        if (const int pr =
-                thread_place_configure(&telemetry_place, "telemetry", key, value, opened);
-            -ENOTSUP != pr)
-        {
-            return pr;
-        }
     }
     if ("telemetry" == key)
     {
@@ -1194,22 +1189,6 @@ int stream_sender::configure(std::string_view key, std::string_view value)
             return -EBUSY;
         }
         telemetry_on = on;
-        return 0;
-    }
-    if ("local" == key)
-    {
-        std::string host;
-        int         port = 0;
-        if (parse_local_spec(value, &host, &port) < 0)
-        {
-            return -EINVAL;
-        }
-        std::lock_guard<std::mutex> lock(mu);
-        if (opened)
-        {
-            return -EBUSY;
-        }
-        local_spec.assign(value.data(), value.size());
         return 0;
     }
     if ("stream" == key)
@@ -1394,11 +1373,6 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         return pr;
     }
-    if (const int pr = thread_place_query(telemetry_place, "telemetry", key, value);
-        -ENOTSUP != pr)
-    {
-        return pr;
-    }
 
     int r = port_caps_query(input_ports(), true, key, value);
     if (0 == r || -EINVAL == r)
@@ -1410,37 +1384,6 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         std::lock_guard<std::mutex> lock(mu);
         *value = stream_spec;
-        return 0;
-    }
-    if ("local" == key)
-    {
-        int fd = -1;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            fd = send_fd;
-        }
-        if (fd < 0)
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            *value = local_spec;
-            return 0;
-        }
-        sockaddr_in bound {};
-        socklen_t   len = sizeof(bound);
-        if (getsockname(fd, reinterpret_cast<sockaddr *>(&bound), &len) < 0)
-        {
-            return -errno;
-        }
-        char host[INET_ADDRSTRLEN];
-        const char *hip = inet_ntop(AF_INET, &bound.sin_addr, host, sizeof(host));
-        if (nullptr == hip)
-        {
-            return -EINVAL;
-        }
-        char buf[64];
-        std::snprintf(buf, sizeof(buf), "%s:%u", hip,
-                      static_cast<unsigned>(ntohs(bound.sin_port)));
-        *value = buf;
         return 0;
     }
     if ("telemetry" == key)

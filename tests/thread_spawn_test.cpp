@@ -116,7 +116,7 @@ TEST(ThreadSpawnTest, PinsNewThreadOnLinux)
 }
 #endif
 
-TEST(ThreadPlaceTest, StreamSenderExposesSendAndTelemetryKeys)
+TEST(ThreadPlaceTest, StreamSenderExposesSendKeysOnly)
 {
     auto snd = vstreamer::component_factory::create_sink("stream_sender");
     if (!snd)
@@ -124,12 +124,11 @@ TEST(ThreadPlaceTest, StreamSenderExposesSendAndTelemetryKeys)
         GTEST_SKIP() << "stream_sender not built";
     }
     EXPECT_EQ(snd->configure("send_cpu", "0"), 0);
-    EXPECT_EQ(snd->configure("telemetry_prio", "7"), 0);
+    EXPECT_EQ(snd->configure("telemetry_prio", "7"), -ENOTSUP);
     std::string v;
     EXPECT_EQ(snd->query("send_cpu", &v), 0);
     EXPECT_EQ(v, "0");
-    EXPECT_EQ(snd->query("telemetry_prio", &v), 0);
-    EXPECT_EQ(v, "7");
+    EXPECT_EQ(snd->query("telemetry_prio", &v), -ENOTSUP);
     EXPECT_EQ(snd->query("send_prio", &v), 0);
     EXPECT_EQ(v, "-1");
 
