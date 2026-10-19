@@ -3,7 +3,7 @@ include(FetchContent)
 # Header-only; only src/bfc is used.
 FetchContent_Declare(bfc
     GIT_REPOSITORY https://github.com/therooftopprinz/BFC.git
-    GIT_TAG c65c59dac13bccd28b75e665680894eca3317e91
+    GIT_TAG 4b29fcc2f2932ebe6a73087af70def3b36286520
 )
 FetchContent_GetProperties(bfc)
 if(NOT bfc_POPULATED)
