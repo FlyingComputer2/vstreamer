@@ -390,13 +390,23 @@ void stream_sender::stop_io_reactor()
     const int fd = send_fd;
     if (fd >= 0)
     {
-        (void)io_reactor_.rem_read_rdy(fd);
+        // Removal is asynchronous off the reactor thread. Do not close the socket
+        // or release this sender until all callbacks for it have been detached.
+        auto removed = std::make_shared<std::promise<void>>();
+        auto done = removed->get_future();
+        (void)io_reactor_->rem_read_rdy(fd, [removed] { removed->set_value(); });
+        done.wait();
     }
-    io_reactor_.stop();
-    if (io_reactor_thread_.joinable())
+    if (owns_io_reactor_)
     {
-        io_reactor_thread_.join();
+        io_reactor_->stop();
+        if (io_reactor_thread_.joinable())
+        {
+            io_reactor_thread_.join();
+        }
     }
+    io_reactor_.reset();
+    owns_io_reactor_ = false;
     io_reactor_running = false;
 }
 
@@ -680,6 +690,24 @@ int stream_sender::open()
         telemetry = telemetry_on;
     }
 
+    std::shared_ptr<default_io_reactor> reactor;
+    bool own_reactor = false;
+    if (telemetry)
+    {
+        std::string name;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            name = reactor_name_;
+        }
+        own_reactor = name.empty();
+        reactor = own_reactor ? std::make_shared<default_io_reactor>()
+                              : default_io_reactor_registry::get_instance().get(name);
+        if (!reactor)
+        {
+            return -ENOENT;
+        }
+    }
+
     const int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
     {
@@ -765,7 +793,9 @@ int stream_sender::open()
         }
         if (telemetry)
         {
-            if (!io_reactor_.add_read_rdy(
+            io_reactor_ = std::move(reactor);
+            owns_io_reactor_ = own_reactor;
+            if (!io_reactor_->add_read_rdy(
                     send_fd,
                     [this]()
                     {
@@ -781,36 +811,39 @@ int stream_sender::open()
                 return -EIO;
             }
             io_reactor_running = true;
-            const auto started = std::make_shared<std::promise<void>>();
-            const std::future<void> started_fut = started->get_future();
-            io_reactor_thread_ = spawn_thread(
-                thread_opts {"vs_io", k_io_reactor_stack_bytes},
-                [this, started]()
-                {
-                    /* Queue before run() so the callback runs only after run() sets
-                     * m_running; open() waits on this before returning. */
-                    io_reactor_.wake_up(
-                        [started]()
-                        {
-                            started->set_value();
-                        });
-                    io_reactor_.run();
-                });
-            if (started_fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+            if (owns_io_reactor_)
             {
-                io_reactor_.stop();
-                if (io_reactor_thread_.joinable())
+                const auto started = std::make_shared<std::promise<void>>();
+                const std::future<void> started_fut = started->get_future();
+                io_reactor_thread_ = spawn_thread(
+                    thread_opts {"vs_io", k_io_reactor_stack_bytes},
+                    [this, started]()
+                    {
+                        /* Queue before run() so the callback runs only after run() sets
+                         * m_running; open() waits on this before returning. */
+                        io_reactor_->wake_up(
+                            [started]()
+                            {
+                                started->set_value();
+                            });
+                        io_reactor_->run();
+                    });
+                if (started_fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
                 {
-                    io_reactor_thread_.join();
+                    io_reactor_->stop();
+                    if (io_reactor_thread_.joinable())
+                    {
+                        io_reactor_thread_.join();
+                    }
+                    io_reactor_running = false;
+                    send_stop = true;
+                    stop_send_thread();
+                    ::close(send_fd);
+                    send_fd = -1;
+                    have_dst = false;
+                    opened = false;
+                    return -ETIMEDOUT;
                 }
-                io_reactor_running = false;
-                send_stop = true;
-                stop_send_thread();
-                ::close(send_fd);
-                send_fd = -1;
-                have_dst = false;
-                opened = false;
-                return -ETIMEDOUT;
             }
         }
 
@@ -1116,6 +1149,16 @@ int stream_sender::configure(std::string_view key, std::string_view value)
             return pr;
         }
     }
+    if ("reactor_name" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        reactor_name_.assign(value.data(), value.size());
+        return 0;
+    }
     if ("telemetry" == key)
     {
         bool on = false;
@@ -1282,6 +1325,12 @@ int stream_sender::query(std::string_view key, std::string *value) const
         return r;
     }
 
+    if ("reactor_name" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        *value = reactor_name_;
+        return 0;
+    }
     if ("stream" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

@@ -930,3 +930,90 @@ TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
 
     sender.close();
 }
+
+TEST(StreamSenderTest, NamedReactorMissingAndConfigureContract)
+{
+    vstreamer::stream_sender sender;
+    std::string name;
+    ASSERT_EQ(0, sender.query("reactor_name", &name));
+    EXPECT_TRUE(name.empty());
+    ASSERT_EQ(0, cfg(sender, "reactor_name", "missing-sender-test-reactor"));
+    ASSERT_EQ(0, sender.query("reactor_name", &name));
+    EXPECT_EQ(name, "missing-sender-test-reactor");
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:5091"));
+    EXPECT_EQ(-ENOENT, sender.open());
+    // A failed lookup can be corrected and retried.
+    ASSERT_EQ(0, cfg(sender, "reactor_name", ""));
+    ASSERT_EQ(0, sender.open());
+    EXPECT_EQ(-EBUSY, cfg(sender, "reactor_name", "other"));
+    sender.close();
+}
+
+namespace
+{
+struct registered_sender_reactor
+{
+    std::shared_ptr<vstreamer::default_io_reactor> reactor =
+        std::make_shared<vstreamer::default_io_reactor>();
+    std::thread worker;
+    registered_sender_reactor()
+    {
+        vstreamer::default_io_reactor_registry::get_instance().add("sender-test-reactor", reactor);
+        auto started = std::make_shared<std::promise<void>>();
+        auto ready = started->get_future();
+        reactor->wake_up([started] { started->set_value(); });
+        worker = std::thread([this] { reactor->run(); });
+        ready.wait();
+    }
+    ~registered_sender_reactor()
+    {
+        reactor->stop();
+        worker.join();
+        vstreamer::default_io_reactor_registry::get_instance().rem("sender-test-reactor");
+    }
+};
+}
+
+TEST(StreamSenderTest, NamedReactorReceivesTelemetryAndSurvivesSenderRestart)
+{
+    registered_sender_reactor host;
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "reactor_name", "sender-test-reactor"));
+    for (int cycle = 0; cycle < 2; ++cycle)
+    {
+        sockaddr_in dst {};
+        ASSERT_TRUE(open_sender_with_reply_addr(sender, &dst));
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        ASSERT_GE(fd, 0);
+        send_report(fd, dst, make_report(42, 7, 99));
+        close(fd);
+        bool received = false;
+        for (int i = 0; i < 100; ++i)
+        {
+            const auto snap = sender.peer_link_snapshot();
+            if (snap.have)
+            {
+                EXPECT_EQ(99u, snap.report.counters.udp_packet_received);
+                received = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        EXPECT_TRUE(received);
+        sender.close();
+        auto alive = std::make_shared<std::promise<void>>();
+        auto ready = alive->get_future();
+        host.reactor->wake_up([alive] { alive->set_value(); });
+        EXPECT_EQ(std::future_status::ready, ready.wait_for(std::chrono::seconds(1)));
+    }
+}
+
+TEST(StreamSenderTest, TelemetryOffDoesNotRequireNamedReactor)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:5091"));
+    ASSERT_EQ(0, cfg(sender, "reactor_name", "missing-sender-test-reactor"));
+    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
+    EXPECT_EQ(0, sender.open());
+    sender.close();
+}

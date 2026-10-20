@@ -146,7 +146,9 @@ private:
     std::thread       send_thread;
     thread_place      send_place;      /* keys send_cpu / send_prio */
     std::atomic<bool> send_stop {false};
-    default_io_reactor io_reactor_;
+    std::string reactor_name_;
+    std::shared_ptr<default_io_reactor> io_reactor_;
+    bool owns_io_reactor_ = false;
     std::thread        io_reactor_thread_;
     bool               io_reactor_running = false;
 

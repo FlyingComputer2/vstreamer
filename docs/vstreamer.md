@@ -211,12 +211,13 @@ FU-A, capture-time header extension).
 
 **`stream_sender`** — UDP egress with RS block-erasure FEC and a bounded queue. Threads:
 `input()` (caller), the send thread, a `default_io_reactor` thread for reverse telemetry
-recv when `telemetry` is on, and `configure()`. Lock order `mu` → `fec_mu`.
+recv when `telemetry` is on and `reactor_name` is empty; otherwise the host's named reactor handles telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
+| `reactor_name` | C Q | Name in vstreamer's `default_io_reactor_registry` (BFC's typed object registry), before `open()` only. Empty (default) creates a private reactor/thread. A missing configured name makes `open()` return `-ENOENT` when telemetry is enabled. The host must run the registered reactor before opening the sender and keep it running until the sender closes; the sender only detaches its socket and never stops a shared reactor. |
 | `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
 | `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
 | `queue_ms` | C Q | 10..2000, default 100 |
@@ -302,7 +303,7 @@ Components do not start pipeline threads; the app does. Threads inside component
 
 | Component | Internal threads | Placement keys |
 |-----------|------------------|----------------|
-| `stream_sender` | send thread (pacing, FEC flush timer); telemetry thread (`poll` + link reports on `send_fd`) | `send_*`, `telemetry_*` |
+| `stream_sender` | send thread (pacing, FEC flush timer); private telemetry reactor thread only when `reactor_name` is empty | `send_*` |
 | `stream_receiver` | receive thread (poll, FEC decode, reverse telemetry `sendto`) | `recv_*` |
 | `mkv_sink` | mux thread (`mkv_writer` file I/O) | `mux_*` |
 | `esp32p4_csi_camera_src` | capture thread | `capture_*` |

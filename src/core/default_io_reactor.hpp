@@ -8,6 +8,8 @@ namespace vstreamer
 {
 
 using default_io_reactor = bfc::default_reactor<std::function<void()>>;
+using default_io_reactor_registry =
+    bfc::object_registry<bfc::object_tag<default_io_reactor>>;
 
 }  // namespace vstreamer
 
