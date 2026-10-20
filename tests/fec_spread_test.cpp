@@ -157,7 +157,7 @@ double ms_between(clock_type::time_point a, clock_type::time_point b)
 void open_fec_sender(vstreamer::stream_sender &sender, const std::string &dst, int k, int n,
                      int spread_ms)
 {
-    ASSERT_EQ(0, cfg(sender, "stream", dst));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", dst));
     ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     /* k first: the default n (12) must stay >= k at every step. */
@@ -373,7 +373,7 @@ TEST(FecSpreadTest, RawNotDelayed)
     getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len);
 
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
     ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "40"));

@@ -37,7 +37,7 @@ namespace
 
 /* Thread stacks on ESP-IDF; ignored on Linux. */
 constexpr size_t k_send_stack_bytes = 12 * 1024;
-constexpr size_t k_io_reactor_stack_bytes = 4 * 1024;
+constexpr size_t k_reactor_stack_bytes = 4 * 1024;
 
 double now_sec()
 {
@@ -381,33 +381,78 @@ void stream_sender::stop_send_thread()
     }
 }
 
-void stream_sender::stop_io_reactor()
+void stream_sender::stop_reactor()
 {
-    if (!io_reactor_running)
+    if (!reactor_running_)
     {
         return;
     }
-    const int fd = send_fd;
-    if (fd >= 0)
+    auto removed = std::make_shared<std::promise<void>>();
+    auto done = removed->get_future();
+    if (queue_reactor_)
     {
-        // Removal is asynchronous off the reactor thread. Do not close the socket
-        // or release this sender until all callbacks for it have been detached.
-        auto removed = std::make_shared<std::promise<void>>();
-        auto done = removed->get_future();
-        (void)io_reactor_->rem_read_rdy(fd, [removed] { removed->set_value(); });
-        done.wait();
-    }
-    if (owns_io_reactor_)
-    {
-        io_reactor_->stop();
-        if (io_reactor_thread_.joinable())
+        if (transport_rx_ && telemetry_on)
         {
-            io_reactor_thread_.join();
+            (void)queue_reactor_->remove_read_rdy(*transport_rx_);
+        }
+        // Wait past any context snapshot already being processed.
+        if (!queue_reactor_->is_reactor_thread())
+        {
+            queue_reactor_->wake_up([removed] { removed->set_value(); });
+            done.wait();
         }
     }
-    io_reactor_.reset();
-    owns_io_reactor_ = false;
-    io_reactor_running = false;
+    else if (send_fd >= 0)
+    {
+        (void)udp_reactor_->rem_read_rdy(send_fd, [removed] { removed->set_value(); });
+        done.wait();
+    }
+    if (owns_reactor_)
+    {
+        if (queue_reactor_)
+        {
+            queue_reactor_->stop();
+        }
+        else
+        {
+            udp_reactor_->stop();
+        }
+        if (reactor_thread_.joinable())
+        {
+            reactor_thread_.join();
+        }
+    }
+    udp_reactor_.reset();
+    queue_reactor_.reset();
+    owns_reactor_ = false;
+    reactor_running_ = false;
+}
+
+void stream_sender::ingest_link_report(const uint8_t *data, size_t len)
+{
+    stream_header hdr {};
+    const uint8_t *payload = nullptr;
+    size_t payload_len = 0;
+    stream_link_report rep {};
+    if (stream_header_parse(data, len, &hdr, &payload, &payload_len) < 0 ||
+        hdr.is_fec || hdr.is_stream_data ||
+        stream_link_report_decode(payload, payload_len, &rep) < 0)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        peer_reports_rejected++;
+        return;
+    }
+    rep.report_seq = hdr.sequence_number;
+    handle_link_report(rep);
+}
+
+void stream_sender::on_queue_report_read()
+{
+    // CV reactors notify once per wake, so drain all available entries.
+    while (auto wire = transport_rx_->pop())
+    {
+        ingest_link_report(wire->u8(), wire->size());
+    }
 }
 
 void stream_sender::on_telemetry_socket_read()
@@ -425,30 +470,7 @@ void stream_sender::on_telemetry_socket_read()
         {
             break;
         }
-        stream_header hdr {};
-        const uint8_t *payload = nullptr;
-        size_t         payload_len = 0;
-        if (stream_header_parse(buf, static_cast<size_t>(n), &hdr, &payload, &payload_len) < 0)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        if (hdr.is_fec || hdr.is_stream_data)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        stream_link_report rep {};
-        if (stream_link_report_decode(payload, payload_len, &rep) < 0)
-        {
-            std::lock_guard<std::mutex> lock(peer_mu);
-            peer_reports_rejected++;
-            continue;
-        }
-        rep.report_seq = hdr.sequence_number;
-        handle_link_report(rep);
+        ingest_link_report(buf, static_cast<size_t>(n));
     }
 }
 
@@ -618,7 +640,7 @@ void stream_sender::send_thread_main()
             continue;
         }
 
-        if (!dst_ok || send_fd < 0)
+        if (!transport_tx_ && (!dst_ok || send_fd < 0))
         {
             continue;
         }
@@ -642,8 +664,18 @@ void stream_sender::send_thread_main()
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
             stream_header_stamp_sequence(wire_buf.u8(), seq);
         }
-        const ssize_t n = sendto(send_fd, wire_buf.u8(), wire_buf.size(), 0,
-                                    reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+        ssize_t n = 0;
+        if (transport_tx_)
+        {
+            n = static_cast<ssize_t>(wire_buf.size());
+            (void)transport_tx_->push(std::move(wire_buf));
+            queue_reactor_->wake_up();
+        }
+        else
+        {
+            n = sendto(send_fd, wire_buf.u8(), wire_buf.size(), 0,
+                       reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
+        }
         if (n < 0)
         {
             continue;
@@ -655,207 +687,167 @@ void stream_sender::send_thread_main()
 
 int stream_sender::open()
 {
-    std::string spec_copy;
-    int         k = 0;
-    int         n = 0;
-    int         timeout_ms = 0;
+    std::lock_guard<std::mutex> lock(mu);
+    if (opened)
     {
-        std::lock_guard<std::mutex> lock(mu);
-        if (opened)
-        {
-            return 0;
-        }
-        if (stream_spec.empty())
-        {
-            return -EINVAL;
-        }
-        spec_copy = stream_spec;
-        k = effective_fec_k();
-        n = effective_fec_n();
-        timeout_ms = fec_timeout_ms;
+        return 0;
     }
-    const size_t shard_bytes = max_fec_shard_bytes();
-    const bool   raw_mode = (fec_mode == fec_mode_e::none);
-
-    char host[128];
-    int  port = 0;
-    if (parse_host_port(spec_copy, host, sizeof(host), &port) < 0)
+    const bool queue_mode = !queue_transport_tx_.empty() || !queue_transport_rx_.empty();
+    if (queue_mode ? (!udp_transport_.empty() || queue_transport_tx_.empty() ||
+                      queue_transport_rx_.empty() || reactor_name_.empty())
+                   : udp_transport_.empty())
     {
         return -EINVAL;
     }
 
-    bool telemetry = true;
+    std::shared_ptr<stream_transport_queue> tx, rx;
+    std::shared_ptr<default_reactor> udp_reactor;
+    std::shared_ptr<bfc::cv_reactor<>> queue_reactor;
+    const bool own_reactor = reactor_name_.empty();
+    if (queue_mode)
     {
-        std::lock_guard<std::mutex> lock(mu);
-        telemetry = telemetry_on;
-    }
-
-    std::shared_ptr<default_io_reactor> reactor;
-    bool own_reactor = false;
-    if (telemetry)
-    {
-        std::string name;
+        tx = stream_transport_queue_registry::get_instance().get(queue_transport_tx_);
+        rx = stream_transport_queue_registry::get_instance().get(queue_transport_rx_);
+        if (!tx || !rx)
         {
-            std::lock_guard<std::mutex> lock(mu);
-            name = reactor_name_;
+            return -ENOENT;
         }
-        own_reactor = name.empty();
-        reactor = own_reactor ? std::make_shared<default_io_reactor>()
-                              : default_io_reactor_registry::get_instance().get(name);
-        if (!reactor)
+        if (tx == rx || tx->capacity() == 0 || rx->capacity() == 0)
+        {
+            return -EINVAL;
+        }
+        queue_reactor = bfc::cv_reactor_registry::get_instance().get(reactor_name_);
+        if (!queue_reactor)
+        {
+            return -ENOENT;
+        }
+    }
+    else if (telemetry_on)
+    {
+        udp_reactor = own_reactor ? std::make_shared<default_reactor>()
+                                 : default_reactor_registry::get_instance().get(reactor_name_);
+        if (!udp_reactor)
         {
             return -ENOENT;
         }
     }
 
-    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
+    int fd = -1;
+    sockaddr_in dst {};
+    if (!queue_mode)
     {
-        return -errno;
+        char host[128];
+        int port = 0;
+        if (parse_host_port(udp_transport_, host, sizeof(host), &port) < 0 ||
+            resolve_ipv4_destination(host, port, &dst) < 0)
+        {
+            return -EINVAL;
+        }
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0)
+        {
+            return -errno;
+        }
+        constexpr int k_sock_buf = 16 * 1024 * 1024;
+        (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &k_sock_buf, sizeof(k_sock_buf));
+        sockaddr_in bind_addr {};
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(fd, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
+        {
+            const int err = errno;
+            ::close(fd);
+            return -err;
+        }
     }
-
-    constexpr int k_sock_buf = 16 * 1024 * 1024;
-    (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &k_sock_buf, sizeof(k_sock_buf));
-
-    sockaddr_in bind_addr {};
-    bind_addr.sin_family = AF_INET;
-    if (resolve_ipv4_bind_addr("0.0.0.0", true, &bind_addr.sin_addr) < 0)
-    {
-        ::close(fd);
-        return -EINVAL;
-    }
-    bind_addr.sin_port = 0;
-    if (bind(fd, reinterpret_cast<sockaddr *>(&bind_addr), sizeof(bind_addr)) < 0)
-    {
-        const int err = errno;
-        ::close(fd);
-        return -err;
-    }
-
-    sockaddr_in dst_in {};
-    if (resolve_ipv4_destination(host, port, &dst_in) < 0)
-    {
-        ::close(fd);
-        return -EINVAL;
-    }
-
     {
         std::lock_guard<std::mutex> flock(fec_mu);
         fec_oversized = 0;
-        if (raw_mode)
+        if (fec_mode == fec_mode_e::none)
         {
             fec.disable();
-            std::fprintf(stderr, "stream_sender: fec mode=none (raw SDU path)\n");
         }
-        else
+        else if (!fec.init(effective_fec_k(), effective_fec_n(), fec_timeout_ms,
+                           stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))))
         {
-            if (0 == shard_bytes || !fec.init(k, n, timeout_ms, shard_bytes))
+            if (fd >= 0)
             {
                 ::close(fd);
-                return -EINVAL;
             }
-            std::fprintf(stderr,
-                         "stream_sender: fec k=%d n=%d timeout=%d ms mode=block (%s)\n", k, n,
-                         timeout_ms, fec.impl_name());
+            return -EINVAL;
         }
     }
 
+    send_fd = fd;
+    dst_addr = dst;
+    have_dst = !queue_mode;
+    transport_tx_ = std::move(tx);
+    transport_rx_ = std::move(rx);
+    udp_reactor_ = std::move(udp_reactor);
+    queue_reactor_ = std::move(queue_reactor);
+    owns_reactor_ = own_reactor;
     {
-        std::lock_guard<std::mutex> lock(mu);
-        if (opened)
-        {
-            ::close(fd);
-            return 0;
-        }
-        send_fd = fd;
-        std::memcpy(&dst_addr, &dst_in, sizeof(dst_in));
-        have_dst = true;
-        opened = true;
-
-        {
-            std::random_device rd;
-            stream_sequence.store(static_cast<uint16_t>(rd()), std::memory_order_relaxed);
-        }
-
-        send_stop = false;
-        send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
-                                   &stream_sender::send_thread_main, this);
-
-        {
-            std::lock_guard<std::mutex> plock(peer_mu);
-            peer_have = false;
-            peer_report = {};
-            peer_session = 0;
-            peer_last_seq = 0;
-            peer_reports_received = 0;
-            peer_reports_lost = 0;
-            peer_reports_rejected = 0;
-        }
-        if (telemetry)
-        {
-            io_reactor_ = std::move(reactor);
-            owns_io_reactor_ = own_reactor;
-            if (!io_reactor_->add_read_rdy(
-                    send_fd,
-                    [this]()
-                    {
-                        on_telemetry_socket_read();
-                    }))
-            {
-                send_stop = true;
-                stop_send_thread();
-                ::close(send_fd);
-                send_fd = -1;
-                have_dst = false;
-                opened = false;
-                return -EIO;
-            }
-            io_reactor_running = true;
-            if (owns_io_reactor_)
-            {
-                const auto started = std::make_shared<std::promise<void>>();
-                const std::future<void> started_fut = started->get_future();
-                io_reactor_thread_ = spawn_thread(
-                    thread_opts {"vs_io", k_io_reactor_stack_bytes},
-                    [this, started]()
-                    {
-                        /* Queue before run() so the callback runs only after run() sets
-                         * m_running; open() waits on this before returning. */
-                        io_reactor_->wake_up(
-                            [started]()
-                            {
-                                started->set_value();
-                            });
-                        io_reactor_->run();
-                    });
-                if (started_fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
-                {
-                    io_reactor_->stop();
-                    if (io_reactor_thread_.joinable())
-                    {
-                        io_reactor_thread_.join();
-                    }
-                    io_reactor_running = false;
-                    send_stop = true;
-                    stop_send_thread();
-                    ::close(send_fd);
-                    send_fd = -1;
-                    have_dst = false;
-                    opened = false;
-                    return -ETIMEDOUT;
-                }
-            }
-        }
-
-        std::fprintf(stderr, "stream_sender: udp://%s:%d\n", host, port);
+        std::random_device rd;
+        stream_sequence.store(static_cast<uint16_t>(rd()), std::memory_order_relaxed);
+        std::lock_guard<std::mutex> plock(peer_mu);
+        peer_have = false;
+        peer_report = {};
+        peer_session = 0;
+        peer_last_seq = 0;
+        peer_reports_received = 0;
+        peer_reports_lost = 0;
+        peer_reports_rejected = 0;
     }
+
+    bool registered = true;
+    if (queue_reactor_ && telemetry_on)
+    {
+        registered = queue_reactor_->add_read_rdy(*transport_rx_,
+                                                 [this] { on_queue_report_read(); });
+        queue_reactor_->wake_up(); // Also handles data queued before open.
+    }
+    else if (udp_reactor_)
+    {
+        registered = udp_reactor_->add_read_rdy(send_fd,
+                                                [this] { on_telemetry_socket_read(); });
+    }
+    if (!registered)
+    {
+        if (send_fd >= 0)
+        {
+            ::close(send_fd);
+        }
+        send_fd = -1;
+        have_dst = false;
+        transport_tx_.reset();
+        transport_rx_.reset();
+        udp_reactor_.reset();
+        queue_reactor_.reset();
+        return -EIO;
+    }
+    reactor_running_ = queue_reactor_ || udp_reactor_;
+    if (reactor_running_ && owns_reactor_)
+    {
+        auto started = std::make_shared<std::promise<void>>();
+        auto ready = started->get_future();
+        reactor_thread_ = spawn_thread(
+            thread_opts {"vs_reactor", k_reactor_stack_bytes}, [this, started] {
+                udp_reactor_->wake_up([started] { started->set_value(); });
+                udp_reactor_->run();
+            });
+        ready.wait();
+    }
+    opened = true;
+    send_stop = false;
+    send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
+                               &stream_sender::send_thread_main, this);
     return 0;
 }
 
 void stream_sender::close()
 {
-    stop_io_reactor();
     stop_send_thread();
+    stop_reactor();
     disable_fec();
 
     std::lock_guard<std::mutex> lock(mu);
@@ -865,6 +857,8 @@ void stream_sender::close()
         send_fd = -1;
     }
     have_dst = false;
+    transport_tx_.reset();
+    transport_rx_.reset();
     opened = false;
 
     {
@@ -1149,7 +1143,7 @@ int stream_sender::configure(std::string_view key, std::string_view value)
             return pr;
         }
     }
-    if ("reactor_name" == key)
+    if ("reactor" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         if (opened)
@@ -1174,10 +1168,30 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         telemetry_on = on;
         return 0;
     }
-    if ("stream" == key)
+    if ("udp_transport" == key || "queue_transport_tx" == key || "queue_transport_rx" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        stream_spec.assign(value.data(), value.size());
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        if (!value.empty())
+        {
+            if (key == "udp_transport")
+            {
+                if (!queue_transport_tx_.empty() || !queue_transport_rx_.empty())
+                {
+                    return -EINVAL;
+                }
+            }
+            else if (!udp_transport_.empty())
+            {
+                return -EINVAL;
+            }
+        }
+        auto &target = key == "udp_transport" ? udp_transport_
+                     : key == "queue_transport_tx" ? queue_transport_tx_ : queue_transport_rx_;
+        target.assign(value.data(), value.size());
         return 0;
     }
     if ("fec_spread_ms" == key)
@@ -1325,16 +1339,17 @@ int stream_sender::query(std::string_view key, std::string *value) const
         return r;
     }
 
-    if ("reactor_name" == key)
+    if ("reactor" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
         *value = reactor_name_;
         return 0;
     }
-    if ("stream" == key)
+    if ("udp_transport" == key || "queue_transport_tx" == key || "queue_transport_rx" == key)
     {
         std::lock_guard<std::mutex> lock(mu);
-        *value = stream_spec;
+        *value = key == "udp_transport" ? udp_transport_
+               : key == "queue_transport_tx" ? queue_transport_tx_ : queue_transport_rx_;
         return 0;
     }
     if ("telemetry" == key)

@@ -64,7 +64,7 @@ bool open_sender_with_reply_addr(vstreamer::stream_sender &sender, sockaddr_in *
     }
     const std::string stream =
         "127.0.0.1:" + std::to_string(ntohs(bind_addr.sin_port));
-    if (0 != cfg(sender, "stream", stream) || 0 != cfg(sender, "fec", "none") ||
+    if (0 != cfg(sender, "udp_transport", stream) || 0 != cfg(sender, "fec", "none") ||
         0 != sender.open() || 0 != sender.set_enabled(true, 0))
     {
         close(rx);
@@ -108,7 +108,7 @@ TEST(StreamSenderTest, OpenWithHostnameDoesNotHang)
     const int port = 5091;
     vstreamer::stream_sender sender;
     const std::string        stream = "localhost:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", stream));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", stream));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
 
     auto fut = std::async(std::launch::async, [&sender]() { return sender.open(); });
@@ -123,7 +123,7 @@ TEST(StreamSenderTest, OpenWithHostnameDoesNotHang)
 TEST(StreamSenderTest, BogusHostnameReturnsQuickly)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "bogus.invalid:5000"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "bogus.invalid:5000"));
     auto fut = std::async(std::launch::async, [&sender]() { return sender.open(); });
     EXPECT_EQ(std::future_status::ready, fut.wait_for(std::chrono::seconds(2)));
     ASSERT_EQ(std::future_status::ready, fut.wait_for(std::chrono::seconds(0)));
@@ -228,7 +228,7 @@ TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec_n", "15"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "8"));
     ASSERT_EQ(0, sender.open());
@@ -256,7 +256,7 @@ TEST(StreamSenderTest, QueueByteCapReturnsEagainWhenSpreadBacksQueue)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
     ASSERT_EQ(0, cfg(sender, "queue_ms", "50"));
@@ -300,7 +300,7 @@ TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
     ASSERT_EQ(0, sender.open());
@@ -350,7 +350,7 @@ TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
     ASSERT_EQ(0, getsockname(rx, reinterpret_cast<sockaddr *>(&addr), &alen));
 
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "4"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
@@ -556,7 +556,7 @@ TEST(StreamSenderTest, PeerReportAgeGrows)
 TEST(StreamSenderTest, CloseJoinsTelemetryQuickly)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, sender.open());
     const auto t0 = std::chrono::steady_clock::now();
@@ -573,7 +573,7 @@ TEST(StreamSenderTest, PeerKeysAnswerBeforeFirstReport)
 {
     vstreamer::stream_sender sender;
     std::string               val;
-    ASSERT_EQ(0, sender.configure("stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, sender.configure("udp_transport", "127.0.0.1:9"));
     ASSERT_EQ(0, sender.open());
     for (const char *key : {"peer_udp_packet_received", "peer_fec_packet_received",
                             "peer_udp_gap_count", "peer_fec_gap_count", "peer_session",
@@ -625,7 +625,7 @@ TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
     vstreamer::stream_sender   sender;
     vstreamer::stream_receiver receiver;
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(receiver, "listen", host_port));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
 
@@ -661,7 +661,7 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
     constexpr size_t k_dg = static_cast<size_t>(vstreamer::stream_sender::k_wire_datagram_bytes);
 
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
@@ -671,7 +671,7 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
     sender.close();
 
     vstreamer::stream_sender raw;
-    ASSERT_EQ(0, cfg(raw, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(raw, "udp_transport", "127.0.0.1:9"));
     ASSERT_EQ(0, cfg(raw, "fec", "none"));
     ASSERT_EQ(0, raw.open());
     const size_t raw_in = query_size_t(raw, "max_input");
@@ -682,7 +682,7 @@ TEST(StreamSenderTest, MaxInputRawAndFecModes)
 TEST(StreamSenderTest, FecKnAccept31Reject32)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:9"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "31"));
@@ -707,7 +707,7 @@ TEST(StreamSenderTest, WireSequenceStampedOnFecAndRaw)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "2"));
@@ -760,7 +760,7 @@ TEST(StreamSenderTest, RawPathDoesNotAdvanceSduBase)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "1"));
@@ -817,7 +817,7 @@ TEST(StreamSenderTest, AcceptsRtpPdus)
     const int port = ephemeral_udp_port();
     ASSERT_GT(port, 0);
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(port)));
     ASSERT_EQ(0, sender.open());
     auto pdu = vstreamer::test_pdu::make_stream_dgram(1, 64);
     pdu.sdu_type = vstreamer::sdu_type_e::RTP;
@@ -835,7 +835,7 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
@@ -898,7 +898,7 @@ TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
 
     vstreamer::stream_sender sender;
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
@@ -935,17 +935,17 @@ TEST(StreamSenderTest, NamedReactorMissingAndConfigureContract)
 {
     vstreamer::stream_sender sender;
     std::string name;
-    ASSERT_EQ(0, sender.query("reactor_name", &name));
+    ASSERT_EQ(0, sender.query("reactor", &name));
     EXPECT_TRUE(name.empty());
-    ASSERT_EQ(0, cfg(sender, "reactor_name", "missing-sender-test-reactor"));
-    ASSERT_EQ(0, sender.query("reactor_name", &name));
+    ASSERT_EQ(0, cfg(sender, "reactor", "missing-sender-test-reactor"));
+    ASSERT_EQ(0, sender.query("reactor", &name));
     EXPECT_EQ(name, "missing-sender-test-reactor");
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:5091"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:5091"));
     EXPECT_EQ(-ENOENT, sender.open());
     // A failed lookup can be corrected and retried.
-    ASSERT_EQ(0, cfg(sender, "reactor_name", ""));
+    ASSERT_EQ(0, cfg(sender, "reactor", ""));
     ASSERT_EQ(0, sender.open());
-    EXPECT_EQ(-EBUSY, cfg(sender, "reactor_name", "other"));
+    EXPECT_EQ(-EBUSY, cfg(sender, "reactor", "other"));
     sender.close();
 }
 
@@ -953,12 +953,12 @@ namespace
 {
 struct registered_sender_reactor
 {
-    std::shared_ptr<vstreamer::default_io_reactor> reactor =
-        std::make_shared<vstreamer::default_io_reactor>();
+    std::shared_ptr<vstreamer::default_reactor> reactor =
+        std::make_shared<vstreamer::default_reactor>();
     std::thread worker;
     registered_sender_reactor()
     {
-        vstreamer::default_io_reactor_registry::get_instance().add("sender-test-reactor", reactor);
+        vstreamer::default_reactor_registry::get_instance().add("sender-test-reactor", reactor);
         auto started = std::make_shared<std::promise<void>>();
         auto ready = started->get_future();
         reactor->wake_up([started] { started->set_value(); });
@@ -969,7 +969,7 @@ struct registered_sender_reactor
     {
         reactor->stop();
         worker.join();
-        vstreamer::default_io_reactor_registry::get_instance().rem("sender-test-reactor");
+        vstreamer::default_reactor_registry::get_instance().rem("sender-test-reactor");
     }
 };
 }
@@ -978,7 +978,7 @@ TEST(StreamSenderTest, NamedReactorReceivesTelemetryAndSurvivesSenderRestart)
 {
     registered_sender_reactor host;
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "reactor_name", "sender-test-reactor"));
+    ASSERT_EQ(0, cfg(sender, "reactor", "sender-test-reactor"));
     for (int cycle = 0; cycle < 2; ++cycle)
     {
         sockaddr_in dst {};
@@ -1011,8 +1011,8 @@ TEST(StreamSenderTest, NamedReactorReceivesTelemetryAndSurvivesSenderRestart)
 TEST(StreamSenderTest, TelemetryOffDoesNotRequireNamedReactor)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:5091"));
-    ASSERT_EQ(0, cfg(sender, "reactor_name", "missing-sender-test-reactor"));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:5091"));
+    ASSERT_EQ(0, cfg(sender, "reactor", "missing-sender-test-reactor"));
     ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     EXPECT_EQ(0, sender.open());
     sender.close();

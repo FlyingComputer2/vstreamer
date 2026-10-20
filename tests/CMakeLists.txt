@@ -42,6 +42,7 @@ if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
         fec_spread_test.cpp
         loopback_test.cpp
         stream_sender_test.cpp
+        stream_queue_transport_test.cpp
         stream_receiver_test.cpp
     )
 endif()

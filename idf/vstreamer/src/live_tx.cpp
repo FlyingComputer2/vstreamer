@@ -320,7 +320,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     std::string size;
     src->query("size", &size);
     apply_kvs(*pay, "pay", cfg.pay);
-    if (snd->configure("stream", cfg.peer) < 0)
+    if (snd->configure("udp_transport", cfg.peer) < 0)
     {
         std::printf("live TX: bad peer '%s'\n", cfg.peer.c_str());
         return -1;

@@ -12,7 +12,7 @@ using kv_list = std::vector<std::pair<std::string, std::string>>;
 
 struct live_tx_config
 {
-    /* stream_sender "stream" destination, host:port. */
+    /* stream_sender "udp_transport" destination, host:port. */
     std::string peer;
     /* Stream this long once the first AU is out; 0 = until reset. */
     int seconds = 0;

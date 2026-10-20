@@ -239,7 +239,7 @@ void run_link(int n_packets,
     vstreamer::stream_receiver receiver;
 
     const std::string host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
 
     if (setup_fn)
@@ -361,7 +361,7 @@ TEST(LoopbackTest, MaxInputOversizedNotSent)
     vstreamer::stream_sender   sender;
     vstreamer::stream_receiver receiver;
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "600"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
@@ -453,7 +453,7 @@ TEST(LoopbackTest, SenderRestartMidStream)
 
     auto run_sender_packets = [&](int n_packets, int start_counter) {
         vstreamer::stream_sender sender;
-        ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+        ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
         ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
         ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
         ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
@@ -510,7 +510,7 @@ TEST(LoopbackTest, SenderRestartMidStream)
 
     {
         vstreamer::stream_sender sender;
-        ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+        ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
         ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
         ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
         ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
@@ -553,7 +553,7 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
 
     const std::string relay_host = "127.0.0.1:" + std::to_string(relay_port);
     const std::string rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "20"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
@@ -604,7 +604,7 @@ TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
     vstreamer::stream_receiver receiver;
     const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
     const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_n", "31"));
@@ -654,7 +654,7 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
     vstreamer::stream_receiver receiver;
     const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
     const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
 
@@ -690,7 +690,7 @@ TEST(LoopbackTest, PeerReportIntervalNearTelemetryMs)
     vstreamer::stream_receiver receiver;
     const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
     const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "100"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
@@ -725,7 +725,7 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     vstreamer::stream_sender   sender;
     vstreamer::stream_receiver receiver;
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", host_port));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "1476"));
     ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
@@ -818,7 +818,7 @@ TEST(LoopbackTest, WholeBlockLossViaBurstDrop)
     vstreamer::stream_receiver receiver;
     const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
     const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "stream", relay_host));
+    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
     ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));

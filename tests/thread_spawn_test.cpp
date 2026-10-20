@@ -132,7 +132,7 @@ TEST(ThreadPlaceTest, StreamSenderExposesSendKeysOnly)
     EXPECT_EQ(snd->query("send_prio", &v), 0);
     EXPECT_EQ(v, "-1");
 
-    ASSERT_EQ(snd->configure("stream", "127.0.0.1:9"), 0);
+    ASSERT_EQ(snd->configure("udp_transport", "127.0.0.1:9"), 0);
     ASSERT_EQ(snd->configure("telemetry", "off"), 0);
     ASSERT_EQ(snd->open(), 0);
     EXPECT_EQ(snd->configure("send_cpu", "-1"), -EBUSY);

@@ -476,7 +476,7 @@ int run()
     relay.add_source("in", "stream_receiver");
     relay.add_sink("out", "stream_sender");
     relay.configure("in", "listen", "127.0.0.1:5600");
-    relay.configure("out", "stream", "127.0.0.1:5601");
+    relay.configure("out", "udp_transport", "127.0.0.1:5601");
     apply_place(*relay.node("out"), k_sender_place);
     relay.link("in", "out");
     /* stream_sender starts with its send gate closed. */
@@ -489,7 +489,7 @@ int run()
         return -1;
     }
 
-    tx->configure("stream", "127.0.0.1:5600");
+    tx->configure("udp_transport", "127.0.0.1:5600");
     apply_place(*tx, k_sender_place);
     tx->set_enabled(true, 0);
     if (tx->open() < 0)

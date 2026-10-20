@@ -210,14 +210,16 @@ FU-A, capture-time header extension).
 | `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
 **`stream_sender`** — UDP egress with RS block-erasure FEC and a bounded queue. Threads:
-`input()` (caller), the send thread, a `default_io_reactor` thread for reverse telemetry
-recv when `telemetry` is on and `reactor_name` is empty; otherwise the host's named reactor handles telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
+`input()` (caller), the send thread, a `default_reactor` thread for reverse telemetry
+recv in UDP mode when `telemetry` is on and `reactor` is empty; otherwise the host's named default or CV reactor handles telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
-| `stream` | C Q | destination `host:port` (hostnames resolved at `open()`) |
+| `udp_transport` | C Q | UDP destination `host:port` (hostnames resolved at `open()`) |
 | `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
-| `reactor_name` | C Q | Name in vstreamer's `default_io_reactor_registry` (BFC's typed object registry), before `open()` only. Empty (default) creates a private reactor/thread. A missing configured name makes `open()` return `-ENOENT` when telemetry is enabled. The host must run the registered reactor before opening the sender and keep it running until the sender closes; the sender only detaches its socket and never stops a shared reactor. |
+| `queue_transport_tx` | C Q | Registered outgoing wire-datagram queue name; requires `queue_transport_rx`. Mutually exclusive with `udp_transport`. |
+| `queue_transport_rx` | C Q | Registered incoming reverse-report queue name; requires `queue_transport_tx`. |
+| `reactor` | C Q | Registered reactor name. UDP resolves vstreamer's `default_reactor_registry`; queue mode resolves BFC's `cv_reactor_registry`. Required in queue mode; empty in UDP mode creates a private default-reactor thread. Host-owned reactors must run until the sender closes; close only detaches this sender. |
 | `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
 | `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 11 (FEC block) or − 4 (`fec none` raw) |
 | `queue_ms` | C Q | 10..2000, default 100 |
@@ -232,6 +234,29 @@ recv when `telemetry` is on and `reactor_name` is empty; otherwise the host's na
 | `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
 
 `set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
+
+Queue transport setup (before `open()`):
+register two distinct, nonzero-capacity `stream_transport_queue` instances using
+`stream_transport_queue_registry` from `core/stream_queue_transport.hpp`.
+These are BFC reactive circular lossy queues of `bfc::shared_sized_buffer`;
+each entry contains one complete wire packet, including the stream header.
+Set `queue_transport_tx` and `queue_transport_rx` to their registry names.
+The host owns capacity and queue lifetime. A full queue evicts its oldest packet;
+the sender's wire counters count packets submitted to the transport, not peer delivery.
+
+Register the shared `bfc::cv_reactor<>` in `bfc::cv_reactor_registry` and select
+it with `reactor`. The sender registers its RX handler there and wakes it after
+TX pushes; register the target's TX-queue consumer on that same reactor.
+A peer pushing reverse reports must also wake the reactor. Read handlers must
+drain their queues. Each queue has one consumer. Closing the sender detaches its
+RX handler, waits for in-flight callbacks, and leaves the host's reactor and
+queued packets intact.
+
+Transport keys and `reactor` can only change while closed (`-EBUSY` otherwise).
+Clear the selected transport's value(s) before switching modes. Mixing modes,
+an incomplete pair, zero capacities, or using the same queue in both directions
+fails with `-EINVAL`; queue mode also requires a named `reactor`. Missing registered queues/reactors fail with `-ENOENT`.
+The former sender keys `stream` and `reactor_name` are removed.
 
 **`stream_receiver`** — UDP ingress, strips stream header, FEC-decodes and re-orders, outputs
 one `STREAM_DGRAM` PDU per original datagram.
@@ -303,7 +328,7 @@ Components do not start pipeline threads; the app does. Threads inside component
 
 | Component | Internal threads | Placement keys |
 |-----------|------------------|----------------|
-| `stream_sender` | send thread (pacing, FEC flush timer); private telemetry reactor thread only when `reactor_name` is empty | `send_*` |
+| `stream_sender` | send thread (pacing, FEC flush timer); private telemetry reactor thread only when `reactor` is empty | `send_*` |
 | `stream_receiver` | receive thread (poll, FEC decode, reverse telemetry `sendto`) | `recv_*` |
 | `mkv_sink` | mux thread (`mkv_writer` file I/O) | `mux_*` |
 | `esp32p4_csi_camera_src` | capture thread | `capture_*` |
@@ -526,7 +551,7 @@ that same socket (NAT-style return path).
 
 | Side | winject mode | Works | Configure |
 |------|--------------|-------|-----------|
-| Rover (`stream_sender`) | server (`rx` only) | yes | `stream=<winject rx>` (ephemeral source port) |
+| Rover (`stream_sender`) | server (`rx` only) | yes | `udp_transport=<winject rx>` (ephemeral source port) |
 | Rover | static (`rx` + `tx`) | use server mode or colocated queue path | fixed source port not configured on sender |
 | Rover | client (`tx` only) | no | — |
 | Ground (`stream_receiver`) | client (`tx` only) | yes | `listen=<winject tx>` |

@@ -13,7 +13,7 @@ pipeline encode
 node jdec jpeg_decoder  size=1920x1080 fps=30 output_mode=convert
 node enc  h264_encoder  size=1920x1080 fps=30 gop=30 rc=cbr cbr=4000000
 node pay  rtp_h264_pay  fps=30 mtu=1400
-node snd  stream_sender stream=192.168.1.10:5001
+node snd  stream_sender udp_transport=192.168.1.10:5001
 link @cap_q -> jdec -> enc -> pay -> snd
 
 # Open the send gate now, as uvc_stream_sender does. For an operator deadman use

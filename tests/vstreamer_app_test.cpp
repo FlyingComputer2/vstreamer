@@ -434,7 +434,7 @@ TEST(VstreamerAppTest, StreamSenderGate)
     {
         pipeline_set set;
         std::string  err;
-        ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender stream=127.0.0.1:9\n",
+        ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender udp_transport=127.0.0.1:9\n",
                                    "t.vsp", &err))
             << err;
         bool on = true;
@@ -443,7 +443,7 @@ TEST(VstreamerAppTest, StreamSenderGate)
     }
     pipeline_set set;
     std::string  err;
-    ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender stream=127.0.0.1:9\nenable snd\n",
+    ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender udp_transport=127.0.0.1:9\nenable snd\n",
                                "t.vsp", &err))
         << err;
     std::string reply;

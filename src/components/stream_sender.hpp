@@ -23,10 +23,11 @@
 #include "core/component_sink.hpp"
 #include "core/buffer_pool.hpp"
 #include "core/component_input.hpp"
-#include "core/default_io_reactor.hpp"
+#include "core/default_reactor.hpp"
 #include "core/port_caps.hpp"
 #include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
+#include "core/stream_queue_transport.hpp"
 #include "core/thread_spawn.hpp"
 
 namespace vstreamer
@@ -38,7 +39,7 @@ enum class fec_mode_e
     block,
 };
 
-/* Pad 0 (sink): STREAM_DGRAM or RTP in → UDP egress (payload is opaque). */
+/* Pad 0 (sink): STREAM_DGRAM or RTP in → UDP or queue egress (payload is opaque). */
 class stream_sender : public component_sink
 {
 public:
@@ -79,7 +80,9 @@ private:
     struct send_thread_wdt;
     void send_thread_main();
     void stop_send_thread();
-    void stop_io_reactor();
+    void stop_reactor();
+    void on_queue_report_read();
+    void ingest_link_report(const uint8_t *data, size_t len);
     void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
     void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
@@ -111,7 +114,11 @@ private:
     mutable std::mutex mu;
     bool               opened = false;
 
-    std::string stream_spec;
+    std::string udp_transport_;
+    std::string queue_transport_tx_;
+    std::string queue_transport_rx_;
+    std::shared_ptr<stream_transport_queue> transport_tx_;
+    std::shared_ptr<stream_transport_queue> transport_rx_;
     bool        telemetry_on = true;
 
     int         send_fd = -1;
@@ -147,10 +154,11 @@ private:
     thread_place      send_place;      /* keys send_cpu / send_prio */
     std::atomic<bool> send_stop {false};
     std::string reactor_name_;
-    std::shared_ptr<default_io_reactor> io_reactor_;
-    bool owns_io_reactor_ = false;
-    std::thread        io_reactor_thread_;
-    bool               io_reactor_running = false;
+    std::shared_ptr<default_reactor> udp_reactor_;
+    std::shared_ptr<bfc::cv_reactor<>> queue_reactor_;
+    bool owns_reactor_ = false;
+    std::thread        reactor_thread_;
+    bool               reactor_running_ = false;
 
     mutable std::mutex peer_mu;
     bool               peer_have = false;
