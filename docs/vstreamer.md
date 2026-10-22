@@ -230,7 +230,7 @@ recv in UDP mode when `telemetry` is on and `reactor` is empty; otherwise the ho
 | `fec_spread_ms` | C Q | 0..250, default 0 (spread each FEC block's shards over N ms: air position p of c at t0 + p × spread / c). Capped at 250: the receiver assumes that spread until it has measured one. The receiver measures the spread from arrival times and sets each block's deadline from it (see `stream_receiver`). Each shard leaves at its release time; a send thread that fell behind sends the shards already due back to back until it is on schedule again. `send_late_max_ms` shows how late datagrams left. Shards wait in the send queue until due; `queue_byte_limit` grows with the spread. Lowering it pulls already-queued shards in to the new spread. On the ESP32-P4 the PIE FEC encoder (`CONFIG_VSTREAMER_RS_PIE`, default on) sends parity in tighter bursts that compete with the H.264 encoder for PSRAM: about 1 encoder fps lost at spread 0, 0.1–0.3 fps at 25 ms or more |
 | `send_cpu`, `send_prio` | C Q | send-thread placement, see Threading |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
-| `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit` | Q | state / counters |
+| `fec_mode`, `stats`, `dropped`, `in_rate`, `fec_oversized`, `pool_misses`, `queue_bytes`, `queue_byte_limit`, `transport_dropped` | Q | state / counters |
 | `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
 
 `set_enabled(on, timeout_ms)` gates sending (0 = on with no deadline, > 0 = on until renewed).
@@ -242,7 +242,8 @@ These are BFC reactive circular lossy queues of `bfc::shared_sized_buffer`;
 each entry contains one complete wire packet, including the stream header.
 Set `queue_transport_tx` and `queue_transport_rx` to their registry names.
 The host owns capacity and queue lifetime. A full queue evicts its oldest packet;
-the sender's wire counters count packets submitted to the transport, not peer delivery.
+the sender's wire counters count packets submitted to the transport, not peer delivery;
+`query("transport_dropped")` counts the packets a full TX queue evicted.
 
 Register the shared `bfc::cv_reactor<>` in `bfc::cv_reactor_registry` and select
 it with `reactor`. The sender registers its RX handler there and wakes it after

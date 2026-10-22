@@ -218,6 +218,9 @@ TEST_F(QueueTransportTest, QueueOverflowRetainsNewestWirePackets)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     ASSERT_EQ(5u, sender.wire_pkts_sent_counter().load());
     ASSERT_EQ(2u, tx->size());
+    std::string dropped;
+    ASSERT_EQ(0, sender.query("transport_dropped", &dropped));
+    EXPECT_EQ("3", dropped);
     for (uint32_t tag : {4u, 5u})
     {
         auto wire = tx->pop();

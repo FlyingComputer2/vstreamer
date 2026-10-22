@@ -159,6 +159,7 @@ private:
     bool owns_reactor_ = false;
     std::thread        reactor_thread_;
     bool               reactor_running_ = false;
+    bool               rx_registered_ = false; /* report handler is on queue_reactor_ */
 
     mutable std::mutex peer_mu;
     bool               peer_have = false;
@@ -177,6 +178,8 @@ private:
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> dropped {0};
     std::atomic<uint64_t> queue_full_rejects {0};
+    /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
+    std::atomic<uint64_t> transport_dropped {0};
 
     double   ingress_rate_t0 = 0.;
     uint64_t ingress_rate_bytes = 0;

@@ -391,7 +391,7 @@ void stream_sender::stop_reactor()
     auto done = removed->get_future();
     if (queue_reactor_)
     {
-        if (transport_rx_ && telemetry_on)
+        if (rx_registered_)
         {
             (void)queue_reactor_->remove_read_rdy(*transport_rx_);
         }
@@ -426,6 +426,7 @@ void stream_sender::stop_reactor()
     queue_reactor_.reset();
     owns_reactor_ = false;
     reactor_running_ = false;
+    rx_registered_ = false;
 }
 
 void stream_sender::ingest_link_report(const uint8_t *data, size_t len)
@@ -668,7 +669,11 @@ void stream_sender::send_thread_main()
         if (transport_tx_)
         {
             n = static_cast<ssize_t>(wire_buf.size());
-            (void)transport_tx_->push(std::move(wire_buf));
+            /* push returns the prior occupancy; at capacity it evicted the oldest packet. */
+            if (transport_tx_->push(std::move(wire_buf)) >= transport_tx_->capacity())
+            {
+                transport_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
             queue_reactor_->wake_up();
         }
         else
@@ -687,15 +692,26 @@ void stream_sender::send_thread_main()
 
 int stream_sender::open()
 {
-    std::lock_guard<std::mutex> lock(mu);
-    if (opened)
+    /* Snapshot the transport config, then resolve and bind without holding mu: a hostname
+     * lookup can block, and query()/configure() must not wait on it. */
+    std::string udp_spec, tx_name, rx_name, reactor_name;
+    bool        telemetry = true;
     {
-        return 0;
+        std::lock_guard<std::mutex> lock(mu);
+        if (opened)
+        {
+            return 0;
+        }
+        udp_spec = udp_transport_;
+        tx_name = queue_transport_tx_;
+        rx_name = queue_transport_rx_;
+        reactor_name = reactor_name_;
+        telemetry = telemetry_on;
     }
-    const bool queue_mode = !queue_transport_tx_.empty() || !queue_transport_rx_.empty();
-    if (queue_mode ? (!udp_transport_.empty() || queue_transport_tx_.empty() ||
-                      queue_transport_rx_.empty() || reactor_name_.empty())
-                   : udp_transport_.empty())
+    const bool queue_mode = !tx_name.empty() || !rx_name.empty();
+    if (queue_mode ? (!udp_spec.empty() || tx_name.empty() || rx_name.empty() ||
+                      reactor_name.empty())
+                   : udp_spec.empty())
     {
         return -EINVAL;
     }
@@ -703,11 +719,11 @@ int stream_sender::open()
     std::shared_ptr<stream_transport_queue> tx, rx;
     std::shared_ptr<default_reactor> udp_reactor;
     std::shared_ptr<bfc::cv_reactor<>> queue_reactor;
-    const bool own_reactor = reactor_name_.empty();
+    const bool own_reactor = reactor_name.empty();
     if (queue_mode)
     {
-        tx = stream_transport_queue_registry::get_instance().get(queue_transport_tx_);
-        rx = stream_transport_queue_registry::get_instance().get(queue_transport_rx_);
+        tx = stream_transport_queue_registry::get_instance().get(tx_name);
+        rx = stream_transport_queue_registry::get_instance().get(rx_name);
         if (!tx || !rx)
         {
             return -ENOENT;
@@ -716,16 +732,16 @@ int stream_sender::open()
         {
             return -EINVAL;
         }
-        queue_reactor = bfc::cv_reactor_registry::get_instance().get(reactor_name_);
+        queue_reactor = bfc::cv_reactor_registry::get_instance().get(reactor_name);
         if (!queue_reactor)
         {
             return -ENOENT;
         }
     }
-    else if (telemetry_on)
+    else if (telemetry)
     {
         udp_reactor = own_reactor ? std::make_shared<default_reactor>()
-                                 : default_reactor_registry::get_instance().get(reactor_name_);
+                                 : default_reactor_registry::get_instance().get(reactor_name);
         if (!udp_reactor)
         {
             return -ENOENT;
@@ -738,7 +754,7 @@ int stream_sender::open()
     {
         char host[128];
         int port = 0;
-        if (parse_host_port(udp_transport_, host, sizeof(host), &port) < 0 ||
+        if (parse_host_port(udp_spec, host, sizeof(host), &port) < 0 ||
             resolve_ipv4_destination(host, port, &dst) < 0)
         {
             return -EINVAL;
@@ -759,6 +775,17 @@ int stream_sender::open()
             ::close(fd);
             return -err;
         }
+    }
+
+    std::lock_guard<std::mutex> lock(mu);
+    if (opened)
+    {
+        /* A concurrent open() won. */
+        if (fd >= 0)
+        {
+            ::close(fd);
+        }
+        return 0;
     }
     {
         std::lock_guard<std::mutex> flock(fec_mu);
@@ -800,10 +827,11 @@ int stream_sender::open()
     }
 
     bool registered = true;
-    if (queue_reactor_ && telemetry_on)
+    if (queue_reactor_ && telemetry)
     {
         registered = queue_reactor_->add_read_rdy(*transport_rx_,
                                                  [this] { on_queue_report_read(); });
+        rx_registered_ = registered;
         queue_reactor_->wake_up(); // Also handles data queued before open.
     }
     else if (udp_reactor_)
@@ -1602,6 +1630,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, dropped.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("transport_dropped" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      transport_dropped.load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }
