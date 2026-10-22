@@ -40,8 +40,6 @@ public:
     int  open() override;
     void close() override;
 
-    /* Wake blocking encode drain / output waits (shutdown without joining a stuck thread). */
-    void cancel_pending_io();
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 
@@ -49,6 +47,7 @@ public:
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    void cancel_pending_io();
     int  encoder_open_locked();
     void encoder_close_locked();
     int  reopen_if_needed_locked();

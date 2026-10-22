@@ -40,7 +40,6 @@ public:
     [[nodiscard]] std::string name() const override;
     int  open() override;
     void close() override;
-    void cancel_pending_io();
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 
@@ -48,6 +47,7 @@ public:
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    void cancel_pending_io();
     [[nodiscard]] int input_pdu_locked(component_pdu &&in);
     [[nodiscard]] bool coded_caps_acceptable(const video_coded_caps &caps) const;
     void maybe_emit_output_caps_locked(int32_t w, int32_t h, int32_t hor, int32_t ver, uint64_t ts_us);

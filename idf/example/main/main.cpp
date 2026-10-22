@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 // Smoke tests for the vstreamer component on ESP-IDF.
 //
 // 1. Loopback:
@@ -452,6 +453,7 @@ int run()
 {
     using vstreamer::component_factory;
 
+    vstreamer::default_reactor_host sender_reactor;
     print_heap("start");
     auto rx = component_factory::create_source("stream_receiver");
     print_heap("after rx");
@@ -476,11 +478,10 @@ int run()
     relay.add_source("in", "stream_receiver");
     relay.add_sink("out", "stream_sender");
     relay.configure("in", "listen", "127.0.0.1:5600");
+    relay.configure("out", "reactor", sender_reactor.name());
     relay.configure("out", "udp_transport", "127.0.0.1:5601");
     apply_place(*relay.node("out"), k_sender_place);
     relay.link("in", "out");
-    /* stream_sender starts with its send gate closed. */
-    static_cast<vstreamer::component_sink *>(relay.node("out"))->set_enabled(true, 0);
     relay.set_cpu(1);
     const int sr = relay.start();
     if (sr < 0)
@@ -489,9 +490,9 @@ int run()
         return -1;
     }
 
+    tx->configure("reactor", sender_reactor.name());
     tx->configure("udp_transport", "127.0.0.1:5600");
     apply_place(*tx, k_sender_place);
-    tx->set_enabled(true, 0);
     if (tx->open() < 0)
     {
         std::printf("tx open failed\n");

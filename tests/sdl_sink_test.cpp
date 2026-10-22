@@ -1,16 +1,18 @@
-#include "components/sdl_nv12_presenter.hpp"
 #include "components/sdl_sink.hpp"
-#include "core/component_factory.hpp"
-#include "core/component_pdu.hpp"
-#include "core/sdu_caps.hpp"
-#include <bfc/shared_sized_buffer.hpp>
 
 #include <gtest/gtest.h>
 
+#include <bfc/shared_sized_buffer.hpp>
 #include <cerrno>
 #include <cstring>
+#include <sstream>
 #include <thread>
 #include <vector>
+
+#include "components/sdl_nv12_presenter.hpp"
+#include "core/component_factory.hpp"
+#include "core/component_pdu.hpp"
+#include "core/sdu_caps.hpp"
 
 namespace
 {
@@ -81,18 +83,26 @@ TEST(SdlSinkTest, InputPresentsOnCallingThread)
     vstreamer::sdl_sink sink;
     ASSERT_EQ(0, sink.configure("video_driver", "dummy"));
     ASSERT_EQ(0, sink.open());
-    const std::thread::id prep_thread = std::this_thread::get_id();
-    ASSERT_EQ(0, sink.prepare(64, 64));
-    EXPECT_EQ(prep_thread, sink.bound_render_thread());
+    std::string render_thread;
+    ASSERT_EQ(0, sink.query("render_thread", &render_thread));
+    EXPECT_TRUE(render_thread.empty());
+    ASSERT_EQ(0, sink.configure("width", "64"));
+    ASSERT_EQ(0, sink.configure("height", "64"));
+    ASSERT_EQ(0, sink.query("render_thread", &render_thread));
+    EXPECT_TRUE(render_thread.empty());
     ASSERT_EQ(0, sink.input(make_nv12_caps(64, 64)));
     ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 1'000'000)));
     ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 1'033'000)));
-    /* Both frames were presented inside input(); nothing is left pending. */
-    EXPECT_EQ(-EAGAIN, sink.present_pending());
+    ASSERT_EQ(0, sink.query("render_thread", &render_thread));
+    std::ostringstream expected;
+    expected << std::this_thread::get_id();
+    EXPECT_EQ(expected.str(), render_thread);
     std::string stats;
     ASSERT_EQ(0, sink.query("stats", &stats));
     EXPECT_EQ(0U, stats.rfind("frames=2", 0)) << stats;
     sink.close();
+    ASSERT_EQ(0, sink.query("render_thread", &render_thread));
+    EXPECT_TRUE(render_thread.empty());
 }
 
 TEST(SdlNv12PresenterTest, TryEnqueueEagainWhenQueueFull)
@@ -123,4 +133,40 @@ TEST(SdlNv12PresenterTest, EnqueueDropOldestWhenQueueFull)
     ASSERT_EQ(0, present.enqueue_drop(f, &dropped));
     EXPECT_TRUE(dropped);
     EXPECT_EQ(1U, present.queue_size());
+}
+
+TEST(SdlSinkTest, ConfiguredDimensionsAllowFramesWithoutCapsOnRenderThread)
+{
+    vstreamer::sdl_sink sink;
+    ASSERT_EQ(0, sink.configure("video_driver", "dummy"));
+    for (const char *bad :
+         {"", "0", "-2", "63", "64junk", "9999999999999999999"})
+    {
+        EXPECT_EQ(-EINVAL, sink.configure("width", bad));
+        EXPECT_EQ(-EINVAL, sink.configure("height", bad));
+    }
+    ASSERT_EQ(0, sink.configure("width", "64"));
+    ASSERT_EQ(0, sink.configure("height", "64"));
+    std::string value;
+    ASSERT_EQ(0, sink.query("width", &value));
+    EXPECT_EQ("64", value);
+    ASSERT_EQ(0, sink.query("height", &value));
+    EXPECT_EQ("64", value);
+    ASSERT_EQ(0, sink.open());
+    // Configuration on a console thread must not bind the renderer.
+    std::thread console(
+        [&]
+        {
+            EXPECT_EQ(0, sink.configure("width", "64"));
+            EXPECT_EQ(0, sink.configure("height", "64"));
+        });
+    console.join();
+    ASSERT_EQ(0, sink.query("render_thread", &value));
+    EXPECT_TRUE(value.empty());
+    ASSERT_EQ(0, sink.input(make_nv12_pdu(64, 64, 123)));
+    ASSERT_EQ(0, sink.query("stats", &value));
+    EXPECT_EQ(0u, value.rfind("frames=1", 0)) << value;
+    EXPECT_EQ(-EINVAL, sink.query("render_thread", nullptr));
+    EXPECT_EQ(-ENOTSUP, sink.query("not_a_setting", &value));
+    sink.close();
 }

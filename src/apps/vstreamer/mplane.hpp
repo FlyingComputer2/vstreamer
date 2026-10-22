@@ -18,10 +18,6 @@ class pipeline_set;
  *   nodes                         "ok <pipeline> <node> <type>" per node
  *   state                         "ok <pipeline> <state>" per pipeline
  *   start|pause|stop [<pipeline>|all]
- *   enable <node> [timeout_ms]    open a sink's send gate; with a timeout it closes unless
- *                                 enabled again in time
- *   disable <node>                close it
- *   enabled <node>                "ok 1" / "ok 0"
  */
 [[nodiscard]] std::string mplane_help();
 

@@ -120,7 +120,8 @@ int feed_decoder_pdu(h264_decoder_mpp *dec, component_pdu &pdu, present_pdu_queu
 
 int prepare_preview_sink(component_sink *preview, bool /*kmsdrm*/, int w, int h)
 {
-    return static_cast<sdl_sink *>(preview)->prepare(w, h);
+    const int r = preview->configure("width", std::to_string(w));
+    return r < 0 ? r : preview->configure("height", std::to_string(h));
 }
 
 void present_thread_main(component_sink *display, present_pdu_queue *present_queue, int width, int height,

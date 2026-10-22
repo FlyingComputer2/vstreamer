@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "core/thread_spawn.hpp"
 
 #include <gtest/gtest.h>
@@ -118,6 +119,7 @@ TEST(ThreadSpawnTest, PinsNewThreadOnLinux)
 
 TEST(ThreadPlaceTest, StreamSenderExposesSendKeysOnly)
 {
+    vstreamer::default_reactor_host reactor;
     auto snd = vstreamer::component_factory::create_sink("stream_sender");
     if (!snd)
     {
@@ -132,6 +134,7 @@ TEST(ThreadPlaceTest, StreamSenderExposesSendKeysOnly)
     EXPECT_EQ(snd->query("send_prio", &v), 0);
     EXPECT_EQ(v, "-1");
 
+    ASSERT_EQ(snd->configure("reactor", reactor.name()), 0);
     ASSERT_EQ(snd->configure("udp_transport", "127.0.0.1:9"), 0);
     ASSERT_EQ(snd->configure("telemetry", "off"), 0);
     ASSERT_EQ(snd->open(), 0);

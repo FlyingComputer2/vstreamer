@@ -26,9 +26,12 @@ Reverse-path RX/gap metrics are not on the media graph.
 
 ### Telemetry
 
-Receiver link counters flow **receiver → reverse UDP → sender**: periodic 48-byte reports
-(`stream_telemetry.hpp`) to the media source address; `stream_sender::peer_link_snapshot()` and
-`peer_*` query keys hold the last report. The app derives `peer_loss_*` from counter deltas.
+Receiver link counters flow **receiver → reverse UDP → sender**: periodic 68-byte reports
+(`stream_telemetry.hpp`, versioned 64-byte payload) to the media source address.
+`peer_udp_pkt_recv`, `peer_fec_pkt_recv`, and `peer_byt_recv` queries hold timestamped tuples
+from the last report. The app derives `peer_loss_*` from packet/gap deltas after checking the
+report generation, timestamps and session. New senders accept legacy packet-only reports;
+byte queries return `-ENODATA` for them. Old senders reject the new report length.
 `scripts/cbr_controller.py` holds AIMD increases when `peer_report_age_ms` is stale (> 3×
 `telemetry_ms`, or no report yet). In the `stream_sdl` bench the reports cross `link_emulator`'s
 reverse direction, the NAT-style return path of the forward flow, so reverse-path loss is

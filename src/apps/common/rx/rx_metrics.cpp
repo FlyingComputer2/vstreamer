@@ -1,15 +1,14 @@
 #include "apps/common/rx/rx_metrics.hpp"
 
-#include "apps/common/pipeline_state.hpp"
-#include "apps/common/stage_latency.hpp"
-
 #include <chrono>
 #include <cstdlib>
 #include <string>
 #include <thread>
 
+#include "apps/common/pipeline_state.hpp"
+#include "apps/common/stage_latency.hpp"
 #include "core/metrics.hpp"
-#include "core/stream_telemetry.hpp"
+#include "core/stream_metrics.hpp"
 
 namespace vstreamer::apps::rx
 {
@@ -20,15 +19,19 @@ using namespace vstreamer;
  * stream_sender.peer_* come from the link reports it receives (tx::sync_sender_peer_link_metrics_live). */
 void sync_rx_link_metrics_live(stream_receiver &rcv)
 {
-    const stream_link_counters cur = rcv.link_counters_snapshot();
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.udp_packet_received"),
-                 cur.udp_packet_received);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.udp_gap_count"),
-                 cur.udp_gap_count);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_packet_received"),
-                 cur.fec_packet_received);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_gap_count"),
-                 cur.fec_gap_count);
+    stream_metric_tuple tuple;
+    for (const auto &layer : {"udp", "fec"})
+    {
+        if (query_stream_metric(rcv, std::string(layer) + "_pkt_recv", &tuple))
+        {
+            const std::string prefix = std::string("stream_receiver.") + layer;
+            metric_store(
+                *g_pipeline_metrics.get_metric(prefix + "_packet_received"),
+                tuple.first);
+            metric_store(*g_pipeline_metrics.get_metric(prefix + "_gap_count"),
+                         tuple.second);
+        }
+    }
     for (const char *key : {"telemetry_sent", "telemetry_send_errors"})
     {
         std::string val;
@@ -46,12 +49,19 @@ void sync_rx_cumulative_counters(const test_app::bench_diag &d, stream_receiver 
     {
         return;
     }
-    const uint64_t fec_pkts =
-        rcv->peer_fec_packet_received_counter().load(std::memory_order_relaxed);
-    const uint64_t in_pkts = fec_pkts > 0 ? fec_pkts : d.rx_udp.load(std::memory_order_relaxed);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.in_packets"), in_pkts);
-    metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_bytes"),
-                 rcv->egress_payload_bytes_counter());
+    stream_metric_tuple tuple;
+    if (query_stream_metric(*rcv, "fec_pkt_recv", &tuple))
+    {
+        metric_store(
+            *g_pipeline_metrics.get_metric("stream_receiver.in_packets"),
+            tuple.first);
+    }
+    if (query_stream_metric(*rcv, "byt_recv", &tuple))
+    {
+        metric_store(
+            *g_pipeline_metrics.get_metric("stream_receiver.out_bytes"),
+            tuple.second);
+    }
 
     metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_packets"), d.rx_dec_in_ok);
     metric_store(*g_pipeline_metrics.get_metric("h264_decoder.in_bytes"), d.rx_dec_in_bytes);

@@ -48,10 +48,7 @@ std::string mplane_help()
            "set <node> <key> <value>\n"
            "nodes\n"
            "state\n"
-           "start|pause|stop [<pipeline>|all]\n"
-           "enable <node> [timeout_ms]\n"
-           "disable <node>\n"
-           "enabled <node>";
+           "start|pause|stop [<pipeline>|all]";
 }
 
 bool handle_mplane_line(pipeline_set &set, const char *line, std::string &reply)
@@ -129,39 +126,6 @@ bool handle_mplane_line(pipeline_set &set, const char *line, std::string &reply)
             r = set.stop(target);
         }
         reply = result_reply(r);
-        return true;
-    }
-    if ("enable" == verb)
-    {
-        const std::string_view node = next_word(&rest);
-        const std::string_view timeout = next_word(&rest);
-        int64_t                timeout_ms = 0;
-        if (node.empty() || !rest.empty() ||
-            (!timeout.empty() &&
-             (key_parse_i64(timeout, &timeout_ms) != 0 || timeout_ms < 0 || timeout_ms > 86'400'000)))
-        {
-            reply = "err usage: enable <node> [timeout_ms]\n";
-            return true;
-        }
-        reply = result_reply(set.set_enabled(node, true, static_cast<int>(timeout_ms)));
-        return true;
-    }
-    if ("disable" == verb || "enabled" == verb)
-    {
-        const std::string_view node = next_word(&rest);
-        if (node.empty() || !rest.empty())
-        {
-            reply = "err usage: " + std::string(verb) + " <node>\n";
-            return true;
-        }
-        if ("disable" == verb)
-        {
-            reply = result_reply(set.set_enabled(node, false, 0));
-            return true;
-        }
-        bool      on = false;
-        const int r = set.enabled(node, &on);
-        reply = (r < 0) ? err_reply(r) : std::string(on ? "ok 1\n" : "ok 0\n");
         return true;
     }
     return false;

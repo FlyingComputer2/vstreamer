@@ -1,17 +1,17 @@
 #include "apps/common/tx/tx_metrics.hpp"
 
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+
 #include "apps/common/pipeline_state.hpp"
 #include "apps/common/stage_latency.hpp"
 #include "apps/common/tx/tx_state.hpp"
 #include "apps/stream_sdl_test/diag.hpp"
-
-#include <chrono>
-#include <cstdlib>
-#include <mutex>
-#include <thread>
-#include <string>
-
 #include "core/metrics.hpp"
+#include "core/stream_metrics.hpp"
 #include "core/stream_telemetry.hpp"
 #include "core/time_util.hpp"
 
@@ -221,37 +221,67 @@ void store_sender_peer_link_metrics(uint64_t udp_recv, uint64_t fec_recv, uint64
     metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_loss_fec_pct"), loss_fec_pct);
 }
 
-/* stream_sender.peer_* come only from the link reports the sender received, never from a
- * receiver object. Published before the first report too (counters 0, age -1, session 0). */
+/* Queries may cross reports. Only combine packet tuples bracketed by an
+ * unchanged report generation and session, with matching receiver sampling
+ * timestamps. */
 void sync_sender_peer_link_metrics_live(stream_sender &sender)
 {
-    const stream_peer_link snap = sender.peer_link_snapshot();
-    const stream_link_counters cur = snap.have ? snap.report.counters : stream_link_counters {};
-
-    double loss_udp = 0.;
-    double loss_fec = 0.;
-    if (snap.have)
+    std::lock_guard<std::mutex> loss_lock(g_sender_peer_loss_mu);
+    stream_metric_tuple udp, fec;
+    uint64_t session = 0;
+    bool have = false;
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
-        std::lock_guard<std::mutex> lock(g_sender_peer_loss_mu);
-        update_receiver_loss_deltas(cur, snap.report.session_id, g_sender_peer_loss);
-        loss_udp = g_sender_peer_loss.loss_udp_pct;
-        loss_fec = g_sender_peer_loss.loss_fec_pct;
+        uint64_t before = 0, after = 0, end_session = 0;
+        if (query_stream_u64(sender, "peer_reports_received", &before) &&
+            query_stream_u64(sender, "peer_session", &session) &&
+            session != 0 &&
+            query_stream_metric(sender, "peer_udp_pkt_recv", &udp) &&
+            query_stream_metric(sender, "peer_fec_pkt_recv", &fec) &&
+            query_stream_u64(sender, "peer_session", &end_session) &&
+            query_stream_u64(sender, "peer_reports_received", &after) &&
+            before == after && session == end_session &&
+            udp.timestamp_ms == fec.timestamp_ms)
+        {
+            have = true;
+            break;
+        }
     }
-
-    store_sender_peer_link_metrics(cur.udp_packet_received, cur.fec_packet_received,
-                                   cur.udp_gap_count, cur.fec_gap_count, loss_udp, loss_fec);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_age_ms"),
-                 static_cast<int64_t>(snap.age_ms));
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_received"),
-                 snap.reports_received);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_lost"),
-                 snap.reports_lost);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_reports_rejected"),
-                 snap.reports_rejected);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_session"),
-                 static_cast<uint64_t>(snap.have ? snap.report.session_id : 0U));
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.peer_report_interval_ms"),
-                 snap.observed_interval_ms);
+    if (have)
+    {
+        stream_link_counters cur;
+        cur.udp_packet_received = udp.first;
+        cur.udp_gap_count = udp.second;
+        cur.fec_packet_received = fec.first;
+        cur.fec_gap_count = fec.second;
+        update_receiver_loss_deltas(cur, static_cast<uint32_t>(session),
+                                    g_sender_peer_loss);
+        store_sender_peer_link_metrics(
+            udp.first, fec.first, udp.second, fec.second,
+            g_sender_peer_loss.loss_udp_pct, g_sender_peer_loss.loss_fec_pct);
+        metric_store(
+            *g_pipeline_metrics.get_metric("stream_sender.peer_session"),
+            session);
+    }
+    for (const char *key :
+         {"peer_report_age_ms", "peer_reports_received", "peer_reports_lost",
+          "peer_reports_rejected", "peer_report_interval_ms"})
+    {
+        std::string value;
+        if (sender.query(key, &value) == 0)
+        {
+            int64_t n = 0;
+            const auto result =
+                std::from_chars(value.data(), value.data() + value.size(), n);
+            if (result.ec == std::errc{} &&
+                result.ptr == value.data() + value.size())
+            {
+                metric_store(*g_pipeline_metrics.get_metric(
+                                 std::string("stream_sender.") + key),
+                             n);
+            }
+        }
+    }
 }
 
 void telemetry_thread_main(stream_sender *sender)
@@ -280,10 +310,17 @@ void sync_tx_cumulative_counters(const test_app::bench_diag &d, stream_sender *s
     metric_store(*g_pipeline_metrics.get_metric("encoder_queue.in_frames"), d.tx_jpeg_nv12);
     metric_store(*g_pipeline_metrics.get_metric("encoder_queue.out_frames"), d.tx_enc_nv12_popped);
     metric_store(*g_pipeline_metrics.get_metric("h264_encoder.in_frames"), d.tx_nv12);
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_packets"),
-                 sender->wire_pkts_sent_counter());
-    metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_bytes"),
-                 sender->wire_bytes_sent_counter());
+    stream_metric_tuple tuple;
+    if (query_stream_metric(*sender, "pkt_sent", &tuple))
+    {
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_packets"),
+                     tuple.first);
+    }
+    if (query_stream_metric(*sender, "byt_sent", &tuple))
+    {
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_bytes"),
+                     tuple.first);
+    }
 }
 
 double sender_peer_fec_loss_pct(stream_sender &sender)

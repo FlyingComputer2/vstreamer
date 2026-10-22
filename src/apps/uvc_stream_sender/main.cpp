@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "apps/common/cpu_map.hpp"
 #include "apps/common/pipeline_controller.hpp"
 #include "apps/common/queues.hpp"
@@ -220,6 +221,7 @@ int main(int argc, char **argv)
     jpeg_decoder_multicore jdec;
     encoder_t              enc;
     rtp_h264_pay           pay;
+    vstreamer::default_reactor_host sender_reactor;
     stream_sender          sender;
 
     if (cfg(camera, "device", device) < 0 || cfg(camera, "size", size_buf) < 0 ||
@@ -240,6 +242,7 @@ int main(int argc, char **argv)
     cfg(enc, "gop", gop_buf);
     cfg(pay, "fps", fps_buf);
     cfg(pay, "mtu", mtu_buf);
+    sender.configure("reactor", sender_reactor.name());
     cfg(sender, "udp_transport", stream_buf);
     if (no_telemetry)
     {
@@ -289,7 +292,6 @@ int main(int argc, char **argv)
     {
         return 1;
     }
-    sender.set_enabled(true, 0);
 
     apps::stage_latency_set_diag_enabled(diag);
 
