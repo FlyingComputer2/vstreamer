@@ -37,10 +37,6 @@ namespace vstreamer::app
  *                                            the queue's writer at the end of a chain and its
  *                                            reader at the start
  *   set <node> <key> <value...>              configure(); the rest of the line is the value
- *   enable <node> [timeout_ms]               open a sink's send gate (component_sink::
- *                                            set_enabled); without it a stream_sender sends
- *                                            nothing. With a timeout the gate closes unless it
- *                                            is enabled again in time (operator deadman).
  *
  * Node names are unique across the file. A queue needs exactly one writer and one reader.
  * Queue endpoint nodes are named @<queue> in their pipelines.
@@ -84,10 +80,6 @@ public:
     /* Node access by global node name. -ENOENT when unknown. Any thread. */
     int configure(std::string_view node, std::string_view key, std::string_view value);
     int query(std::string_view node, std::string_view key, std::string *value) const;
-
-    /* Sink send gate. -ENOENT unknown node, -EINVAL not a sink. Any thread. */
-    int set_enabled(std::string_view node, bool on, int timeout_ms);
-    int enabled(std::string_view node, bool *on) const;
 
     [[nodiscard]] std::vector<node_info> nodes() const;
     [[nodiscard]] std::vector<std::pair<std::string, pipeline_state_e>> states() const;

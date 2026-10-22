@@ -37,7 +37,6 @@ public:
     int  open() override;
     void close() override;
 
-    void stop_pregenerate();
     int output(component_pdu &out) override;
 
     [[nodiscard]] int64_t next_deadline_ns() const override;
@@ -46,6 +45,7 @@ public:
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    void stop_pregenerate();
     int  fill_nv12_locked(uint8_t *dst, size_t dst_sz);
     int  emit_raw_caps_locked(component_pdu &out);
     bool raw_caps_match_locked() const;

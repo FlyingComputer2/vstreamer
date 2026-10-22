@@ -1,15 +1,7 @@
 #include "components/stream_receiver.hpp"
 
-#include "core/component_pdu.hpp"
-#include "core/rs_block_erasure.hpp"
-#include "core/stream_header.hpp"
-#include "core/stream_telemetry.hpp"
-
-#include <gtest/gtest.h>
-
-#include "test_pdu_helpers.hpp"
-
 #include <arpa/inet.h>
+#include <gtest/gtest.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -20,6 +12,13 @@
 #include <cstring>
 #include <string>
 #include <thread>
+
+#include "core/component_pdu.hpp"
+#include "core/rs_block_erasure.hpp"
+#include "core/stream_header.hpp"
+#include "core/stream_telemetry.hpp"
+#include "stream_query_test_helpers.hpp"
+#include "test_pdu_helpers.hpp"
 
 namespace
 {
@@ -479,11 +478,19 @@ TEST(StreamReceiverTest, TelemetryCountersResetOnReopen)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     } while (std::chrono::steady_clock::now() < sent_deadline);
     EXPECT_NE("0", sent);
+    const auto counts = vstreamer::test_query::receiver_counters(receiver);
+    EXPECT_EQ(wire.size(), counts.udp_bytes_received);
+    EXPECT_EQ(32u, counts.fec_bytes_received);
 
     receiver.close();
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, receiver.query("telemetry_sent", &sent));
     EXPECT_EQ("0", sent);
+    const auto reset = vstreamer::test_query::receiver_counters(receiver);
+    EXPECT_EQ(0u, reset.udp_bytes_received);
+    EXPECT_EQ(0u, reset.fec_bytes_received);
+    EXPECT_EQ(0u, reset.udp_packet_received);
+    EXPECT_EQ(0u, reset.fec_packet_received);
     receiver.close();
     close(s);
 }
@@ -618,4 +625,68 @@ TEST(StreamReceiverTest, PduDiscontAfterUdpSequenceGap)
 
     receiver.close();
     close(s);
+}
+
+TEST(StreamReceiverTest, PacketGapTuplesStayConsistentDuringReception)
+{
+    const int port = ephemeral_udp_port();
+    ASSERT_GT(port, 0);
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ASSERT_GE(fd, 0);
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(
+        0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
+    ASSERT_EQ(0, receiver.configure("telemetry", "off"));
+    ASSERT_EQ(0, receiver.open());
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(static_cast<uint16_t>(port));
+    dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    constexpr int packets = 300;
+    std::atomic<bool> finished{false};
+    std::thread producer(
+        [&]
+        {
+            for (int i = 0; i < packets; ++i)
+            {
+                std::vector<uint8_t> wire(vstreamer::k_stream_header_len + 16, 0x33);
+                vstreamer::stream_header header {};
+                header.sequence_number = static_cast<uint16_t>(i * 3);
+                header.is_stream_data = true;
+                vstreamer::stream_header_write(wire.data(), header);
+                EXPECT_EQ(
+                    static_cast<ssize_t>(wire.size()),
+                    sendto(fd, wire.data(), wire.size(), 0,
+                           reinterpret_cast<sockaddr *>(&dst), sizeof(dst)));
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            }
+            finished = true;
+        });
+    do
+    {
+        for (const char *key : {"udp_pkt_recv", "fec_pkt_recv"})
+        {
+            const auto tuple = vstreamer::test_query::tuple(receiver, key);
+            EXPECT_EQ(tuple.first == 0 ? 0 : (tuple.first - 1) * 2,
+                      tuple.second)
+                << key;
+        }
+    } while (!finished);
+    producer.join();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (vstreamer::test_query::tuple(receiver, "fec_pkt_recv").first <
+               packets &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::yield();
+    }
+    const auto counts = vstreamer::test_query::receiver_counters(receiver);
+    EXPECT_EQ(packets, counts.fec_packet_received);
+    EXPECT_EQ(packets * 16u, counts.fec_bytes_received);
+    std::string value;
+    EXPECT_EQ(-EINVAL, receiver.query("byt_recv", nullptr));
+    EXPECT_EQ(-ENOTSUP, receiver.query("not_a_metric", &value));
+    receiver.close();
+    close(fd);
 }

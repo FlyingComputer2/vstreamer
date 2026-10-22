@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "components/stream_receiver.hpp"
 #include "components/stream_sender.hpp"
 #include "core/fec_spread.hpp"
@@ -157,7 +158,7 @@ double ms_between(clock_type::time_point a, clock_type::time_point b)
 void open_fec_sender(vstreamer::stream_sender &sender, const std::string &dst, int k, int n,
                      int spread_ms)
 {
-    ASSERT_EQ(0, cfg(sender, "stream", dst));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", dst));
     ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     /* k first: the default n (12) must stay >= k at every step. */
@@ -165,7 +166,6 @@ void open_fec_sender(vstreamer::stream_sender &sender, const std::string &dst, i
     ASSERT_EQ(0, cfg(sender, "fec_n", std::to_string(n)));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", std::to_string(spread_ms)));
     ASSERT_EQ(0, sender.open());
-    ASSERT_EQ(0, sender.set_enabled(true, 0));
 }
 
 std::vector<std::vector<uint8_t>> encode_tags(rs_block_erasure &enc, uint16_t sdu_base,
@@ -228,7 +228,9 @@ TEST(FecSpreadTest, OffsetsTileTheWindow)
 
 TEST(FecSpreadTest, ConfigRangeAndQuery)
 {
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "40"));
     EXPECT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
@@ -245,7 +247,9 @@ TEST(FecSpreadTest, ConfigRangeAndQuery)
 TEST(FecSpreadTest, ZeroSendsBlockAtOnce)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
     for (uint8_t t = 0; t < 4; t++)
     {
@@ -261,7 +265,9 @@ TEST(FecSpreadTest, ZeroSendsBlockAtOnce)
 TEST(FecSpreadTest, BlockSpreadOverWindowInOrder)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
     for (uint8_t t = 0; t < 4; t++)
     {
@@ -292,7 +298,9 @@ TEST(FecSpreadTest, BlockSpreadOverWindowInOrder)
 TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 8, 12, 20);
     ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1))));  // flushed by the 20 ms timeout
     const auto got = sniff.collect(5, 1000);
@@ -306,7 +314,9 @@ TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
 TEST(FecTimeoutTest, ZeroWaitsForFullBlock)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     ASSERT_EQ(0, cfg(sender, "fec_timeout_ms", "0"));
     open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
     ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0))));
@@ -326,7 +336,9 @@ TEST(FecTimeoutTest, ZeroWaitsForFullBlock)
 TEST(FecSpreadTest, OverlappingBlocksInterleave)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
     for (uint8_t t = 0; t < 4; t++)
     {
@@ -372,13 +384,14 @@ TEST(FecSpreadTest, RawNotDelayed)
     socklen_t len = sizeof(addr);
     getsockname(fd, reinterpret_cast<sockaddr *>(&addr), &len);
 
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, cfg(sender, "stream", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
+    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
     ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "40"));
     ASSERT_EQ(0, sender.open());
-    ASSERT_EQ(0, sender.set_enabled(true, 0));
 
     const auto t0 = clock_type::now();
     ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(7))));
@@ -471,7 +484,9 @@ TEST(FecSpreadTest, InterleavingSurvivesBurst)
 /* End to end over loopback: sender with spreading, receiver decodes every packet in order. */
 TEST(FecSpreadTest, LoopbackInOrderWithSpread)
 {
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender   sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     vstreamer::stream_receiver receiver;
     /* Pick a free port for the receiver to bind. */
     const int fd_port_probe = socket(AF_INET, SOCK_DGRAM, 0);
@@ -523,7 +538,9 @@ TEST(FecSpreadTest, LoopbackInOrderWithSpread)
 TEST(FecSpreadTest, TimeoutFlushOnTimeWhenIdle)
 {
     wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 8, 12, 0);
     double worst_ms = 0.;
     for (int i = 0; i < 12; i++)

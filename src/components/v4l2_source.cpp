@@ -692,13 +692,6 @@ int v4l2_source::open()
     return 0;
 }
 
-void v4l2_source::interrupt_shutdown()
-{
-    stop_poll_watcher();
-    std::lock_guard<std::mutex> lock(mu);
-    capture_close_locked();
-}
-
 void v4l2_source::close()
 {
     stop_poll_watcher();

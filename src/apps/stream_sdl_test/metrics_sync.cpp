@@ -7,16 +7,14 @@
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
 #include "apps/common/tx/tx_metrics.hpp"
 #endif
+#include <cstdlib>
+#include <string>
+
 #include "apps/common/rx/rx_metrics.hpp"
 #include "apps/stream_sdl_test/bench_stream_metrics.hpp"
 #include "apps/stream_sdl_test/pipeline_state.hpp"
-
-#include <cstdlib>
-
-#include <string>
-
 #include "core/metrics.hpp"
-#include "core/stream_telemetry.hpp"
+#include "core/stream_metrics.hpp"
 
 namespace vstreamer::test_app
 {
@@ -87,22 +85,16 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const auto t_now = std::chrono::steady_clock::now();
     double     dt = 1.0;
     pipeline_counters prev {};
-    uint64_t          prev_snd_pkts = 0;
-    uint64_t          prev_snd_bytes = 0;
     uint64_t          prev_dec_dropped = 0;
     uint64_t          prev_sink_dropped = 0;
-    uint64_t          prev_rcv_bytes = 0;
     uint64_t          prev_ch_bytes_in = 0;
     uint64_t          prev_ch_bytes_out = 0;
     uint64_t          prev_ch_fwd_drops = 0;
     if (rate.have_snap)
     {
         prev = rate.snap;
-        prev_snd_pkts = rate.snd_pkts;
-        prev_snd_bytes = rate.snd_bytes;
         prev_dec_dropped = rate.dec_dropped;
         prev_sink_dropped = rate.sink_dropped;
-        prev_rcv_bytes = rate.rcv_bytes;
         prev_ch_bytes_in = rate.ch_bytes_in;
         prev_ch_bytes_out = rate.ch_bytes_out;
         prev_ch_fwd_drops = rate.ch_fwd_drops;
@@ -110,22 +102,44 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     }
     const pipeline_counters now = snapshot_counters(d);
 
-    std::string rcv_stats;
-    std::string snd_stats;
+    stream_metric_tuple tuple;
+    double snd_pkt_ps = 0., snd_in_kbps = 0., rx_pkt_ps = 0., rcv_out_kbps = 0.;
+    double ignored = 0.;
+    bool snd_packets_ok = false, snd_bytes_ok = false;
+    bool rx_packets_ok = false, rx_bytes_ok = false;
+    if (nullptr != sender)
+    {
+        snd_packets_ok =
+            query_stream_metric(*sender, "pkt_sent", &tuple) &&
+            rate.sender_packets.sample(tuple, 0, &snd_pkt_ps, &ignored);
+        snd_bytes_ok =
+            query_stream_metric(*sender, "byt_sent", &tuple) &&
+            rate.sender_bytes.sample(tuple, 0, &snd_in_kbps, &ignored);
+        snd_in_kbps *= 8. / 1000.;
+    }
 #if defined(ENABLE_STREAM_RECEIVER)
     if (nullptr != rcv)
     {
-        (void)rcv->query("stats", &rcv_stats);
+        uint64_t session = 0, end_session = 0;
+        if (query_stream_u64(*rcv, "session_id", &session) &&
+            query_stream_metric(*rcv, "fec_pkt_recv", &tuple) &&
+            query_stream_u64(*rcv, "session_id", &end_session) &&
+            session == end_session)
+        {
+            rx_packets_ok = rate.receiver_packets.sample(tuple, session,
+                                                         &rx_pkt_ps, &ignored);
+        }
+        if (query_stream_u64(*rcv, "session_id", &session) &&
+            query_stream_metric(*rcv, "byt_recv", &tuple) &&
+            query_stream_u64(*rcv, "session_id", &end_session) &&
+            session == end_session)
+        {
+            rx_bytes_ok = rate.receiver_bytes.sample(tuple, session, &ignored,
+                                                     &rcv_out_kbps);
+            rcv_out_kbps *= 8. / 1000.;
+        }
     }
 #endif
-    if (nullptr != sender)
-    {
-        (void)sender->query("stats", &snd_stats);
-    }
-
-    const uint64_t rcv_bytes_now = apps::parse_stats_field(rcv_stats, "bytes");
-    const uint64_t snd_pkts_now = apps::parse_stats_field(snd_stats, "pkts");
-    const uint64_t snd_bytes_now = apps::parse_stats_field(snd_stats, "bytes");
 
 #if !defined(VSTREAMER_BENCH_TX_ONLY) && !defined(VSTREAMER_BENCH_RX_ONLY)
     const auto ch = (nullptr != channel) ? channel->forward_stats_snapshot()
@@ -137,8 +151,6 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const double jpeg_out_fps = apps::rate_per_sec(now.tx_jpeg_nv12, prev.tx_jpeg_nv12, dt);
     const double enc_in_fps = apps::rate_per_sec(now.tx_nv12, prev.tx_nv12, dt);
     const double enc_pkt_ps = apps::rate_per_sec(now.tx_rtp_sock, prev.tx_rtp_sock, dt);
-    const double snd_pkt_ps = apps::rate_per_sec(snd_pkts_now, prev_snd_pkts, dt);
-    const double rx_pkt_ps = apps::rate_per_sec(now.rx_udp, prev.rx_udp, dt);
     const double dec_in_au_pps = apps::rate_per_sec(now.rx_dec_in_ok, prev.rx_dec_in_ok, dt);
     const double depay_au_pps = apps::rate_per_sec(now.rx_depay_au, prev.rx_depay_au, dt);
     const double dec_out_fps = apps::rate_per_sec(now.rx_nv12_out, prev.rx_nv12_out, dt);
@@ -164,17 +176,6 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     /* Encoder output bitrate (H.264 AU bytes); same unit as h264_encoder.cbr_kbps. */
     const uint64_t enc_out_bytes_now =
         d.tx_enc_out_bytes.load(std::memory_order_relaxed);
-    double rcv_out_kbps = 0.0;
-    if (rate.have_snap && dt > 0.0 && rcv_bytes_now >= prev_rcv_bytes && rcv_bytes_now > prev_rcv_bytes)
-    {
-        rcv_out_kbps =
-            static_cast<double>(rcv_bytes_now - prev_rcv_bytes) * 8.0 / dt / 1000.0;
-    }
-    double snd_in_kbps = 0.0;
-    if (rate.have_snap && dt > 0.0 && snd_bytes_now >= prev_snd_bytes && snd_bytes_now > prev_snd_bytes)
-    {
-        snd_in_kbps = static_cast<double>(snd_bytes_now - prev_snd_bytes) * 8.0 / dt / 1000.0;
-    }
     double source_out_kbps = 0.0;
     if (rate.have_snap && dt > 0.0 && now.tx_source_bytes >= prev.tx_source_bytes &&
         now.tx_source_bytes > prev.tx_source_bytes)
@@ -235,7 +236,7 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     const bool pipeline_flowing =
         (now.tx_rtp_sock > 0 && now.rx_udp > 0) || (enc_pkt_ps > 0.5 && rx_pkt_ps > 0.5);
 
-    const double snd_pps = snd_pkt_ps > 0.0 ? snd_pkt_ps : enc_pkt_ps;
+    const double snd_pps = snd_pkt_ps;
 
     const double glass_ms = apps::g_glass_latency_ms.load(std::memory_order_relaxed);
 #if !defined(VSTREAMER_BENCH_TX_ONLY)
@@ -332,8 +333,17 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
             metric_store(*g_pipeline_metrics.get_metric("h264_encoder.latency_ms"), enc_lat_ms);
         }
 
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"), snd_pps);
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_kbps"), snd_in_kbps);
+        if (snd_packets_ok)
+        {
+            metric_store(*g_pipeline_metrics.get_metric("stream_sender.in_pps"),
+                         snd_pps);
+        }
+        if (snd_bytes_ok)
+        {
+            metric_store(
+                *g_pipeline_metrics.get_metric("stream_sender.in_kbps"),
+                snd_in_kbps);
+        }
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_k"),
                      static_cast<int64_t>(query_u64(*sender, "fec_k")));
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_n"),
@@ -384,8 +394,18 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 #if defined(ENABLE_STREAM_RECEIVER)
     if (nullptr != rcv)
     {
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.in_pps"), rx_pkt_ps);
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.out_kbps"), rcv_out_kbps);
+        if (rx_packets_ok)
+        {
+            metric_store(
+                *g_pipeline_metrics.get_metric("stream_receiver.in_pps"),
+                rx_pkt_ps);
+        }
+        if (rx_bytes_ok)
+        {
+            metric_store(
+                *g_pipeline_metrics.get_metric("stream_receiver.out_kbps"),
+                rcv_out_kbps);
+        }
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_recovered"),
                      fec_recovered);
         metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_failures"),
@@ -450,12 +470,9 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
 
     rate.snap = now;
     rate.t0 = t_now;
-    rate.snd_pkts = snd_pkts_now;
-    rate.snd_bytes = snd_bytes_now;
     rate.enc_out_bytes = enc_out_bytes_now;
     rate.dec_dropped = dec_dropped_now;
     rate.sink_dropped = sink_dropped_now;
-    rate.rcv_bytes = rcv_bytes_now;
     rate.ch_bytes_in = ch.bytes_in;
     rate.ch_bytes_out = ch.bytes_out;
     rate.ch_pkts_out = ch.pkts_out;

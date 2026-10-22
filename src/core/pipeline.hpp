@@ -66,7 +66,7 @@ class pipeline_queue;
  *     enc.link_chain({"from_cap", "jdec", "enc", "pay", "snd"});
  *
  *     cap.configure("cam", "device", "/dev/video0");
- *     enc.configure("snd", "stream", "192.168.1.10:5600");
+ *     enc.configure("snd", "udp_transport", "192.168.1.10:5600");
  *     enc.start();
  *     cap.start();
  *     ...

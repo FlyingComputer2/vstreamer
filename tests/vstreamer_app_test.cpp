@@ -297,9 +297,7 @@ TEST(VstreamerAppTest, FileErrorsNameTheLine)
     EXPECT_EQ("t.vsp:1: queue 'q' needs a writer and a reader",
               load_error("queue q\npipeline p\nnode a src\nnode s snk\nlink a -> @q\n"));
     EXPECT_EQ("t.vsp:1: no pipeline declared", load_error("# empty\n"));
-    EXPECT_EQ("t.vsp:3: node 'a' is not a sink", load_error("pipeline p\nnode a src\nenable a\n"));
-    EXPECT_EQ("t.vsp:2: unknown node 'x'", load_error("pipeline p\nenable x\n"));
-    EXPECT_EQ("t.vsp:3: bad timeout '-1'", load_error("pipeline p\nnode s snk\nenable s -1\n"));
+    EXPECT_EQ("t.vsp:3: unknown command 'enable'", load_error("pipeline p\nnode a src\nenable a\n"));
 }
 
 TEST(VstreamerAppTest, SetTakesRestOfLineAndCommentsAreIgnored)
@@ -412,49 +410,6 @@ TEST(VstreamerAppTest, SupervisorRestartsToWantedState)
     f.set.wake_supervisor();
     sup.join();
 }
-
-TEST(VstreamerAppTest, MplaneGateVerbsOnFakes)
-{
-    fixture f;
-    ASSERT_EQ("", f.load(k_two_pipes));
-    EXPECT_EQ("ok\n", f.mplane("enable s 500"));
-    EXPECT_EQ("ok 1\n", f.mplane("enabled s"));
-    EXPECT_EQ("ok\n", f.mplane("disable s"));
-    EXPECT_EQ("err -22 EINVAL\n", f.mplane("enable a"));
-    EXPECT_EQ("err -2 ENOENT\n", f.mplane("enabled ghost"));
-    EXPECT_EQ("err usage: enable <node> [timeout_ms]\n", f.mplane("enable s soon"));
-    EXPECT_EQ("err usage: disable <node>\n", f.mplane("disable"));
-}
-
-#if defined(ENABLE_STREAM_SENDER)
-/* The sender's gate is closed until the file or the operator opens it; with a timeout it closes
- * again unless re-enabled (deadman). */
-TEST(VstreamerAppTest, StreamSenderGate)
-{
-    {
-        pipeline_set set;
-        std::string  err;
-        ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender stream=127.0.0.1:9\n",
-                                   "t.vsp", &err))
-            << err;
-        bool on = true;
-        ASSERT_EQ(0, set.enabled("snd", &on));
-        EXPECT_FALSE(on);
-    }
-    pipeline_set set;
-    std::string  err;
-    ASSERT_EQ(0, set.load_text("pipeline p\nnode snd stream_sender stream=127.0.0.1:9\nenable snd\n",
-                               "t.vsp", &err))
-        << err;
-    std::string reply;
-    ASSERT_TRUE(vstreamer::app::handle_mplane_line(set, "enabled snd", reply));
-    EXPECT_EQ("ok 1\n", reply);
-    ASSERT_TRUE(vstreamer::app::handle_mplane_line(set, "enable snd 30", reply));
-    std::this_thread::sleep_for(80ms);
-    ASSERT_TRUE(vstreamer::app::handle_mplane_line(set, "enabled snd", reply));
-    EXPECT_EQ("ok 0\n", reply);
-}
-#endif
 
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_JPEG_DECODER_MULTICORE) &&                   \
     (defined(ENABLE_H264_ENCODER_MPP) || defined(ENABLE_H264_ENCODER_CEDAR) ||                  \

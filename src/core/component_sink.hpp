@@ -18,9 +18,6 @@ public:
 
     virtual int  open() = 0;
     virtual void close() = 0;
-
-    virtual int set_enabled(bool on, int timeout_ms);
-    [[nodiscard]] virtual bool enabled() const;
 };
 
 }  // namespace vstreamer

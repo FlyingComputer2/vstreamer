@@ -17,6 +17,7 @@ set(VSTREAMER_TEST_SOURCES
     pipeline_test.cpp
     stream_header_test.cpp
     stream_telemetry_test.cpp
+    stream_metrics_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
     thread_spawn_test.cpp
@@ -42,6 +43,7 @@ if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
         fec_spread_test.cpp
         loopback_test.cpp
         stream_sender_test.cpp
+        stream_queue_transport_test.cpp
         stream_receiver_test.cpp
     )
 endif()

@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "vstreamer_idf/live_tx.hpp"
 
 #include "vstreamer_idf/live_mplane.hpp"
@@ -45,8 +46,8 @@ struct place_kv
  * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0). */
 constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13};
 constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
-constexpr place_kv k_live_src_place[] = {
-    {"capture_cpu", "0"}, {"capture_prio", "12"}, {"encode_cpu", "1"}, {"encode_prio", "13"}};
+// esp32_h264_isp_ng_src dequeues camera buffers and encodes them on the same worker.
+constexpr place_kv k_live_src_place[] = {{"encode_cpu", "1"}, {"encode_prio", "13"}};
 constexpr place_kv k_live_snd_place[] = {{"send_cpu", "1"}, {"send_prio", "14"}};
 
 template <size_t N>
@@ -287,7 +288,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     const int k_seconds = cfg.seconds;
     const bool  run_forever = (0 == k_seconds);
 
-    auto src = vstreamer::component_factory::create_source("h264_isp_src");
+    vstreamer::default_reactor_host sender_reactor;
+    auto src = vstreamer::component_factory::create_source("esp32_h264_isp_ng_src");
     auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
     auto snd = vstreamer::component_factory::create_sink("stream_sender");
     auto *pay_c = dynamic_cast<vstreamer::component_coder *>(pay.get());
@@ -320,7 +322,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     std::string size;
     src->query("size", &size);
     apply_kvs(*pay, "pay", cfg.pay);
-    if (snd->configure("stream", cfg.peer) < 0)
+    snd->configure("reactor", sender_reactor.name());
+    if (snd->configure("udp_transport", cfg.peer) < 0)
     {
         std::printf("live TX: bad peer '%s'\n", cfg.peer.c_str());
         return -1;
@@ -333,7 +336,6 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         std::printf("live TX open failed\n");
         return -1;
     }
-    snd_s->set_enabled(true, 0);
 
     /* Runtime control (FEC k/n, bitrate, ...) for bench sweeps. */
     live_mplane mplane;
@@ -360,12 +362,12 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
 
     if (run_forever)
     {
-        std::printf("live TX streaming %s until reset (size %s, h264_isp_src)\n",
+        std::printf("live TX streaming %s until reset (size %s, esp32_h264_isp_ng_src)\n",
                     cfg.peer.c_str(), size.c_str());
     }
     else
     {
-        std::printf("live TX streaming %s for %d s (size %s, h264_isp_src)\n",
+        std::printf("live TX streaming %s for %d s (size %s, esp32_h264_isp_ng_src)\n",
                     cfg.peer.c_str(), k_seconds, size.c_str());
     }
     std::fflush(stdout);

@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 /*
  * Bench: synthetic noise through RTP loopback + impaired UDP channel → SDL.
  *
@@ -83,23 +84,14 @@ void on_signal(int /*sig*/)
     g_run = false;
 }
 
-void shutdown_pipeline(h264_encoder_t &enc, h264_decoder_mpp &dec, stream_sender &sender,
-                       stream_receiver &rcv, jpeg_decoder_multicore *jdec, v4l2_source *v4l2,
-                       apps::pipeline_pdu_queue *mjpeg_pipe, apps::pipeline_pdu_queue *nv12_pipe)
+void shutdown_pipeline(stream_sender &sender, stream_receiver &rcv,
+                       jpeg_decoder_multicore *jdec,
+                       apps::pipeline_pdu_queue *mjpeg_pipe,
+                       apps::pipeline_pdu_queue *nv12_pipe)
 {
     g_run = false;
-#if defined(ENABLE_H264_ENCODER_MPP)
-    enc.cancel_pending_io();
-#endif
-    dec.cancel_pending_io();
     sender.close();
     rcv.close();
-#ifdef ENABLE_V4L2_SOURCE
-    if (nullptr != v4l2)
-    {
-        v4l2->interrupt_shutdown();
-    }
-#endif
     if (nullptr != jdec)
     {
         jdec->close();
@@ -484,6 +476,7 @@ int main(int argc, char **argv)
     jpeg_decoder_multicore jdec;
     h264_encoder_t enc;
     rtp_h264_pay pay;
+    vstreamer::default_reactor_host sender_reactor;
     stream_sender sender;
     stream_receiver rcv;
     rtp_h264_depay depay;
@@ -568,21 +561,10 @@ int main(int argc, char **argv)
     cfg_str(pay, "fps", fps_buf);
     cfg_str(depay, "fps", fps_buf);
     cfg_str(pay, "mtu", mtu_buf);
-    cfg_str(sender, "stream", stream_buf);
-    cfg_str(sender, "mtu", mtu_buf);
+    sender.configure("reactor", sender_reactor.name());
+    cfg_str(sender, "udp_transport", stream_buf);
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
-    cfg_str(sender, "max_datagram", "1476");
     cfg_str(rcv, "max_datagram", "1476");
-    if (const char *pace = std::getenv("VSTREAMER_WIRE_PACE_KBPS");
-        nullptr != pace && pace[0] != '\0' && 0 != std::strcmp(pace, "0"))
-    {
-        if (cfg_str(sender, "max_kbps", pace) < 0)
-        {
-            return 1;
-        }
-        std::fprintf(stderr, "%s: UDP wire pace %s kb/s (VSTREAMER_WIRE_PACE_KBPS)\n", app_label,
-                     pace);
-    }
     cfg_str(rcv, "listen", listen_buf);
     if (!telemetry)
     {
@@ -734,7 +716,6 @@ int main(int argc, char **argv)
         });
     channel.set_stream_sender(&sender);
 
-    sender.set_enabled(true, 0);
 
 #if defined(ENABLE_V4L2_SOURCE) && defined(ENABLE_NOISE_SOURCE)
     g_tx.metrics_source =
@@ -965,9 +946,8 @@ int main(int argc, char **argv)
         ctrl.run();
     }
 
-    shutdown_pipeline(enc, dec, sender, rcv, use_jpeg_decode ? &jdec : nullptr,
-                      use_v4l2 ? &camera : nullptr, use_jpeg_decode ? &mjpeg_pipe : nullptr,
-                      &nv12_pipe);
+    shutdown_pipeline(sender, rcv, use_jpeg_decode ? &jdec : nullptr,
+                      use_jpeg_decode ? &mjpeg_pipe : nullptr, &nv12_pipe);
     present_queue.wake();
     au_in_pipe.wake();
     mjpeg_pipe.wake_shutdown();

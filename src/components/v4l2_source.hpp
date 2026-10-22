@@ -41,8 +41,6 @@ class v4l2_source : public component_source
     int  open() override;
     void close() override;
 
-    /* Unblock capture select (pipeline shutdown). */
-    void interrupt_shutdown();
     int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;

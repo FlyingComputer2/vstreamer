@@ -1,29 +1,29 @@
 #include "components/stream_receiver.hpp"
 
-#include "core/host_util.hpp"
-#include "core/key_util.hpp"
-#include "core/port_caps.hpp"
-#include "core/sequence_gap.hpp"
-#include "core/stream_header.hpp"
-#include "core/stream_telemetry.hpp"
-#include "core/thread_spawn.hpp"
-
-#include <cerrno>
-#include <cinttypes>
-#include <cstdio>
-#include <cstring>
-
-#include <chrono>
-#include <random>
-#include <thread>
-#include <vector>
-
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#include <cerrno>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <thread>
+#include <vector>
+
+#include "core/host_util.hpp"
+#include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/sequence_gap.hpp"
+#include "core/stream_header.hpp"
+#include "core/stream_metrics.hpp"
+#include "core/stream_telemetry.hpp"
+#include "core/thread_spawn.hpp"
 
 namespace
 {
@@ -129,7 +129,6 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
         return;
     }
 
-    const size_t payload_len = payload.size();
     component_pdu pdu;
     pdu.ts_us = monotonic_timestamp_us();
     pdu.sdu_type = sdu_type_e::STREAM_DGRAM;
@@ -151,17 +150,29 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
         }
         pdu_queue.push_back(std::move(pdu));
     }
+    if (evicted)
     {
         std::lock_guard<std::mutex> lock(mu);
-        fec_packet_received.fetch_add(1, std::memory_order_relaxed);
-        recv_bytes.fetch_add(payload_len, std::memory_order_relaxed);
-        if (evicted)
-        {
-            recv_dropped++;
-        }
+        recv_dropped++;
     }
     notify_wakeup();
     q_cv.notify_all();
+}
+
+// Commit reconstruction counts alongside the gaps from that decode/poll
+// operation. Queueing and downstream consumption do not change the post-FEC
+// accounting boundary.
+void stream_receiver::account_payloads_locked(
+    const fec_rx_payload_list &payloads, size_t max_app_bytes)
+{
+    for (const auto &payload : payloads)
+    {
+        if (!payload.empty() && payload.size() <= max_app_bytes)
+        {
+            fec_packet_received.fetch_add(1, std::memory_order_relaxed);
+            recv_bytes.fetch_add(payload.size(), std::memory_order_relaxed);
+        }
+    }
 }
 
 void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes)
@@ -276,6 +287,7 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             valid_media = true;
             enqueue_app_max = cached_max_raw_sdu;
         }
+        account_payloads_locked(payloads, enqueue_app_max);
     }
     if (!payloads.empty() && enqueue_app_max > 0)
     {
@@ -411,10 +423,7 @@ void stream_receiver::recv_thread_main()
         if (have_peer && telemetry_on.load(std::memory_order_relaxed) && now >= next_report)
         {
             const int interval = telemetry_ms.load(std::memory_order_relaxed);
-            stream_link_report rep {};
-            rep.session_id = session_id.load(std::memory_order_relaxed);
-            rep.timestamp_us = monotonic_timestamp_us();
-            rep.counters = link_counters_snapshot();
+            stream_link_report rep = link_report_snapshot();
             const uint16_t seq = static_cast<uint16_t>(report_seq.fetch_add(1, std::memory_order_relaxed));
             rep.report_seq = seq;
 
@@ -454,6 +463,7 @@ void stream_receiver::recv_thread_main()
             note_fec_output_gaps(fec, fec_gap_count);
             fec_lost = fec.decode_fail();
             decoded_max = cached_max_decoded_app;
+            account_payloads_locked(payloads, decoded_max);
         }
         if (!payloads.empty() && decoded_max > 0)
         {
@@ -462,14 +472,20 @@ void stream_receiver::recv_thread_main()
     }
 }
 
-stream_link_counters stream_receiver::link_counters_snapshot() const
+stream_link_report stream_receiver::link_report_snapshot() const
 {
-    stream_link_counters c;
+    std::lock_guard<std::mutex> lock(mu);
+    stream_link_report report;
+    report.session_id = session_id.load(std::memory_order_relaxed);
+    report.timestamp_us = monotonic_timestamp_us();
+    auto &c = report.counters;
     c.udp_packet_received = udp_packet_received.load(std::memory_order_relaxed);
     c.fec_packet_received = fec_packet_received.load(std::memory_order_relaxed);
     c.udp_gap_count = udp_gap_count.load(std::memory_order_relaxed);
     c.fec_gap_count = fec_gap_count.load(std::memory_order_relaxed);
-    return c;
+    c.udp_bytes_received = recv_wire_bytes.load(std::memory_order_relaxed);
+    c.fec_bytes_received = recv_bytes.load(std::memory_order_relaxed);
+    return report;
 }
 
 int stream_receiver::open()
@@ -568,6 +584,8 @@ int stream_receiver::open()
         fec_packet_received.store(0, std::memory_order_relaxed);
         udp_gap_count.store(0, std::memory_order_relaxed);
         fec_gap_count.store(0, std::memory_order_relaxed);
+        recv_bytes.store(0, std::memory_order_relaxed);
+        recv_wire_bytes.store(0, std::memory_order_relaxed);
         last_udp_seq = 0;
         have_udp_seq = false;
         discont_next_ = false;
@@ -739,6 +757,29 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("udp_pkt_recv" == key || "fec_pkt_recv" == key || "byt_recv" == key)
+    {
+        const auto report = link_report_snapshot();
+        const auto &c = report.counters;
+        const auto ts = report.timestamp_us / 1000;
+        if (key == "udp_pkt_recv")
+        {
+            *value = stream_metric_format(ts, c.udp_packet_received,
+                                          c.udp_gap_count);
+        }
+        else if (key == "fec_pkt_recv")
+        {
+            *value = stream_metric_format(ts, c.fec_packet_received,
+                                          c.fec_gap_count);
+        }
+        else
+        {
+            *value = stream_metric_format(ts, c.udp_bytes_received,
+                                          c.fec_bytes_received);
+        }
+        return 0;
+    }
+    // Legacy scalar queries remain compatible with existing console/scripts.
     if ("udp_packet_received" == key || "fec_packet_received" == key || "udp_gap_count" == key ||
         "fec_gap_count" == key)
     {

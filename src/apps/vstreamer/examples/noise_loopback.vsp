@@ -7,7 +7,7 @@ pipeline tx
 node noise noise_source size=1280x720 fps=30 format=nv12
 node enc   h264_encoder size=1280x720 fps=30 gop=30 rc=cbr cbr=4000000
 node pay   rtp_h264_pay fps=30 mtu=1400
-node snd   stream_sender mtu=1400 max_datagram=1476 stream=127.0.0.1:5001
+node snd   stream_sender udp_transport=127.0.0.1:5001
 link noise -> enc -> pay -> snd
 
 pipeline rx
@@ -19,5 +19,3 @@ link rcv -> depay -> dec -> @shown
 pipeline display
 node screen sdl_sink
 link @shown -> screen
-
-enable snd

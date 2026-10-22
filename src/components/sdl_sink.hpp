@@ -38,11 +38,6 @@ public:
     int  open() override;
     void close() override;
 
-    int prepare(int width, int height);
-    /* Present queued NV12 on the calling thread (must match prepare/open thread). input()
-     * already presents everything it queues, so this normally returns -EAGAIN. */
-    int present_pending();
-    [[nodiscard]] std::thread::id bound_render_thread() const;
     /* Queues the frame and presents it on the calling thread, which must be the render thread.
      * Caps PDUs only update the input caps. */
     int input(component_pdu &&in) override;
@@ -51,6 +46,7 @@ public:
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    int present_pending();
     const char *presenter_video_driver() const;
 
     [[nodiscard]] int input_pdu_locked(component_pdu &&in);
@@ -70,8 +66,8 @@ private:
     bool           have_input_caps_ = false;
     bool           caps_reject_ = false;
     video_raw_caps input_caps_ {};
-    int            prepared_w_ = 0;
-    int            prepared_h_ = 0;
+    int            configured_w_ = 0;
+    int            configured_h_ = 0;
 
     std::optional<sdl_nv12_presenter> present;
 };

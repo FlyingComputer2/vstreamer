@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "apps/common/cpu_map.hpp"
 #include "apps/common/pipeline_controller.hpp"
 #include "apps/common/queues.hpp"
@@ -43,9 +44,7 @@ void usage(const char *prog)
                  "  --fps N             default 30\n"
                  "  --cbr KBPS          default 4000\n"
                  "  --gop N             default fps\n"
-                 "  --max-datagram N    default 1476\n"
                  "  --fec-spread-ms N   spread each FEC block over N ms (>=0, default 0)\n"
-                 "  --local [HOST:]PORT stream_sender bind (winject static)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
                  "  --noise-bandwidth N 0..100 (default 100)\n"
@@ -72,9 +71,7 @@ int main(int argc, char **argv)
     int         fps = 30;
     int         cbr_kbps = 4000;
     int         gop = 0;
-    int         max_datagram = 1476;
     int         fec_spread_ms = 0;
-    const char *local_bind = nullptr;
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
     int         pregenerate = 30;
@@ -125,19 +122,9 @@ int main(int argc, char **argv)
             gop = std::atoi(argv[++i]);
             continue;
         }
-        if (0 == std::strcmp(argv[i], "--max-datagram") && i + 1 < argc)
-        {
-            max_datagram = std::atoi(argv[++i]);
-            continue;
-        }
         if (0 == std::strcmp(argv[i], "--fec-spread-ms") && i + 1 < argc)
         {
             fec_spread_ms = std::atoi(argv[++i]);
-            continue;
-        }
-        if (0 == std::strcmp(argv[i], "--local") && i + 1 < argc)
-        {
-            local_bind = argv[++i];
             continue;
         }
         if (0 == std::strcmp(argv[i], "--console") && i + 1 < argc)
@@ -234,6 +221,7 @@ int main(int argc, char **argv)
     jpeg_decoder_multicore jdec;
     encoder_t              enc;
     rtp_h264_pay           pay;
+    vstreamer::default_reactor_host sender_reactor;
     stream_sender          sender;
 
     if (cfg(camera, "device", device) < 0 || cfg(camera, "size", size_buf) < 0 ||
@@ -254,19 +242,12 @@ int main(int argc, char **argv)
     cfg(enc, "gop", gop_buf);
     cfg(pay, "fps", fps_buf);
     cfg(pay, "mtu", mtu_buf);
-    cfg(sender, "mtu", mtu_buf);
-    cfg(sender, "stream", stream_buf);
-    if (nullptr != local_bind)
-    {
-        cfg(sender, "local", local_bind);
-    }
+    sender.configure("reactor", sender_reactor.name());
+    cfg(sender, "udp_transport", stream_buf);
     if (no_telemetry)
     {
         cfg(sender, "telemetry", "off");
     }
-    char maxdg[16];
-    std::snprintf(maxdg, sizeof(maxdg), "%d", max_datagram);
-    cfg(sender, "max_datagram", maxdg);
     char spread_buf[16];
     std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
     if (cfg(sender, "fec_spread_ms", spread_buf) < 0)
@@ -311,7 +292,6 @@ int main(int argc, char **argv)
     {
         return 1;
     }
-    sender.set_enabled(true, 0);
 
     apps::stage_latency_set_diag_enabled(diag);
 

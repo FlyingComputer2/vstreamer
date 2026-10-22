@@ -7,7 +7,7 @@ config VSTREAMER_IDF_LIVE_TX
         Skip loopback smoke tests; stream to CONFIG_VSTREAMER_RX_PEER after DHCP.
 
 config VSTREAMER_RX_PEER
-    string "Receiver host:port (stream_sender stream=)"
+    string "Receiver host:port (stream_sender udp_transport=)"
     default "192.168.253.106:21090"
     depends on VSTREAMER_IDF_LIVE_TX
 

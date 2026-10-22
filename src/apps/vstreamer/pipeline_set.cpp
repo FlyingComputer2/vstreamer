@@ -1,3 +1,4 @@
+#include "core/default_reactor_host.hpp"
 #include "apps/vstreamer/pipeline_set.hpp"
 
 #include <cerrno>
@@ -143,6 +144,7 @@ struct pipeline_set::impl
         std::string type;
     };
 
+    std::unique_ptr<default_reactor_host> sender_reactor;
     node_factory_fn                          factory;
     std::vector<std::unique_ptr<pipe_entry>> pipes;
     std::vector<queue_entry>                 queues;
@@ -211,19 +213,6 @@ struct pipeline_set::impl
             failure_pending = true;
         }
         fail_cv.notify_all();
-    }
-
-    [[nodiscard]] component_sink *find_sink(std::string_view name, int *err) const
-    {
-        const node_rec *n = find_node(name);
-        if (nullptr == n)
-        {
-            *err = -ENOENT;
-            return nullptr;
-        }
-        auto *sink = dynamic_cast<component_sink *>(n->pipe->p->node(name));
-        *err = (nullptr != sink) ? 0 : -EINVAL;
-        return sink;
     }
 
     void compute_start_order();
@@ -389,10 +378,6 @@ private:
         {
             return cmd_set(line, t);
         }
-        if ("enable" == cmd)
-        {
-            return cmd_enable(t);
-        }
         return fail("unknown command '" + std::string(cmd) + "'");
     }
 
@@ -552,33 +537,6 @@ private:
         return configure(t[1].text, t[2].text, value);
     }
 
-    int cmd_enable(const std::vector<token> &t)
-    {
-        if (t.size() < 2 || t.size() > 3)
-        {
-            return fail("usage: enable <node> [timeout_ms]");
-        }
-        int64_t timeout_ms = 0;
-        if (3 == t.size() && (key_parse_i64(t[2].text, &timeout_ms) != 0 || timeout_ms < 0 ||
-                              timeout_ms > 86'400'000))
-        {
-            return fail("bad timeout '" + std::string(t[2].text) + "'");
-        }
-        int             err = 0;
-        component_sink *sink = s_.find_sink(t[1].text, &err);
-        if (nullptr == sink)
-        {
-            return fail(-ENOENT == err ? "unknown node '" + std::string(t[1].text) + "'"
-                                       : "node '" + std::string(t[1].text) + "' is not a sink");
-        }
-        const int r = sink->set_enabled(true, static_cast<int>(timeout_ms));
-        if (r < 0)
-        {
-            return fail("enable " + std::string(t[1].text) + " failed (" + err_text(r) + ")");
-        }
-        return 0;
-    }
-
     /* Resolves one link end in the current pipeline. Queue ends add their endpoint node the
      * first time. */
     int resolve(std::string_view text, bool first, bool last, std::string *node, uint8_t *port)
@@ -732,7 +690,7 @@ private:
 
 pipeline_set::pipeline_set() : impl_(std::make_unique<impl>())
 {
-    impl_->factory = [](std::string_view type) {
+    impl_->factory = [this](std::string_view type) {
         created_node c;
         const std::string t(type);
         c.source = component_factory::create_source(t);
@@ -743,6 +701,14 @@ pipeline_set::pipeline_set() : impl_(std::make_unique<impl>())
         if (!c.source && !c.coder)
         {
             c.sink = component_factory::create_sink(t);
+            if (c.sink && type == "stream_sender")
+            {
+                if (!impl_->sender_reactor)
+                {
+                    impl_->sender_reactor = std::make_unique<default_reactor_host>();
+                }
+                c.sink->configure("reactor", impl_->sender_reactor->name());
+            }
         }
         return c;
     };
@@ -799,25 +765,6 @@ int pipeline_set::query(std::string_view node, std::string_view key, std::string
 {
     const impl::node_rec *n = impl_->find_node(node);
     return (nullptr != n) ? n->pipe->p->query(node, key, value) : -ENOENT;
-}
-
-int pipeline_set::set_enabled(std::string_view node, bool on, int timeout_ms)
-{
-    int             err = 0;
-    component_sink *sink = impl_->find_sink(node, &err);
-    return (nullptr != sink) ? sink->set_enabled(on, timeout_ms) : err;
-}
-
-int pipeline_set::enabled(std::string_view node, bool *on) const
-{
-    int             err = 0;
-    component_sink *sink = impl_->find_sink(node, &err);
-    if (nullptr == sink)
-    {
-        return err;
-    }
-    *on = sink->enabled();
-    return 0;
 }
 
 std::vector<pipeline_set::node_info> pipeline_set::nodes() const

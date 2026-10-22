@@ -49,34 +49,13 @@ public:
     int configure(std::string_view key, std::string_view value) override;
     int query(std::string_view key, std::string *value) const override;
 
-    [[nodiscard]] stream_link_counters link_counters_snapshot() const;
-
-    [[nodiscard]] const std::atomic<uint64_t> &peer_udp_packet_received_counter() const
-    {
-        return udp_packet_received;
-    }
-    [[nodiscard]] const std::atomic<uint64_t> &peer_fec_packet_received_counter() const
-    {
-        return fec_packet_received;
-    }
-    [[nodiscard]] const std::atomic<uint64_t> &peer_udp_gap_count_counter() const
-    {
-        return udp_gap_count;
-    }
-    [[nodiscard]] const std::atomic<uint64_t> &peer_fec_gap_count_counter() const
-    {
-        return fec_gap_count;
-    }
-    [[nodiscard]] const std::atomic<uint64_t> &egress_payload_bytes_counter() const
-    {
-        return recv_bytes;
-    }
-
 private:
+    [[nodiscard]] stream_link_report link_report_snapshot() const;
     void recv_thread_main();
     void stop_recv_thread();
     /* Returns true when the datagram is valid stream media (telemetry peer update). */
     bool ingest_datagram(const uint8_t *data, size_t len);
+    void account_payloads_locked(const fec_rx_payload_list &payloads, size_t max_app_bytes);
     void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
     void enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, size_t max_app_bytes,
                                 bool discont);
