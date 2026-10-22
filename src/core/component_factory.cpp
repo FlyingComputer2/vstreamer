@@ -18,6 +18,10 @@
 #include "components/esp32p4_csi_camera_src.hpp"
 #endif
 
+#ifdef ENABLE_ESP32_H264_ISP_NG_SRC
+#include "components/esp32_h264_isp_ng_src.hpp"
+#endif
+
 #ifdef ENABLE_ESP32_H264_ISP_SRC
 #include "components/esp32_h264_isp_src.hpp"
 #endif
@@ -89,8 +93,15 @@ std::unique_ptr<component_source> component_factory::create_source(std::string n
     }
 #endif
 
+#ifdef ENABLE_ESP32_H264_ISP_NG_SRC
+    if ("esp32_h264_isp_ng_src" == name)
+    {
+        return std::make_unique<esp32_h264_isp_ng_src>();
+    }
+#endif
+
 #ifdef ENABLE_ESP32_H264_ISP_SRC
-    if ("esp32_h264_isp_src" == name || "h264_isp_src" == name)
+    if ("esp32_h264_isp_src" == name)
     {
         return std::make_unique<esp32_h264_isp_src>();
     }

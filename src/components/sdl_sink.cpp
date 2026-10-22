@@ -1,13 +1,14 @@
 #include "components/sdl_sink.hpp"
 
-#include "core/key_util.hpp"
-#include "core/port_caps.hpp"
-
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <sstream>
+
+#include "core/key_util.hpp"
+#include "core/port_caps.hpp"
 
 namespace vstreamer
 {
@@ -133,39 +134,6 @@ void sdl_sink::close()
     caps_reject_ = false;
 }
 
-int sdl_sink::prepare(int width, int height)
-{
-    std::lock_guard<std::mutex> lock(mu);
-    if (!opened.load(std::memory_order_acquire) || !present.has_value())
-    {
-        return -EBADF;
-    }
-    prepared_w_ = width;
-    prepared_h_ = height;
-    bool session_open = opened.load(std::memory_order_relaxed);
-    const int r = present->prepare(width, height, session_open);
-    if (r < 0)
-    {
-        std::fprintf(stderr, "sdl_sink: prepare(%d,%d) failed (%d", width, height, r);
-        if (-r > 0 && -r < 4096)
-        {
-            std::fprintf(stderr, "; %s", std::strerror(-r));
-        }
-        std::fprintf(stderr, ")\n");
-    }
-    return r;
-}
-
-std::thread::id sdl_sink::bound_render_thread() const
-{
-    std::lock_guard<std::mutex> lock(mu);
-    if (!present.has_value())
-    {
-        return {};
-    }
-    return present->bound_render_thread();
-}
-
 int sdl_sink::present_pending()
 {
     bool session_open = false;
@@ -225,12 +193,12 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     {
         return -EINVAL;
     }
-    if (!have_input_caps_ && prepared_w_ > 0 && prepared_h_ > 0)
+    if (!have_input_caps_ && configured_w_ > 0 && configured_h_ > 0)
     {
-        input_caps_.width = prepared_w_;
-        input_caps_.height = prepared_h_;
-        input_caps_.hor_stride = prepared_w_;
-        input_caps_.ver_stride = prepared_h_;
+        input_caps_.width = configured_w_;
+        input_caps_.height = configured_h_;
+        input_caps_.hor_stride = configured_w_;
+        input_caps_.ver_stride = configured_h_;
         have_input_caps_ = true;
         caps_reject_ = false;
     }
@@ -251,10 +219,11 @@ int sdl_sink::input_pdu_locked(component_pdu &&in)
     return enq;
 }
 
-/* Presents on the calling thread, so input() must come from the thread that renders (the one
- * that opened and prepared the sink). With vsync the present can block for one refresh.
- * A failed present drops that frame and is counted in the presenter (stats fail=); it is not
- * an input() error, since the frame was accepted. */
+/* Presents on the calling thread, so input() must come from the thread that
+ * renders (the one that creates the rendering resources on the first frame).
+ * With vsync the present can block for one refresh. A failed present drops that
+ * frame and is counted in the presenter (stats fail=); it is not an input()
+ * error, since the frame was accepted. */
 int sdl_sink::input(component_pdu &&in)
 {
     {
@@ -276,6 +245,17 @@ int sdl_sink::input(component_pdu &&in)
 
 int sdl_sink::configure(std::string_view key, std::string_view value)
 {
+    if ("width" == key || "height" == key)
+    {
+        int64_t n = 0;
+        if (key_parse_i64(value, &n) < 0 || n <= 0 || n > 16384 || n % 2 != 0)
+        {
+            return -EINVAL;
+        }
+        std::lock_guard<std::mutex> lock(mu);
+        (key == "width" ? configured_w_ : configured_h_) = static_cast<int>(n);
+        return 0;
+    }
     if ("title" == key)
     {
         /* open()/close() emplace and reset present under mu, possibly on another thread. */
@@ -334,6 +314,26 @@ int sdl_sink::query(std::string_view key, std::string *value) const
         return r;
     }
 
+    if ("width" == key || "height" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        *value = std::to_string(key == "width" ? configured_w_ : configured_h_);
+        return 0;
+    }
+    if ("render_thread" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        const auto id = present.has_value() ? present->bound_render_thread()
+                                            : std::thread::id{};
+        value->clear();
+        if (id != std::thread::id{})
+        {
+            std::ostringstream out;
+            out << id;
+            *value = out.str();
+        }
+        return 0;
+    }
     if ("video_driver" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

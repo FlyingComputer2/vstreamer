@@ -51,7 +51,7 @@ extracted `~/rover/camera` graph.
 | `CedrusEncoder` | NV12 → H.264 (`qp` 36, `gop` 30) |
 | `RtpSink` | RTP/H264 to `winject-manager` `:22081` (bus `c3`) |
 | `Mp4Sink` | optional MJPEG→MP4 (`output`) |
-| `feedback_winject` | local `gci` TX-queue → `configure` / `set_enabled` |
+| `feedback_winject` | local `gci` TX-queue → `configure` / controller delivery policy |
 
 Talks to manager RTP bind `:22081` and camera console `:22092`. Does
 **not** talk to the drive ESP32 or drive console `:22090`.

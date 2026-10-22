@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "components/components.hpp"
+#include "core/stream_metrics.hpp"
 
 namespace vstreamer::test_app
 {
@@ -70,12 +71,13 @@ struct pipeline_rate_state
 {
     std::chrono::steady_clock::time_point t0 {};
     pipeline_counters                       snap {};
-    uint64_t                                snd_pkts = 0;
-    uint64_t                                snd_bytes = 0;
+    stream_metric_rate sender_packets;
+    stream_metric_rate sender_bytes;
+    stream_metric_rate receiver_packets;
+    stream_metric_rate receiver_bytes;
     uint64_t                                enc_out_bytes = 0;
     uint64_t                                dec_dropped = 0;
     uint64_t                                sink_dropped = 0;
-    uint64_t                                rcv_bytes = 0;
     uint64_t                                ch_bytes_in = 0;
     uint64_t                                ch_bytes_out = 0;
     uint64_t                                ch_pkts_out = 0;

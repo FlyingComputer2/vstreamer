@@ -15,6 +15,8 @@ struct stream_link_counters
     uint64_t fec_packet_received = 0;
     uint64_t udp_gap_count = 0;
     uint64_t fec_gap_count = 0;
+    uint64_t udp_bytes_received = 0;
+    uint64_t fec_bytes_received = 0;
 };
 
 struct stream_link_report
@@ -23,6 +25,7 @@ struct stream_link_report
     uint16_t             report_seq = 0;
     uint64_t             timestamp_us = 0;
     stream_link_counters counters {};
+    bool has_byte_totals = true;
 };
 
 struct stream_peer_link
@@ -36,7 +39,10 @@ struct stream_peer_link
     uint64_t             reports_rejected = 0;
 };
 
-inline constexpr size_t k_stream_link_report_payload_len = 44;
+// Legacy reports have no header or byte totals. V2 starts with "VL", version,
+// reserved.
+inline constexpr size_t k_stream_link_report_v1_payload_len = 44;
+inline constexpr size_t k_stream_link_report_payload_len = 64;
 
 namespace detail
 {
@@ -89,12 +95,19 @@ inline void stream_link_report_encode_payload(const stream_link_report &r, uint8
     {
         return;
     }
+    out[0] = 'V';
+    out[1] = 'L';
+    out[2] = 2;
+    out[3] = 0;
+    out += 4;
     detail::put_be32(out + 0, r.session_id);
     detail::put_be64(out + 4, r.timestamp_us);
     detail::put_be64(out + 12, r.counters.udp_packet_received);
     detail::put_be64(out + 20, r.counters.udp_gap_count);
     detail::put_be64(out + 28, r.counters.fec_packet_received);
     detail::put_be64(out + 36, r.counters.fec_gap_count);
+    detail::put_be64(out + 44, r.counters.udp_bytes_received);
+    detail::put_be64(out + 52, r.counters.fec_bytes_received);
 }
 
 inline int stream_link_report_decode(const uint8_t *data, size_t len, stream_link_report *out)
@@ -103,11 +116,21 @@ inline int stream_link_report_decode(const uint8_t *data, size_t len, stream_lin
     {
         return -EINVAL;
     }
-    if (len != k_stream_link_report_payload_len)
+    const bool legacy = len == k_stream_link_report_v1_payload_len;
+    if (!legacy)
     {
-        return -EMSGSIZE;
+        if (len != k_stream_link_report_payload_len)
+        {
+            return -EMSGSIZE;
+        }
+        if (data[0] != 'V' || data[1] != 'L' || data[2] != 2 || data[3] != 0)
+        {
+            return -EPROTO;
+        }
+        data += 4;
     }
     stream_link_report r {};
+    r.has_byte_totals = !legacy;
     r.session_id = detail::get_be32(data + 0);
     if (0 == r.session_id)
     {
@@ -118,6 +141,11 @@ inline int stream_link_report_decode(const uint8_t *data, size_t len, stream_lin
     r.counters.udp_gap_count = detail::get_be64(data + 20);
     r.counters.fec_packet_received = detail::get_be64(data + 28);
     r.counters.fec_gap_count = detail::get_be64(data + 36);
+    if (!legacy)
+    {
+        r.counters.udp_bytes_received = detail::get_be64(data + 44);
+        r.counters.fec_bytes_received = detail::get_be64(data + 52);
+    }
     *out = r;
     return 0;
 }

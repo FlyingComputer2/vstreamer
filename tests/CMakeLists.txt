@@ -17,6 +17,7 @@ set(VSTREAMER_TEST_SOURCES
     pipeline_test.cpp
     stream_header_test.cpp
     stream_telemetry_test.cpp
+    stream_metrics_test.cpp
     pix_convert_test.cpp
     rs_block_erasure_emit_test.cpp
     thread_spawn_test.cpp

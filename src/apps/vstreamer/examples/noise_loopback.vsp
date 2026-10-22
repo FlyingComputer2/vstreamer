@@ -19,5 +19,3 @@ link rcv -> depay -> dec -> @shown
 pipeline display
 node screen sdl_sink
 link @shown -> screen
-
-enable snd

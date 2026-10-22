@@ -28,7 +28,7 @@ struct live_tx_config
 };
 
 /*
- * Live video TX on the ESP32-P4: h264_isp_src (MIPI-CSI camera, ISP, hardware H.264) ->
+ * Live video TX on the ESP32-P4: esp32_h264_isp_ng_src (MIPI-CSI camera, ISP, hardware H.264) ->
  * rtp_h264_pay -> stream_sender to cfg.peer, with the P4 thread layout (FEC encode on core 0,
  * send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
  * passed (or forever) and returns 0 when the stream ran at a usable rate, -1 on failure, and 0

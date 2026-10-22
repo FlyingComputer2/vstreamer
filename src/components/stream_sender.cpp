@@ -1,30 +1,31 @@
 #include "components/stream_sender.hpp"
 
-#include "core/fec_spread.hpp"
-#include "core/host_util.hpp"
-#include "core/key_util.hpp"
-#include "core/port_caps.hpp"
-#include "core/stream_header.hpp"
-#include "core/thread_spawn.hpp"
-
-#include <cerrno>
-#include <climits>
-#include <cinttypes>
-#include <cstdio>
-#include <cstring>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cinttypes>
+#include <climits>
+#include <cstdio>
+#include <cstring>
 #include <future>
 #include <iterator>
 #include <memory>
 #include <random>
 #include <thread>
 #include <vector>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+
+#include "core/fec_spread.hpp"
+#include "core/host_util.hpp"
+#include "core/key_util.hpp"
+#include "core/port_caps.hpp"
+#include "core/stream_header.hpp"
+#include "core/stream_metrics.hpp"
+#include "core/thread_spawn.hpp"
 
 #if defined(ESP_PLATFORM)
 #include "esp_task_wdt.h"
@@ -37,31 +38,6 @@ namespace
 
 /* Thread stacks on ESP-IDF; ignored on Linux. */
 constexpr size_t k_send_stack_bytes = 12 * 1024;
-constexpr size_t k_reactor_stack_bytes = 4 * 1024;
-
-double now_sec()
-{
-    struct timespec ts {};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
-}
-
-void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
-{
-    const double t = now_sec();
-    if (t0 <= 0.)
-    {
-        t0 = t;
-    }
-    acc += nbytes;
-    const double dt = t - t0;
-    if (dt >= 0.5)
-    {
-        kbps = static_cast<float>(acc * 8.0 / dt / 1000.0);
-        t0 = t;
-        acc = 0;
-    }
-}
 
 size_t wire_packet_bytes(const bfc::shared_sized_buffer &buf)
 {
@@ -124,35 +100,6 @@ stream_sender::stream_sender()
 {
 }
 
-size_t stream_sender::queue_byte_limit() const
-{
-    std::lock_guard<std::mutex> lock(mu);
-    /* ingress_kbps is the app rate; parity adds n/k on the wire. */
-    const double rate_bps = static_cast<double>(ingress_kbps) * 125.0 *
-                            static_cast<double>(effective_fec_n()) /
-                            static_cast<double>(effective_fec_k());
-    /* Spread holds each block's shards back for up to fec_spread_ms on top of the normal
-     * queueing, so the queue holds that much more traffic before it rejects SDUs. */
-    const int    window_ms = queue_ms + fec_spread_ms.load(std::memory_order_relaxed);
-    const size_t scaled =
-        static_cast<size_t>(rate_bps * static_cast<double>(window_ms) / 1000.0);
-    /* The queue absorbs bursts. A keyframe and all of its parity are enqueued before the send
-     * thread runs; evicting from the head then drops unsent data shards of a block whose first
-     * shards are already on the wire, and the receiver rebuilds them from parity only after
-     * later packets, which the depayloader sees as reordering. */
-    const size_t unpaced_min =
-        k_queue_min_unpaced_app_bytes * static_cast<size_t>(effective_fec_n()) /
-        static_cast<size_t>(effective_fec_k());
-    size_t wire_min = std::max<size_t>(256U * 1024U, unpaced_min);
-    const int spread_ms = fec_spread_ms.load(std::memory_order_relaxed);
-    if (spread_ms > 0 && queue_ms > 0)
-    {
-        wire_min = wire_min * static_cast<size_t>(queue_ms + spread_ms) /
-                   static_cast<size_t>(queue_ms);
-    }
-    return std::max<size_t>(wire_min, scaled);
-}
-
 int stream_sender::effective_fec_k() const
 {
     if (fec_mode == fec_mode_e::none)
@@ -197,29 +144,17 @@ std::string stream_sender::name() const
 
 bool stream_sender::queue_has_room_for_sdu() const
 {
+    /* The SDU that completes a block releases the whole block: all n shards, since data shards
+     * wait in the block until it is encoded. Raw mode sends one packet. Not atomic with the
+     * enqueue: a timeout flush on the send thread in between can add one partial block over
+     * k_queue_packet_cap. */
     size_t pkts = 1;
-    size_t pkt_bytes = 0;
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (fec_mode_e::none == fec_mode)
-        {
-            pkt_bytes = k_stream_header_len + stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
-        }
-        else
-        {
-            /* One SDU can close a block: its data shard plus all of the block's parity. */
-            pkts = static_cast<size_t>(std::max(1, fec_n - fec_k + 1));
-            pkt_bytes =
-                k_stream_header_len + stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes));
-        }
+        pkts = static_cast<size_t>(std::max(1, effective_fec_n()));
     }
-    const size_t limit = queue_byte_limit();
     std::lock_guard<std::mutex> lock(q_mu);
-    if (queue.empty())
-    {
-        return true;
-    }
-    return queue_bytes + pkts * pkt_bytes <= limit && queue.size() + pkts <= k_queue_packet_cap;
+    return queue.empty() || queue.size() + pkts <= k_queue_packet_cap;
 }
 
 int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
@@ -244,12 +179,10 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
         return -EINVAL;
     }
     const size_t wire_len = k_stream_header_len + len;
-    const size_t limit = queue_byte_limit();
 
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        if (!force && !queue.empty() &&
-            (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
+        if (!force && !queue.empty() && queue.size() >= k_queue_packet_cap)
         {
             return -EAGAIN;
         }
@@ -273,6 +206,7 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
+        if (queue.size() >= k_queue_packet_cap) std::fprintf(stderr, "DBG push at %zu fec=%d\n", queue.size(), (int)is_fec_shard);
         /* Usually the newest release time, so the search ends at the back. */
         auto pos = queue.end();
         while (pos != queue.begin() && std::prev(pos)->release > release)
@@ -306,13 +240,11 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         return;
     }
     const size_t wire_len = k_stream_header_len + len;
-    const size_t limit = queue_byte_limit();
 
     bool evicted = false;
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        while (!queue.empty() &&
-               (queue_bytes + wire_len > limit || queue.size() >= k_queue_packet_cap))
+        while (!queue.empty() && queue.size() >= k_queue_packet_cap)
         {
             queue_bytes -= wire_packet_bytes(queue.front().buf);
             queue.pop_front();
@@ -338,6 +270,7 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
+        if (queue.size() >= k_queue_packet_cap) std::fprintf(stderr, "DBG push at %zu fec=%d\n", queue.size(), (int)is_fec_shard);
         /* Usually the newest release time, so the search ends at the back. */
         auto pos = queue.end();
         while (pos != queue.begin() && std::prev(pos)->release > release)
@@ -385,6 +318,8 @@ void stream_sender::stop_reactor()
 {
     if (!reactor_running_)
     {
+        udp_reactor_.reset();
+        queue_reactor_.reset();
         return;
     }
     auto removed = std::make_shared<std::promise<void>>();
@@ -407,24 +342,8 @@ void stream_sender::stop_reactor()
         (void)udp_reactor_->rem_read_rdy(send_fd, [removed] { removed->set_value(); });
         done.wait();
     }
-    if (owns_reactor_)
-    {
-        if (queue_reactor_)
-        {
-            queue_reactor_->stop();
-        }
-        else
-        {
-            udp_reactor_->stop();
-        }
-        if (reactor_thread_.joinable())
-        {
-            reactor_thread_.join();
-        }
-    }
     udp_reactor_.reset();
     queue_reactor_.reset();
-    owns_reactor_ = false;
     reactor_running_ = false;
     rx_registered_ = false;
 }
@@ -646,20 +565,6 @@ void stream_sender::send_thread_main()
             continue;
         }
 
-        {
-            std::lock_guard<std::mutex> gate(gate_mu);
-            if (!send_enabled)
-            {
-                continue;
-            }
-            if (deadline_sec > 0 && now_sec() >= deadline_sec)
-            {
-                send_enabled = false;
-                deadline_sec = 0;
-                continue;
-            }
-        }
-
         if (wire_buf.size() >= k_stream_header_len)
         {
             const uint16_t seq = stream_sequence.fetch_add(1, std::memory_order_relaxed);
@@ -685,6 +590,7 @@ void stream_sender::send_thread_main()
         {
             continue;
         }
+        std::lock_guard<std::mutex> metrics_lock(metrics_mu);
         pkts_sent.fetch_add(1, std::memory_order_relaxed);
         bytes_sent.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
     }
@@ -709,9 +615,9 @@ int stream_sender::open()
         telemetry = telemetry_on;
     }
     const bool queue_mode = !tx_name.empty() || !rx_name.empty();
-    if (queue_mode ? (!udp_spec.empty() || tx_name.empty() || rx_name.empty() ||
-                      reactor_name.empty())
-                   : udp_spec.empty())
+    if (reactor_name.empty() ||
+        (queue_mode ? (!udp_spec.empty() || tx_name.empty() || rx_name.empty())
+                    : udp_spec.empty()))
     {
         return -EINVAL;
     }
@@ -719,7 +625,6 @@ int stream_sender::open()
     std::shared_ptr<stream_transport_queue> tx, rx;
     std::shared_ptr<default_reactor> udp_reactor;
     std::shared_ptr<bfc::cv_reactor<>> queue_reactor;
-    const bool own_reactor = reactor_name.empty();
     if (queue_mode)
     {
         tx = stream_transport_queue_registry::get_instance().get(tx_name);
@@ -738,10 +643,9 @@ int stream_sender::open()
             return -ENOENT;
         }
     }
-    else if (telemetry)
+    else
     {
-        udp_reactor = own_reactor ? std::make_shared<default_reactor>()
-                                 : default_reactor_registry::get_instance().get(reactor_name);
+        udp_reactor = default_reactor_registry::get_instance().get(reactor_name);
         if (!udp_reactor)
         {
             return -ENOENT;
@@ -812,7 +716,6 @@ int stream_sender::open()
     transport_rx_ = std::move(rx);
     udp_reactor_ = std::move(udp_reactor);
     queue_reactor_ = std::move(queue_reactor);
-    owns_reactor_ = own_reactor;
     {
         std::random_device rd;
         stream_sequence.store(static_cast<uint16_t>(rd()), std::memory_order_relaxed);
@@ -834,7 +737,7 @@ int stream_sender::open()
         rx_registered_ = registered;
         queue_reactor_->wake_up(); // Also handles data queued before open.
     }
-    else if (udp_reactor_)
+    else if (udp_reactor_ && telemetry)
     {
         registered = udp_reactor_->add_read_rdy(send_fd,
                                                 [this] { on_telemetry_socket_read(); });
@@ -853,18 +756,7 @@ int stream_sender::open()
         queue_reactor_.reset();
         return -EIO;
     }
-    reactor_running_ = queue_reactor_ || udp_reactor_;
-    if (reactor_running_ && owns_reactor_)
-    {
-        auto started = std::make_shared<std::promise<void>>();
-        auto ready = started->get_future();
-        reactor_thread_ = spawn_thread(
-            thread_opts {"vs_reactor", k_reactor_stack_bytes}, [this, started] {
-                udp_reactor_->wake_up([started] { started->set_value(); });
-                udp_reactor_->run();
-            });
-        ready.wait();
-    }
+    reactor_running_ = telemetry;
     opened = true;
     send_stop = false;
     send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
@@ -905,8 +797,7 @@ void stream_sender::close()
     q_cv.notify_all();
 }
 
-int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingress_bytes,
-                                  bool pdu_no_evict)
+int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict)
 {
     bool oversized = false;
     bool opened_block = false;
@@ -996,14 +887,17 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, size_t ingres
             q_cv.notify_one();
         }
     }
+    if (oversized)
     {
         std::lock_guard<std::mutex> lock(mu);
-        if (oversized)
-        {
-            fec_oversized++;
-            dropped.fetch_add(1, std::memory_order_relaxed);
-        }
-        update_kbps_window(ingress_rate_t0, ingress_rate_bytes, ingress_kbps, ingress_bytes);
+        fec_oversized++;
+        dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        std::lock_guard<std::mutex> lock(metrics_mu);
+        ++fec_pkts_sent;
+        fec_bytes_sent += len;
     }
     return 0;
 }
@@ -1019,43 +913,9 @@ int stream_sender::input(component_pdu &&in)
     {
         return -EINVAL;
     }
-    return ingest_app_sdu(in.sdu.u8(), in.sdu.size(), in.sdu.size(), true);
+    return ingest_app_sdu(in.sdu.u8(), in.sdu.size(), true);
 }
 
-
-int stream_sender::set_enabled(bool on, int timeout_ms)
-{
-    std::lock_guard<std::mutex> gate(gate_mu);
-    send_enabled = on;
-    if (!on)
-    {
-        deadline_sec = 0;
-        return 0;
-    }
-    if (timeout_ms <= 0)
-    {
-        deadline_sec = 0;
-    }
-    else
-    {
-        deadline_sec = now_sec() + (timeout_ms / 1000.0);
-    }
-    return 0;
-}
-
-bool stream_sender::enabled() const
-{
-    std::lock_guard<std::mutex> gate(gate_mu);
-    if (!send_enabled)
-    {
-        return false;
-    }
-    if (deadline_sec > 0 && now_sec() >= deadline_sec)
-    {
-        return false;
-    }
-    return true;
-}
 
 int stream_sender::reinit_fec_if_active()
 {
@@ -1246,19 +1106,6 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         q_cv.notify_one();
         return 0;
     }
-    if ("queue_ms" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 10 || v > 2000 || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            queue_ms = static_cast<int>(v);
-        }
-        return 0;
-    }
     if ("fec" == key)
     {
         std::string mode(value.data(), value.size());
@@ -1386,6 +1233,45 @@ int stream_sender::query(std::string_view key, std::string *value) const
         *value = telemetry_on ? "on" : "off";
         return 0;
     }
+    if ("pkt_sent" == key || "byt_sent" == key)
+    {
+        std::lock_guard<std::mutex> lock(metrics_mu);
+        *value = stream_metric_format(
+            stream_metric_timestamp_ms(),
+            key == "pkt_sent" ? pkts_sent.load(std::memory_order_relaxed)
+                              : bytes_sent.load(std::memory_order_relaxed),
+            key == "pkt_sent" ? fec_pkts_sent : fec_bytes_sent);
+        return 0;
+    }
+    if ("peer_udp_pkt_recv" == key || "peer_fec_pkt_recv" == key ||
+        "peer_byt_recv" == key)
+    {
+        std::lock_guard<std::mutex> lock(peer_mu);
+        if (!peer_have ||
+            (key == "peer_byt_recv" && !peer_report.has_byte_totals))
+        {
+            return -ENODATA;
+        }
+        const auto &c = peer_report.counters;
+        const uint64_t ts = peer_report.timestamp_us / 1000;
+        if (key == "peer_udp_pkt_recv")
+        {
+            *value = stream_metric_format(ts, c.udp_packet_received,
+                                          c.udp_gap_count);
+        }
+        else if (key == "peer_fec_pkt_recv")
+        {
+            *value = stream_metric_format(ts, c.fec_packet_received,
+                                          c.fec_gap_count);
+        }
+        else
+        {
+            *value = stream_metric_format(ts, c.udp_bytes_received,
+                                          c.fec_bytes_received);
+        }
+        return 0;
+    }
+    // Preserve scalar query aliases for existing console/script consumers.
     if ("peer_udp_packet_received" == key)
     {
         std::lock_guard<std::mutex> lock(peer_mu);
@@ -1465,14 +1351,6 @@ int stream_sender::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(peer_mu);
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%" PRIu32, peer_have ? peer_session : 0U);
-        *value = buf;
-        return 0;
-    }
-    if ("in_rate" == key)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.1f", static_cast<double>(ingress_kbps));
         *value = buf;
         return 0;
     }
@@ -1558,23 +1436,23 @@ int stream_sender::query(std::string_view key, std::string *value) const
         {
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " in_rate=%.1f fec_oversized=%" PRIu64 " fec=k=%d,n=%d"
+                          " fec_oversized=%" PRIu64 " fec=k=%d,n=%d"
                           " peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
                           pkts_sent.load(std::memory_order_relaxed),
                           bytes_sent.load(std::memory_order_relaxed),
                           dropped.load(std::memory_order_relaxed),
-                          static_cast<double>(ingress_kbps), fec_oversized, fec_k, fec_n,
+                          fec_oversized, fec_k, fec_n,
                           peer.reports_received, peer.reports_lost, peer.reports_rejected);
         }
         else
         {
             std::snprintf(buf, sizeof(buf),
                           "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " in_rate=%.1f peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
+                          " peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
                           pkts_sent.load(std::memory_order_relaxed),
                           bytes_sent.load(std::memory_order_relaxed),
                           dropped.load(std::memory_order_relaxed),
-                          static_cast<double>(ingress_kbps), peer.reports_received,
+                          peer.reports_received,
                           peer.reports_lost, peer.reports_rejected);
         }
         *value = buf;
@@ -1587,26 +1465,19 @@ int stream_sender::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("queue_packets" == key)
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%zu", queue.size());
+        *value = buf;
+        return 0;
+    }
     if ("queue_bytes" == key)
     {
         std::lock_guard<std::mutex> lock(q_mu);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%zu", queue_bytes);
-        *value = buf;
-        return 0;
-    }
-    if ("queue_byte_limit" == key)
-    {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%zu", queue_byte_limit());
-        *value = buf;
-        return 0;
-    }
-    if ("queue_ms" == key)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", queue_ms);
         *value = buf;
         return 0;
     }
