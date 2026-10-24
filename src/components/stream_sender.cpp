@@ -206,7 +206,6 @@ int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool i
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
-        if (queue.size() >= k_queue_packet_cap) std::fprintf(stderr, "DBG push at %zu fec=%d\n", queue.size(), (int)is_fec_shard);
         /* Usually the newest release time, so the search ends at the back. */
         auto pos = queue.end();
         while (pos != queue.begin() && std::prev(pos)->release > release)
@@ -241,15 +240,22 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     }
     const size_t wire_len = k_stream_header_len + len;
 
-    bool evicted = false;
+    /* Forced input can leave the queue past its cap, so one push may evict several. */
+    uint64_t evicted = 0;
     {
         std::lock_guard<std::mutex> lock(q_mu);
         while (!queue.empty() && queue.size() >= k_queue_packet_cap)
         {
             queue_bytes -= wire_packet_bytes(queue.front().buf);
             queue.pop_front();
-            evicted = true;
+            ++evicted;
         }
+    }
+    if (evicted > 0)
+    {
+        queue_evicted.fetch_add(evicted, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(mu);
+        dropped.fetch_add(evicted, std::memory_order_relaxed);
     }
 
     bfc::shared_sized_buffer buf = pool.acquire(wire_len);
@@ -270,7 +276,6 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     {
         std::lock_guard<std::mutex> lock(q_mu);
         queue_bytes += wire_len;
-        if (queue.size() >= k_queue_packet_cap) std::fprintf(stderr, "DBG push at %zu fec=%d\n", queue.size(), (int)is_fec_shard);
         /* Usually the newest release time, so the search ends at the back. */
         auto pos = queue.end();
         while (pos != queue.begin() && std::prev(pos)->release > release)
@@ -278,11 +283,6 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
             --pos;
         }
         queue.insert(pos, queued_wire {std::move(buf), release});
-    }
-    if (evicted)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        dropped.fetch_add(1, std::memory_order_relaxed);
     }
     q_cv.notify_one();
 }
@@ -335,6 +335,11 @@ void stream_sender::stop_reactor()
         {
             queue_reactor_->wake_up([removed] { removed->set_value(); });
             done.wait();
+        }
+        else if (transport_rx_)
+        {
+            // This pass may still hold the queue's raw pointer; keep it alive past it.
+            queue_reactor_->wake_up([rx = transport_rx_] {});
         }
     }
     else if (send_fd >= 0)
@@ -844,7 +849,7 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_e
             std::lock_guard<std::mutex> flock(fec_mu);
             if (!fec.enabled())
             {
-                std::lock_guard<std::mutex> lock(mu);
+                /* dropped is atomic; taking mu here would invert the mu -> fec_mu order. */
                 dropped.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
@@ -1501,6 +1506,14 @@ int stream_sender::query(std::string_view key, std::string *value) const
     {
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, dropped.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("queue_evicted" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      queue_evicted.load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }

@@ -236,7 +236,7 @@ telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
 | `peer_udp_pkt_recv`, `peer_fec_pkt_recv` | Q | `ts,rcv,gap` from the last receiver report; `-ENODATA` before one arrives |
 | `peer_byt_recv` | Q | `ts,udp,fec` byte totals from the receiver report; `-ENODATA` for legacy reports without bytes |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
-| `fec_mode`, `stats`, `dropped`, `queue_full_rejects`, `fec_oversized`, `pool_misses`, `queue_packets`, `queue_bytes`, `transport_dropped` | Q | state / counters |
+| `fec_mode`, `stats`, `dropped`, `queue_full_rejects`, `queue_evicted`, `fec_oversized`, `pool_misses`, `queue_packets`, `queue_bytes`, `transport_dropped` | Q | state / counters |
 | `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
 
 `stream_sender` transmits data delivered to it while open. The controller owns data delivery policy.
@@ -250,6 +250,8 @@ Set `queue_transport_tx` and `queue_transport_rx` to their registry names.
 The host owns capacity and queue lifetime. A full queue evicts its oldest packet;
 the sender's wire counters count packets submitted to the transport, not peer delivery;
 `query("transport_dropped")` counts the packets a full TX queue evicted.
+`query("queue_evicted")` counts send-queue packets evicted by an FEC timeout or reconfigure
+flush (one count per packet, also included in `dropped`); input itself never evicts.
 
 UDP hosts register a `vstreamer::default_reactor` in `vstreamer::default_reactor_registry`
 and configure its name with `reactor`. Applications can use `default_reactor_host`

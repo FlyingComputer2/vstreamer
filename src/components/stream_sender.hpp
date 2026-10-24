@@ -159,6 +159,8 @@ private:
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> dropped {0};
     std::atomic<uint64_t> queue_full_rejects {0};
+    /* Send queue: packets evicted to make room (also counted in dropped). */
+    std::atomic<uint64_t> queue_evicted {0};
     /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
     std::atomic<uint64_t> transport_dropped {0};
 
