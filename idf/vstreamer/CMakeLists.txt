@@ -65,6 +65,9 @@ idf_component_register(
 
 target_compile_options(${COMPONENT_LIB} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
+    # bfc (stream_sender's queue transport) throws on fatal errors; with IDF's C++ exceptions
+    # off a throw aborts.
+    $<$<COMPILE_LANGUAGE:CXX>:-fexceptions>
 )
 if(VSTREAMER_IDF_ISAL_SOURCES)
     set_source_files_properties(${VSTREAMER_IDF_ISAL_SOURCES}
