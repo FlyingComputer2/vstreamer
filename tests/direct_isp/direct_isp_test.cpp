@@ -321,12 +321,16 @@ int main()
         std::lock_guard<std::mutex> lock(hw.mu);
         check(hw.same_address, "same DMA address at encode");
     }
-    // Keep the coded AU waiting: next raw frame must be returned without
-    // encoding.
+    // One coded AU may wait: the next raw frame is still encoded.
     hw.feed();
-    eventually([] { return count(&fake_hardware::returns) == 2; }, "backpressure frame returned");
-    check(count(&fake_hardware::encodes) == 1, "backpressure skips raw encode");
+    eventually([] { return count(&fake_hardware::returns) == 2; }, "second frame returned");
+    check(count(&fake_hardware::encodes) == 2, "one waiting AU does not drop");
+    // With two AUs waiting, the next raw frame is returned without encoding.
+    hw.feed();
+    eventually([] { return count(&fake_hardware::returns) == 3; }, "backpressure frame returned");
+    check(count(&fake_hardware::encodes) == 2, "backpressure skips raw encode");
     check(next(*source).sdu_type == sdu_type_e::H264_AU, "coded AU preserved");
+    check(next(*source).sdu_type == sdu_type_e::H264_AU, "second coded AU preserved");
     component_pdu empty;
     check(source->output(empty) == -EAGAIN, "empty output is nonblocking");
     // Closing during encode must wait before tearing down the camera mapping.
@@ -352,7 +356,7 @@ int main()
     }
     check(closing.wait_for(2s) == std::future_status::ready, "close finishes after DMA");
     closing.get();
-    check(count(&fake_hardware::returns) == 3, "in-flight buffer returned at shutdown");
+    check(count(&fake_hardware::returns) == 4, "in-flight buffer returned at shutdown");
     {
         std::lock_guard<std::mutex> lock(hw.mu);
         check(!hw.closed_during_encode, "mapping alive during DMA");
@@ -368,7 +372,7 @@ int main()
         hw.encode_result = -EIO;
     }
     hw.feed();
-    eventually([] { return count(&fake_hardware::returns) == 4; }, "overflow returns buffer");
+    eventually([] { return count(&fake_hardware::returns) == 5; }, "overflow returns buffer");
     {
         std::lock_guard<std::mutex> lock(hw.mu);
         hw.encode_result = 0;
