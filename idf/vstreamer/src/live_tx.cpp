@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -288,7 +289,21 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     const int k_seconds = cfg.seconds;
     const bool  run_forever = (0 == k_seconds);
 
-    vstreamer::default_reactor_host sender_reactor;
+    const bool queue_mode = cfg.peer.empty();
+    if (queue_mode && (cfg.queue_tx.empty() || cfg.queue_rx.empty() || cfg.queue_reactor.empty()))
+    {
+        std::printf("live TX: needs peer, or queue_tx, queue_rx and queue_reactor\n");
+        return -1;
+    }
+    const std::string dest = queue_mode ? "queue:" + cfg.queue_tx + "," + cfg.queue_rx + "@" +
+                                              cfg.queue_reactor
+                                        : cfg.peer;
+    /* The UDP transport runs on a reactor of its own; queues use the caller's. */
+    std::optional<vstreamer::default_reactor_host> sender_reactor;
+    if (!queue_mode)
+    {
+        sender_reactor.emplace();
+    }
     auto src = vstreamer::component_factory::create_source("esp32_h264_isp_ng_src");
     auto pay = vstreamer::component_factory::create_coder("rtp_h264_pay");
     auto snd = vstreamer::component_factory::create_sink("stream_sender");
@@ -322,10 +337,15 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     std::string size;
     src->query("size", &size);
     apply_kvs(*pay, "pay", cfg.pay);
-    snd->configure("reactor", sender_reactor.name());
-    if (snd->configure("udp_transport", cfg.peer) < 0)
+    const bool transport_ok =
+        queue_mode ? snd->configure("reactor", cfg.queue_reactor) >= 0 &&
+                         snd->configure("queue_transport_tx", cfg.queue_tx) >= 0 &&
+                         snd->configure("queue_transport_rx", cfg.queue_rx) >= 0
+                   : snd->configure("reactor", sender_reactor->name()) >= 0 &&
+                         snd->configure("udp_transport", cfg.peer) >= 0;
+    if (!transport_ok)
     {
-        std::printf("live TX: bad peer '%s'\n", cfg.peer.c_str());
+        std::printf("live TX: bad transport '%s'\n", dest.c_str());
         return -1;
     }
     apply_kvs(*snd, "snd", cfg.snd);
@@ -363,12 +383,12 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     if (run_forever)
     {
         std::printf("live TX streaming %s until reset (size %s, esp32_h264_isp_ng_src)\n",
-                    cfg.peer.c_str(), size.c_str());
+                    dest.c_str(), size.c_str());
     }
     else
     {
         std::printf("live TX streaming %s for %d s (size %s, esp32_h264_isp_ng_src)\n",
-                    cfg.peer.c_str(), k_seconds, size.c_str());
+                    dest.c_str(), k_seconds, size.c_str());
     }
     std::fflush(stdout);
 
