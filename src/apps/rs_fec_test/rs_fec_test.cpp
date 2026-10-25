@@ -11,8 +11,14 @@ using vstreamer::rs_block_erasure;
 
 int main()
 {
+    // Drive RX deadlines deterministically; TX timeout flushing uses the real clock.
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    constexpr int past_deadline_ms = rs_block_erasure::k_spread_cap_ms +
+                                     rs_block_erasure::k_deadline_margin_min_ms + 10;
+
     rs_block_erasure enc;
     rs_block_erasure dec;
+    dec.set_clock([&now] { return now; });
     if (!enc.init(10, 12, 20))
     {
         std::fprintf(stderr, "init failed\n");
@@ -65,6 +71,7 @@ int main()
     /* Blocks must be emitted in sdu_base order even when shards arrive OOO. */
     rs_block_erasure enc2;
     rs_block_erasure dec2;
+    dec2.set_clock([&now] { return now; });
     if (!enc2.init(2, 4, 20))
     {
         std::fprintf(stderr, "init2 failed\n");
@@ -135,6 +142,7 @@ int main()
     /* Many blocks, all shards: no decode failures or spurious app loss. */
     rs_block_erasure enc3;
     rs_block_erasure dec3;
+    dec3.set_clock([&now] { return now; });
     if (!enc3.init(10, 12, 20))
     {
         std::fprintf(stderr, "init3 failed\n");
@@ -207,8 +215,8 @@ int main()
         }
         return base;
     };
-    auto tick_after = [](rs_block_erasure& d, int ms, fec_rx_payload_list& sink) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    auto tick_after = [&now](rs_block_erasure& d, int ms, fec_rx_payload_list& sink) {
+        now += std::chrono::milliseconds(ms);
         fec_rx_payload_list b;
         d.poll_rx(&b);
         sink.insert(sink.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
@@ -218,6 +226,7 @@ int main()
     {
         rs_block_erasure enc4;
         rs_block_erasure dec4;
+        dec4.set_clock([&now] { return now; });
         if (!enc4.init(2, 4, 20))
         {
             std::fprintf(stderr, "init4 failed\n");
@@ -236,10 +245,11 @@ int main()
     }
 
     /* A block lost entirely on the wire must not stall later blocks forever;
-     * a late copy of it is still delivered. */
+     * a late copy is ignored after the receiver advances past it. */
     {
         rs_block_erasure enc5;
         rs_block_erasure dec5;
+        dec5.set_clock([&now] { return now; });
         if (!enc5.init(2, 4, 20))
         {
             std::fprintf(stderr, "init5 failed\n");
@@ -256,27 +266,30 @@ int main()
             std::fprintf(stderr, "hole: expected only block A (2) got %zu\n", got.size());
             return 1;
         }
-        tick_after(dec5, 10, got);
+        tick_after(dec5, rs_block_erasure::k_deadline_margin_min_ms - 1, got);
         if (got.size() != 2U)
         {
             std::fprintf(stderr, "hole: released C too early (%zu)\n", got.size());
             return 1;
         }
-        tick_after(dec5, dec5.emit_hold_ms() + 20, got);
+        tick_after(dec5, past_deadline_ms, got);
         if (got.size() != 4U || got[2].u8()[1] != 0xC)
         {
-            std::fprintf(stderr, "hole: expected C after emit_hold got %zu\n", got.size());
+            std::fprintf(stderr, "hole: expected C after gap deadline got %zu\n", got.size());
             return 1;
         }
         feed(dec5, b, got);
-        if (got.size() != 6U || got[4].u8()[1] != 0xB)
+        if (got.size() != 4U || dec5.late_blocks() != 1U ||
+            dec5.take_fail_lost_app_pkts() != 2U)
         {
-            std::fprintf(stderr, "hole: late B not delivered (%zu)\n", got.size());
+            std::fprintf(stderr,
+                         "hole: late B was not ignored or gap loss was miscounted (%zu)\n",
+                         got.size());
             return 1;
         }
         const auto d = make_block(enc5, 0xD);
         feed(dec5, d, got);
-        if (got.size() != 8U || got[6].u8()[1] != 0xD)
+        if (got.size() != 6U || got[4].u8()[1] != 0xD)
         {
             std::fprintf(stderr, "hole: stream did not resume after late B (%zu)\n", got.size());
             return 1;
@@ -305,26 +318,37 @@ int main()
         }
     }
 
-    /* Sender process restart (new random sdu_base): receiver resyncs. */
+    /* Sender restart outside the reference window: receiver resyncs. */
     {
         rs_block_erasure enc7a;
         rs_block_erasure enc7b;
         rs_block_erasure dec7;
+        dec7.set_clock([&now] { return now; });
         if (!enc7a.init(2, 4, 20) || !enc7b.init(2, 4, 20))
         {
             std::fprintf(stderr, "init7 failed\n");
             return 1;
         }
+        enc7a.set_tx_sdu_seq(1000);
+        enc7b.set_tx_sdu_seq(5000);
         fec_rx_payload_list got;
         feed(dec7, make_block(enc7a, 1), got);
         feed(dec7, make_block(enc7a, 2), got);
         feed(dec7, make_block(enc7b, 3), got);
         feed(dec7, make_block(enc7b, 4), got);
-        tick_after(dec7, dec7.emit_hold_ms() + 20, got);
-        if (got.size() != 8U)
+        tick_after(dec7, past_deadline_ms, got);
+        if (got.size() != 8U || dec7.new_references() != 1U)
         {
             std::fprintf(stderr, "restart: expected 8 payloads got %zu\n", got.size());
             return 1;
+        }
+        for (size_t i = 0; i < got.size(); i++)
+        {
+            if (got[i].u8()[1] != static_cast<uint8_t>(i / 2 + 1))
+            {
+                std::fprintf(stderr, "restart: payload order mismatch at %zu\n", i);
+                return 1;
+            }
         }
         feed(dec7, make_block(enc7b, 5), got);
         if (got.size() != 10U || got[8].u8()[1] != 5)
@@ -339,6 +363,7 @@ int main()
     {
         rs_block_erasure enc_nk;
         rs_block_erasure dec_nk;
+        dec_nk.set_clock([&now] { return now; });
         if (!enc_nk.init(4, 4, 20))
         {
             std::fprintf(stderr, "init n=k failed\n");
@@ -389,6 +414,7 @@ int main()
     {
         rs_block_erasure enc_gap;
         rs_block_erasure dec_gap;
+        dec_gap.set_clock([&now] { return now; });
         if (!enc_gap.init(4, 4, 20))
         {
             std::fprintf(stderr, "init gap n=k failed\n");
@@ -408,7 +434,7 @@ int main()
             out.insert(out.end(), std::make_move_iterator(step.begin()),
                        std::make_move_iterator(step.end()));
         }
-        tick_after(dec_gap, dec_gap.rx_hold_ms() + 30, out);
+        tick_after(dec_gap, past_deadline_ms, out);
         const uint64_t lost = dec_gap.take_fail_lost_app_pkts();
         if (out.size() != 3U || lost != 1U)
         {
@@ -460,6 +486,7 @@ int main()
             return 1;
         }
         rs_block_erasure dec_part;
+        dec_part.set_clock([&now] { return now; });
         /* Skip SDU 0 and omit parity: too few shards to RS-decode. */
         fec_rx_payload_list out;
         for (size_t i = 1; i <= 2; i++)
@@ -469,9 +496,9 @@ int main()
             out.insert(out.end(), std::make_move_iterator(step.begin()),
                        std::make_move_iterator(step.end()));
         }
-        tick_after(dec_part, dec_part.rx_hold_ms() + 30, out);
+        tick_after(dec_part, past_deadline_ms, out);
         const uint64_t lost = dec_part.take_fail_lost_app_pkts();
-        if (lost != 1U)
+        if (lost != 1U || out.size() != 2U)
         {
             std::fprintf(stderr, "partial N gap: expected lost=1 got %llu out=%zu\n",
                          static_cast<unsigned long long>(lost), out.size());
@@ -483,23 +510,33 @@ int main()
     {
         rs_block_erasure enc8;
         rs_block_erasure dec8;
+        dec8.set_clock([&now] { return now; });
         if (!enc8.init(2, 2, 20))
         {
             std::fprintf(stderr, "init8 wrap failed\n");
             return 1;
         }
+        enc8.set_tx_sdu_seq(65500);
         fec_rx_payload_list got;
         for (int i = 0; i < 258; i++)
         {
             feed(dec8, make_block(enc8, static_cast<uint8_t>(i & 0x7F)), got);
         }
-        tick_after(dec8, dec8.emit_hold_ms() + 30, got);
-        if (got.size() != 516U || dec8.decode_fail() != 0)
+        tick_after(dec8, past_deadline_ms, got);
+        if (got.size() != 516U || dec8.decode_fail() != 0 || dec8.new_references() != 0)
         {
             std::fprintf(stderr,
                          "sdu_base wrap: expected 516 payloads decode_fail=0 got %zu fail=%llu\n",
                          got.size(), static_cast<unsigned long long>(dec8.decode_fail()));
             return 1;
+        }
+        for (size_t i = 0; i < got.size(); i++)
+        {
+            if (got[i].u8()[1] != static_cast<uint8_t>((i / 2) & 0x7F))
+            {
+                std::fprintf(stderr, "sdu_base wrap: payload order mismatch at %zu\n", i);
+                return 1;
+            }
         }
     }
 
