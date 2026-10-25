@@ -177,7 +177,10 @@ void esp32_h264_isp_ng_src::encode_main()
             ++frames_;
             // Drain capture while the consumer is slow, dropping raw frames
             // only. Never discard a coded AU: later P frames can reference it.
-            if (!out_q_.empty())
+            // One AU may still wait: encode takes about a frame interval, so
+            // the next frame is ready as soon as an AU is queued, before a
+            // polling consumer has taken it.
+            if (out_q_.size() >= 2)
             {
                 ++backlog_drops_;
                 continue;

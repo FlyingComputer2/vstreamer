@@ -2,8 +2,10 @@
 
 #include <arpa/inet.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -132,17 +134,14 @@ int main(int argc, char **argv)
 
     double schedule_cursor_sec = 0.0;
 
-    auto pump_decoder = [&](vstreamer::fec_rx_payload_list *batch) {
+    auto pump_decoder = [&] {
+        vstreamer::fec_rx_payload_list batch;
         const auto pump_t0 = steady_clk::now();
-        dec.poll_rx(batch);
+        dec.poll_rx(&batch);
         fec_decode_wall_sec += secs_between(pump_t0, steady_clk::now());
-        if (batch != nullptr)
+        for (auto &p : batch)
         {
-            for (auto &p : *batch)
-            {
-                decoded.push_back(std::move(p));
-            }
-            batch->clear();
+            decoded.push_back(std::move(p));
         }
     };
 
@@ -180,7 +179,7 @@ int main(int argc, char **argv)
             sendq.pop_front();
         }
 
-        pump_decoder(nullptr);
+        pump_decoder();
 
         if (sendq.empty())
         {
@@ -215,17 +214,20 @@ int main(int argc, char **argv)
             decoded.push_back(std::move(p));
         }
         sendq.pop_front();
-        pump_decoder(nullptr);
+        pump_decoder();
     }
 
-    /* Let RX block expiry / emit queue finish. */
-    const int tail_ms =
-        std::max(dec.emit_hold_ms(), dec.rx_hold_ms()) + dec.done_hold_ms() + 100;
+    /* Allow a cold-start spread deadline, or the learned spread plus jitter, to expire.
+     * Completed blocks no longer have a separate done-cache retention timer. */
+    const int tail_ms = static_cast<int>(std::ceil(
+        std::max(static_cast<double>(rs_block_erasure::k_spread_cap_ms),
+                 dec.spread_estimate_ms()) +
+        std::max(static_cast<double>(rs_block_erasure::k_deadline_margin_min_ms),
+                 3.0 * dec.jitter_estimate_ms()))) + 100;
     const auto tail_end = steady_clk::now() + std::chrono::milliseconds(tail_ms);
     while (steady_clk::now() < tail_end)
     {
-        vstreamer::fec_rx_payload_list batch;
-        pump_decoder(&batch);
+        pump_decoder();
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
@@ -278,9 +280,10 @@ int main(int argc, char **argv)
     if (missing > 0)
     {
         std::fprintf(stderr,
-                     "WARN: %" PRIu64 " apps missing from decode (tail/partial block); "
+                     "FAIL: %" PRIu64 " apps missing from decode (tail/partial block); "
                      "seq_errors=%" PRIu64 "\n",
                      missing, seq_errors);
+        return 1;
     }
 
     std::printf("PASS: no sequence corruption through %" PRIu64 " wire id wraps "

@@ -224,6 +224,9 @@ TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
     std::string dropped_s;
     ASSERT_EQ(0, sender.query("dropped", &dropped_s));
     EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
+    std::string evicted_s;
+    ASSERT_EQ(0, sender.query("queue_evicted", &evicted_s));
+    EXPECT_EQ(0ULL, std::strtoull(evicted_s.c_str(), nullptr, 10));
 
     sender.close();
 }
@@ -269,6 +272,9 @@ TEST(StreamSenderTest, QueuePacketCapHoldsWholeBlocksWhenSpreadBacksQueue)
     std::string dropped_s;
     ASSERT_EQ(0, sender.query("dropped", &dropped_s));
     EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
+    std::string evicted_s;
+    ASSERT_EQ(0, sender.query("queue_evicted", &evicted_s));
+    EXPECT_EQ(0ULL, std::strtoull(evicted_s.c_str(), nullptr, 10));
 
     sender.close();
 }

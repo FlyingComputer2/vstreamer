@@ -12,8 +12,14 @@ using kv_list = std::vector<std::pair<std::string, std::string>>;
 
 struct live_tx_config
 {
-    /* stream_sender "udp_transport" destination, host:port. */
+    /* stream_sender "udp_transport" destination, host:port. Leave empty for the queue transport. */
     std::string peer;
+    /* Queue transport instead of peer: stream_sender "queue_transport_tx" / "queue_transport_rx"
+     * names and its "reactor", a running bfc::cv_reactor<>. The caller registers all three and
+     * keeps them for as long as live TX may run. */
+    std::string queue_tx;
+    std::string queue_rx;
+    std::string queue_reactor;
     /* Stream this long once the first AU is out; 0 = until reset. */
     int seconds = 0;
     /* UDP port of the management plane (get/set src|pay|snd <key>, get sys stats); 0 = none. */
@@ -29,7 +35,7 @@ struct live_tx_config
 
 /*
  * Live video TX on the ESP32-P4: esp32_h264_isp_ng_src (MIPI-CSI camera, ISP, hardware H.264) ->
- * rtp_h264_pay -> stream_sender to cfg.peer, with the P4 thread layout (FEC encode on core 0,
+ * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), with the P4 thread layout (FEC encode on core 0,
  * send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
  * passed (or forever) and returns 0 when the stream ran at a usable rate, -1 on failure, and 0
  * without streaming when no camera sensor answers.
