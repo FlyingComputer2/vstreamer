@@ -33,7 +33,7 @@ void record_pdu_edge_latency_ms(std::atomic<double> *node, const component_pdu &
 void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
                            std::atomic<uint64_t> *gap_counter);
 
-void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &stop_flag);
+void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &run_flag);
 
 }  // namespace vstreamer::apps
 

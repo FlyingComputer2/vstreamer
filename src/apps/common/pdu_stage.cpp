@@ -107,9 +107,9 @@ void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
     }
 }
 
-void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &stop_flag)
+void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &run_flag)
 {
-    if (stop_flag.load(std::memory_order_relaxed))
+    if (!run_flag.load(std::memory_order_relaxed))
     {
         return;
     }
