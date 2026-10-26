@@ -100,6 +100,10 @@ private:
             uint8_t *buf = nullptr;
             uint32_t cap = 0;
             bool     free = true;
+            /* Bytes of the last AU handed out from this slot. A consumer that holds an AU alone
+             * may write into it (rtp_h264_pay writes RTP headers in place), leaving dirty cache
+             * lines over the next encode's DMA target; written back before the slot is reused. */
+            uint32_t handed_out = 0;
         };
         std::mutex            mu;
         std::vector<slot>     slots;

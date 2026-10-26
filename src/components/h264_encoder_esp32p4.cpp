@@ -21,6 +21,7 @@ extern "C"
 {
 #include "esp_h264_alloc.h"
 }
+#include "esp_cache.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_timer.h"
 
@@ -432,6 +433,10 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_loc
     const std::shared_ptr<slot_pool> pool = pool_;
     uint8_t *const                   slot_buf = pool->slots[out_index].buf;
     const uint32_t                   slot_cap = pool->slots[out_index].cap;
+    /* Lines the last AU's consumer dirtied would otherwise be evicted during the encoder's DMA
+     * into this buffer and land on top of the new bitstream. */
+    const uint32_t dirty_bytes = pool->slots[out_index].handed_out;
+    pool->slots[out_index].handed_out = 0;
 
     /* Everything the hardware calls need, taken under mu; enc_ and param_ stay valid without it
      * because only hw_mu_ holders open or close the codec. */
@@ -450,6 +455,11 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_loc
     hw_dirty_ = 0;
     lock.unlock();
 
+    if (dirty_bytes > 0)
+    {
+        (void)esp_cache_msync(slot_buf, dirty_bytes,
+                              ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
     if (0 != (dirty & k_hw_bitrate) && esp_h264_enc_set_bitrate(param, bitrate_now) != ESP_H264_ERR_OK)
     {
         std::fprintf(stderr, "h264_encoder_esp32p4: set bitrate %" PRIu32 " failed\n", bitrate_now);
@@ -516,6 +526,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_loc
         rc_qp_sum_ += static_cast<uint64_t>(qp_used);
         rc_update_locked(8.0 * out_frame.length, idr);
     }
+    pool->slots[out_index].handed_out = out_frame.length;
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
     au.sdu = bfc::shared_sized_buffer::adopt(
         reinterpret_cast<std::byte *>(slot_buf), slot_cap, out_frame.length,
