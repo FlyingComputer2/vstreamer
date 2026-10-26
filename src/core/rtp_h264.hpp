@@ -18,6 +18,20 @@ struct rtp_h264_config
     int      fps = 30;
 };
 
+/* One datagram of an AU as pack_annexb_rtp_ts() would build it, without building it: the RTP
+ * header (rtp_h264_packer::write_rtp_header), then fu (FU-A indicator and header, fu_len 0 or
+ * 2), then payload. payload points into the AU passed to plan_annexb_rtp_ts(), or into the
+ * packer's cached SPS/PPS when cached_param (which the next AU's plan may overwrite). */
+struct rtp_h264_dgram
+{
+    const uint8_t *payload = nullptr;
+    int            payload_len = 0;
+    uint8_t        fu[2] {};
+    int            fu_len = 0;
+    bool           marker = false;
+    bool           cached_param = false;
+};
+
 /* Annex-B H.264 access unit → complete RTP/UDP datagrams (12-byte RTP header + payload). */
 class rtp_h264_packer
 {
@@ -43,12 +57,27 @@ public:
                                                     uint32_t rtp_ts,
                                                     int64_t capture_rt_ns = 0) const;
 
+    /* The datagrams pack_annexb_rtp_ts would emit, in order, into *out. Updates the SPS/PPS
+     * cache as pack does; does not queue anything or advance seq. */
+    int plan_annexb_rtp_ts(const uint8_t *data, size_t size, int64_t capture_rt_ns,
+                           std::vector<rtp_h264_dgram> *out);
+
+    /* RTP header bytes (with the capture extension when capture_rt_ns > 0). */
+    [[nodiscard]] static int rtp_header_len(int64_t capture_rt_ns);
+
+    /* Writes the next datagram's RTP header (rtp_header_len bytes) and advances seq. */
+    void write_rtp_header(uint8_t *dst, bool marker, uint32_t ts, int64_t capture_rt_ns);
+
+    /* Size of the next datagram pop_datagram returns; 0 when none is pending. */
+    [[nodiscard]] size_t front_size() const { return queue.empty() ? 0 : queue.front().size(); }
+
     /* Copies one datagram into dst; returns size or negative errno. */
     int pop_datagram(uint8_t *dst, size_t cap);
 
 private:
-    int append_datagram(const uint8_t *payload, int plen, int marker, uint32_t ts,
-                        int64_t capture_rt_ns = 0);
+    /* prefix (the FU-A indicator and header) goes in front of payload in the same datagram. */
+    int append_datagram(const uint8_t *prefix, int prefix_len, const uint8_t *payload, int plen,
+                        int marker, uint32_t ts, int64_t capture_rt_ns = 0);
     int send_nal(const uint8_t *nal, int len, int marker, uint32_t ts,
                  int64_t capture_rt_ns = 0);
     void cache_param(const uint8_t *nal, int len);
@@ -60,6 +89,12 @@ private:
     uint8_t         pps[256];
     int             pps_len = 0;
     std::deque<std::vector<uint8_t>> queue;
+    /* count_annexb_rtp_datagrams() runs the packing logic on a copy with this set: datagrams
+     * are counted, not built. */
+    bool            count_only = false;
+    size_t          counted = 0;
+    /* Set by plan_annexb_rtp_ts(): datagrams are described here instead of built. */
+    std::vector<rtp_h264_dgram> *plan_out = nullptr;
 };
 
 /* One RTP datagram in → depay state; complete AU out as Annex-B. */
