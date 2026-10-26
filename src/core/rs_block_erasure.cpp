@@ -1,6 +1,8 @@
 #include "core/rs_block_erasure.hpp"
 #include "core/rs_encode_scalar.hpp"
 
+#include <chrono>
+
 #include <algorithm>
 #include <array>
 #include <arpa/inet.h>
@@ -274,9 +276,14 @@ bool vstreamer::rs_block_erasure::encode_block(
     }
     if (p > 0)
     {
+        const auto kernel_t0 = std::chrono::steady_clock::now();
         VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), cfg_k, p,
                           const_cast<unsigned char*>(g_tbls.data()),
                           data_ptrs.data(), coding_ptrs.data());
+        encode_kernel_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - kernel_t0)
+                .count());
     }
 
     out->clear();

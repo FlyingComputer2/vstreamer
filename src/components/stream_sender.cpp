@@ -856,7 +856,13 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_e
             const uint64_t                        before = fec.oversized();
             std::chrono::steady_clock::time_point dl;
             const bool had_deadline = fec.next_deadline(&dl);
+            const auto push_t0 = std::chrono::steady_clock::now();
             fec.push_app(data, len, &air);
+            fec_push_us.fetch_add(static_cast<uint64_t>(
+                                      std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - push_t0)
+                                          .count()),
+                                  std::memory_order_relaxed);
             oversized = fec.oversized() != before;
             opened_block = !had_deadline && fec.next_deadline(&dl);
         }
@@ -1514,6 +1520,25 @@ int stream_sender::query(std::string_view key, std::string *value) const
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64,
                       queue_evicted.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("fec_push_us" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, fec_push_us.load(std::memory_order_relaxed));
+        *value = buf;
+        return 0;
+    }
+    if ("fec_kernel_us" == key)
+    {
+        uint64_t us = fec.encode_kernel_us();
+        {
+            std::lock_guard<std::mutex> flock(fec_mu);
+            us = fec.encode_kernel_us();
+        }
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, us);
         *value = buf;
         return 0;
     }

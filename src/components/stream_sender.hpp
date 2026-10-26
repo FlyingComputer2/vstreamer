@@ -163,6 +163,7 @@ private:
     std::atomic<uint64_t> queue_evicted {0};
     /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
     std::atomic<uint64_t> transport_dropped {0};
+    std::atomic<uint64_t> fec_push_us {0}; /* time in fec.push_app (RS encode included) */
 
     /* FEC block spreading: a block's shards are released evenly over this window instead of
      * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the wire.

@@ -172,6 +172,11 @@ public:
     {
         return given_up_blocks_count;
     }
+    /* Time spent in the parity kernel (encode_block), microseconds. */
+    uint64_t encode_kernel_us() const
+    {
+        return encode_kernel_us_;
+    }
     uint64_t oversized() const
     {
         return oversized_count;
@@ -315,6 +320,7 @@ private:
     uint64_t given_up_blocks_count = 0;
     uint64_t new_references_count = 0;
     uint64_t oversized_count = 0;
+    mutable uint64_t encode_kernel_us_ = 0;
 
     size_t max_shard_bytes = 1470;
 };

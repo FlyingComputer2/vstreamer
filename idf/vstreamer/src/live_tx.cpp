@@ -199,14 +199,31 @@ void print_sys_stats()
 }
 #endif
 
+/* TX thread time per stats interval: payloader calls, stream_sender input (FEC encode and
+ * queueing) and how often the sender pushed back. */
+std::atomic<int64_t>  g_pay_us {0};
+std::atomic<int64_t>  g_snd_us {0};
+std::atomic<uint64_t> g_snd_calls {0};
+std::atomic<uint64_t> g_snd_eagain {0};
+
 void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_sink *sender)
 {
     vstreamer::component_pdu out;
-    while (pay->output(out) == 0)
+    for (;;)
     {
+        const int64_t t_pay = esp_timer_get_time();
+        const int     pr = pay->output(out);
+        g_pay_us.fetch_add(esp_timer_get_time() - t_pay, std::memory_order_relaxed);
+        if (pr != 0)
+        {
+            break;
+        }
         while (true)
         {
-            const int r = sender->input(std::move(out));
+            const int64_t t_snd = esp_timer_get_time();
+            const int     r = sender->input(std::move(out));
+            g_snd_us.fetch_add(esp_timer_get_time() - t_snd, std::memory_order_relaxed);
+            g_snd_calls.fetch_add(1, std::memory_order_relaxed);
             if (0 == r)
             {
                 break;
@@ -216,6 +233,7 @@ void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_s
                 std::printf("stream_sender input failed: %d\n", r);
                 return;
             }
+            g_snd_eagain.fetch_add(1, std::memory_order_relaxed);
             vTaskDelay(1);
         }
     }
@@ -268,7 +286,9 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
     for (;;)
     {
         drain_pay_to_sender(pay, sender);
-        const int r = pay->input(std::move(out));
+        const int64_t t_pay = esp_timer_get_time();
+        const int     r = pay->input(std::move(out));
+        g_pay_us.fetch_add(esp_timer_get_time() - t_pay, std::memory_order_relaxed);
         if (0 == r)
         {
             break;
@@ -426,6 +446,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     int64_t       last_enc_us = last_stats_us;
     uint64_t      last_frames = 0;
     uint64_t      last_bytes = 0;
+    uint64_t      last_fec_us = 0;
+    uint64_t      last_kern_us = 0;
 
     auto tx_fn = [&]() {
         while (!stop.load(std::memory_order_acquire))
@@ -504,11 +526,30 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             std::string node_lat;
             (void)src->query("latency_ms", &lat);
             (void)src->query("node_latency_ms", &node_lat);
+            std::string fec_us_s;
+            (void)snd->query("fec_push_us", &fec_us_s);
+            const uint64_t fec_us_total = std::strtoull(fec_us_s.c_str(), nullptr, 10);
+            const uint64_t fec_us = fec_us_total - last_fec_us;
+            last_fec_us = fec_us_total;
+            std::string kern_s;
+            (void)snd->query("fec_kernel_us", &kern_s);
+            const uint64_t kern_total = std::strtoull(kern_s.c_str(), nullptr, 10);
+            const uint64_t kern_us = kern_total - last_kern_us;
+            last_kern_us = kern_total;
+            const int64_t  pay_us = g_pay_us.exchange(0);
+            const int64_t  snd_us = g_snd_us.exchange(0);
+            const uint64_t snd_calls = g_snd_calls.exchange(0);
+            const uint64_t snd_eagain = g_snd_eagain.exchange(0);
             std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f) "
-                        "latency_ms=%s node_latency_ms=%s; isp %s; snd %s\n",
+                        "latency_ms=%s node_latency_ms=%s; tx pay=%.1f%% snd=%.1f%% fec=%.1f%% kernel=%.1f%% "
+                        "snd_calls=%" PRIu64 " snd_eagain=%" PRIu64 "; isp %s; snd %s\n",
                         win_fps, enc_fps, win_kbps,
                         age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
                         age_n > 0 ? age_in / 1000.0 / age_n : 0.0, lat.c_str(), node_lat.c_str(),
+                        stat_dt > 0 ? pay_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? snd_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? fec_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? kern_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
                         isp_stats.c_str(), snd_stats.c_str());
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
             print_sys_stats();
