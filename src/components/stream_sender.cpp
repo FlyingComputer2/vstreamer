@@ -98,6 +98,8 @@ const std::vector<port_desc> &stream_sender::input_ports()
 stream_sender::stream_sender()
     : pool(static_cast<size_t>(1500), k_queue_packet_cap)
 {
+    /* FEC shards are built in pool buffers with room for the stream header: no copy to send. */
+    fec.set_tx_buffers(k_stream_header_len, [this](size_t cap) { return pool.acquire(cap); });
 }
 
 int stream_sender::effective_fec_k() const
@@ -157,90 +159,23 @@ bool stream_sender::queue_has_room_for_sdu() const
     return queue.empty() || queue.size() + pkts <= k_queue_packet_cap;
 }
 
-int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                         std::chrono::steady_clock::time_point release,
-                                         bool force)
+bool stream_sender::wire_payload_fits(size_t len, bool is_fec_shard)
 {
-    if (nullptr == data || 0 == len)
-    {
-        return 0;
-    }
-    size_t payload_max = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        payload_max =
-            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))
-                         : stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
-    }
+    std::lock_guard<std::mutex> lock(mu);
+    const size_t payload_max =
+        is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))
+                     : stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
     if (0 == payload_max || len > payload_max)
     {
-        std::lock_guard<std::mutex> lock(mu);
         dropped.fetch_add(1, std::memory_order_relaxed);
-        return -EINVAL;
+        return false;
     }
-    const size_t wire_len = k_stream_header_len + len;
-
-    {
-        std::lock_guard<std::mutex> lock(q_mu);
-        if (!force && !queue.empty() && queue.size() >= k_queue_packet_cap)
-        {
-            return -EAGAIN;
-        }
-    }
-
-    bfc::shared_sized_buffer buf = pool.acquire(wire_len);
-    if (0 == buf.capacity() || buf.size() != wire_len)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return -ENOMEM;
-    }
-    /* sequence_number is stamped in send_thread_main() on every datagram. */
-    stream_header hdr {};
-    hdr.sequence_number = 0;
-    hdr.is_fec = is_fec_shard;
-    hdr.is_stream_data = true;
-    hdr.ext_len = 0;
-    stream_header_write(buf.u8(), hdr);
-    std::memcpy(buf.u8() + k_stream_header_len, data, len);
-    {
-        std::lock_guard<std::mutex> lock(q_mu);
-        queue_bytes += wire_len;
-        /* Usually the newest release time, so the search ends at the back. */
-        auto pos = queue.end();
-        while (pos != queue.begin() && std::prev(pos)->release > release)
-        {
-            --pos;
-        }
-        queue.insert(pos, queued_wire {std::move(buf), release});
-    }
-    q_cv.notify_one();
-    return 0;
+    return true;
 }
 
-void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                      std::chrono::steady_clock::time_point release)
+/* Forced input can leave the queue past its cap, so one push may evict several. */
+void stream_sender::evict_for_room()
 {
-    if (nullptr == data || 0 == len)
-    {
-        return;
-    }
-    size_t payload_max = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        payload_max =
-            is_fec_shard ? stream_max_fec_shard(static_cast<size_t>(k_wire_datagram_bytes))
-                         : stream_max_raw_sdu(static_cast<size_t>(k_wire_datagram_bytes));
-    }
-    if (0 == payload_max || len > payload_max)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const size_t wire_len = k_stream_header_len + len;
-
-    /* Forced input can leave the queue past its cap, so one push may evict several. */
     uint64_t evicted = 0;
     {
         std::lock_guard<std::mutex> lock(q_mu);
@@ -257,14 +192,11 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
         std::lock_guard<std::mutex> lock(mu);
         dropped.fetch_add(evicted, std::memory_order_relaxed);
     }
+}
 
-    bfc::shared_sized_buffer buf = pool.acquire(wire_len);
-    if (0 == buf.capacity() || buf.size() != wire_len)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
+void stream_sender::queue_wire(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                               std::chrono::steady_clock::time_point release)
+{
     /* sequence_number is stamped in send_thread_main() on every datagram. */
     stream_header hdr {};
     hdr.sequence_number = 0;
@@ -272,10 +204,9 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     hdr.is_stream_data = true;
     hdr.ext_len = 0;
     stream_header_write(buf.u8(), hdr);
-    std::memcpy(buf.u8() + k_stream_header_len, data, len);
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        queue_bytes += wire_len;
+        queue_bytes += buf.size();
         /* Usually the newest release time, so the search ends at the back. */
         auto pos = queue.end();
         while (pos != queue.begin() && std::prev(pos)->release > release)
@@ -287,7 +218,91 @@ void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_f
     q_cv.notify_one();
 }
 
-void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
+int stream_sender::try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                                         std::chrono::steady_clock::time_point release,
+                                         bool force)
+{
+    if (nullptr == data || 0 == len)
+    {
+        return 0;
+    }
+    if (!wire_payload_fits(len, is_fec_shard))
+    {
+        return -EINVAL;
+    }
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        if (!force && !queue.empty() && queue.size() >= k_queue_packet_cap)
+        {
+            return -EAGAIN;
+        }
+    }
+    bfc::shared_sized_buffer buf = pool.acquire(k_stream_header_len + len);
+    if (0 == buf.capacity() || buf.size() != k_stream_header_len + len)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return -ENOMEM;
+    }
+    std::memcpy(buf.u8() + k_stream_header_len, data, len);
+    queue_wire(std::move(buf), is_fec_shard, release);
+    return 0;
+}
+
+void stream_sender::enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
+                                      std::chrono::steady_clock::time_point release)
+{
+    if (nullptr == data || 0 == len || !wire_payload_fits(len, is_fec_shard))
+    {
+        return;
+    }
+    evict_for_room();
+    bfc::shared_sized_buffer buf = pool.acquire(k_stream_header_len + len);
+    if (0 == buf.capacity() || buf.size() != k_stream_header_len + len)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    std::memcpy(buf.u8() + k_stream_header_len, data, len);
+    queue_wire(std::move(buf), is_fec_shard, release);
+}
+
+int stream_sender::try_enqueue_wire_buf(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                                        std::chrono::steady_clock::time_point release, bool force)
+{
+    if (buf.size() <= k_stream_header_len)
+    {
+        return 0;
+    }
+    if (!wire_payload_fits(buf.size() - k_stream_header_len, is_fec_shard))
+    {
+        return -EINVAL;
+    }
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        if (!force && !queue.empty() && queue.size() >= k_queue_packet_cap)
+        {
+            return -EAGAIN;
+        }
+    }
+    queue_wire(std::move(buf), is_fec_shard, release);
+    return 0;
+}
+
+void stream_sender::enqueue_wire_buf(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                                     std::chrono::steady_clock::time_point release)
+{
+    if (buf.size() <= k_stream_header_len ||
+        !wire_payload_fits(buf.size() - k_stream_header_len, is_fec_shard))
+    {
+        return;
+    }
+    evict_for_room();
+    queue_wire(std::move(buf), is_fec_shard, release);
+}
+
+void stream_sender::enqueue_fec_air(std::vector<bfc::shared_sized_buffer> *air)
 {
     if (nullptr == air)
     {
@@ -297,9 +312,8 @@ void stream_sender::enqueue_fec_air(std::vector<std::vector<uint8_t>> *air)
     const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
     for (size_t j = 0; j < air->size(); j++)
     {
-        auto &pkt = (*air)[j];
-        enqueue_wire_copy(pkt.data(), pkt.size(), true,
-                          t0 + fec_spread_offset(j, air->size(), spread));
+        enqueue_wire_buf(std::move((*air)[j]), true,
+                         t0 + fec_spread_offset(j, air->size(), spread));
     }
 }
 
@@ -482,7 +496,7 @@ void stream_sender::send_thread_main()
 
         int wait_ms = 50;
         {
-            std::vector<std::vector<uint8_t>> tick_air;
+            std::vector<bfc::shared_sized_buffer> tick_air;
             {
                 std::lock_guard<std::mutex> flock(fec_mu);
                 fec.on_tick(&tick_air);
@@ -844,7 +858,7 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_e
     }
     else
     {
-        std::vector<std::vector<uint8_t>> air;
+        std::vector<bfc::shared_sized_buffer> air;
         {
             std::lock_guard<std::mutex> flock(fec_mu);
             if (!fec.enabled())
@@ -874,10 +888,9 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_e
                 const int  spread = fec_spread_ms.load(std::memory_order_relaxed);
                 for (size_t j = 0; j < air.size(); j++)
                 {
-                    auto &pkt = air[j];
-                    /* Room was checked above; a failure here is oversize or no buffer,
-                     * which drops only this shard and is counted in dropped. */
-                    (void)try_enqueue_wire_copy(pkt.data(), pkt.size(), true,
+                    /* Room was checked above; a failure here is oversize, which drops only
+                     * this shard and is counted in dropped. */
+                    (void)try_enqueue_wire_buf(std::move(air[j]), true,
                                                 t0 + fec_spread_offset(j, air.size(), spread),
                                                 true);
                 }
@@ -965,8 +978,8 @@ int stream_sender::reinit_fec_if_active()
 
     /* Flush the partial block under the old k/n so no app packet is lost;
      * sdu_seq keeps counting so the receiver's order state stays valid. */
-    std::vector<std::vector<uint8_t>> air;
-    bool                              ok = true;
+    std::vector<bfc::shared_sized_buffer> air;
+    bool                                  ok = true;
     {
         std::lock_guard<std::mutex> flock(fec_mu);
         fec.flush(&air);
@@ -995,7 +1008,7 @@ int stream_sender::reinit_fec_if_active()
 
 void stream_sender::disable_fec()
 {
-    std::vector<std::vector<uint8_t>> air;
+    std::vector<bfc::shared_sized_buffer> air;
     {
         std::lock_guard<std::mutex> flock(fec_mu);
         if (!fec.enabled())

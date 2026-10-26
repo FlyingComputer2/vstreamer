@@ -121,6 +121,7 @@ bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_
     encode_matrix = tables.encode_matrix;
     g_tbls = tables.g_tbls;
     pending.clear();
+    pending_rows.clear();
     deadline_set = false;
     rx_blocks.clear();
     ready_blocks.clear();
@@ -155,6 +156,7 @@ void vstreamer::rs_block_erasure::disable()
 {
     active = false;
     pending.clear();
+    pending_rows.clear();
     deadline_set = false;
     cfg_k = 0;
     cfg_n = 0;
@@ -664,6 +666,192 @@ void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
     pending.clear();
     deadline_set = false;
     blocks_count++;
+}
+
+void vstreamer::rs_block_erasure::set_tx_buffers(size_t headroom, shard_alloc alloc)
+{
+    tx_headroom = headroom;
+    tx_alloc = std::move(alloc);
+}
+
+namespace
+{
+constexpr size_t k_tx_body_align = 16;
+}
+
+bool vstreamer::rs_block_erasure::alloc_tx_row(tx_row* row)
+{
+    if (!tx_alloc)
+    {
+        return false;
+    }
+    const size_t shard_max = max_shard_bytes - k_header_len;
+    const size_t cap = k_tx_body_align - 1 + tx_headroom + k_header_len + shard_max;
+    row->buf = tx_alloc(cap);
+    if (row->buf.size() < cap)
+    {
+        row->buf = {};
+        return false;
+    }
+    const auto body = reinterpret_cast<uintptr_t>(row->buf.u8()) + tx_headroom + k_header_len;
+    row->start = (k_tx_body_align - body % k_tx_body_align) % k_tx_body_align;
+    return true;
+}
+
+void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len,
+                                           std::vector<bfc::shared_sized_buffer>* out)
+{
+    if (out != nullptr)
+    {
+        out->clear();
+    }
+    if (!active || out == nullptr || data == nullptr)
+    {
+        return;
+    }
+    tx_row row;
+    if (len > max_original() || !alloc_tx_row(&row))
+    {
+        oversized_count++;
+        return;
+    }
+    uint8_t* body = row.buf.u8() + row.start + tx_headroom + k_header_len;
+    store_be16(body, static_cast<uint16_t>(len));
+    memcpy(body + k_len_prefix, data, len);
+    row.len = len;
+    pending_rows.push_back(std::move(row));
+    if (!deadline_set)
+    {
+        deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeout_ms);
+        deadline_set = true;
+    }
+    if (static_cast<int>(pending_rows.size()) >= cfg_k)
+    {
+        flush(out);
+    }
+}
+
+void vstreamer::rs_block_erasure::flush(std::vector<bfc::shared_sized_buffer>* out)
+{
+    if (out != nullptr)
+    {
+        out->clear();
+    }
+    if (!active || out == nullptr || pending_rows.empty())
+    {
+        return;
+    }
+    const int sdu_n = static_cast<int>(pending_rows.size());
+    if (!encode_tx_rows(sdu_seq, out))
+    {
+        oversized_count++;
+        out->clear();
+        pending_rows.clear();
+        deadline_set = false;
+        return;
+    }
+    sdu_seq = static_cast<uint16_t>(sdu_seq + static_cast<uint16_t>(sdu_n));
+    pending_rows.clear();
+    deadline_set = false;
+    blocks_count++;
+}
+
+void vstreamer::rs_block_erasure::on_tick(std::vector<bfc::shared_sized_buffer>* out)
+{
+    if (out != nullptr)
+    {
+        out->clear();
+    }
+    if (!active || !deadline_set || timeout_ms <= 0)
+    {
+        return;
+    }
+    if (std::chrono::steady_clock::now() < deadline)
+    {
+        return;
+    }
+    flush(out);
+}
+
+/* encode_block() over pending_rows, in place: same shard bytes, same order. */
+bool vstreamer::rs_block_erasure::encode_tx_rows(uint16_t sdu_base,
+                                                 std::vector<bfc::shared_sized_buffer>* out)
+{
+    const int sdu_n = static_cast<int>(pending_rows.size());
+    if (sdu_n > cfg_k)
+    {
+        return false;
+    }
+    size_t max_row = k_len_prefix;
+    for (const tx_row& row : pending_rows)
+    {
+        max_row = std::max(max_row, k_len_prefix + row.len);
+    }
+    const size_t shard_len = align_shard(max_row);
+    if (k_header_len + shard_len > max_shard_bytes)
+    {
+        return false;
+    }
+    if (tx_zero_row.size() < shard_len)
+    {
+        tx_zero_row.assign(shard_len, 0);
+    }
+    const size_t body_off = tx_headroom + k_header_len;
+    std::array<unsigned char*, k_header_k_n_max> data_ptrs {}; /* k, n <= 31: header fields */
+    std::array<unsigned char*, k_header_k_n_max> coding_ptrs {};
+    for (int i = 0; i < cfg_k; i++)
+    {
+        if (i < sdu_n)
+        {
+            tx_row& row = pending_rows[static_cast<size_t>(i)];
+            uint8_t* body = row.buf.u8() + row.start + body_off;
+            /* Short rows are zero-padded to shard_len for the kernel; the pad is not sent. */
+            memset(body + k_len_prefix + row.len, 0, shard_len - k_len_prefix - row.len);
+            data_ptrs[static_cast<size_t>(i)] = body;
+        }
+        else
+        {
+            data_ptrs[static_cast<size_t>(i)] = tx_zero_row.data();
+        }
+    }
+    std::vector<tx_row> parity(static_cast<size_t>(p));
+    for (int i = 0; i < p; i++)
+    {
+        tx_row& row = parity[static_cast<size_t>(i)];
+        if (!alloc_tx_row(&row))
+        {
+            return false;
+        }
+        coding_ptrs[static_cast<size_t>(i)] = row.buf.u8() + row.start + body_off;
+    }
+    if (p > 0)
+    {
+        const auto kernel_t0 = std::chrono::steady_clock::now();
+        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), cfg_k, p,
+                          const_cast<unsigned char*>(g_tbls.data()), data_ptrs.data(),
+                          coding_ptrs.data());
+        encode_kernel_us_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - kernel_t0)
+                .count());
+    }
+
+    out->clear();
+    out->reserve(static_cast<size_t>(sdu_n + p));
+    for (int i = 0; i < cfg_n; i++)
+    {
+        if (i < cfg_k && i >= sdu_n)
+        {
+            continue;
+        }
+        tx_row&      row = i < cfg_k ? pending_rows[static_cast<size_t>(i)]
+                                     : parity[static_cast<size_t>(i - cfg_k)];
+        const size_t body_len = i < cfg_k ? k_len_prefix + row.len : shard_len;
+        pack_header(row.buf.u8() + row.start + tx_headroom, sdu_base, i, cfg_k, cfg_n, sdu_n);
+        out->push_back(row.buf.subview(row.start, body_off + body_len));
+    }
+    return true;
 }
 
 void vstreamer::rs_block_erasure::on_tick(std::vector<std::vector<uint8_t>>* out)

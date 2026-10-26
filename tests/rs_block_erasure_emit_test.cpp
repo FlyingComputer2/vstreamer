@@ -1292,3 +1292,74 @@ TEST(RsBlockErasureEmitTest, RsFailureOfLaterBlockStillInOrder)
         EXPECT_EQ(out[i].u8()[0], i + 1);
     }
 }
+
+/* The zero-copy TX overloads must emit exactly the vector overloads' shards, in order, for full
+ * blocks and timeout-flushed short ones, leave the caller's headroom untouched in front of each
+ * shard header, and start every shard body 16-byte aligned. */
+TEST(RsBlockErasureEmitTest, TxBuffersMatchVectorShards)
+{
+    std::mt19937 rng(5);
+    for (const int headroom : {0, 4, 7})
+    {
+        for (int trial = 0; trial < 20; ++trial)
+        {
+            const int k = 1 + static_cast<int>(rng() % 21);
+            const int n = k + static_cast<int>(rng() % (32 - k));
+            rs_block_erasure vec;
+            rs_block_erasure buf;
+            ASSERT_TRUE(vec.init(k, n, 20, 1441));
+            ASSERT_TRUE(buf.init(k, n, 20, 1441));
+            vec.set_tx_sdu_seq(1000);
+            buf.set_tx_sdu_seq(1000);
+            buf.set_tx_buffers(static_cast<size_t>(headroom), [](size_t cap) {
+                /* Odd offsets inside the storage, to exercise the body alignment. */
+                auto b = bfc::shared_sized_buffer::allocate(cap + 3);
+                b.resize(cap + 3);
+                std::fill(b.u8(), b.u8() + b.size(), uint8_t {0xEE});
+                return b.subview(3, cap);
+            });
+            const int packets = 1 + static_cast<int>(rng() % (3 * k));
+            std::vector<std::vector<uint8_t>>     want;
+            std::vector<bfc::shared_sized_buffer> got;
+            const auto collect = [&](std::vector<std::vector<uint8_t>> &v,
+                                     std::vector<bfc::shared_sized_buffer> &b) {
+                want.insert(want.end(), v.begin(), v.end());
+                got.insert(got.end(), b.begin(), b.end());
+            };
+            for (int i = 0; i < packets; ++i)
+            {
+                std::vector<uint8_t> pkt(1 + rng() % 1400);
+                for (auto &x : pkt)
+                {
+                    x = static_cast<uint8_t>(rng());
+                }
+                std::vector<std::vector<uint8_t>>     v;
+                std::vector<bfc::shared_sized_buffer> b;
+                vec.push_app(pkt.data(), pkt.size(), &v);
+                buf.push_app(pkt.data(), pkt.size(), &b);
+                collect(v, b);
+            }
+            std::vector<std::vector<uint8_t>>     v;
+            std::vector<bfc::shared_sized_buffer> b;
+            vec.flush(&v);
+            buf.flush(&b);
+            collect(v, b);
+
+            ASSERT_EQ(want.size(), got.size()) << "k=" << k << " n=" << n;
+            for (size_t i = 0; i < want.size(); ++i)
+            {
+                const auto &g = got[i];
+                ASSERT_EQ(want[i].size() + static_cast<size_t>(headroom), g.size()) << i;
+                EXPECT_TRUE(std::all_of(g.u8(), g.u8() + headroom,
+                                        [](uint8_t x) { return x == 0xEE; }))
+                    << "headroom " << i;
+                EXPECT_TRUE(std::equal(want[i].begin(), want[i].end(), g.u8() + headroom))
+                    << "k=" << k << " n=" << n << " shard " << i;
+                const auto body = reinterpret_cast<uintptr_t>(g.u8()) + headroom +
+                                  rs_block_erasure::k_header_len;
+                EXPECT_EQ(0U, body % 16) << "shard " << i;
+            }
+            EXPECT_EQ(vec.tx_sdu_seq(), buf.tx_sdu_seq());
+        }
+    }
+}

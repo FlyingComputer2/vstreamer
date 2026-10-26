@@ -113,6 +113,21 @@ public:
     void flush(std::vector<std::vector<uint8_t>>* out);
     // TX tick: timeout-flush a partial block. Also expires RX state.
     void on_tick(std::vector<std::vector<uint8_t>>* out);
+
+    /*
+     * Zero-copy TX: the same shards, in the same order, built where they will be sent. Each app
+     * datagram is copied once into a buffer from alloc(capacity); parity is computed into
+     * buffers from alloc too, and the 5-byte shard headers are written in place. Every output
+     * buffer has headroom bytes free in front of its shard header for the caller's own header,
+     * and size() covers headroom + shard. Shard bodies start 16-byte aligned, which the PIE
+     * kernel needs to load and store rows directly. Use these overloads or the vector ones for
+     * a block, not both.
+     */
+    using shard_alloc = std::function<bfc::shared_sized_buffer(size_t capacity)>;
+    void set_tx_buffers(size_t headroom, shard_alloc alloc);
+    void push_app(const uint8_t* data, size_t len, std::vector<bfc::shared_sized_buffer>* out);
+    void flush(std::vector<bfc::shared_sized_buffer>* out);
+    void on_tick(std::vector<bfc::shared_sized_buffer>* out);
     /* Next partial-block flush time; false if no pending TX deadline. */
     [[nodiscard]] bool next_deadline(std::chrono::steady_clock::time_point* out) const;
     // RX tick: flush the head block once its deadline has passed and release what follows
@@ -282,6 +297,20 @@ private:
     std::vector<uint8_t> g_tbls;
 
     std::vector<std::vector<uint8_t>> pending;
+    /* Zero-copy TX rows: the buffer, where its output view starts (headroom + header + body
+     * follow, the body 16-byte aligned) and the app datagram's length. */
+    struct tx_row
+    {
+        bfc::shared_sized_buffer buf;
+        size_t                   start = 0;
+        size_t                   len = 0;
+    };
+    [[nodiscard]] bool alloc_tx_row(tx_row* row);
+    bool encode_tx_rows(uint16_t sdu_base, std::vector<bfc::shared_sized_buffer>* out);
+    std::vector<tx_row> pending_rows;
+    size_t              tx_headroom = 0;
+    shard_alloc         tx_alloc;
+    std::vector<uint8_t> tx_zero_row; /* stands in for the block's missing data rows */
     std::chrono::steady_clock::time_point deadline{};
     bool deadline_set = false;
     uint16_t sdu_seq = 0;

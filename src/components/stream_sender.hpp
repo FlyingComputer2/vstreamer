@@ -78,9 +78,20 @@ private:
     [[nodiscard]] int try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
                                             std::chrono::steady_clock::time_point release,
                                             bool force = false);
+    /* Built wire packets: buf holds k_stream_header_len free bytes, then the payload. */
+    void enqueue_wire_buf(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                          std::chrono::steady_clock::time_point release);
+    [[nodiscard]] int try_enqueue_wire_buf(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                                           std::chrono::steady_clock::time_point release,
+                                           bool force = false);
+    [[nodiscard]] bool wire_payload_fits(size_t len, bool is_fec_shard);
+    void evict_for_room();
+    void queue_wire(bfc::shared_sized_buffer &&buf, bool is_fec_shard,
+                    std::chrono::steady_clock::time_point release);
     /* True when the queue has room for every wire packet one app SDU can produce. */
     [[nodiscard]] bool queue_has_room_for_sdu() const;
-    void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
+    /* FEC shards built with k_stream_header_len headroom (rs_block_erasure::set_tx_buffers). */
+    void enqueue_fec_air(std::vector<bfc::shared_sized_buffer> *air);
 
     [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict);
 
