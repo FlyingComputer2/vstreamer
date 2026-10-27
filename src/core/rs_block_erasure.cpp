@@ -1,16 +1,15 @@
+/* rs_block_erasure: wire header, TX encode and the block decoder (receive side is in _rx). */
 #include "core/rs_block_erasure.hpp"
 #include "core/rs_encode_scalar.hpp"
 
-#include <chrono>
-
 #include <algorithm>
 #include <array>
-#include <arpa/inet.h>
+#include <chrono>
+#include <cstring>
 #include <mutex>
 #include <optional>
-#include <utility>
-#include <cstring>
 #include <random>
+#include <utility>
 
 extern "C"
 {
@@ -29,20 +28,22 @@ extern "C" void vstreamer_ec_encode_data(int len, int k, int rows,
 
 namespace
 {
+using vstreamer::rs_block_erasure;
+
 constexpr size_t k_min_shard = 16;  // ISA-L NEON kernels need >= 16 bytes.
-constexpr int    k_kn_cache = 32;
+constexpr size_t k_tx_body_align = 16;
+constexpr int    k_max_k = rs_block_erasure::k_header_k_n_max;
+constexpr int    k_max_rows = 2 * rs_block_erasure::k_header_k_n_max; /* data + parity */
 
 void store_be16(uint8_t* p, uint16_t v)
 {
-    const uint16_t n = htons(v);
-    memcpy(p, &n, sizeof(n));
+    p[0] = static_cast<uint8_t>(v >> 8);
+    p[1] = static_cast<uint8_t>(v & 0xFF);
 }
 
 uint16_t load_be16(const uint8_t* p)
 {
-    uint16_t n;
-    memcpy(&n, p, sizeof(n));
-    return ntohs(n);
+    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
 }
 
 size_t align_shard(size_t row)
@@ -50,304 +51,60 @@ size_t align_shard(size_t row)
     return row < k_min_shard ? k_min_shard : row;
 }
 
+/* Cauchy matrix of a block with k data rows and k + p rows in all; parity row j is row k + j. */
 struct kn_encode_tables
 {
     std::vector<uint8_t> encode_matrix;
     std::vector<uint8_t> g_tbls;
 };
 
-const kn_encode_tables& kn_encode_tables_for(int k, int n)
+const kn_encode_tables& kn_encode_tables_for(int k, int total)
 {
     static std::mutex mu;
-    static std::array<std::array<std::optional<kn_encode_tables>, k_kn_cache>, k_kn_cache> cache;
-    std::lock_guard<std::mutex>                          lock(mu);
-    std::optional<kn_encode_tables>&                     slot = cache[static_cast<size_t>(k)]
-        [static_cast<size_t>(n)];
+    static std::array<std::array<std::optional<kn_encode_tables>, k_max_rows + 1>, k_max_k + 1>
+                                cache;
+    std::lock_guard<std::mutex> lock(mu);
+    std::optional<kn_encode_tables>& slot =
+        cache[static_cast<size_t>(k)][static_cast<size_t>(total)];
     if (!slot.has_value())
     {
         kn_encode_tables built;
-        const int        p = n - k;
-        built.encode_matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(k), 0);
-        built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(p) * 32, 0);
-        gf_gen_cauchy1_matrix(built.encode_matrix.data(), n, k);
-        ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+        const int        p = total - k;
+        built.encode_matrix.assign(static_cast<size_t>(total) * static_cast<size_t>(k), 0);
+        built.g_tbls.assign(static_cast<size_t>(k) * static_cast<size_t>(std::max(p, 1)) * 32, 0);
+        gf_gen_cauchy1_matrix(built.encode_matrix.data(), total, k);
+        if (p > 0)
+        {
+            ec_init_tables_base(k, p, built.encode_matrix.data() + k * k, built.g_tbls.data());
+        }
         slot = std::move(built);
     }
     return *slot;
 }
-}  // namespace
 
-size_t vstreamer::rs_block_erasure::max_original() const
+/* Inverts the k surviving rows; rows err_list[] of the matrix are rebuilt by decode_matrix. */
+int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint8_t* err_list,
+                      int nerrs, uint8_t* decode_matrix, uint8_t* decode_index)
 {
-    if (max_shard_bytes <= k_header_len + k_len_prefix)
-    {
-        return 0;
-    }
-    return max_shard_bytes - k_header_len - k_len_prefix;
-}
-
-const char* vstreamer::rs_block_erasure::impl_name() const
-{
-#ifdef VSTREAMER_ISAL_NEON
-    return "isa-l neon";
-#else
-    return rs_encode_scalar_impl();
-#endif
-}
-
-vstreamer::rs_block_erasure::rs_block_erasure()
-{
-    // Random TX start id: a restarted sender must not replay ids that the
-    // receiver's duplicate filter / in-order emit queue still remembers.
-    std::random_device rd;
-    sdu_seq = static_cast<uint16_t>(rd());
-}
-
-bool vstreamer::rs_block_erasure::init(int k, int n, int timeout_ms, size_t max_shard_bytes_in)
-{
-    if (k < k_header_k_n_min || n < k || n > k_header_k_n_max ||
-        k > k_header_k_n_max || timeout_ms < 0 ||
-        max_shard_bytes_in < k_header_len + k_len_prefix + 1)
-    {
-        return false;
-    }
-    active = false;
-    cfg_k = k;
-    cfg_n = n;
-    p = n - k;
-    this->timeout_ms = timeout_ms;
-    max_shard_bytes = max_shard_bytes_in;
-    const kn_encode_tables& tables = kn_encode_tables_for(cfg_k, cfg_n);
-    encode_matrix = tables.encode_matrix;
-    g_tbls = tables.g_tbls;
-    pending.clear();
-    pending_rows.clear();
-    deadline_set = false;
-    rx_blocks.clear();
-    ready_blocks.clear();
-    emit_base_set = false;
-    emit_next = 0;
-    recovered_count = 0;
-    recovered_seen = 0;
-    blocks_count = 0;
-    decode_fail_seen = 0;
-    hdr_errors_count = 0;
-    hdr_errors_seen = 0;
-    kn_mismatch_count = 0;
-    kn_mismatch_seen = 0;
-    evicted_blocks_count = 0;
-    evicted_blocks_seen = 0;
-    rs_failures_count = 0;
-    rs_failures_seen = 0;
-    missing_shards_count = 0;
-    missing_shards_seen = 0;
-    fail_lost_app_pkts_count = 0;
-    fail_lost_app_pkts_seen = 0;
-    late_blocks_count = 0;
-    late_blocks_seen = 0;
-    given_up_blocks_count = 0;
-    new_references_count = 0;
-    oversized_count = 0;
-    active = true;
-    return true;
-}
-
-void vstreamer::rs_block_erasure::disable()
-{
-    active = false;
-    pending.clear();
-    pending_rows.clear();
-    deadline_set = false;
-    cfg_k = 0;
-    cfg_n = 0;
-    p = 0;
-    encode_matrix.clear();
-    g_tbls.clear();
-    rx_blocks.clear();
-    ready_blocks.clear();
-    emit_base_set = false;
-    emit_next = 0;
-}
-
-bool vstreamer::rs_block_erasure::pack_header(uint8_t* out, uint16_t sdu_base, int index, int k,
-                                              int n, int sdu_n)
-{
-    if (out == nullptr || index < 0 || index >= n || k < k_header_k_n_min ||
-        k > k_header_k_n_max || n < k || n > k_header_k_n_max || sdu_n < 1 || sdu_n > k)
-    {
-        return false;
-    }
-    store_be16(out, sdu_base);
-    const uint16_t fec_config = static_cast<uint16_t>(
-        ((static_cast<uint16_t>(k) & 0x1FU) << 11) |
-        ((static_cast<uint16_t>(n) & 0x1FU) << 6) |
-        ((static_cast<uint16_t>(index) & 0x1FU) << 1));
-    store_be16(out + 2, fec_config);
-    out[4] = static_cast<uint8_t>((static_cast<uint8_t>(sdu_n) & 0x1FU) << 3);
-    return true;
-}
-
-bool vstreamer::rs_block_erasure::unpack_header(const uint8_t* data, size_t len,
-                                                uint16_t* sdu_base, int* index, int* k, int* n,
-                                                int* sdu_n)
-{
-    if (data == nullptr || len < k_header_len || sdu_base == nullptr || index == nullptr ||
-        k == nullptr || n == nullptr || sdu_n == nullptr)
-    {
-        return false;
-    }
-    const uint16_t fec_config = load_be16(data + 2);
-    if (0 != (fec_config & k_wire_fec_config_spare))
-    {
-        return false;
-    }
-    const int kk = static_cast<int>((fec_config >> 11) & 0x1F);
-    const int nn = static_cast<int>((fec_config >> 6) & 0x1F);
-    const int idx = static_cast<int>((fec_config >> 1) & 0x1F);
-    const uint8_t fec2 = data[4];
-    if (0 != (fec2 & k_wire_fec2_spare))
-    {
-        return false;
-    }
-    const int sn = static_cast<int>((fec2 >> 3) & 0x1F);
-    if (kk < k_header_k_n_min || kk > k_header_k_n_max || nn < kk || nn > k_header_k_n_max ||
-        idx >= nn || sn < 1 || sn > kk)
-    {
-        return false;
-    }
-    *sdu_base = load_be16(data);
-    *index = idx;
-    *k = kk;
-    *n = nn;
-    *sdu_n = sn;
-    return true;
-}
-
-bool vstreamer::rs_block_erasure::encode_block(
-    const std::vector<std::vector<uint8_t>>& packets, uint16_t sdu_base,
-    std::vector<std::vector<uint8_t>>* out) const
-{
-    if (!active || out == nullptr || packets.size() > static_cast<size_t>(cfg_k))
-    {
-        return false;
-    }
-    std::vector<std::vector<uint8_t>> data_shards(static_cast<size_t>(cfg_k));
-    size_t max_row = 0;
-    for (int i = 0; i < cfg_k; i++)
-    {
-        const std::vector<uint8_t>* pkt = i < static_cast<int>(packets.size())
-                                              ? &packets[static_cast<size_t>(i)]
-                                              : nullptr;
-        const size_t plen = pkt != nullptr ? pkt->size() : 0;
-        if (plen > max_original())
-        {
-            return false;
-        }
-        data_shards[static_cast<size_t>(i)].resize(k_len_prefix + plen);
-        store_be16(data_shards[static_cast<size_t>(i)].data(),
-                   static_cast<uint16_t>(plen));
-        if (plen > 0)
-        {
-            memcpy(data_shards[static_cast<size_t>(i)].data() + k_len_prefix,
-                   pkt->data(), plen);
-        }
-        max_row = std::max(max_row, data_shards[static_cast<size_t>(i)].size());
-    }
-    const size_t shard_len = align_shard(max_row);
-    if (k_header_len + shard_len > max_shard_bytes)
-    {
-        return false;
-    }
-    for (int i = 0; i < cfg_k; i++)
-    {
-        data_shards[static_cast<size_t>(i)].resize(shard_len, 0);
-    }
-    std::vector<std::vector<uint8_t>> parity(static_cast<size_t>(p));
-    std::vector<unsigned char*> data_ptrs(static_cast<size_t>(cfg_k));
-    std::vector<unsigned char*> coding_ptrs(static_cast<size_t>(p));
-    for (int i = 0; i < cfg_k; i++)
-    {
-        data_ptrs[static_cast<size_t>(i)] =
-            data_shards[static_cast<size_t>(i)].data();
-    }
-    for (int i = 0; i < p; i++)
-    {
-        parity[static_cast<size_t>(i)].assign(shard_len, 0);
-        coding_ptrs[static_cast<size_t>(i)] =
-            parity[static_cast<size_t>(i)].data();
-    }
-    if (p > 0)
-    {
-        const auto kernel_t0 = std::chrono::steady_clock::now();
-        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), cfg_k, p,
-                          const_cast<unsigned char*>(g_tbls.data()),
-                          data_ptrs.data(), coding_ptrs.data());
-        encode_kernel_us_ += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - kernel_t0)
-                .count());
-    }
-
-    out->clear();
-    const int sdu_n = static_cast<int>(packets.size());
-    for (int i = 0; i < cfg_n; i++)
-    {
-        if (i < cfg_k && i >= sdu_n)
-        {
-            continue;
-        }
-        size_t body_len = shard_len;
-        const uint8_t* body = nullptr;
-        if (i < cfg_k)
-        {
-            const size_t plen = packets[static_cast<size_t>(i)].size();
-            body_len = k_len_prefix + plen;
-            body = data_shards[static_cast<size_t>(i)].data();
-        }
-        else
-        {
-            body = parity[static_cast<size_t>(i - cfg_k)].data();
-        }
-        std::vector<uint8_t> pkt(k_header_len + body_len);
-        pack_header(pkt.data(), sdu_base, i, cfg_k, cfg_n, sdu_n);
-        memcpy(pkt.data() + k_header_len, body, body_len);
-        out->push_back(std::move(pkt));
-    }
-    return true;
-}
-
-int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
-                                        const uint8_t* encode_matrix,
-                                        const uint8_t* err_list, int nerrs,
-                                        uint8_t* decode_matrix,
-                                        uint8_t* decode_index)
-{
-    if (encode_matrix == nullptr || err_list == nullptr ||
-        decode_matrix == nullptr || decode_index == nullptr || k < 1 ||
-        n <= k)
-    {
-        return -1;
-    }
-    std::vector<uint8_t> in_err(static_cast<size_t>(n), 0);
+    std::array<uint8_t, k_max_rows> in_err {};
     for (int i = 0; i < nerrs; i++)
     {
-        if (err_list[i] >= n)
+        if (err_list[i] >= total)
         {
             return -1;
         }
         in_err[err_list[i]] = 1;
     }
     std::vector<uint8_t> b(static_cast<size_t>(k) * static_cast<size_t>(k));
-    std::vector<uint8_t> invert(static_cast<size_t>(k) *
-                                static_cast<size_t>(k));
-    int r = 0;
+    std::vector<uint8_t> invert(static_cast<size_t>(k) * static_cast<size_t>(k));
+    int                  r = 0;
     for (int i = 0; i < k; i++, r++)
     {
-        while (r < n && in_err[static_cast<size_t>(r)])
+        while (r < total && in_err[static_cast<size_t>(r)])
         {
             r++;
         }
-        if (r >= n)
+        if (r >= total)
         {
             return -1;
         }
@@ -365,10 +122,8 @@ int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
         const int idx = err_list[e];
         if (idx < k)
         {
-            memcpy(decode_matrix +
-                       static_cast<size_t>(k) * static_cast<size_t>(e),
-                   invert.data() +
-                       static_cast<size_t>(k) * static_cast<size_t>(idx),
+            memcpy(decode_matrix + static_cast<size_t>(k) * static_cast<size_t>(e),
+                   invert.data() + static_cast<size_t>(k) * static_cast<size_t>(idx),
                    static_cast<size_t>(k));
             continue;
         }
@@ -377,12 +132,10 @@ int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
             uint8_t s = 0;
             for (int j = 0; j < k; j++)
             {
-                s ^= gf_mul(
-                    invert[static_cast<size_t>(j) * static_cast<size_t>(k) +
-                           static_cast<size_t>(i)],
-                    encode_matrix[static_cast<size_t>(k) *
-                                       static_cast<size_t>(idx) +
-                                   static_cast<size_t>(j)]);
+                s ^= gf_mul(invert[static_cast<size_t>(j) * static_cast<size_t>(k) +
+                                   static_cast<size_t>(i)],
+                            encode_matrix[static_cast<size_t>(k) * static_cast<size_t>(idx) +
+                                          static_cast<size_t>(j)]);
             }
             decode_matrix[static_cast<size_t>(k) * static_cast<size_t>(e) +
                           static_cast<size_t>(i)] = s;
@@ -390,282 +143,127 @@ int vstreamer::rs_block_erasure::gen_decode_matrix(int k, int n,
     }
     return 0;
 }
+}  // namespace
 
-bool vstreamer::rs_block_erasure::decode_block(
-    const std::unordered_map<int, bfc::shared_sized_buffer>& frags, fec_rx_payload_list* payloads,
-    int* recovered) const
+/* --- wire --- */
+
+void vstreamer::rs_block_erasure::write_data_header(uint8_t* out, uint16_t sequence_number)
 {
-    if (!active)
-    {
-        return false;
-    }
-    return decode_block(cfg_k, cfg_n, cfg_k, frags, payloads, recovered);
+    out[0] = k_flag_is_data;
+    store_be16(out + 1, sequence_number);
 }
 
-bool vstreamer::rs_block_erasure::decode_block(
-    int k, int n, int sdu_n, const std::unordered_map<int, bfc::shared_sized_buffer>& frags,
-    fec_rx_payload_list* payloads, int* recovered) const
+bool vstreamer::rs_block_erasure::write_parity_header(uint8_t* out, uint16_t sequence_number,
+                                                      int n, int k_total, int k_i)
 {
-    if (payloads == nullptr || k < 1 || n < k || n > static_cast<int>(k_max_n) ||
-        sdu_n < 0 || sdu_n > k)
+    if (out == nullptr || n < k_header_k_n_min || n > k_header_k_n_max ||
+        k_total < k_header_k_n_min || k_total > k_header_k_n_max || k_i < 0 || k_i >= n)
     {
         return false;
     }
-    size_t shard_slots = frags.size();
-    for (int i = sdu_n; i < k; i++)
-    {
-        if (frags.find(i) == frags.end())
-        {
-            shard_slots++;
-        }
-    }
-    if (shard_slots < static_cast<size_t>(k))
-    {
-        return false;
-    }
-    const int               parity = n - k;
-    const kn_encode_tables& tables = kn_encode_tables_for(k, n);
-    const uint8_t*          encode_matrix = tables.encode_matrix.data();
-
-    size_t shard_len = k_len_prefix;
-    for (const auto& kv : frags)
-    {
-        if (kv.first < 0 || kv.first >= n || kv.second.size() < k_header_len)
-        {
-            return false;
-        }
-        const size_t body_len = kv.second.size() - k_header_len;
-        shard_len = std::max(shard_len, body_len);
-    }
-    shard_len = align_shard(shard_len);
-
-    std::array<uint8_t, k_max_n>              have {};
-    std::array<std::vector<uint8_t>, k_max_n> owned {};
-    for (const auto& kv : frags)
-    {
-        const int idx = kv.first;
-        have[static_cast<size_t>(idx)] = 1;
-        const uint8_t* body = kv.second.u8() + k_header_len;
-        const size_t   body_len = kv.second.size() - k_header_len;
-        if (body_len < shard_len)
-        {
-            owned[static_cast<size_t>(idx)].assign(body, body + body_len);
-            owned[static_cast<size_t>(idx)].resize(shard_len, 0);
-        }
-    }
-    for (int i = sdu_n; i < k; i++)
-    {
-        if (frags.find(i) != frags.end())
-        {
-            continue;
-        }
-        have[static_cast<size_t>(i)] = 1;
-        owned[static_cast<size_t>(i)].assign(shard_len, 0);
-    }
-
-    const auto row_ref = [&](int idx) -> const std::vector<uint8_t>& {
-        if (!owned[static_cast<size_t>(idx)].empty())
-        {
-            return owned[static_cast<size_t>(idx)];
-        }
-        const bfc::shared_sized_buffer& shard = frags.at(idx);
-        owned[static_cast<size_t>(idx)].assign(shard.u8() + k_header_len,
-                                                shard.u8() + shard.size());
-        if (owned[static_cast<size_t>(idx)].size() < shard_len)
-        {
-            owned[static_cast<size_t>(idx)].resize(shard_len, 0);
-        }
-        return owned[static_cast<size_t>(idx)];
-    };
-
-    bool have_all_systematic = true;
-    for (int i = 0; i < k; i++)
-    {
-        if (!have[static_cast<size_t>(i)])
-        {
-            have_all_systematic = false;
-            break;
-        }
-    }
-
-    std::vector<std::vector<uint8_t>> data_copy(static_cast<size_t>(k));
-    int                               rec = 0;
-    if (!have_all_systematic)
-    {
-        for (int i = 0; i < k; i++)
-        {
-            if (have[static_cast<size_t>(i)])
-            {
-                data_copy[static_cast<size_t>(i)] = row_ref(i);
-            }
-        }
-        uint8_t err_list[k_max_n];
-        int     nerrs = 0;
-        for (int i = 0; i < n; i++)
-        {
-            if (!have[static_cast<size_t>(i)])
-            {
-                err_list[nerrs++] = static_cast<uint8_t>(i);
-            }
-        }
-        if (nerrs > parity)
-        {
-            return false;
-        }
-        std::vector<uint8_t> decode_matrix(static_cast<size_t>(nerrs) *
-                                           static_cast<size_t>(k));
-        uint8_t decode_index[k_max_n];
-        if (gen_decode_matrix(k, n, encode_matrix, err_list, nerrs, decode_matrix.data(),
-                              decode_index) != 0)
-        {
-            return false;
-        }
-        std::vector<uint8_t>              decode_tbls(static_cast<size_t>(k) *
-                                                      static_cast<size_t>(nerrs) * 32);
-        std::vector<unsigned char*>       src_ptrs(static_cast<size_t>(k));
-        std::vector<std::vector<uint8_t>> recover(static_cast<size_t>(nerrs));
-        std::vector<unsigned char*>       rec_ptrs(static_cast<size_t>(nerrs));
-        for (int i = 0; i < k; i++)
-        {
-            const int idx = decode_index[i];
-            if (!have[static_cast<size_t>(idx)])
-            {
-                return false;
-            }
-            src_ptrs[static_cast<size_t>(i)] =
-                const_cast<unsigned char*>(row_ref(idx).data());
-        }
-        for (int i = 0; i < nerrs; i++)
-        {
-            recover[static_cast<size_t>(i)].assign(shard_len, 0);
-            rec_ptrs[static_cast<size_t>(i)] = recover[static_cast<size_t>(i)].data();
-        }
-        ec_init_tables_base(k, nerrs, decode_matrix.data(), decode_tbls.data());
-        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), k, nerrs, decode_tbls.data(),
-                            src_ptrs.data(), rec_ptrs.data());
-        for (int i = 0; i < nerrs; i++)
-        {
-            const int idx = err_list[i];
-            if (idx < k)
-            {
-                data_copy[static_cast<size_t>(idx)] = std::move(recover[static_cast<size_t>(i)]);
-                rec++;
-            }
-        }
-    }
-
-    payloads->clear();
-    for (int i = 0; i < k; i++)
-    {
-        if (have_all_systematic)
-        {
-            if (!have[static_cast<size_t>(i)])
-            {
-                continue;
-            }
-            if (frags.find(i) != frags.end())
-            {
-                bfc::shared_sized_buffer app;
-                if (!frag_to_app(frags.at(i), &app))
-                {
-                    return false;
-                }
-                if (app.empty())
-                {
-                    continue;
-                }
-                payloads->push_back(std::move(app));
-                continue;
-            }
-            const std::vector<uint8_t>& row = owned[static_cast<size_t>(i)];
-            if (row.size() < k_len_prefix)
-            {
-                return false;
-            }
-            const uint16_t orig_len = load_be16(row.data());
-            if (orig_len == 0)
-            {
-                continue;
-            }
-            payloads->push_back(
-                bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
-            continue;
-        }
-        const std::vector<uint8_t>& row = data_copy[static_cast<size_t>(i)];
-        if (row.empty() || row.size() < k_len_prefix)
-        {
-            return false;
-        }
-        const uint16_t orig_len = load_be16(row.data());
-        if (orig_len == 0)
-        {
-            continue;
-        }
-        if (k_len_prefix + orig_len > row.size())
-        {
-            return false;
-        }
-        payloads->push_back(bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, orig_len));
-    }
-    if (recovered != nullptr)
-    {
-        *recovered = rec;
-    }
+    const uint16_t flag = static_cast<uint16_t>(((static_cast<uint16_t>(n) & 0x1FU) << 10) |
+                                                ((static_cast<uint16_t>(k_total) & 0x1FU) << 5) |
+                                                (static_cast<uint16_t>(k_i) & 0x1FU));
+    store_be16(out, flag);
+    store_be16(out + 2, sequence_number);
     return true;
 }
 
-void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len,
-                              std::vector<std::vector<uint8_t>>* out)
+bool vstreamer::rs_block_erasure::parse_header(const uint8_t* data, size_t len, shard_header* out)
 {
-    if (out != nullptr)
+    if (data == nullptr || out == nullptr || len == 0)
     {
-        out->clear();
+        return false;
     }
-    if (!active || out == nullptr || data == nullptr)
+    shard_header h;
+    if (0 != (data[0] & k_flag_is_data))
     {
-        return;
+        if (len <= k_data_header_len || 0 != (data[0] & k_data_flag_spare))
+        {
+            return false;
+        }
+        h.is_data = true;
+        h.sequence_number = load_be16(data + 1);
+        h.header_len = k_data_header_len;
+        *out = h;
+        return true;
     }
-    if (len > max_original())
+    if (len <= k_parity_header_len + k_len_prefix)
     {
-        oversized_count++;
-        return;
+        return false;
     }
-    pending.emplace_back(data, data + len);
-    if (!deadline_set)
+    const uint16_t flag = load_be16(data);
+    h.n = static_cast<int>((flag >> 10) & 0x1F);
+    h.k_total = static_cast<int>((flag >> 5) & 0x1F);
+    h.k_i = static_cast<int>(flag & 0x1F);
+    if (h.n < k_header_k_n_min || h.k_total < k_header_k_n_min || h.k_i >= h.n)
     {
-        deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeout_ms);
-        deadline_set = true;
+        return false;
     }
-    if (static_cast<int>(pending.size()) >= cfg_k)
-    {
-        flush(out);
-    }
+    h.sequence_number = load_be16(data + 2);
+    h.header_len = k_parity_header_len;
+    *out = h;
+    return true;
 }
 
-void vstreamer::rs_block_erasure::flush(std::vector<std::vector<uint8_t>>* out)
+/* --- setup --- */
+
+vstreamer::rs_block_erasure::rs_block_erasure() : ring(k_rx_ring)
 {
-    if (out != nullptr)
+    // Random TX start id: a restarted sender must not replay ids that the receiver's in-order
+    // release still remembers.
+    std::random_device rd;
+    tx_seq = static_cast<uint16_t>(rd());
+}
+
+const char* vstreamer::rs_block_erasure::impl_name() const
+{
+#ifdef VSTREAMER_ISAL_NEON
+    return "isa-l neon";
+#else
+    return rs_encode_scalar_impl();
+#endif
+}
+
+size_t vstreamer::rs_block_erasure::max_app_payload(size_t max_datagram)
+{
+    /* Parity is the largest shard: its header and the coded length prefix sit before a body as
+     * long as the longest data payload. */
+    const size_t overhead = k_parity_header_len + k_len_prefix;
+    return max_datagram > overhead ? max_datagram - overhead : 0;
+}
+
+size_t vstreamer::rs_block_erasure::max_data_payload(size_t max_datagram)
+{
+    return max_datagram > k_data_header_len ? max_datagram - k_data_header_len : 0;
+}
+
+bool vstreamer::rs_block_erasure::init(int k, int n, size_t max_datagram)
+{
+    if (k < k_header_k_n_min || k > k_header_k_n_max || n < k || n - k > k_header_k_n_max ||
+        max_datagram < k_parity_header_len + k_len_prefix + k_min_shard)
     {
-        out->clear();
+        return false;
     }
-    if (!active || out == nullptr || pending.empty())
-    {
-        return;
-    }
-    const int sdu_n = static_cast<int>(pending.size());
-    if (!encode_block(pending, sdu_seq, out))
-    {
-        oversized_count++;
-        out->clear();
-        pending.clear();
-        deadline_set = false;
-        return;
-    }
-    sdu_seq = static_cast<uint16_t>(sdu_seq + static_cast<uint16_t>(sdu_n));
-    pending.clear();
-    deadline_set = false;
-    blocks_count++;
+    /* The open block keeps its old k/n: the caller flushes it first. */
+    pending_rows.clear();
+    cfg_k = k;
+    cfg_n = n;
+    p = n - k;
+    max_datagram_ = max_datagram;
+    full_g_tbls = kn_encode_tables_for(cfg_k, cfg_n).g_tbls.data();
+    active = true;
+    return true;
+}
+
+void vstreamer::rs_block_erasure::disable()
+{
+    active = false;
+    pending_rows.clear();
+    cfg_k = 0;
+    cfg_n = 0;
+    p = 0;
+    full_g_tbls = nullptr;
 }
 
 void vstreamer::rs_block_erasure::set_tx_buffers(size_t headroom, shard_alloc alloc)
@@ -674,216 +272,328 @@ void vstreamer::rs_block_erasure::set_tx_buffers(size_t headroom, shard_alloc al
     tx_alloc = std::move(alloc);
 }
 
-namespace
-{
-constexpr size_t k_tx_body_align = 16;
-}
+/* --- TX --- */
 
-bool vstreamer::rs_block_erasure::alloc_tx_row(tx_row* row)
+bool vstreamer::rs_block_erasure::alloc_tx_row(tx_row* row, size_t header_len, size_t body_max)
 {
-    if (!tx_alloc)
+    const size_t cap = k_tx_body_align - 1 + tx_headroom + header_len + body_max;
+    if (tx_alloc)
     {
-        return false;
+        row->buf = tx_alloc(cap);
     }
-    const size_t shard_max = max_shard_bytes - k_header_len;
-    const size_t cap = k_tx_body_align - 1 + tx_headroom + k_header_len + shard_max;
-    row->buf = tx_alloc(cap);
+    else
+    {
+        row->buf = bfc::shared_sized_buffer::allocate(cap);
+        row->buf.resize(cap);
+    }
     if (row->buf.size() < cap)
     {
         row->buf = {};
         return false;
     }
-    const auto body = reinterpret_cast<uintptr_t>(row->buf.u8()) + tx_headroom + k_header_len;
+    const auto body = reinterpret_cast<uintptr_t>(row->buf.u8()) + tx_headroom + header_len;
     row->start = (k_tx_body_align - body % k_tx_body_align) % k_tx_body_align;
     return true;
 }
 
-void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len,
-                                           std::vector<bfc::shared_sized_buffer>* out)
+void vstreamer::rs_block_erasure::push_app(const uint8_t* data, size_t len, tx_out* out)
 {
-    if (out != nullptr)
-    {
-        out->clear();
-    }
-    if (!active || out == nullptr || data == nullptr)
+    if (out == nullptr)
     {
         return;
     }
-    tx_row row;
-    if (len > max_original() || !alloc_tx_row(&row))
+    out->shards.clear();
+    out->parity = 0;
+    out->block_k = 0;
+    if (!active || data == nullptr)
+    {
+        return;
+    }
+    const size_t body_max = max_original();
+    tx_row       row;
+    if (0 == len || len > body_max || !alloc_tx_row(&row, k_data_header_len, body_max))
     {
         oversized_count++;
         return;
     }
-    uint8_t* body = row.buf.u8() + row.start + tx_headroom + k_header_len;
-    store_be16(body, static_cast<uint16_t>(len));
-    memcpy(body + k_len_prefix, data, len);
-    row.len = len;
-    pending_rows.push_back(std::move(row));
-    if (!deadline_set)
+    uint8_t* hdr = row.buf.u8() + row.start + tx_headroom;
+    write_data_header(hdr, tx_seq);
+    memcpy(hdr + k_data_header_len, data, len);
+    if (p > 0)
     {
-        deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(timeout_ms);
-        deadline_set = true;
+        /* The kernel reads every row to the block's longest; zero the tail now, before the shard
+         * is handed out, so nothing writes into it while it is in flight. */
+        memset(hdr + k_data_header_len + len, 0, body_max - len);
     }
+    row.len = len;
+    if (pending_rows.empty())
+    {
+        block_base = tx_seq;
+        block_start_ = clock ? clock() : std::chrono::steady_clock::now();
+    }
+    tx_seq++;
+    out->shards.push_back(row.buf.subview(row.start, tx_headroom + k_data_header_len + len));
+    if (0 == p)
+    {
+        return;
+    }
+    pending_rows.push_back(std::move(row));
     if (static_cast<int>(pending_rows.size()) >= cfg_k)
     {
-        flush(out);
+        (void)encode_block(out);
     }
 }
 
-void vstreamer::rs_block_erasure::flush(std::vector<bfc::shared_sized_buffer>* out)
+void vstreamer::rs_block_erasure::flush(tx_out* out)
 {
-    if (out != nullptr)
-    {
-        out->clear();
-    }
-    if (!active || out == nullptr || pending_rows.empty())
+    if (out == nullptr)
     {
         return;
     }
-    const int sdu_n = static_cast<int>(pending_rows.size());
-    if (!encode_tx_rows(sdu_seq, out))
+    out->shards.clear();
+    out->parity = 0;
+    out->block_k = 0;
+    if (!active || pending_rows.empty())
     {
-        oversized_count++;
-        out->clear();
-        pending_rows.clear();
-        deadline_set = false;
         return;
     }
-    sdu_seq = static_cast<uint16_t>(sdu_seq + static_cast<uint16_t>(sdu_n));
-    pending_rows.clear();
-    deadline_set = false;
-    blocks_count++;
+    (void)encode_block(out);
 }
 
-void vstreamer::rs_block_erasure::on_tick(std::vector<bfc::shared_sized_buffer>* out)
+/* Parity over pending_rows, appended to out->shards. Two kernel passes: the data bodies (in place,
+ * already zero-padded) and the 2-byte length rows; parity is [length parity | data parity]. */
+bool vstreamer::rs_block_erasure::encode_block(tx_out* out)
 {
-    if (out != nullptr)
-    {
-        out->clear();
-    }
-    if (!active || !deadline_set || timeout_ms <= 0)
-    {
-        return;
-    }
-    if (std::chrono::steady_clock::now() < deadline)
-    {
-        return;
-    }
-    flush(out);
-}
-
-/* encode_block() over pending_rows, in place: same shard bytes, same order. */
-bool vstreamer::rs_block_erasure::encode_tx_rows(uint16_t sdu_base,
-                                                 std::vector<bfc::shared_sized_buffer>* out)
-{
-    const int sdu_n = static_cast<int>(pending_rows.size());
-    if (sdu_n > cfg_k)
-    {
-        return false;
-    }
-    size_t max_row = k_len_prefix;
+    const int k_total = static_cast<int>(pending_rows.size());
+    size_t    max_len = 0;
     for (const tx_row& row : pending_rows)
     {
-        max_row = std::max(max_row, k_len_prefix + row.len);
+        max_len = std::max(max_len, row.len);
     }
-    const size_t shard_len = align_shard(max_row);
-    if (k_header_len + shard_len > max_shard_bytes)
+    const size_t shard_len = align_shard(max_len);
+    const size_t body_max = max_original();
+    if (shard_len > body_max || k_total < 1 || k_total > k_header_k_n_max)
+    {
+        oversized_count++;
+        pending_rows.clear();
+        return false;
+    }
+    /* The cache never moves an entry, so the full block's tables can be kept from init(). */
+    unsigned char* const g_tbls = const_cast<unsigned char*>(
+        k_total == cfg_k && nullptr != full_g_tbls
+            ? full_g_tbls
+            : kn_encode_tables_for(k_total, k_total + p).g_tbls.data());
+
+    alignas(16) uint8_t len_rows[k_max_k][k_min_shard] {};
+    alignas(16) uint8_t len_parity[k_max_k][k_min_shard] {};
+    std::array<unsigned char*, k_max_k> data_ptrs {};
+    std::array<unsigned char*, k_max_k> len_ptrs {};
+    std::array<unsigned char*, k_max_k> coding_ptrs {};
+    std::array<unsigned char*, k_max_k> len_coding_ptrs {};
+    const size_t                        data_off = tx_headroom + k_data_header_len;
+    for (int i = 0; i < k_total; i++)
+    {
+        tx_row& row = pending_rows[static_cast<size_t>(i)];
+        data_ptrs[static_cast<size_t>(i)] = row.buf.u8() + row.start + data_off;
+        store_be16(len_rows[i], static_cast<uint16_t>(row.len));
+        len_ptrs[static_cast<size_t>(i)] = len_rows[i];
+    }
+    std::vector<tx_row> parity(static_cast<size_t>(p));
+    const size_t        parity_off = tx_headroom + k_parity_header_len + k_len_prefix;
+    for (int j = 0; j < p; j++)
+    {
+        tx_row& row = parity[static_cast<size_t>(j)];
+        if (!alloc_tx_row(&row, k_parity_header_len + k_len_prefix, body_max))
+        {
+            oversized_count++;
+            pending_rows.clear();
+            return false;
+        }
+        coding_ptrs[static_cast<size_t>(j)] = row.buf.u8() + row.start + parity_off;
+        len_coding_ptrs[static_cast<size_t>(j)] = len_parity[j];
+    }
+    const auto kernel_t0 = std::chrono::steady_clock::now();
+    VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), k_total, p, g_tbls, data_ptrs.data(),
+                        coding_ptrs.data());
+    VSTREAMER_EC_ENCODE(static_cast<int>(k_min_shard), k_total, p, g_tbls, len_ptrs.data(),
+                        len_coding_ptrs.data());
+    encode_kernel_us_ += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() -
+                                                              kernel_t0)
+            .count());
+
+    for (int j = 0; j < p; j++)
+    {
+        tx_row&  row = parity[static_cast<size_t>(j)];
+        uint8_t* hdr = row.buf.u8() + row.start + tx_headroom;
+        (void)write_parity_header(hdr, block_base, p, k_total, j);
+        memcpy(hdr + k_parity_header_len, len_parity[j], k_len_prefix);
+        out->shards.push_back(row.buf.subview(
+            row.start, tx_headroom + k_parity_header_len + k_len_prefix + shard_len));
+    }
+    out->parity = p;
+    out->block_k = k_total;
+    out->block_start = block_start_;
+    pending_rows.clear();
+    blocks_count++;
+    return true;
+}
+
+/* --- decode --- */
+
+bool vstreamer::rs_block_erasure::decode_rows(int k_total, int n,
+                                              std::vector<bfc::shared_sized_buffer>* data,
+                                              const std::vector<bfc::shared_sized_buffer>& parity,
+                                              int* recovered)
+{
+    if (data == nullptr || k_total < 1 || k_total > k_header_k_n_max || n < 1 ||
+        n > k_header_k_n_max || data->size() != static_cast<size_t>(k_total) ||
+        parity.size() != static_cast<size_t>(n))
     {
         return false;
     }
-    if (tx_zero_row.size() < shard_len)
+    const int total = k_total + n;
+    /* Row length: every parity body has it; data rows are [len | payload] zero-padded to it. */
+    size_t row_len = 0;
+    int    have = 0;
+    for (const auto& body : parity)
     {
-        tx_zero_row.assign(shard_len, 0);
-    }
-    const size_t body_off = tx_headroom + k_header_len;
-    std::array<unsigned char*, k_header_k_n_max> data_ptrs {}; /* k, n <= 31: header fields */
-    std::array<unsigned char*, k_header_k_n_max> coding_ptrs {};
-    for (int i = 0; i < cfg_k; i++)
-    {
-        if (i < sdu_n)
+        if (!body.empty())
         {
-            tx_row& row = pending_rows[static_cast<size_t>(i)];
-            uint8_t* body = row.buf.u8() + row.start + body_off;
-            /* Short rows are zero-padded to shard_len for the kernel; the pad is not sent. */
-            memset(body + k_len_prefix + row.len, 0, shard_len - k_len_prefix - row.len);
-            data_ptrs[static_cast<size_t>(i)] = body;
+            if (row_len != 0 && body.size() != row_len)
+            {
+                return false;
+            }
+            row_len = body.size();
+            have++;
+        }
+    }
+    int missing_data = 0;
+    for (const auto& payload : *data)
+    {
+        if (payload.empty())
+        {
+            missing_data++;
         }
         else
         {
-            data_ptrs[static_cast<size_t>(i)] = tx_zero_row.data();
+            have++;
         }
     }
-    std::vector<tx_row> parity(static_cast<size_t>(p));
-    for (int i = 0; i < p; i++)
+    if (recovered != nullptr)
     {
-        tx_row& row = parity[static_cast<size_t>(i)];
-        if (!alloc_tx_row(&row))
-        {
-            return false;
-        }
-        coding_ptrs[static_cast<size_t>(i)] = row.buf.u8() + row.start + body_off;
+        *recovered = 0;
     }
-    if (p > 0)
+    if (0 == missing_data)
     {
-        const auto kernel_t0 = std::chrono::steady_clock::now();
-        VSTREAMER_EC_ENCODE(static_cast<int>(shard_len), cfg_k, p,
-                          const_cast<unsigned char*>(g_tbls.data()), data_ptrs.data(),
-                          coding_ptrs.data());
-        encode_kernel_us_ += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - kernel_t0)
-                .count());
+        return true;
     }
-
-    out->clear();
-    out->reserve(static_cast<size_t>(sdu_n + p));
-    for (int i = 0; i < cfg_n; i++)
-    {
-        if (i < cfg_k && i >= sdu_n)
-        {
-            continue;
-        }
-        tx_row&      row = i < cfg_k ? pending_rows[static_cast<size_t>(i)]
-                                     : parity[static_cast<size_t>(i - cfg_k)];
-        const size_t body_len = i < cfg_k ? k_len_prefix + row.len : shard_len;
-        pack_header(row.buf.u8() + row.start + tx_headroom, sdu_base, i, cfg_k, cfg_n, sdu_n);
-        out->push_back(row.buf.subview(row.start, body_off + body_len));
-    }
-    return true;
-}
-
-void vstreamer::rs_block_erasure::on_tick(std::vector<std::vector<uint8_t>>* out)
-{
-    if (out != nullptr)
-    {
-        out->clear();
-    }
-    if (!active || !deadline_set || timeout_ms <= 0)
-    {
-        return;
-    }
-    if (std::chrono::steady_clock::now() < deadline)
-    {
-        return;
-    }
-    flush(out);
-}
-
-bool vstreamer::rs_block_erasure::next_deadline(
-    std::chrono::steady_clock::time_point* out) const
-{
-    if (!active || !deadline_set || timeout_ms <= 0)
+    if (have < k_total || row_len < k_len_prefix + k_min_shard)
     {
         return false;
     }
-    if (nullptr != out)
+    for (const auto& payload : *data)
     {
-        *out = deadline;
+        if (!payload.empty() && k_len_prefix + payload.size() > row_len)
+        {
+            return false;
+        }
+    }
+
+    const kn_encode_tables&           tables = kn_encode_tables_for(k_total, total);
+    std::vector<std::vector<uint8_t>> rows(static_cast<size_t>(total));
+    std::array<uint8_t, k_max_rows>   err_list {};
+    int                               nerrs = 0;
+    for (int i = 0; i < total; i++)
+    {
+        const bfc::shared_sized_buffer& src =
+            i < k_total ? (*data)[static_cast<size_t>(i)]
+                        : parity[static_cast<size_t>(i - k_total)];
+        if (src.empty())
+        {
+            err_list[static_cast<size_t>(nerrs++)] = static_cast<uint8_t>(i);
+            continue;
+        }
+        std::vector<uint8_t>& row = rows[static_cast<size_t>(i)];
+        row.assign(row_len, 0);
+        if (i < k_total)
+        {
+            store_be16(row.data(), static_cast<uint16_t>(src.size()));
+            memcpy(row.data() + k_len_prefix, src.u8(), src.size());
+        }
+        else
+        {
+            memcpy(row.data(), src.u8(), row_len);
+        }
+    }
+    /* Only the missing data rows need rebuilding; missing parity rows stay erased. */
+    std::array<uint8_t, k_max_rows> want {};
+    int                             nwant = 0;
+    for (int e = 0; e < nerrs; e++)
+    {
+        if (err_list[static_cast<size_t>(e)] < k_total)
+        {
+            want[static_cast<size_t>(nwant++)] = err_list[static_cast<size_t>(e)];
+        }
+    }
+    std::vector<uint8_t>            decode_matrix(static_cast<size_t>(nerrs) *
+                                                  static_cast<size_t>(k_total));
+    std::array<uint8_t, k_max_rows> decode_index {};
+    if (gen_decode_matrix(k_total, total, tables.encode_matrix.data(), err_list.data(), nerrs,
+                          decode_matrix.data(), decode_index.data()) != 0)
+    {
+        return false;
+    }
+    /* gen_decode_matrix lists rows in err_list order; keep only the data ones. */
+    std::vector<uint8_t> want_matrix(static_cast<size_t>(nwant) * static_cast<size_t>(k_total));
+    for (int w = 0, e = 0; e < nerrs; e++)
+    {
+        if (err_list[static_cast<size_t>(e)] < k_total)
+        {
+            memcpy(want_matrix.data() + static_cast<size_t>(w) * static_cast<size_t>(k_total),
+                   decode_matrix.data() + static_cast<size_t>(e) * static_cast<size_t>(k_total),
+                   static_cast<size_t>(k_total));
+            w++;
+        }
+    }
+    std::vector<uint8_t> decode_tbls(static_cast<size_t>(k_total) * static_cast<size_t>(nwant) *
+                                     32);
+    std::array<unsigned char*, k_max_rows> src_ptrs {};
+    std::vector<std::vector<uint8_t>>      out_rows(static_cast<size_t>(nwant));
+    std::array<unsigned char*, k_max_rows> out_ptrs {};
+    for (int i = 0; i < k_total; i++)
+    {
+        src_ptrs[static_cast<size_t>(i)] = rows[decode_index[static_cast<size_t>(i)]].data();
+    }
+    for (int w = 0; w < nwant; w++)
+    {
+        out_rows[static_cast<size_t>(w)].assign(row_len, 0);
+        out_ptrs[static_cast<size_t>(w)] = out_rows[static_cast<size_t>(w)].data();
+    }
+    ec_init_tables_base(k_total, nwant, want_matrix.data(), decode_tbls.data());
+    VSTREAMER_EC_ENCODE(static_cast<int>(row_len), k_total, nwant, decode_tbls.data(),
+                        src_ptrs.data(), out_ptrs.data());
+    int rec = 0;
+    for (int w = 0; w < nwant; w++)
+    {
+        const std::vector<uint8_t>& row = out_rows[static_cast<size_t>(w)];
+        const uint16_t              len = load_be16(row.data());
+        if (0 == len || k_len_prefix + len > row_len)
+        {
+            return false;
+        }
+        (*data)[want[static_cast<size_t>(w)]] =
+            bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, len);
+        rec++;
+    }
+    if (recovered != nullptr)
+    {
+        *recovered = rec;
     }
     return true;
 }
+
+/* --- counters --- */
 
 uint64_t vstreamer::rs_block_erasure::take_recovered()
 {
@@ -900,51 +610,24 @@ uint64_t vstreamer::rs_block_erasure::take_decode_fail()
     return n;
 }
 
-uint64_t vstreamer::rs_block_erasure::take_hdr_errors()
-{
-    const uint64_t n = hdr_errors_count - hdr_errors_seen;
-    hdr_errors_seen = hdr_errors_count;
-    return n;
-}
-
-uint64_t vstreamer::rs_block_erasure::take_kn_mismatch()
-{
-    const uint64_t n = kn_mismatch_count - kn_mismatch_seen;
-    kn_mismatch_seen = kn_mismatch_count;
-    return n;
-}
-
-uint64_t vstreamer::rs_block_erasure::take_evicted_blocks()
-{
-    const uint64_t n = evicted_blocks_count - evicted_blocks_seen;
-    evicted_blocks_seen = evicted_blocks_count;
-    return n;
-}
-
-uint64_t vstreamer::rs_block_erasure::take_rs_failures()
-{
-    const uint64_t n = rs_failures_count - rs_failures_seen;
-    rs_failures_seen = rs_failures_count;
-    return n;
-}
-
 uint64_t vstreamer::rs_block_erasure::take_fail_missing_shards()
 {
-    const uint64_t n = missing_shards_count - missing_shards_seen;
-    missing_shards_seen = missing_shards_count;
-    return n;
-}
-
-uint64_t vstreamer::rs_block_erasure::take_late_blocks()
-{
-    const uint64_t n = late_blocks_count - late_blocks_seen;
-    late_blocks_seen = late_blocks_count;
+    const uint64_t total = missing_shards();
+    const uint64_t n = total - missing_shards_seen;
+    missing_shards_seen = total;
     return n;
 }
 
 uint64_t vstreamer::rs_block_erasure::take_fail_lost_app_pkts()
 {
-    const uint64_t n = fail_lost_app_pkts_count - fail_lost_app_pkts_seen;
-    fail_lost_app_pkts_seen = fail_lost_app_pkts_count;
+    const uint64_t n = missing_data_count - lost_app_seen;
+    lost_app_seen = missing_data_count;
+    return n;
+}
+
+uint64_t vstreamer::rs_block_erasure::take_missing_parity()
+{
+    const uint64_t n = missing_parity_count - missing_parity_seen;
+    missing_parity_seen = missing_parity_count;
     return n;
 }

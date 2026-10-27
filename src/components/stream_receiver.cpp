@@ -55,12 +55,20 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
     }
 }
 
-void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count)
+/* Post-FEC gaps are data shards given up; parity never seen is wire loss on top of the data
+ * sequence gaps. */
+void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count,
+                          std::atomic<uint64_t> &udp_gap_count)
 {
     const uint64_t n = fec.take_fail_lost_app_pkts();
     if (n > 0)
     {
         fec_gap_count.fetch_add(n, std::memory_order_relaxed);
+    }
+    const uint64_t parity = fec.take_missing_parity();
+    if (parity > 0)
+    {
+        udp_gap_count.fetch_add(parity, std::memory_order_relaxed);
     }
     (void)fec.take_fail_missing_shards();
     (void)fec.take_decode_fail();
@@ -73,15 +81,6 @@ namespace vstreamer
 
 namespace
 {
-
-size_t max_decoded_app_bytes_from_shard(size_t shard_max)
-{
-    if (shard_max <= rs_block_erasure::k_header_len + rs_block_erasure::k_len_prefix)
-    {
-        return 0;
-    }
-    return shard_max - rs_block_erasure::k_header_len - rs_block_erasure::k_len_prefix;
-}
 
 uint64_t monotonic_timestamp_us()
 {
@@ -211,82 +210,46 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             return false;
         }
 
-        stream_header hdr {};
-        const uint8_t *payload = nullptr;
-        size_t         payload_len = 0;
-        if (stream_header_parse(data, len, &hdr, &payload, &payload_len) < 0)
+        rs_block_erasure::shard_header hdr;
+        if (!rs_block_erasure::parse_header(data, len, &hdr))
         {
             recv_dropped++;
             rx_bad_header++;
             return false;
         }
-
-        if (!hdr.is_stream_data)
+        if (hdr.is_data)
         {
-            recv_dropped++;
-            rx_bad_header++;
-            return false;
-        }
-
-        const uint64_t dg = note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
-        if (dg > 0)
-        {
-            udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
-            discont_next_ = true;
+            if (0 == cached_max_app || len - hdr.header_len > cached_max_app)
+            {
+                recv_dropped++;
+                return false;
+            }
+            /* Data shards carry the only sequence on the wire; parity loss is counted per
+             * block by the decoder. */
+            const uint64_t dg =
+                note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
+            if (dg > 0)
+            {
+                udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+                discont_next_ = true;
+            }
         }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
 
-        const size_t shard_max = cached_max_fec_shard;
-
-        if (hdr.is_fec)
+        bfc::shared_sized_buffer shard = pool.acquire(len);
+        if (0 == shard.capacity() || shard.size() != len)
         {
-            if (payload_len < rs_block_erasure::k_header_len || 0 == shard_max ||
-                payload_len > shard_max)
-            {
-                recv_dropped++;
-                rx_bad_header++;
-                return false;
-            }
-            bfc::shared_sized_buffer shard = pool.acquire(payload_len);
-            if (0 == shard.capacity() || shard.size() != payload_len)
-            {
-                recv_dropped++;
-                return false;
-            }
-            std::memcpy(shard.u8(), payload, payload_len);
-            const uint64_t hdr_errors_before = fec.hdr_errors();
-            fec.push_air(std::move(shard), &payloads);
-            note_fec_output_gaps(fec, fec_gap_count);
-            fec_rec = fec.recovered();
-            fec_lost = fec.decode_fail();
-            valid_media = fec.hdr_errors() == hdr_errors_before;
-            enqueue_app_max = cached_max_decoded_app;
+            recv_dropped++;
+            return false;
         }
-        else
-        {
-            /* Raw path (fec none): one SDU per datagram; wire loss is payload loss too. */
-            if (0 == cached_max_raw_sdu || payload_len > cached_max_raw_sdu)
-            {
-                recv_dropped++;
-                return false;
-            }
-            bfc::shared_sized_buffer sdu = pool.acquire(payload_len);
-            if (0 == sdu.capacity() || sdu.size() != payload_len)
-            {
-                recv_dropped++;
-                return false;
-            }
-            std::memcpy(sdu.u8(), payload, payload_len);
-            payloads.push_back(std::move(sdu));
-            if (dg > 0)
-            {
-                /* Without FEC, a UDP gap is an SDU gap (mode switches may miscount slightly). */
-                fec_gap_count.fetch_add(dg, std::memory_order_relaxed);
-            }
-            valid_media = true;
-            enqueue_app_max = cached_max_raw_sdu;
-        }
+        std::memcpy(shard.u8(), data, len);
+        fec.push_air(std::move(shard), &payloads);
+        note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
+        fec_rec = fec.recovered();
+        fec_lost = fec.decode_fail();
+        valid_media = true;
+        enqueue_app_max = cached_max_app;
         account_payloads_locked(payloads, enqueue_app_max);
     }
     if (!payloads.empty() && enqueue_app_max > 0)
@@ -460,9 +423,9 @@ void stream_receiver::recv_thread_main()
         {
             std::lock_guard<std::mutex> lock(mu);
             fec.poll_rx(&payloads);
-            note_fec_output_gaps(fec, fec_gap_count);
+            note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
             fec_lost = fec.decode_fail();
-            decoded_max = cached_max_decoded_app;
+            decoded_max = cached_max_app;
             account_payloads_locked(payloads, decoded_max);
         }
         if (!payloads.empty() && decoded_max > 0)
@@ -590,9 +553,7 @@ int stream_receiver::open()
         have_udp_seq = false;
         discont_next_ = false;
         rx_bad_header = 0;
-        cached_max_fec_shard = stream_max_fec_shard(static_cast<size_t>(max_datagram));
-        cached_max_decoded_app = max_decoded_app_bytes_from_shard(cached_max_fec_shard);
-        cached_max_raw_sdu = stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+        cached_max_app = rs_block_erasure::max_data_payload(static_cast<size_t>(max_datagram));
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;

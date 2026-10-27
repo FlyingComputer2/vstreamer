@@ -99,9 +99,7 @@ private:
     uint16_t last_udp_seq = 0;
     bool     have_udp_seq = false;
 
-    size_t cached_max_fec_shard = 0;
-    size_t cached_max_decoded_app = 0;
-    size_t cached_max_raw_sdu = 0;
+    size_t cached_max_app = 0;
 
     std::thread       recv_thread;
     thread_place      recv_place; /* keys recv_cpu / recv_prio */

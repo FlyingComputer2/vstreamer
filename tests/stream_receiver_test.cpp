@@ -125,29 +125,14 @@ TEST(StreamReceiverTest, LoopbackRxTruncatedZero)
 namespace
 {
 
+/* A data shard: the wire for one app datagram, FEC or not. */
 std::vector<uint8_t> make_valid_media_datagram(uint16_t stream_seq,
                                               const std::vector<uint8_t> &app)
 {
-    vstreamer::rs_block_erasure enc;
-    const size_t                shard_max = vstreamer::stream_max_fec_shard(1500);
-    if (!enc.init(1, 1, 20, shard_max))
-    {
-        return {};
-    }
-    std::vector<std::vector<uint8_t>> air;
-    enc.push_app(app.data(), app.size(), &air);
-    if (air.empty())
-    {
-        return {};
-    }
-    std::vector<uint8_t> wire(vstreamer::k_stream_header_len + air[0].size());
-    vstreamer::stream_header hdr {};
-    hdr.sequence_number = stream_seq;
-    hdr.is_fec = true;
-    hdr.is_stream_data = true;
-    hdr.ext_len = 0;
-    vstreamer::stream_header_write(wire.data(), hdr);
-    std::memcpy(wire.data() + vstreamer::k_stream_header_len, air[0].data(), air[0].size());
+    std::vector<uint8_t> wire(vstreamer::rs_block_erasure::k_data_header_len + app.size());
+    vstreamer::rs_block_erasure::write_data_header(wire.data(), stream_seq);
+    std::memcpy(wire.data() + vstreamer::rs_block_erasure::k_data_header_len, app.data(),
+                app.size());
     return wire;
 }
 
@@ -649,11 +634,8 @@ TEST(StreamReceiverTest, PacketGapTuplesStayConsistentDuringReception)
         {
             for (int i = 0; i < packets; ++i)
             {
-                std::vector<uint8_t> wire(vstreamer::k_stream_header_len + 16, 0x33);
-                vstreamer::stream_header header {};
-                header.sequence_number = static_cast<uint16_t>(i * 3);
-                header.is_stream_data = true;
-                vstreamer::stream_header_write(wire.data(), header);
+                const std::vector<uint8_t> wire = make_valid_media_datagram(
+                    static_cast<uint16_t>(i * 3), std::vector<uint8_t>(16, 0x33));
                 EXPECT_EQ(
                     static_cast<ssize_t>(wire.size()),
                     sendto(fd, wire.data(), wire.size(), 0,

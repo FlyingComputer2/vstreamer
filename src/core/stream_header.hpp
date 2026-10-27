@@ -8,6 +8,8 @@
 namespace vstreamer
 {
 
+/* Header of the reverse path only (receiver link reports to the sender). Media datagrams carry
+ * the rs_block_erasure shard header instead. */
 inline constexpr uint8_t k_stream_wire_version = 2;
 inline constexpr size_t k_stream_header_len = 4;
 
@@ -29,20 +31,6 @@ struct stream_header
 {
     return static_cast<uint16_t>((static_cast<uint16_t>(wire[0]) << 8) |
                                  static_cast<uint16_t>(wire[1]));
-}
-
-[[nodiscard]] inline size_t stream_max_fec_shard(size_t max_datagram)
-{
-    if (max_datagram <= k_stream_header_len)
-    {
-        return 0;
-    }
-    return max_datagram - k_stream_header_len;
-}
-
-[[nodiscard]] inline size_t stream_max_raw_sdu(size_t max_datagram)
-{
-    return stream_max_fec_shard(max_datagram);
 }
 
 inline void stream_header_write(uint8_t *out, const stream_header &hdr)

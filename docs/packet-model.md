@@ -24,28 +24,32 @@ latency accounting downstream.
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
 estimate or correct offset in-band.
 
-## Forward datagram (wire v2)
+## Forward datagram (streaming FEC wire)
 
-`stream_sender` prepends a 4-byte `stream_header` (version 2) on every UDP datagram: stream media
-(FEC shard or raw SDU) and reverse telemetry each carry their own header. Systematic FEC shards
-add a 2-byte big-endian `orig_len` before the RTP datagram inside the shard body.
+Every media datagram is one FEC shard. Data shards leave as soon as the app datagram arrives;
+every `fec_k` data shards close a block, and its `fec_n - fec_k` parity shards follow, spread
+over `fec_spread_ms`. Bits are MSB-first; multi-byte fields are big-endian.
 
 ```text
-| stream_header (4) | FEC shard hdr (5) | [orig_len (2)] | RTP hdr (12) | RTP ext (16) | H.264 |
+data shard:   | flag (1) | sequence_number (2) | RTP hdr (12) | RTP ext (16) | H.264 |
+parity shard: | flag (2) | sequence_number (2) | parity |
 ```
 
 | Region | Size | Notes |
 |--------|------|--------|
-| `stream_header` | 4 | `sequence_number` (BE), flags: version=2, `is_fec`, `is_stream_data`, `ext_len` |
-| FEC shard header | 5 | `sdu_base`, `k`/`n`/`idx`, `sdu_n` (see `rs_block_erasure`) |
-| `orig_len` | 2 | Systematic shards: BE byte count of following app payload; parity shards carry parity bytes (not a length) |
+| data `flag` | 1 | `is_data`=1, 7 spare bits = 0 |
+| data `sequence_number` | 2 | one counter over data shards only; the payload length is the datagram's |
+| parity `flag` | 2 | `is_data`=0, `n`(5) parity shards in the block, `k_total`(5) data shards, `k_i`(5) this row |
+| parity `sequence_number` | 2 | the block's first data shard; the block covers `[sequence_number, sequence_number + k_total)` |
+| parity body | var | RS parity over rows of `[u16 data length | data | zero pad]`, so a recovered shard carries its length |
 | RTP fixed header | 12 | PT 96, marker on AU boundary; SSRC from payloader |
 | RTP extension | 16 | RFC 5285: id 2, 8 B CLOCK_REALTIME capture ns (BE) |
 | Payload | var | Single NAL, STAP-A, or FU-A |
 
-`fec none` sends raw SDUs (`is_fec=0`) with only the 4-byte stream header prefix.
+`fec none` sends data shards only (no parity). Per-packet overhead is 3 bytes for data and 4 for
+parity; parity is 2 bytes longer than the block's longest data payload.
 
-`stream_receiver` strips the stream header and FEC, then emits **`STREAM_DGRAM`** PDUs.
+`stream_receiver` strips the shard header and FEC, then emits **`STREAM_DGRAM`** PDUs.
 `rtp_h264_depay` accepts `RTP` or `STREAM_DGRAM` and outputs `H264_AU` (and `CAPS_VIDEO_CODED`
 when SPS dimensions change).
 
@@ -57,7 +61,7 @@ counters to the source address of the last valid media datagram; `stream_sender`
 on its bound media socket. Loss % is derived in the app from report deltas (`stream_sdl`
 re-baselines on a new `session_id` or a counter decrease).
 
-v1 and v2 wire layouts do not interoperate; upgrade both ends together. Winject radio forwards
+Earlier wire layouts do not interoperate with this one; upgrade both ends together. Winject radio forwards
 bytes unchanged.
 
 ### Reverse path: versioned link report payload (64 bytes, big-endian)
