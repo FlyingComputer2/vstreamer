@@ -174,6 +174,8 @@ public:
     void push_air(bfc::shared_sized_buffer shard, fec_rx_payload_list* out);
     void push_air(const uint8_t* data, size_t len, fec_rx_payload_list* out);
     void poll_rx(fec_rx_payload_list* out);
+    /* Drops all RX state and the buffers it holds (counters and estimates stay). */
+    void reset_rx();
     [[nodiscard]] bool have_spread_estimate() const
     {
         return fitted_blocks >= 2;
@@ -283,6 +285,9 @@ private:
     static int seq_dist(uint16_t a, uint16_t b);
     rx_slot*   slot_for(uint16_t seq);
     void       new_reference(uint16_t seq);
+    /* Moves the release point on one and drops the payload that can no longer be decoded
+     * with. */
+    void       advance_emit();
     void       push_data(const shard_header& h, bfc::shared_sized_buffer&& shard,
                          fec_rx_payload_list* out);
     void       push_parity(const shard_header& h, bfc::shared_sized_buffer&& shard,

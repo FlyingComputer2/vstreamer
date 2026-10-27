@@ -620,14 +620,14 @@ int stream_receiver::open()
 
 int stream_receiver::set_datagram_transport(datagram_receive receive, datagram_send send)
 {
-    if (!receive || !send)
-    {
-        return -EINVAL;
-    }
     std::lock_guard<std::mutex> lock(mu);
     if (opened)
     {
         return -EBUSY;
+    }
+    if (!receive || !send)
+    {
+        return -EINVAL;
     }
     dgram_receive = std::move(receive);
     dgram_send = std::move(send);
@@ -651,6 +651,8 @@ void stream_receiver::close()
         ::close(recv_fd);
         recv_fd = -1;
     }
+    /* Release the datagrams the decoder still holds (they may belong to the transport). */
+    fec.reset_rx();
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);

@@ -805,3 +805,30 @@ TEST(RsBlockErasureRx, RandomLossStreamRecoversWithinParity)
     EXPECT_EQ(rx.dec.decode_fail(), 0u);
     EXPECT_GT(rx.dec.recovered(), 0u);
 }
+
+TEST(RsBlockErasureRx, ReleasesDatagramsBehindReleasePoint)
+{
+    std::mt19937 rng(15);
+    auto         enc = make_enc(4, 6);
+    auto         all = encode_all(enc, make_apps(400, &rng, 60)); /* 100 blocks */
+    rs_block_erasure dec;
+    int              released = 0;
+    for (const auto &s : all)
+    {
+        auto *bytes = new std::byte[s.data.size()];
+        std::memcpy(bytes, s.data.data(), s.data.size());
+        vstreamer::fec_rx_payload_list out;
+        dec.push_air(bfc::shared_sized_buffer::adopt(bytes, s.data.size(), s.data.size(),
+                                                     [&released](std::byte *p)
+                                                     {
+                                                         released++;
+                                                         delete[] p;
+                                                     }),
+                     &out);
+    }
+    /* Only data shards the last blocks may still decode with, and the parity of blocks still
+     * open for late parity, may be held: never the stream's history. */
+    EXPECT_GE(released, static_cast<int>(all.size()) - 64);
+    dec.reset_rx();
+    EXPECT_EQ(released, static_cast<int>(all.size()));
+}

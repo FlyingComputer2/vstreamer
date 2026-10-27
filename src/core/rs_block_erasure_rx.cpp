@@ -410,6 +410,33 @@ void vstreamer::rs_block_erasure::try_decode(uint16_t base, rx_block* block)
 
 /* --- sequencer --- */
 
+/* A block needing decode has data at or past the release point and is at most
+ * k_header_k_n_max long, so a payload further behind than that is never read again. */
+void vstreamer::rs_block_erasure::advance_emit()
+{
+    emit_next++;
+    const uint16_t old = static_cast<uint16_t>(emit_next - 1 - k_header_k_n_max);
+    if (rx_slot* s = slot_for(old); s->seq == old)
+    {
+        s->payload = {};
+    }
+}
+
+void vstreamer::rs_block_erasure::reset_rx()
+{
+    for (rx_slot& s : ring)
+    {
+        s = rx_slot {};
+    }
+    rx_blocks.clear();
+    emit_base_set = false;
+    hole_timed = false;
+    gave_up_any = false;
+    layout_known = false;
+    data_since_parity = 0;
+    parity_seen = false;
+}
+
 void vstreamer::rs_block_erasure::new_reference(uint16_t seq)
 {
     /* The old session's blocks are over: count their missing parity while the ring still has
@@ -453,7 +480,7 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
             {
                 out->push_back(s->payload);
             }
-            emit_next++;
+            advance_emit();
             hole_timed = false;
             continue;
         }
@@ -495,7 +522,7 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
         gave_up_known = have_block;
         gave_up_base = base;
         gave_up_last = emit_next;
-        emit_next++;
+        advance_emit();
     }
 }
 
@@ -529,6 +556,10 @@ void vstreamer::rs_block_erasure::push_data(const shard_header& h,
     if (seq_dist(seq, emit_next) < 0)
     {
         late_count++;
+        if (seq_dist(seq, emit_next) < -k_header_k_n_max)
+        {
+            return; /* too far behind to help any block still decoding */
+        }
     }
     s->payload = shard.subview(h.header_len, shard.size() - h.header_len);
     s->seq = seq;
