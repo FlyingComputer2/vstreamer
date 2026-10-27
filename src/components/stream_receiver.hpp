@@ -10,7 +10,9 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -44,6 +46,17 @@ public:
     [[nodiscard]] std::string name() const override;
     int  open() override;
     void close() override;
+
+    /*
+     * In-process datagrams instead of the listen socket; set before open() (then listen is not
+     * needed). receive returns the next wire datagram, or nothing when none is ready, and must
+     * not block: the receive thread polls it about every millisecond. send takes one reverse link
+     * report. Both run on the receive thread. A received datagram is kept, not copied: its
+     * shards are views into it until they are released.
+     */
+    using datagram_receive = std::function<std::optional<bfc::shared_sized_buffer>()>;
+    using datagram_send = std::function<bool(const uint8_t *, size_t)>;
+    int set_datagram_transport(datagram_receive receive, datagram_send send);
     int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
@@ -53,8 +66,10 @@ private:
     [[nodiscard]] stream_link_report link_report_snapshot() const;
     void recv_thread_main();
     void stop_recv_thread();
-    /* Returns true when the datagram is valid stream media (telemetry peer update). */
-    bool ingest_datagram(const uint8_t *data, size_t len);
+    /* Returns true when the datagram is valid stream media (telemetry peer update). With owner,
+     * data lies in it and is kept instead of copied. */
+    bool ingest_datagram(const uint8_t *data, size_t len,
+                         const bfc::shared_sized_buffer *owner = nullptr);
     void account_payloads_locked(const fec_rx_payload_list &payloads, size_t max_app_bytes);
     void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
     void enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, size_t max_app_bytes,
@@ -65,7 +80,9 @@ private:
     mutable std::mutex mu;
     bool               opened = false;
 
-    std::string listen_spec;
+    datagram_receive dgram_receive;
+    datagram_send    dgram_send;
+    std::string      listen_spec;
     int         max_datagram = 1472;
     int         recv_fd = -1;
 

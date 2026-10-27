@@ -66,7 +66,13 @@ public:
      * soon as a later data shard shows the sender is past it.
      */
     static constexpr int k_spread_cap_ms = 250;
-    static constexpr int k_deadline_margin_min_ms = 5;
+    /* Floor of the deadline margin; a platform whose scheduling can hold a queued parity shard
+     * longer raises it at build time. */
+#ifndef VSTREAMER_RX_DEADLINE_MARGIN_MIN_MS
+#define VSTREAMER_RX_DEADLINE_MARGIN_MIN_MS 5
+#endif
+    static constexpr int k_deadline_margin_min_ms = VSTREAMER_RX_DEADLINE_MARGIN_MIN_MS;
+    static_assert(k_deadline_margin_min_ms >= 5 && k_deadline_margin_min_ms <= 100);
     /* Data shards without any parity after which the stream counts as data-only. Spread parity
      * can trail its block by many data shards, so this is well above the largest block. */
     static constexpr int k_data_only_after = 256;

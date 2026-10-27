@@ -11,6 +11,15 @@
 #include <random>
 #include <utility>
 
+#if defined(ESP_PLATFORM) && __has_include("sdkconfig.h")
+#include "sdkconfig.h"
+#endif
+#if defined(CONFIG_VSTREAMER_RX_PSRAM) && CONFIG_VSTREAMER_RX_PSRAM
+#include <new>
+
+#include "esp_heap_caps.h"
+#endif
+
 extern "C"
 {
 #include "erasure_code.h"
@@ -82,7 +91,8 @@ const kn_encode_tables& kn_encode_tables_for(int k, int total)
     return *slot;
 }
 
-/* Inverts the k surviving rows; rows err_list[] of the matrix are rebuilt by decode_matrix. */
+/* Inverts the first k surviving rows. err_list[] is in row order, so its missing data rows come
+ * first; decode_matrix gets one row for each of those (missing parity is never rebuilt). */
 int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint8_t* err_list,
                       int nerrs, uint8_t* decode_matrix, uint8_t* decode_index)
 {
@@ -117,31 +127,34 @@ int gen_decode_matrix(int k, int total, const uint8_t* encode_matrix, const uint
     {
         return -1;
     }
-    for (int e = 0; e < nerrs; e++)
+    for (int e = 0; e < nerrs && err_list[e] < k; e++)
     {
-        const int idx = err_list[e];
-        if (idx < k)
-        {
-            memcpy(decode_matrix + static_cast<size_t>(k) * static_cast<size_t>(e),
-                   invert.data() + static_cast<size_t>(k) * static_cast<size_t>(idx),
-                   static_cast<size_t>(k));
-            continue;
-        }
-        for (int i = 0; i < k; i++)
-        {
-            uint8_t s = 0;
-            for (int j = 0; j < k; j++)
-            {
-                s ^= gf_mul(invert[static_cast<size_t>(j) * static_cast<size_t>(k) +
-                                   static_cast<size_t>(i)],
-                            encode_matrix[static_cast<size_t>(k) * static_cast<size_t>(idx) +
-                                          static_cast<size_t>(j)]);
-            }
-            decode_matrix[static_cast<size_t>(k) * static_cast<size_t>(e) +
-                          static_cast<size_t>(i)] = s;
-        }
+        memcpy(decode_matrix + static_cast<size_t>(k) * static_cast<size_t>(e),
+               invert.data() + static_cast<size_t>(k) * static_cast<size_t>(err_list[e]),
+               static_cast<size_t>(k));
     }
     return 0;
+}
+
+/* A 16-byte aligned decode row; in PSRAM where configured, to keep internal RAM for the
+ * network and USB drivers. */
+bfc::shared_sized_buffer alloc_decode_row(size_t len)
+{
+#if defined(CONFIG_VSTREAMER_RX_PSRAM) && CONFIG_VSTREAMER_RX_PSRAM
+    auto* bytes = static_cast<std::byte*>(
+        heap_caps_aligned_alloc(k_tx_body_align, len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (bytes == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+    return bfc::shared_sized_buffer::adopt(bytes, len, len, [](std::byte* p) { heap_caps_free(p); });
+#else
+    auto storage = bfc::shared_sized_buffer::allocate(len + k_tx_body_align - 1);
+    storage.resize(len + k_tx_body_align - 1);
+    const size_t off = (k_tx_body_align - reinterpret_cast<uintptr_t>(storage.u8()) % k_tx_body_align) %
+                       k_tx_body_align;
+    return storage.subview(off, len);
+#endif
 }
 }  // namespace
 
@@ -500,95 +513,78 @@ bool vstreamer::rs_block_erasure::decode_rows(int k_total, int n,
         }
     }
 
-    const kn_encode_tables&           tables = kn_encode_tables_for(k_total, total);
-    std::vector<std::vector<uint8_t>> rows(static_cast<size_t>(total));
-    std::array<uint8_t, k_max_rows>   err_list {};
-    int                               nerrs = 0;
+    const kn_encode_tables&         tables = kn_encode_tables_for(k_total, total);
+    std::array<uint8_t, k_max_rows> err_list {};
+    int                             nerrs = 0;
     for (int i = 0; i < total; i++)
     {
-        const bfc::shared_sized_buffer& src =
-            i < k_total ? (*data)[static_cast<size_t>(i)]
-                        : parity[static_cast<size_t>(i - k_total)];
-        if (src.empty())
+        const bool missing = i < k_total ? (*data)[static_cast<size_t>(i)].empty()
+                                         : parity[static_cast<size_t>(i - k_total)].empty();
+        if (missing)
         {
             err_list[static_cast<size_t>(nerrs++)] = static_cast<uint8_t>(i);
-            continue;
-        }
-        std::vector<uint8_t>& row = rows[static_cast<size_t>(i)];
-        row.assign(row_len, 0);
-        if (i < k_total)
-        {
-            store_be16(row.data(), static_cast<uint16_t>(src.size()));
-            memcpy(row.data() + k_len_prefix, src.u8(), src.size());
-        }
-        else
-        {
-            memcpy(row.data(), src.u8(), row_len);
         }
     }
-    /* Only the missing data rows need rebuilding; missing parity rows stay erased. */
-    std::array<uint8_t, k_max_rows> want {};
-    int                             nwant = 0;
-    for (int e = 0; e < nerrs; e++)
-    {
-        if (err_list[static_cast<size_t>(e)] < k_total)
-        {
-            want[static_cast<size_t>(nwant++)] = err_list[static_cast<size_t>(e)];
-        }
-    }
-    std::vector<uint8_t>            decode_matrix(static_cast<size_t>(nerrs) *
-                                                  static_cast<size_t>(k_total));
+    /* Missing data rows are the head of err_list (row order). */
+    std::vector<uint8_t> decode_matrix(static_cast<size_t>(missing_data) *
+                                       static_cast<size_t>(k_total));
     std::array<uint8_t, k_max_rows> decode_index {};
     if (gen_decode_matrix(k_total, total, tables.encode_matrix.data(), err_list.data(), nerrs,
                           decode_matrix.data(), decode_index.data()) != 0)
     {
         return false;
     }
-    /* gen_decode_matrix lists rows in err_list order; keep only the data ones. */
-    std::vector<uint8_t> want_matrix(static_cast<size_t>(nwant) * static_cast<size_t>(k_total));
-    for (int w = 0, e = 0; e < nerrs; e++)
-    {
-        if (err_list[static_cast<size_t>(e)] < k_total)
-        {
-            memcpy(want_matrix.data() + static_cast<size_t>(w) * static_cast<size_t>(k_total),
-                   decode_matrix.data() + static_cast<size_t>(e) * static_cast<size_t>(k_total),
-                   static_cast<size_t>(k_total));
-            w++;
-        }
-    }
-    std::vector<uint8_t> decode_tbls(static_cast<size_t>(k_total) * static_cast<size_t>(nwant) *
-                                     32);
-    std::array<unsigned char*, k_max_rows> src_ptrs {};
-    std::vector<std::vector<uint8_t>>      out_rows(static_cast<size_t>(nwant));
-    std::array<unsigned char*, k_max_rows> out_ptrs {};
+    /* Only the k source rows the decoder picked are read. A parity body already is a row; a data
+     * row is built as [u16 BE length | payload | zero pad]. */
+    std::array<bfc::shared_sized_buffer, k_max_k> data_rows {};
+    std::array<unsigned char*, k_max_rows>        src_ptrs {};
     for (int i = 0; i < k_total; i++)
     {
-        src_ptrs[static_cast<size_t>(i)] = rows[decode_index[static_cast<size_t>(i)]].data();
+        const int idx = decode_index[static_cast<size_t>(i)];
+        if (idx >= k_total)
+        {
+            src_ptrs[static_cast<size_t>(i)] =
+                const_cast<unsigned char*>(parity[static_cast<size_t>(idx - k_total)].u8());
+            continue;
+        }
+        const bfc::shared_sized_buffer& src = (*data)[static_cast<size_t>(idx)];
+        bfc::shared_sized_buffer&       row = data_rows[static_cast<size_t>(idx)];
+        row = alloc_decode_row(row_len);
+        store_be16(row.u8(), static_cast<uint16_t>(src.size()));
+        memcpy(row.u8() + k_len_prefix, src.u8(), src.size());
+        memset(row.u8() + k_len_prefix + src.size(), 0, row_len - k_len_prefix - src.size());
+        src_ptrs[static_cast<size_t>(i)] = row.u8();
     }
-    for (int w = 0; w < nwant; w++)
+    std::vector<uint8_t> decode_tbls(static_cast<size_t>(k_total) *
+                                     static_cast<size_t>(missing_data) * 32);
+    std::array<bfc::shared_sized_buffer, k_max_k> out_rows {};
+    std::array<unsigned char*, k_max_rows>        out_ptrs {};
+    for (int w = 0; w < missing_data; w++)
     {
-        out_rows[static_cast<size_t>(w)].assign(row_len, 0);
-        out_ptrs[static_cast<size_t>(w)] = out_rows[static_cast<size_t>(w)].data();
+        out_rows[static_cast<size_t>(w)] = alloc_decode_row(row_len);
+        out_ptrs[static_cast<size_t>(w)] = out_rows[static_cast<size_t>(w)].u8();
     }
-    ec_init_tables_base(k_total, nwant, want_matrix.data(), decode_tbls.data());
-    VSTREAMER_EC_ENCODE(static_cast<int>(row_len), k_total, nwant, decode_tbls.data(),
+    ec_init_tables_base(k_total, missing_data, decode_matrix.data(), decode_tbls.data());
+    VSTREAMER_EC_ENCODE(static_cast<int>(row_len), k_total, missing_data, decode_tbls.data(),
                         src_ptrs.data(), out_ptrs.data());
-    int rec = 0;
-    for (int w = 0; w < nwant; w++)
+    for (int w = 0; w < missing_data; w++)
     {
-        const std::vector<uint8_t>& row = out_rows[static_cast<size_t>(w)];
-        const uint16_t              len = load_be16(row.data());
+        const bfc::shared_sized_buffer& row = out_rows[static_cast<size_t>(w)];
+        const uint16_t                  len = load_be16(row.u8());
         if (0 == len || k_len_prefix + len > row_len)
         {
             return false;
         }
-        (*data)[want[static_cast<size_t>(w)]] =
-            bfc::shared_sized_buffer::copy_from(row.data() + k_len_prefix, len);
-        rec++;
+    }
+    for (int w = 0; w < missing_data; w++)
+    {
+        (*data)[err_list[static_cast<size_t>(w)]] =
+            out_rows[static_cast<size_t>(w)].subview(k_len_prefix,
+                                                     load_be16(out_rows[static_cast<size_t>(w)].u8()));
     }
     if (recovered != nullptr)
     {
-        *recovered = rec;
+        *recovered = missing_data;
     }
     return true;
 }

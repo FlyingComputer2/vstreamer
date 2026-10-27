@@ -6,12 +6,17 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "core/component_pdu.hpp"
 #include "core/rs_block_erasure.hpp"
@@ -671,4 +676,74 @@ TEST(StreamReceiverTest, PacketGapTuplesStayConsistentDuringReception)
     EXPECT_EQ(-ENOTSUP, receiver.query("not_a_metric", &value));
     receiver.close();
     close(fd);
+}
+
+TEST(StreamReceiverTest, InProcessDatagramsRecoverAndReport)
+{
+    vstreamer::rs_block_erasure enc;
+    ASSERT_TRUE(enc.init(4, 6, 1476));
+    std::mutex                                 mu;
+    std::deque<bfc::shared_sized_buffer>       wire;
+    std::vector<std::vector<uint8_t>>          apps;
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        apps.emplace_back(40 + i, static_cast<uint8_t>(0x30 + i));
+        vstreamer::rs_block_erasure::tx_out out;
+        enc.push_app(apps.back().data(), apps.back().size(), &out);
+        for (size_t j = 0; j < out.shards.size(); j++)
+        {
+            /* Lose data shard 2: the block's parity recovers it. */
+            if (!(2 == i && 0 == j))
+            {
+                wire.push_back(out.shards[j]);
+            }
+        }
+    }
+    std::atomic<int> reports {0};
+    std::atomic<int> report_len {0};
+
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(-EINVAL, receiver.set_datagram_transport(nullptr, nullptr));
+    ASSERT_EQ(0, receiver.set_datagram_transport(
+                     [&]() -> std::optional<bfc::shared_sized_buffer>
+                     {
+                         std::lock_guard<std::mutex> lock(mu);
+                         if (wire.empty())
+                         {
+                             return std::nullopt;
+                         }
+                         auto b = std::move(wire.front());
+                         wire.pop_front();
+                         return b;
+                     },
+                     [&](const uint8_t *, size_t len)
+                     {
+                         report_len = static_cast<int>(len);
+                         reports++;
+                         return true;
+                     }));
+    ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
+    ASSERT_EQ(0, receiver.open()); /* no listen needed */
+    EXPECT_EQ(-EBUSY, receiver.set_datagram_transport([] { return std::nullopt; },
+                                                      [](const uint8_t *, size_t) { return true; }));
+
+    std::vector<std::vector<uint8_t>> got;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline && (got.size() < apps.size() || reports < 1))
+    {
+        vstreamer::component_pdu pdu;
+        while (0 == receiver.output(pdu))
+        {
+            got.emplace_back(pdu.sdu.u8(), pdu.sdu.u8() + pdu.sdu.size());
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    receiver.close();
+    EXPECT_EQ(got, apps);
+    EXPECT_GE(reports.load(), 1);
+    EXPECT_EQ(static_cast<size_t>(report_len.load()),
+              vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len);
+    std::string recovered;
+    ASSERT_EQ(0, receiver.query("fec_recovered", &recovered));
+    EXPECT_EQ("1", recovered);
 }

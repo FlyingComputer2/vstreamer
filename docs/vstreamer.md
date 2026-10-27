@@ -291,6 +291,13 @@ one `STREAM_DGRAM` PDU per original datagram.
 | `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_given_up_blocks`, `fec_late_blocks`, `fec_new_references`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
 | `fec_spread_est_ms`, `fec_jitter_est_ms` | Q | sender spread (from the parity row gap) and arrival jitter measured from receive times (spread = 250 until two blocks are fitted). A hole is given up when its block's last parity is due under the sender's release rule, from that block's own fill time, plus a jitter margin |
 
+In-process input: `set_datagram_transport(receive, send)` (before `open()`) replaces the listen
+socket. `receive` returns the next wire datagram or nothing and must not block; the receive
+thread drains up to 64 per pass and polls about every millisecond. `send` takes each reverse
+link report. Received datagrams are kept as views, not copied. Embedded builds can raise the
+deadline margin floor with `VSTREAMER_RX_DEADLINE_MARGIN_MIN_MS` (5..100, default 5) and put
+FEC decode rows in PSRAM with `CONFIG_VSTREAMER_RX_PSRAM`.
+
 Stream metrics use the eight tuple queries above. Each value contains three decimal integers,
 with no spaces. Reads do not reset counters. UDP totals count valid stream transport datagrams
 and their complete wire payload bytes, including the shard headers, padding and

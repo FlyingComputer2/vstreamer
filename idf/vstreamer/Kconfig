@@ -15,4 +15,12 @@ config VSTREAMER_RS_PIE
         difference is about 0.1-0.3 fps. Turn it off where every encoder frame matters more
         than core 0 time.
 
+config VSTREAMER_RX_PSRAM
+    bool "FEC receive: decode rows in PSRAM"
+    depends on SPIRAM
+    default n
+    help
+        Allocate the rows the FEC decoder builds and the payloads it recovers in PSRAM, keeping
+        internal RAM for the network and USB drivers.
+
 endmenu
