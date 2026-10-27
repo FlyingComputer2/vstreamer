@@ -72,15 +72,20 @@ private:
     void ingest_link_report(const uint8_t *data, size_t len);
     void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
-    void enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                           std::chrono::steady_clock::time_point release);
+    /* Built wire datagrams (rs_block_erasure shards, headers included). */
+    void enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
+                          std::chrono::steady_clock::time_point release);
     /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */
-    [[nodiscard]] int try_enqueue_wire_copy(const uint8_t *data, size_t len, bool is_fec_shard,
-                                            std::chrono::steady_clock::time_point release,
-                                            bool force = false);
+    [[nodiscard]] int try_enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
+                                           std::chrono::steady_clock::time_point release,
+                                           bool force = false);
+    [[nodiscard]] bool wire_fits(size_t len);
+    void evict_for_room();
+    void queue_wire(bfc::shared_sized_buffer &&buf, std::chrono::steady_clock::time_point release);
     /* True when the queue has room for every wire packet one app SDU can produce. */
     [[nodiscard]] bool queue_has_room_for_sdu() const;
-    void enqueue_fec_air(std::vector<std::vector<uint8_t>> *air);
+    /* Queues one push's shards: the data shard at once, parity on the spread schedule. */
+    void enqueue_tx_out(rs_block_erasure::tx_out *out, bool no_evict);
 
     [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict);
 
@@ -88,9 +93,8 @@ private:
 
     [[nodiscard]] int effective_fec_k() const;
     [[nodiscard]] int effective_fec_n() const;
-    [[nodiscard]] size_t max_fec_shard_bytes() const;
-    [[nodiscard]] size_t max_raw_sdu_bytes() const;
-    /* Flush partial block, (re)init with current k/n/timeout. No locks held. */
+    [[nodiscard]] static size_t max_input_bytes();
+    /* Flush the open block, (re)init with the current k/n. No locks held. */
     int  reinit_fec_if_active();
     /* Flush partial block and stop encoding. No locks held. */
     void disable_fec();
@@ -123,9 +127,6 @@ private:
     /* Ordered by release time (ties keep enqueue order). */
     std::deque<queued_wire> queue;
     size_t                  queue_bytes = 0;
-    /* Set (under q_mu) when input() opens a new FEC block: its timeout deadline is earlier
-     * than whatever the send thread is sleeping toward, so the thread must recompute it. */
-    bool                    fec_deadline_changed = false;
     /* Fixed send-queue capacity in packets (= buffer pool size); input() gets -EAGAIN past it. */
     static constexpr size_t k_queue_packet_cap = 1024;
 
@@ -163,11 +164,12 @@ private:
     std::atomic<uint64_t> queue_evicted {0};
     /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
     std::atomic<uint64_t> transport_dropped {0};
+    std::atomic<uint64_t> fec_push_us {0}; /* time in fec.push_app (RS encode included) */
 
-    /* FEC block spreading: a block's shards are released evenly over this window instead of
-     * back to back; 0 sends them at once. Blocks overlap, so their shards interleave on the wire.
-     * Capped at k_fec_spread_max_ms. Shards wait in the send queue until due, so about
-     * rate x spread worth of packets are queued against k_queue_packet_cap. */
+    /* FEC spreading: a block's k + p shards span this window. Data shards never wait; parity
+     * keeps its slot in the window and at least its row's offset after the block closes, so it
+     * is never sent in a lump. 0 sends parity at once. Capped at k_fec_spread_max_ms. Parity
+     * waits in the send queue until due, against k_queue_packet_cap. */
     std::atomic<int> fec_spread_ms {0};
     /* Largest delay of a datagram past its release time since the last query (us). */
     mutable std::atomic<int64_t> send_late_max_us {0};
@@ -179,10 +181,8 @@ private:
     fec_mode_e        fec_mode = fec_mode_e::block;
     int               fec_k = 10;
     int               fec_n = 12;
-    int               fec_timeout_ms = rs_block_erasure::k_default_timeout_ms;
     uint64_t          fec_oversized = 0;
 
-    std::atomic<uint16_t> stream_sequence {0};
 };
 
 }  // namespace vstreamer

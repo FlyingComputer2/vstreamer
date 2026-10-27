@@ -58,10 +58,18 @@ void parse_annexb_nals(const uint8_t *data, size_t size,
         }
         const size_t start = i + sc;
         size_t         j = start;
+        /* A start code begins with a zero byte, which is rare in slice data: memchr skips to
+         * each candidate instead of testing every byte (the AU sits in PSRAM on the P4). */
         while (j + 3 < size)
         {
-            if (data[j] == 0 && data[j + 1] == 0 &&
-                (data[j + 2] == 1 || (data[j + 2] == 0 && j + 3 < size && data[j + 3] == 1)))
+            const void *z = std::memchr(data + j, 0, size - 3 - j);
+            if (nullptr == z)
+            {
+                j = size;
+                break;
+            }
+            j = static_cast<size_t>(static_cast<const uint8_t *>(z) - data);
+            if (data[j + 1] == 0 && (data[j + 2] == 1 || (data[j + 2] == 0 && data[j + 3] == 1)))
             {
                 break;
             }
@@ -94,18 +102,15 @@ void rtp_h264_packer::reset()
     pps_len = 0;
 }
 
-int rtp_h264_packer::append_datagram(const uint8_t *payload, int plen, int marker, uint32_t ts,
-                                     int64_t capture_rt_ns)
+int rtp_h264_packer::rtp_header_len(int64_t capture_rt_ns)
+{
+    return k_rtp_hdr + (capture_rt_ns > 0 ? k_capture_ext_total : 0);
+}
+
+void rtp_h264_packer::write_rtp_header(uint8_t *pkt, bool marker, uint32_t ts,
+                                       int64_t capture_rt_ns)
 {
     const bool have_capture = capture_rt_ns > 0;
-    const int  hdr_extra = have_capture ? k_capture_ext_total : 0;
-    const int  total = k_rtp_hdr + hdr_extra + plen;
-    if (plen < 0 || total > cfg.mtu || total > k_max_rtp)
-    {
-        return -EINVAL;
-    }
-
-    std::vector<uint8_t> pkt(static_cast<size_t>(total));
     pkt[0] = static_cast<uint8_t>(have_capture ? 0x90 : 0x80);
     pkt[1] = static_cast<uint8_t>(cfg.payload_type | (marker ? 0x80 : 0));
     pkt[2] = static_cast<uint8_t>(seq >> 8);
@@ -134,8 +139,49 @@ int rtp_h264_packer::append_datagram(const uint8_t *payload, int plen, int marke
         pkt[26] = 0;
         pkt[27] = 0;
     }
-    std::memcpy(pkt.data() + k_rtp_hdr + hdr_extra, payload, static_cast<size_t>(plen));
     seq++;
+}
+
+int rtp_h264_packer::append_datagram(const uint8_t *prefix, int prefix_len, const uint8_t *payload,
+                                     int plen, int marker, uint32_t ts, int64_t capture_rt_ns)
+{
+    const int hdr = rtp_header_len(capture_rt_ns);
+    const int total = hdr + prefix_len + plen;
+    if (plen < 0 || prefix_len < 0 || prefix_len > 2 || total > cfg.mtu || total > k_max_rtp)
+    {
+        return -EINVAL;
+    }
+    if (count_only)
+    {
+        seq++;
+        ++counted;
+        return 0;
+    }
+    if (nullptr != plan_out)
+    {
+        rtp_h264_dgram d;
+        d.payload = payload;
+        d.payload_len = plen;
+        d.fu_len = prefix_len;
+        if (prefix_len > 0)
+        {
+            std::memcpy(d.fu, prefix, static_cast<size_t>(prefix_len));
+        }
+        d.marker = 0 != marker;
+        d.cached_param = (payload >= sps && payload < sps + sizeof(sps)) ||
+                         (payload >= pps && payload < pps + sizeof(pps));
+        plan_out->push_back(d);
+        return 0;
+    }
+
+    std::vector<uint8_t> pkt(static_cast<size_t>(total));
+    write_rtp_header(pkt.data(), 0 != marker, ts, capture_rt_ns);
+    uint8_t *body = pkt.data() + hdr;
+    if (prefix_len > 0)
+    {
+        std::memcpy(body, prefix, static_cast<size_t>(prefix_len));
+    }
+    std::memcpy(body + prefix_len, payload, static_cast<size_t>(plen));
     queue.push_back(std::move(pkt));
     return 0;
 }
@@ -152,7 +198,7 @@ int rtp_h264_packer::send_nal(const uint8_t *nal, int len, int marker, uint32_t 
     }
     if (len <= max_single)
     {
-        return append_datagram(nal, len, marker, ts, capture_rt_ns);
+        return append_datagram(nullptr, 0, nal, len, marker, ts, capture_rt_ns);
     }
 
     const int max_fu = cfg.mtu - k_rtp_hdr - hdr_extra - 2;
@@ -170,11 +216,10 @@ int rtp_h264_packer::send_nal(const uint8_t *nal, int len, int marker, uint32_t 
     {
         const int chunk = left < max_fu ? left : max_fu;
         const int last = (left - chunk) == 0;
-        uint8_t   fu[k_max_rtp];
+        uint8_t   fu[2];
         fu[0] = static_cast<uint8_t>(nri | 28);
         fu[1] = static_cast<uint8_t>(type | (first ? 0x80 : 0) | (last ? 0x40 : 0));
-        std::memcpy(fu + 2, p, static_cast<size_t>(chunk));
-        if (append_datagram(fu, chunk + 2, marker && last, ts, capture_rt_ns) < 0)
+        if (append_datagram(fu, 2, p, chunk, marker && last, ts, capture_rt_ns) < 0)
         {
             return -EINVAL;
         }
@@ -215,11 +260,14 @@ size_t rtp_h264_packer::count_annexb_rtp_datagrams(const uint8_t *data, size_t s
                                                    uint32_t rtp_ts, int64_t capture_rt_ns) const
 {
     rtp_h264_packer probe(*this);
+    probe.queue.clear();
+    probe.count_only = true;
+    probe.counted = 0;
     if (probe.pack_annexb_rtp_ts(data, size, rtp_ts, capture_rt_ns) < 0)
     {
         return 0;
     }
-    return probe.pending_datagram_count();
+    return probe.counted;
 }
 
 int rtp_h264_packer::pack_annexb_rtp_ts(const uint8_t *data, size_t size, uint32_t rtp_ts,
@@ -302,6 +350,25 @@ int rtp_h264_packer::pack_annexb_rtp_ts(const uint8_t *data, size_t size, uint32
         }
     }
     return 0;
+}
+
+int rtp_h264_packer::plan_annexb_rtp_ts(const uint8_t *data, size_t size, int64_t capture_rt_ns,
+                                        std::vector<rtp_h264_dgram> *out)
+{
+    if (nullptr == out)
+    {
+        return -EINVAL;
+    }
+    out->clear();
+    /* The same packing logic, with append_datagram() recording instead of building. Packing
+     * clears the queue first, so keep what is pending. */
+    std::deque<std::vector<uint8_t>> kept;
+    kept.swap(queue);
+    plan_out = out;
+    const int r = pack_annexb_rtp_ts(data, size, 0, capture_rt_ns);
+    plan_out = nullptr;
+    queue.swap(kept);
+    return r;
 }
 
 int rtp_h264_packer::pop_datagram(uint8_t *dst, size_t cap)

@@ -1,7 +1,5 @@
 #include "core/rs_block_erasure.hpp"
 
-#include <arpa/inet.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
@@ -22,7 +20,7 @@ namespace
 
 constexpr int k_fec_k = 10;
 constexpr int k_fec_n = 11;
-constexpr int k_fec_timeout_ms = 20;
+constexpr size_t k_max_datagram = 1476;
 constexpr size_t k_pkt_hdr = 8; /* uint64_t seq */
 constexpr int    k_wrap_lead_sdus = 2000;
 
@@ -79,13 +77,13 @@ int main(int argc, char **argv)
 
     rs_block_erasure enc;
     rs_block_erasure dec;
-    if (!enc.init(k_fec_k, k_fec_n, k_fec_timeout_ms))
+    if (!enc.init(k_fec_k, k_fec_n, k_max_datagram))
     {
         std::fprintf(stderr, "init failed\n");
         return 1;
     }
-    /* Start just below the u16 sdu_base wrap so every run crosses it. */
-    enc.set_tx_sdu_seq(static_cast<uint16_t>(0x10000 - k_wrap_lead_sdus));
+    /* Start just below the u16 sequence wrap so every run crosses it. */
+    enc.set_tx_sequence(static_cast<uint16_t>(0x10000 - k_wrap_lead_sdus));
 
     std::mt19937                            rng(0xC0DE);
     std::uniform_real_distribution<double>  jitter(0.65, 1.35);
@@ -115,11 +113,16 @@ int main(int argc, char **argv)
         item.due = t0 + std::chrono::duration_cast<steady_clk::duration>(
                              std::chrono::duration<double>(send_sec));
         item.bytes = std::move(shard);
-        uint16_t wire_base = 0;
-        if (item.bytes.size() >= rs_block_erasure::k_header_len)
+        uint16_t                       wire_base = 0;
+        rs_block_erasure::shard_header h;
+        if (rs_block_erasure::parse_header(item.bytes.data(), item.bytes.size(), &h) &&
+            h.is_data)
         {
-            memcpy(&wire_base, item.bytes.data(), sizeof(wire_base));
-            wire_base = ntohs(wire_base);
+            wire_base = h.sequence_number;
+        }
+        else
+        {
+            wire_base = last_wire_base;
         }
         if (have_wire && wire_base < last_wire_base)
         {
@@ -151,18 +154,12 @@ int main(int argc, char **argv)
         store_u64_le(pkt.data(), app_seq);
         app_seq++;
 
-        std::vector<std::vector<uint8_t>> air;
+        rs_block_erasure::tx_out air;
         enc.push_app(pkt.data(), pkt.size(), &air);
-        for (auto &shard : air)
+        for (auto &shard : air.shards)
         {
-            schedule_shard(std::move(shard), &schedule_cursor_sec);
-        }
-
-        std::vector<std::vector<uint8_t>> tick_air;
-        enc.on_tick(&tick_air);
-        for (auto &shard : tick_air)
-        {
-            schedule_shard(std::move(shard), &schedule_cursor_sec);
+            schedule_shard(std::vector<uint8_t>(shard.u8(), shard.u8() + shard.size()),
+                           &schedule_cursor_sec);
         }
 
         const auto now = steady_clk::now();
@@ -190,11 +187,12 @@ int main(int argc, char **argv)
     /* Drain remaining scheduled shards (still at paced times, or burst if late). */
     /* Flush partial block and drain. */
     {
-        std::vector<std::vector<uint8_t>> air;
+        rs_block_erasure::tx_out air;
         enc.flush(&air);
-        for (auto &shard : air)
+        for (auto &shard : air.shards)
         {
-            schedule_shard(std::move(shard), &schedule_cursor_sec);
+            schedule_shard(std::vector<uint8_t>(shard.u8(), shard.u8() + shard.size()),
+                           &schedule_cursor_sec);
         }
     }
 
@@ -266,14 +264,14 @@ int main(int argc, char **argv)
 
     if (0 == wire_wrap_marks)
     {
-        std::fprintf(stderr, "FAIL: sdu_base never wrapped (%" PRIu64 " blocks)\n", blocks);
+        std::fprintf(stderr, "FAIL: sequence never wrapped (%" PRIu64 " blocks)\n", blocks);
         return 1;
     }
     if (seq_errors > 0)
     {
         std::fprintf(stderr,
                      "FAIL: payload sequence errors after %" PRIu64 " blocks / %" PRIu64
-                     " wire wraps — sdu_base collision likely\n",
+                     " wire wraps — sequence collision likely\n",
                      blocks, wire_wrap_marks);
         return 1;
     }

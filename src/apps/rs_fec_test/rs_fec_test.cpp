@@ -3,570 +3,277 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <thread>
 #include <vector>
 
 using vstreamer::fec_rx_payload_list;
 using vstreamer::rs_block_erasure;
 
+namespace
+{
+
+constexpr size_t k_max_datagram = 1476;
+
+using wire_list = std::vector<std::vector<uint8_t>>;
+
+/* App datagram tagged with its index (bytes 0..3, little endian). */
+std::vector<uint8_t> app(uint32_t i, size_t len)
+{
+    std::vector<uint8_t> p(len < 4 ? 4 : len, static_cast<uint8_t>(i * 7));
+    std::memcpy(p.data(), &i, 4);
+    return p;
+}
+
+uint32_t tag_of(const bfc::shared_sized_buffer &p)
+{
+    uint32_t i = 0;
+    if (p.size() >= 4)
+    {
+        std::memcpy(&i, p.u8(), 4);
+    }
+    return i;
+}
+
+/* Every shard the encoder sends for apps [first, first + count), in send order. */
+wire_list encode(rs_block_erasure &enc, uint32_t first, uint32_t count, size_t len = 200)
+{
+    wire_list out;
+    for (uint32_t i = first; i < first + count; i++)
+    {
+        const auto               a = app(i, len);
+        rs_block_erasure::tx_out tx;
+        enc.push_app(a.data(), a.size(), &tx);
+        for (const auto &b : tx.shards)
+        {
+            out.emplace_back(b.u8(), b.u8() + b.size());
+        }
+    }
+    return out;
+}
+
+void deliver(rs_block_erasure &dec, const std::vector<uint8_t> &w, fec_rx_payload_list *got)
+{
+    fec_rx_payload_list batch;
+    dec.push_air(w.data(), w.size(), &batch);
+    got->insert(got->end(), batch.begin(), batch.end());
+}
+
+/* got must hold tags first, first + 1, ... count of them. */
+bool check_tags(const char *what, const fec_rx_payload_list &got, uint32_t first, size_t count)
+{
+    if (got.size() != count)
+    {
+        std::fprintf(stderr, "%s: expected %zu payloads got %zu\n", what, count, got.size());
+        return false;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        if (tag_of(got[i]) != first + i)
+        {
+            std::fprintf(stderr, "%s: payload %zu has tag %u\n", what, i, tag_of(got[i]));
+            return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
 int main()
 {
-    // Drive RX deadlines deterministically; TX timeout flushing uses the real clock.
-    auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    /* RX deadlines run on this clock; nothing here sleeps. */
+    auto now = std::chrono::steady_clock::time_point {} + std::chrono::hours(1);
+    const auto clock = [&now] { return now; };
     constexpr int past_deadline_ms = rs_block_erasure::k_spread_cap_ms +
                                      rs_block_erasure::k_deadline_margin_min_ms + 10;
 
-    rs_block_erasure enc;
-    rs_block_erasure dec;
-    dec.set_clock([&now] { return now; });
-    if (!enc.init(10, 12, 20))
+    /* Two lost data shards come back from parity, in order. */
     {
-        std::fprintf(stderr, "init failed\n");
-        return 1;
-    }
-
-    std::vector<std::vector<uint8_t>> pending;
-    for (int i = 0; i < 10; i++)
-    {
-        std::vector<uint8_t> pkt(200, static_cast<uint8_t>(i));
-        pkt[0] = static_cast<uint8_t>(0x80);
-        pkt[1] = static_cast<uint8_t>(i);
-        enc.push_app(pkt.data(), pkt.size(), &pending);
-    }
-    if (pending.size() != 12U)
-    {
-        std::fprintf(stderr, "expected 12 shards got %zu\n", pending.size());
-        return 1;
-    }
-
-    /* Drop two systematic shards; parity should recover. */
-    fec_rx_payload_list recovered;
-    for (size_t i = 0; i < pending.size(); i++)
-    {
-        if (2 == i || 5 == i)
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        if (!enc.init(10, 12, k_max_datagram))
         {
-            continue;
-        }
-        fec_rx_payload_list batch;
-        dec.push_air(pending[i].data(), pending[i].size(), &batch);
-        recovered.insert(recovered.end(), std::make_move_iterator(batch.begin()),
-                         std::make_move_iterator(batch.end()));
-    }
-    if (recovered.size() != 10U)
-    {
-        std::fprintf(stderr, "expected 10 payloads got %zu fec_rec=%llu fec_lost=%llu\n",
-                     recovered.size(), static_cast<unsigned long long>(dec.recovered()),
-                     static_cast<unsigned long long>(dec.decode_fail()));
-        return 1;
-    }
-    for (size_t i = 0; i < recovered.size(); i++)
-    {
-        if (recovered[i].size() != 200U || recovered[i].u8()[1] != static_cast<uint8_t>(i))
-        {
-            std::fprintf(stderr, "payload %zu mismatch\n", i);
+            std::fprintf(stderr, "init failed\n");
             return 1;
         }
-    }
-
-    /* Blocks must be emitted in sdu_base order even when shards arrive OOO. */
-    rs_block_erasure enc2;
-    rs_block_erasure dec2;
-    dec2.set_clock([&now] { return now; });
-    if (!enc2.init(2, 4, 20))
-    {
-        std::fprintf(stderr, "init2 failed\n");
-        return 1;
-    }
-    std::vector<std::vector<uint8_t>> block0;
-    std::vector<std::vector<uint8_t>> block1;
-    for (int b = 0; b < 2; b++)
-    {
-        std::vector<std::vector<uint8_t>> pending;
-        for (int i = 0; i < 2; i++)
+        const wire_list w = encode(enc, 0, 10);
+        if (w.size() != 12U)
         {
-            std::vector<uint8_t> pkt(32, static_cast<uint8_t>(b * 10 + i));
-            pkt[0] = static_cast<uint8_t>(0x80);
-            pkt[3] = static_cast<uint8_t>(b * 2 + i);
-            enc2.push_app(pkt.data(), pkt.size(), &pending);
-        }
-        if (b == 0)
-        {
-            block0 = pending;
-        }
-        else
-        {
-            block1 = pending;
-        }
-    }
-    /* First shard of block0 arrives, then all of block1, then the rest of
-     * block0: block1 must be held until block0 completes. */
-    fec_rx_payload_list ordered;
-    fec_rx_payload_list batch;
-    dec2.push_air(block0[0].data(), block0[0].size(), &batch);
-    ordered.insert(ordered.end(), std::make_move_iterator(batch.begin()),
-                    std::make_move_iterator(batch.end()));
-    for (size_t i = 0; i < block1.size(); i++)
-    {
-        dec2.push_air(block1[i].data(), block1[i].size(), &batch);
-        ordered.insert(ordered.end(), std::make_move_iterator(batch.begin()),
-                        std::make_move_iterator(batch.end()));
-    }
-    for (const auto& row : ordered)
-    {
-        if (row.size() > 3U && row.u8()[3] >= 2)
-        {
-            std::fprintf(stderr, "ooo emit released block1 before block0 (%zu)\n", ordered.size());
+            std::fprintf(stderr, "expected 12 shards got %zu\n", w.size());
             return 1;
         }
-    }
-    for (size_t i = 1; i < block0.size(); i++)
-    {
-        dec2.push_air(block0[i].data(), block0[i].size(), &batch);
-        ordered.insert(ordered.end(), std::make_move_iterator(batch.begin()),
-                        std::make_move_iterator(batch.end()));
-    }
-    if (ordered.size() != 4U)
-    {
-        std::fprintf(stderr, "ooo emit expected 4 payloads got %zu\n", ordered.size());
-        return 1;
-    }
-    for (int i = 0; i < 4; i++)
-    {
-        if (ordered[static_cast<size_t>(i)].u8()[3] != static_cast<uint8_t>(i))
-        {
-            std::fprintf(stderr, "ooo emit seq mismatch at %d\n", i);
-            return 1;
-        }
-    }
-
-    /* Many blocks, all shards: no decode failures or spurious app loss. */
-    rs_block_erasure enc3;
-    rs_block_erasure dec3;
-    dec3.set_clock([&now] { return now; });
-    if (!enc3.init(10, 12, 20))
-    {
-        std::fprintf(stderr, "init3 failed\n");
-        return 1;
-    }
-    std::vector<std::vector<uint8_t>> all_air;
-    for (int b = 0; b < 50; b++)
-    {
-        std::vector<std::vector<uint8_t>> block_air;
-        for (int i = 0; i < 10; i++)
-        {
-            std::vector<uint8_t> pkt(64, static_cast<uint8_t>(b));
-            pkt[0] = static_cast<uint8_t>(0x80);
-            enc3.push_app(pkt.data(), pkt.size(), &block_air);
-        }
-        all_air.insert(all_air.end(), block_air.begin(), block_air.end());
-    }
-    size_t payloads_out = 0;
-    for (const auto& shard : all_air)
-    {
-        fec_rx_payload_list batch;
-        dec3.push_air(shard.data(), shard.size(), &batch);
-        payloads_out += batch.size();
-    }
-    if (payloads_out != 500U)
-    {
-        std::fprintf(stderr, "lossless stream expected 500 payloads got %zu fail=%llu\n",
-                     payloads_out, static_cast<unsigned long long>(dec3.decode_fail()));
-        return 1;
-    }
-    if (dec3.decode_fail() != 0U)
-    {
-        std::fprintf(stderr, "lossless stream decode_fail=%llu\n",
-                     static_cast<unsigned long long>(dec3.decode_fail()));
-        return 1;
-    }
-
-    /* Helpers for the ordering/stall cases below. */
-    auto make_block = [](rs_block_erasure& e, uint8_t tag) {
-        std::vector<std::vector<uint8_t>> air;
-        for (int i = 0; i < e.k(); i++)
-        {
-            std::vector<uint8_t> pkt(32, tag);
-            pkt[0] = static_cast<uint8_t>(0x80);
-            e.push_app(pkt.data(), pkt.size(), &air);
-        }
-        return air;
-    };
-    auto feed = [](rs_block_erasure& d, const std::vector<std::vector<uint8_t>>& air,
-                   fec_rx_payload_list& sink) {
-        for (const auto& s : air)
-        {
-            fec_rx_payload_list b;
-            d.push_air(s.data(), s.size(), &b);
-            sink.insert(sink.end(), std::make_move_iterator(b.begin()),
-                        std::make_move_iterator(b.end()));
-        }
-    };
-    auto sdu_base_of = [](const std::vector<std::vector<uint8_t>>& air) {
-        uint16_t base = 0;
-        int      idx = 0;
-        int      k = 0;
-        int      n = 0;
-        int      sn = 0;
-        if (air.empty() ||
-            !rs_block_erasure::unpack_header(air[0].data(), air[0].size(), &base, &idx, &k, &n,
-                                             &sn))
-        {
-            return static_cast<uint16_t>(0);
-        }
-        return base;
-    };
-    auto tick_after = [&now](rs_block_erasure& d, int ms, fec_rx_payload_list& sink) {
-        now += std::chrono::milliseconds(ms);
-        fec_rx_payload_list b;
-        d.poll_rx(&b);
-        sink.insert(sink.end(), std::make_move_iterator(b.begin()), std::make_move_iterator(b.end()));
-    };
-
-    /* Receiver joining mid-stream must emit from the first block it sees. */
-    {
-        rs_block_erasure enc4;
-        rs_block_erasure dec4;
-        dec4.set_clock([&now] { return now; });
-        if (!enc4.init(2, 4, 20))
-        {
-            std::fprintf(stderr, "init4 failed\n");
-            return 1;
-        }
-        (void)make_block(enc4, 1);
-        (void)make_block(enc4, 2);
-        const auto late_join = make_block(enc4, 3);
         fec_rx_payload_list got;
-        feed(dec4, late_join, got);
-        if (got.size() != 2U)
+        for (size_t i = 0; i < w.size(); i++)
         {
-            std::fprintf(stderr, "mid-stream join expected 2 payloads got %zu\n", got.size());
-            return 1;
-        }
-    }
-
-    /* A block lost entirely on the wire must not stall later blocks forever;
-     * a late copy is ignored after the receiver advances past it. */
-    {
-        rs_block_erasure enc5;
-        rs_block_erasure dec5;
-        dec5.set_clock([&now] { return now; });
-        if (!enc5.init(2, 4, 20))
-        {
-            std::fprintf(stderr, "init5 failed\n");
-            return 1;
-        }
-        const auto a = make_block(enc5, 0xA);
-        const auto b = make_block(enc5, 0xB);
-        const auto c = make_block(enc5, 0xC);
-        fec_rx_payload_list got;
-        feed(dec5, a, got);
-        feed(dec5, c, got);
-        if (got.size() != 2U)
-        {
-            std::fprintf(stderr, "hole: expected only block A (2) got %zu\n", got.size());
-            return 1;
-        }
-        tick_after(dec5, rs_block_erasure::k_deadline_margin_min_ms - 1, got);
-        if (got.size() != 2U)
-        {
-            std::fprintf(stderr, "hole: released C too early (%zu)\n", got.size());
-            return 1;
-        }
-        tick_after(dec5, past_deadline_ms, got);
-        if (got.size() != 4U || got[2].u8()[1] != 0xC)
-        {
-            std::fprintf(stderr, "hole: expected C after gap deadline got %zu\n", got.size());
-            return 1;
-        }
-        feed(dec5, b, got);
-        if (got.size() != 4U || dec5.late_blocks() != 1U ||
-            dec5.take_fail_lost_app_pkts() != 2U)
-        {
-            std::fprintf(stderr,
-                         "hole: late B was not ignored or gap loss was miscounted (%zu)\n",
-                         got.size());
-            return 1;
-        }
-        const auto d = make_block(enc5, 0xD);
-        feed(dec5, d, got);
-        if (got.size() != 6U || got[4].u8()[1] != 0xD)
-        {
-            std::fprintf(stderr, "hole: stream did not resume after late B (%zu)\n", got.size());
-            return 1;
-        }
-    }
-
-    /* TX sdu_base continues across a runtime k/n re-init. */
-    {
-        rs_block_erasure enc6;
-        if (!enc6.init(2, 4, 20))
-        {
-            std::fprintf(stderr, "init6 failed\n");
-            return 1;
-        }
-        const uint16_t id0 = sdu_base_of(make_block(enc6, 1));
-        if (!enc6.init(3, 5, 20))
-        {
-            std::fprintf(stderr, "reinit6 failed\n");
-            return 1;
-        }
-        const uint16_t id1 = sdu_base_of(make_block(enc6, 2));
-        if (id1 != static_cast<uint16_t>(id0 + 2))
-        {
-            std::fprintf(stderr, "sdu_base reset on reinit (%u -> %u)\n", id0, id1);
-            return 1;
-        }
-    }
-
-    /* Sender restart outside the reference window: receiver resyncs. */
-    {
-        rs_block_erasure enc7a;
-        rs_block_erasure enc7b;
-        rs_block_erasure dec7;
-        dec7.set_clock([&now] { return now; });
-        if (!enc7a.init(2, 4, 20) || !enc7b.init(2, 4, 20))
-        {
-            std::fprintf(stderr, "init7 failed\n");
-            return 1;
-        }
-        enc7a.set_tx_sdu_seq(1000);
-        enc7b.set_tx_sdu_seq(5000);
-        fec_rx_payload_list got;
-        feed(dec7, make_block(enc7a, 1), got);
-        feed(dec7, make_block(enc7a, 2), got);
-        feed(dec7, make_block(enc7b, 3), got);
-        feed(dec7, make_block(enc7b, 4), got);
-        tick_after(dec7, past_deadline_ms, got);
-        if (got.size() != 8U || dec7.new_references() != 1U)
-        {
-            std::fprintf(stderr, "restart: expected 8 payloads got %zu\n", got.size());
-            return 1;
-        }
-        for (size_t i = 0; i < got.size(); i++)
-        {
-            if (got[i].u8()[1] != static_cast<uint8_t>(i / 2 + 1))
+            if (2 != i && 5 != i)
             {
-                std::fprintf(stderr, "restart: payload order mismatch at %zu\n", i);
-                return 1;
+                deliver(dec, w[i], &got);
             }
         }
-        feed(dec7, make_block(enc7b, 5), got);
-        if (got.size() != 10U || got[8].u8()[1] != 5)
+        if (!check_tags("recover", got, 0, 10) || dec.recovered() != 2U)
         {
-            std::fprintf(stderr, "restart: stream did not flow after resync (%zu)\n",
-                         got.size());
             return 1;
         }
     }
 
-    /* n=k: headered blocks, no parity shards. */
+    /* A later block's shards wait behind an earlier block's hole. */
     {
-        rs_block_erasure enc_nk;
-        rs_block_erasure dec_nk;
-        dec_nk.set_clock([&now] { return now; });
-        if (!enc_nk.init(4, 4, 20))
-        {
-            std::fprintf(stderr, "init n=k failed\n");
-            return 1;
-        }
-        std::vector<std::vector<uint8_t>> block;
-        for (int i = 0; i < 4; i++)
-        {
-            std::vector<uint8_t> pkt(48, static_cast<uint8_t>(i));
-            enc_nk.push_app(pkt.data(), pkt.size(), &block);
-        }
-        if (block.size() != 4U)
-        {
-            std::fprintf(stderr, "n=k: expected 4 shards got %zu\n", block.size());
-            return 1;
-        }
-        for (const auto& shard : block)
-        {
-            uint16_t base = 0;
-            int      idx = 0;
-            int      k = 0;
-            int      n = 0;
-            int      sn = 0;
-            if (shard.size() < rs_block_erasure::k_header_len ||
-                !rs_block_erasure::unpack_header(shard.data(), shard.size(), &base, &idx, &k, &n,
-                                                 &sn) || k != 4 || n != 4 || sn != 4 || idx >= 4)
-            {
-                std::fprintf(stderr, "n=k: bad shard header\n");
-                return 1;
-            }
-        }
-        fec_rx_payload_list out;
-        for (const auto& shard : block)
-        {
-            fec_rx_payload_list step;
-            dec_nk.push_air(shard.data(), shard.size(), &step);
-            out.insert(out.end(), std::make_move_iterator(step.begin()),
-                       std::make_move_iterator(step.end()));
-        }
-        if (out.size() != 4U)
-        {
-            std::fprintf(stderr, "n=k: expected 4 payloads got %zu\n", out.size());
-            return 1;
-        }
-    }
-
-    /* Post-FEC gap uses wire N (SDUs in block), not RS k. */
-    {
-        rs_block_erasure enc_gap;
-        rs_block_erasure dec_gap;
-        dec_gap.set_clock([&now] { return now; });
-        if (!enc_gap.init(4, 4, 20))
-        {
-            std::fprintf(stderr, "init gap n=k failed\n");
-            return 1;
-        }
-        std::vector<std::vector<uint8_t>> block;
-        for (int i = 0; i < 4; i++)
-        {
-            std::vector<uint8_t> pkt(16, static_cast<uint8_t>(0x40 + i));
-            enc_gap.push_app(pkt.data(), pkt.size(), &block);
-        }
-        fec_rx_payload_list out;
-        for (size_t i = 1; i < block.size(); i++)
-        {
-            fec_rx_payload_list step;
-            dec_gap.push_air(block[i].data(), block[i].size(), &step);
-            out.insert(out.end(), std::make_move_iterator(step.begin()),
-                       std::make_move_iterator(step.end()));
-        }
-        tick_after(dec_gap, past_deadline_ms, out);
-        const uint64_t lost = dec_gap.take_fail_lost_app_pkts();
-        if (out.size() != 3U || lost != 1U)
-        {
-            std::fprintf(stderr,
-                         "fec gap N: expected 3 payloads lost=1 got %zu lost=%llu\n",
-                         out.size(), static_cast<unsigned long long>(lost));
-            return 1;
-        }
-    }
-
-    {
-        rs_block_erasure enc_part;
-        if (!enc_part.init(10, 12, 20))
-        {
-            std::fprintf(stderr, "init partial gap failed\n");
-            return 1;
-        }
-        for (int i = 0; i < 3; i++)
-        {
-            std::vector<uint8_t> pkt(24, static_cast<uint8_t>(i));
-            std::vector<std::vector<uint8_t>> tmp;
-            enc_part.push_app(pkt.data(), pkt.size(), &tmp);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(25));
-        std::vector<std::vector<uint8_t>> block;
-        enc_part.on_tick(&block);
-        int partial_sn = 0;
-        if (block.empty())
-        {
-            std::fprintf(stderr, "partial flush: empty block\n");
-            return 1;
-        }
-        {
-            uint16_t base = 0;
-            int      idx = 0;
-            int      k = 0;
-            int      n = 0;
-            if (!rs_block_erasure::unpack_header(block[0].data(), block[0].size(), &base, &idx, &k,
-                                                 &n, &partial_sn) || partial_sn != 3)
-            {
-                std::fprintf(stderr, "partial flush: expected sdu_n=3 got %d\n", partial_sn);
-                return 1;
-            }
-        }
-        if (block.size() != 5U)
-        {
-            std::fprintf(stderr, "partial flush: expected 5 on-air shards (3+parity) got %zu\n",
-                         block.size());
-            return 1;
-        }
-        rs_block_erasure dec_part;
-        dec_part.set_clock([&now] { return now; });
-        /* Skip SDU 0 and omit parity: too few shards to RS-decode. */
-        fec_rx_payload_list out;
-        for (size_t i = 1; i <= 2; i++)
-        {
-            fec_rx_payload_list step;
-            dec_part.push_air(block[i].data(), block[i].size(), &step);
-            out.insert(out.end(), std::make_move_iterator(step.begin()),
-                       std::make_move_iterator(step.end()));
-        }
-        tick_after(dec_part, past_deadline_ms, out);
-        const uint64_t lost = dec_part.take_fail_lost_app_pkts();
-        if (lost != 1U || out.size() != 2U)
-        {
-            std::fprintf(stderr, "partial N gap: expected lost=1 got %llu out=%zu\n",
-                         static_cast<unsigned long long>(lost), out.size());
-            return 1;
-        }
-    }
-
-    /* u16 sdu_base wrap: in-order emit must stay lossless. */
-    {
-        rs_block_erasure enc8;
-        rs_block_erasure dec8;
-        dec8.set_clock([&now] { return now; });
-        if (!enc8.init(2, 2, 20))
-        {
-            std::fprintf(stderr, "init8 wrap failed\n");
-            return 1;
-        }
-        enc8.set_tx_sdu_seq(65500);
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        enc.init(2, 4, k_max_datagram);
+        const wire_list w = encode(enc, 0, 4); /* d0 d1 p0 p1 | d2 d3 p0 p1 */
         fec_rx_payload_list got;
-        for (int i = 0; i < 258; i++)
+        deliver(dec, w[0], &got);
+        for (size_t i = 4; i < 8; i++)
         {
-            feed(dec8, make_block(enc8, static_cast<uint8_t>(i & 0x7F)), got);
+            deliver(dec, w[i], &got);
         }
-        tick_after(dec8, past_deadline_ms, got);
-        if (got.size() != 516U || dec8.decode_fail() != 0 || dec8.new_references() != 0)
+        if (got.size() != 1U)
         {
-            std::fprintf(stderr,
-                         "sdu_base wrap: expected 516 payloads decode_fail=0 got %zu fail=%llu\n",
-                         got.size(), static_cast<unsigned long long>(dec8.decode_fail()));
+            std::fprintf(stderr, "ooo: block1 released before block0 (%zu)\n", got.size());
             return 1;
         }
-        for (size_t i = 0; i < got.size(); i++)
+        deliver(dec, w[2], &got);
+        if (!check_tags("ooo", got, 0, 4))
         {
-            if (got[i].u8()[1] != static_cast<uint8_t>((i / 2) & 0x7F))
+            return 1;
+        }
+    }
+
+    /* Many blocks, every shard: no failures, no recovery. */
+    {
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        enc.init(8, 12, k_max_datagram);
+        fec_rx_payload_list got;
+        for (const auto &s : encode(enc, 0, 800, 1000))
+        {
+            deliver(dec, s, &got);
+        }
+        if (!check_tags("lossless", got, 0, 800) || dec.decode_fail() != 0U ||
+            dec.recovered() != 0U)
+        {
+            return 1;
+        }
+    }
+
+    /* A block lost entirely (data and parity) is given up; later ones still come. */
+    {
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        dec.set_clock(clock);
+        enc.init(4, 6, k_max_datagram);
+        const wire_list w = encode(enc, 0, 12); /* 3 blocks of 6 shards */
+        fec_rx_payload_list got;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            if (i < 6 || i >= 12)
             {
-                std::fprintf(stderr, "sdu_base wrap: payload order mismatch at %zu\n", i);
-                return 1;
+                deliver(dec, w[i], &got);
             }
         }
+        now += std::chrono::milliseconds(past_deadline_ms);
+        fec_rx_payload_list tail;
+        dec.poll_rx(&tail);
+        got.insert(got.end(), tail.begin(), tail.end());
+        if (got.size() != 8U || tag_of(got[4]) != 8U || dec.given_up_blocks() != 1U)
+        {
+            std::fprintf(stderr, "lost block: %zu payloads, given up %llu\n", got.size(),
+                         static_cast<unsigned long long>(dec.given_up_blocks()));
+            return 1;
+        }
     }
 
+    /* The data sequence keeps counting across a runtime k/n change. */
     {
-        uint16_t bid = 0;
-        int      idx = 0;
-        int      kk = 0;
-        int      nn = 0;
-        int      sn = 0;
-        uint8_t  good[5] = {0x00, 0x07, 0x23, 0x04, 0x18};
-        if (!rs_block_erasure::unpack_header(good, 5, &bid, &idx, &kk, &nn, &sn) || bid != 7 ||
-            idx != 2 || kk != 4 || nn != 12 || sn != 3)
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        enc.init(4, 6, k_max_datagram);
+        fec_rx_payload_list got;
+        wire_list           w = encode(enc, 0, 6);
+        rs_block_erasure::tx_out tail;
+        enc.flush(&tail);
+        for (const auto &b : tail.shards)
         {
-            std::fprintf(stderr, "header unpack good sample failed\n");
-            return 1;
+            w.emplace_back(b.u8(), b.u8() + b.size());
         }
-        uint8_t bad_cfg[5] = {0x00, 0x07, 0x23, 0x05, 0x18};
-        if (rs_block_erasure::unpack_header(bad_cfg, 5, &bid, &idx, &kk, &nn, &sn))
+        enc.init(3, 5, k_max_datagram);
+        const wire_list more = encode(enc, 6, 6);
+        w.insert(w.end(), more.begin(), more.end());
+        for (size_t i = 0; i < w.size(); i++)
         {
-            std::fprintf(stderr, "header unpack should reject fec_config spare bit\n");
-            return 1;
+            if (i != 7 && i != 13) /* the short block's last data shard, a parity shard */
+            {
+                deliver(dec, w[i], &got);
+            }
         }
-        uint8_t bad_sn[5] = {0x00, 0x07, 0x23, 0x04, 0x19};
-        if (rs_block_erasure::unpack_header(bad_sn, 5, &bid, &idx, &kk, &nn, &sn))
+        if (!check_tags("reinit", got, 0, 12))
         {
-            std::fprintf(stderr, "header unpack should reject fec2 spare bits\n");
             return 1;
         }
     }
 
-    std::printf("rs_fec_test ok (max_orig=%zu)\n", enc.max_original());
+    /* A sender restart far outside the window takes a new reference. */
+    {
+        rs_block_erasure a;
+        rs_block_erasure b;
+        rs_block_erasure dec;
+        a.init(4, 6, k_max_datagram);
+        b.init(4, 6, k_max_datagram);
+        a.set_tx_sequence(100);
+        b.set_tx_sequence(40000);
+        fec_rx_payload_list got;
+        for (const auto &s : encode(a, 0, 8))
+        {
+            deliver(dec, s, &got);
+        }
+        for (const auto &s : encode(b, 8, 8))
+        {
+            deliver(dec, s, &got);
+        }
+        if (!check_tags("restart", got, 0, 16) || dec.new_references() != 1U)
+        {
+            return 1;
+        }
+    }
+
+    /* n == k: data shards only. */
+    {
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        enc.init(5, 5, k_max_datagram);
+        const wire_list w = encode(enc, 0, 20);
+        fec_rx_payload_list got;
+        for (const auto &s : w)
+        {
+            deliver(dec, s, &got);
+        }
+        if (w.size() != 20U || !check_tags("n==k", got, 0, 20))
+        {
+            return 1;
+        }
+    }
+
+    /* u16 sequence wrap: lossless and in order, with recovery across it. */
+    {
+        rs_block_erasure enc;
+        rs_block_erasure dec;
+        enc.init(6, 8, k_max_datagram);
+        enc.set_tx_sequence(65530);
+        const wire_list w = encode(enc, 0, 24);
+        fec_rx_payload_list got;
+        for (size_t i = 0; i < w.size(); i++)
+        {
+            if (i != 8 && i != 9) /* the first two data shards after the wrap */
+            {
+                deliver(dec, w[i], &got);
+            }
+        }
+        if (!check_tags("wrap", got, 0, 24))
+        {
+            return 1;
+        }
+    }
+
+    std::printf("rs_fec_test: ok (%s)\n", rs_block_erasure().impl_name());
     return 0;
 }

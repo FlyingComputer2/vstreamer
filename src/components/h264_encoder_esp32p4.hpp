@@ -49,8 +49,14 @@ private:
     int  codec_open_locked();
     void codec_close_locked();
     int  input_caps_locked(const component_pdu &in);
-    int  encode_locked(const component_pdu &in);
+    int  encode_locked(const component_pdu &in, std::unique_lock<std::mutex> &lock);
 
+    /*
+     * hw_mu_ owns the codec (enc_, param_, the slot pool's lifetime) and is held across an encode;
+     * mu guards the settings, counters and out_q_ and is never held across hardware work, so
+     * configure(), query() and output() do not wait out an encode. Order: hw_mu_, then mu.
+     */
+    std::mutex         hw_mu_;
     mutable std::mutex mu;
 
     bool opened = false;
@@ -64,6 +70,9 @@ private:
     int      qp_min = 20;
     int      qp_max = 51;
     bool     pending_idr = false;
+    /* Settings changed while open, for the encode thread to pass to esp_h264 before the next
+     * frame (k_hw_* bits in the .cpp). */
+    unsigned hw_dirty_ = 0;
     /* true: our frame-level rate control (esp_h264 at a fixed QP, the frame QP set through the
      * non-ROI delta). false: esp_h264's own rate control, which limit-cycles at ~1 s. */
     bool     frame_rc = true;
@@ -91,6 +100,10 @@ private:
             uint8_t *buf = nullptr;
             uint32_t cap = 0;
             bool     free = true;
+            /* Bytes of the last AU handed out from this slot. A consumer that holds an AU alone
+             * may write into it (rtp_h264_pay writes RTP headers in place), leaving dirty cache
+             * lines over the next encode's DMA target; written back before the slot is reused. */
+            uint32_t handed_out = 0;
         };
         std::mutex            mu;
         std::vector<slot>     slots;

@@ -175,10 +175,3 @@ TEST(StreamHeaderTest, RejectV1StyleFecBytes)
     EXPECT_EQ(-EPROTO,
               vstreamer::stream_header_parse(wire, sizeof(wire), &out, &payload, &payload_len));
 }
-
-TEST(StreamHeaderTest, MaxShardAndRawHelpers)
-{
-    EXPECT_EQ(1396U, vstreamer::stream_max_fec_shard(1400));
-    EXPECT_EQ(1396U, vstreamer::stream_max_raw_sdu(1400));
-    EXPECT_EQ(0U, vstreamer::stream_max_fec_shard(3));
-}

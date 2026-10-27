@@ -21,6 +21,7 @@ extern "C"
 {
 #include "esp_h264_alloc.h"
 }
+#include "esp_cache.h"
 #include "esp_h264_enc_single_hw.h"
 #include "esp_timer.h"
 
@@ -47,6 +48,11 @@ constexpr double k_rc_repay_s = 0.5;
 constexpr double k_rc_ema = 0.25;
 constexpr double k_rc_gain = 0.25;
 constexpr int    k_rc_max_step = 1;
+
+/* hw_dirty_ bits. */
+constexpr unsigned k_hw_bitrate = 1U << 0;
+constexpr unsigned k_hw_gop = 1U << 1;
+constexpr unsigned k_hw_fps = 1U << 2;
 
 size_t frame_bytes(int w, int h)
 {
@@ -216,6 +222,7 @@ int h264_encoder_esp32p4::codec_open_locked()
     live_h_ = height;
     reopen_req = false;
     pending_idr = false;
+    hw_dirty_ = 0; /* the new codec was created with the current settings */
     return 0;
 }
 
@@ -307,6 +314,7 @@ int h264_encoder_esp32p4::acquire_out_slot_locked(size_t *index)
 
 int h264_encoder_esp32p4::open()
 {
+    std::lock_guard<std::mutex> hw(hw_mu_);
     std::lock_guard<std::mutex> lock(mu);
     if (opened)
     {
@@ -325,6 +333,7 @@ void h264_encoder_esp32p4::close()
 {
     std::deque<component_pdu> queued;
     {
+        std::lock_guard<std::mutex> hw(hw_mu_);
         std::lock_guard<std::mutex> lock(mu);
         codec_close_locked();
         queued.swap(out_q_);
@@ -390,7 +399,8 @@ void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr)
     rc_qp_ = std::clamp(rc_qp_ + d, qp_min, qp_max);
 }
 
-int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
+/* Called with hw_mu_ and lock (on mu) held; drops mu for the esp_h264 calls. */
+int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_lock<std::mutex> &lock)
 {
     if (reopen_req)
     {
@@ -423,20 +433,57 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     const std::shared_ptr<slot_pool> pool = pool_;
     uint8_t *const                   slot_buf = pool->slots[out_index].buf;
     const uint32_t                   slot_cap = pool->slots[out_index].cap;
+    /* Lines the last AU's consumer dirtied would otherwise be evicted during the encoder's DMA
+     * into this buffer and land on top of the new bitstream. */
+    const uint32_t dirty_bytes = pool->slots[out_index].handed_out;
+    pool->slots[out_index].handed_out = 0;
 
+    /* Everything the hardware calls need, taken under mu; enc_ and param_ stay valid without it
+     * because only hw_mu_ holders open or close the codec. */
     auto *enc = static_cast<esp_h264_enc_handle_t>(enc_);
-    if (pending_idr)
-    {
-        (void)esp_h264_enc_force_idr(static_cast<esp_h264_enc_param_handle_t>(param_));
-        pending_idr = false;
-    }
+    void *const    param_raw = param_;
+    auto *const    param = static_cast<esp_h264_enc_param_handle_t>(param_raw);
+    const bool     force_idr = pending_idr;
+    const unsigned dirty = hw_dirty_;
+    const uint32_t bitrate_now = bitrate;
+    const int      gop_now = gop;
+    const int      fps_now = fps;
+    const bool     frame_rc_now = frame_rc;
+    const int      qp_used = rc_qp_;
+    const int      delta_qp = qp_used - qp_min;
+    pending_idr = false;
+    hw_dirty_ = 0;
+    lock.unlock();
 
-    if (frame_rc)
+    if (dirty_bytes > 0)
+    {
+        (void)esp_cache_msync(slot_buf, dirty_bytes,
+                              ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    }
+    if (0 != (dirty & k_hw_bitrate) && esp_h264_enc_set_bitrate(param, bitrate_now) != ESP_H264_ERR_OK)
+    {
+        std::fprintf(stderr, "h264_encoder_esp32p4: set bitrate %" PRIu32 " failed\n", bitrate_now);
+    }
+    if (0 != (dirty & k_hw_gop) &&
+        esp_h264_enc_set_gop(param, static_cast<uint8_t>(gop_now)) != ESP_H264_ERR_OK)
+    {
+        std::fprintf(stderr, "h264_encoder_esp32p4: set gop %d failed\n", gop_now);
+    }
+    if (0 != (dirty & k_hw_fps) &&
+        esp_h264_enc_set_fps(param, static_cast<uint8_t>(fps_now)) != ESP_H264_ERR_OK)
+    {
+        std::fprintf(stderr, "h264_encoder_esp32p4: set fps %d failed\n", fps_now);
+    }
+    if (force_idr)
+    {
+        (void)esp_h264_enc_force_idr(param);
+    }
+    if (frame_rc_now)
     {
         esp_h264_enc_roi_cfg_t roi {};
         roi.roi_mode = ESP_H264_ROI_MODE_DELTA_QP;
-        roi.none_roi_delta_qp = static_cast<int8_t>(rc_qp_ - qp_min);
-        (void)esp_h264_enc_hw_cfg_roi(static_cast<esp_h264_enc_param_hw_handle_t>(param_), roi);
+        roi.none_roi_delta_qp = static_cast<int8_t>(delta_qp);
+        (void)esp_h264_enc_hw_cfg_roi(static_cast<esp_h264_enc_param_hw_handle_t>(param_raw), roi);
     }
 
     esp_h264_enc_in_frame_t in_frame {};
@@ -451,6 +498,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
     const int64_t t0 = esp_timer_get_time();
     const esp_h264_err_t err = esp_h264_enc_process(enc, &in_frame, &out_frame);
     const int64_t dt = esp_timer_get_time() - t0;
+    lock.lock();
     if (err != ESP_H264_ERR_OK || 0 == out_frame.length || out_frame.length > slot_cap)
     {
         pool->release(out_index);
@@ -473,11 +521,12 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in)
         sum_p_encode_us_ += dt;
         ++p_frames_;
     }
-    if (frame_rc)
+    if (frame_rc_now)
     {
-        rc_qp_sum_ += static_cast<uint64_t>(rc_qp_);
+        rc_qp_sum_ += static_cast<uint64_t>(qp_used);
         rc_update_locked(8.0 * out_frame.length, idr);
     }
+    pool->slots[out_index].handed_out = out_frame.length;
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
     au.sdu = bfc::shared_sized_buffer::adopt(
         reinterpret_cast<std::byte *>(slot_buf), slot_cap, out_frame.length,
@@ -510,7 +559,8 @@ int h264_encoder_esp32p4::input(component_pdu &&in)
     {
         return -EINVAL;
     }
-    std::lock_guard<std::mutex> lock(mu);
+    std::lock_guard<std::mutex>  hw(hw_mu_);
+    std::unique_lock<std::mutex> lock(mu);
     if (!opened)
     {
         return -EBADF;
@@ -532,7 +582,7 @@ int h264_encoder_esp32p4::input(component_pdu &&in)
         entry_ts_us_ = in.ts_us;
         entry_ns_ = steady_mono_ns();
     }
-    return encode_locked(in);
+    return encode_locked(in, lock);
 }
 
 int h264_encoder_esp32p4::output(component_pdu &out)
@@ -551,7 +601,6 @@ int h264_encoder_esp32p4::output(component_pdu &out)
 int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value)
 {
     std::lock_guard<std::mutex> lock(mu);
-    auto *param = static_cast<esp_h264_enc_param_handle_t>(param_);
     int64_t n = 0;
 
     if (key == "size")
@@ -580,13 +629,10 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
             return -EINVAL;
         }
         fps = static_cast<int>(n);
-        if (nullptr != param &&
-            esp_h264_enc_set_fps(param, static_cast<uint8_t>(fps)) != ESP_H264_ERR_OK)
-        {
-            return -EIO;
-        }
+        hw_dirty_ |= opened ? k_hw_fps : 0;
         return 0;
     }
+    /* gop, bitrate and fps reach a live codec from the encode thread before its next frame. */
     if (key == "gop")
     {
         if (parse_int(value, 1, 255, &n) < 0)
@@ -594,11 +640,7 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
             return -EINVAL;
         }
         gop = static_cast<int>(n);
-        if (nullptr != param &&
-            esp_h264_enc_set_gop(param, static_cast<uint8_t>(gop)) != ESP_H264_ERR_OK)
-        {
-            return -EIO;
-        }
+        hw_dirty_ |= opened ? k_hw_gop : 0;
         return 0;
     }
     if (key == "bitrate" || key == "bps")
@@ -608,10 +650,7 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
             return -EINVAL;
         }
         bitrate = static_cast<uint32_t>(n);
-        if (nullptr != param && esp_h264_enc_set_bitrate(param, bitrate) != ESP_H264_ERR_OK)
-        {
-            return -EIO;
-        }
+        hw_dirty_ |= opened ? k_hw_bitrate : 0;
         return 0;
     }
     if (key == "qp_min" || key == "qp_max")

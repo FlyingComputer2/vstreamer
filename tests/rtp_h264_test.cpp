@@ -9,6 +9,7 @@
 #include <bfc/shared_sized_buffer.hpp>
 #include "core/time_util.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -345,6 +346,157 @@ TEST(RtpH264Test, PackAuWith100Nals)
     rtp_h264_depacketizer dep(30);
     const std::vector<uint8_t> out = depack_datagrams(dep, dgrams);
     EXPECT_EQ(au, out);
+}
+
+/* A NAL body full of zero bytes and near-miss start codes (00 00 02, 00 00 00 02, runs of
+ * zeros). No byte 1 anywhere, so no real start code inside it; it ends with a non-zero byte,
+ * since trailing zeros would belong to the next start code. */
+std::vector<uint8_t> near_miss_nal(uint8_t header, int max_len)
+{
+    std::vector<uint8_t> nal {header};
+    const int            len = 1 + std::rand() % max_len;
+    while (static_cast<int>(nal.size()) < len)
+    {
+        switch (std::rand() % 6)
+        {
+        case 0: nal.insert(nal.end(), {0, 0, 2}); break;
+        case 1: nal.insert(nal.end(), {0, 0, 0, 2}); break;
+        case 2: nal.insert(nal.end(), {0, 0, 3, 0}); break;
+        case 3: nal.push_back(0); break;
+        default: nal.push_back(static_cast<uint8_t>(2 + std::rand() % 254)); break;
+        }
+    }
+    nal.push_back(0x80);
+    return nal;
+}
+
+/* The start-code scan skips between zero bytes and must still find exactly the real NAL
+ * boundaries. Each AU also checks the packer's datagram count. */
+TEST(RtpH264Test, RoundTripNalsWithNearMissStartCodes)
+{
+    std::srand(7);
+    for (int round = 0; round < 50; ++round)
+    {
+        std::vector<uint8_t> au;
+        const int            nals = 1 + std::rand() % 6;
+        for (int n = 0; n < nals; ++n)
+        {
+            const std::vector<uint8_t> nal = near_miss_nal(n == 0 ? 0x65 : 0x41, 3000);
+            append_nal(&au, nal.data(), nal.size());
+        }
+        rtp_h264_config cfg;
+        cfg.mtu = 1400;
+        rtp_h264_packer packer(cfg);
+        const size_t    counted = packer.count_annexb_rtp_datagrams(au.data(), au.size(), 1000);
+        const auto      dgrams = pack_au(au, 1400);
+        EXPECT_EQ(counted, dgrams.size()) << "round " << round;
+
+        rtp_h264_depacketizer      dep(30);
+        const std::vector<uint8_t> out = depack_datagrams(dep, dgrams);
+        EXPECT_EQ(au, out) << "round " << round;
+    }
+}
+
+/* rtp_h264_pay writes headers into the AU in place when it holds the only reference, and copies
+ * when a consumer still holds earlier datagrams; datagrams a consumer keeps must never change
+ * afterwards. Either way its datagrams must match the
+ * packer's after the RTP header (seq, timestamp and capture time differ by construction), keep
+ * the marker and payload type, number seq consecutively, and reassemble to the original AUs,
+ * including a cached SPS/PPS injected in front of an IDR that lacks them. */
+TEST(RtpH264Test, PayInPlaceAndCopiedMatchPacker)
+{
+    for (const bool retain : {false, true})
+    {
+        std::srand(11);
+        vstreamer::rtp_h264_pay pay;
+        ASSERT_EQ(0, pay.open());
+        ASSERT_EQ(0, pay.input(vstreamer::test_pdu::make_h264_coded_caps(64, 64)));
+        rtp_h264_config cfg;
+        cfg.mtu = 1400;
+        rtp_h264_packer packer(cfg);
+        rtp_h264_depacketizer dep(30);
+        std::vector<vstreamer::component_pdu> held;
+        std::vector<std::vector<uint8_t>>     held_bytes; /* each held datagram when emitted */
+        int                                   last_seq = -1;
+        std::vector<uint8_t>                  params; /* last SPS+PPS, as Annex-B */
+        for (int round = 0; round < 30; ++round)
+        {
+            std::vector<uint8_t> au;
+            const int            kind = round % 3; /* 0: SPS+PPS+IDR, 1: IDR only, 2: P */
+            if (0 == kind)
+            {
+                const std::vector<uint8_t> sps = near_miss_nal(0x67, 40);
+                const std::vector<uint8_t> pps = near_miss_nal(0x68, 10);
+                append_nal(&au, sps.data(), sps.size());
+                append_nal(&au, pps.data(), pps.size());
+                params = au;
+            }
+            const int nals = 1 + std::rand() % 3;
+            for (int n = 0; n < nals; ++n)
+            {
+                const std::vector<uint8_t> nal = near_miss_nal(2 == kind ? 0x41 : 0x65, 5000);
+                append_nal(&au, nal.data(), nal.size());
+            }
+            ASSERT_EQ(0, packer.pack_annexb(au.data(), au.size(), round, 1));
+            ASSERT_EQ(0, pay.input(vstreamer::test_pdu::make_h264_au(
+                             au.data(), au.size(), 1000000 + 33333ULL * round)));
+
+            std::vector<std::vector<uint8_t>> got;
+            vstreamer::component_pdu          out;
+            while (0 == pay.output(out))
+            {
+                got.emplace_back(out.sdu.u8(), out.sdu.u8() + out.sdu.size());
+                if (retain)
+                {
+                    held.push_back(out);
+                    held_bytes.push_back(got.back());
+                }
+            }
+            uint8_t buf[2048];
+            size_t  i = 0;
+            for (; packer.pending(); ++i)
+            {
+                const int n = packer.pop_datagram(buf, sizeof(buf));
+                ASSERT_GT(n, 28) << "round " << round;
+                ASSERT_LT(i, got.size()) << "round " << round;
+                const std::vector<uint8_t> &g = got[i];
+                ASSERT_EQ(static_cast<size_t>(n), g.size()) << "round " << round << " dgram " << i;
+                EXPECT_EQ(buf[0], g[0]);
+                EXPECT_EQ(buf[1], g[1]) << "marker/pt, round " << round << " dgram " << i;
+                EXPECT_TRUE(std::equal(buf + 28, buf + n, g.begin() + 28))
+                    << "round " << round << " dgram " << i;
+                const int seq = (g[2] << 8) | g[3];
+                if (last_seq >= 0)
+                {
+                    EXPECT_EQ((last_seq + 1) & 0xffff, seq);
+                }
+                last_seq = seq;
+            }
+            EXPECT_EQ(i, got.size()) << "round " << round;
+            /* An IDR without SPS/PPS goes out behind the cached ones. */
+            std::vector<uint8_t> expect = 1 == kind ? params : std::vector<uint8_t> {};
+            expect.insert(expect.end(), au.begin(), au.end());
+            EXPECT_EQ(expect, depack_datagrams(dep, got)) << "round " << round;
+        }
+        std::string in_place;
+        std::string copied;
+        ASSERT_EQ(0, pay.query("datagrams_in_place", &in_place));
+        ASSERT_EQ(0, pay.query("datagrams_copied", &copied));
+        /* Later in-place headers must never have written into a datagram a consumer holds. */
+        for (size_t h = 0; h < held.size(); ++h)
+        {
+            const auto &sdu = held[h].sdu;
+            EXPECT_TRUE(std::equal(sdu.u8(), sdu.u8() + sdu.size(), held_bytes[h].begin(),
+                                   held_bytes[h].end()))
+                << "held datagram " << h;
+        }
+        EXPECT_NE("0", in_place);
+        if (retain)
+        {
+            EXPECT_NE("0", copied);
+        }
+        pay.close();
+    }
 }
 
 TEST(RtpH264Test, PayLargeIdrThenAcceptsNextAu)

@@ -685,7 +685,7 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
     EXPECT_EQ(cnt.udp_gap_count, cnt.fec_gap_count);
     EXPECT_EQ(cnt.udp_packet_received, cnt.fec_packet_received);
     EXPECT_EQ(cnt.fec_packet_received * 64, cnt.fec_bytes_received);
-    EXPECT_EQ(cnt.udp_packet_received * (64 + vstreamer::k_stream_header_len),
+    EXPECT_EQ(cnt.udp_packet_received * (64 + vstreamer::rs_block_erasure::k_data_header_len),
               cnt.udp_bytes_received);
 
     sender.close();
@@ -756,7 +756,7 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     std::string max_in_s;
     ASSERT_EQ(0, sender.query("max_input", &max_in_s));
     const size_t max_in = static_cast<size_t>(std::strtoull(max_in_s.c_str(), nullptr, 10));
-    EXPECT_EQ(1472U, max_in);
+    EXPECT_EQ(1470U, max_in);
 
     auto send_and_expect = [&](size_t payload_len, uint32_t tag) {
         std::vector<uint8_t> storage(payload_len);

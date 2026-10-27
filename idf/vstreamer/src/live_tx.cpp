@@ -20,6 +20,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -117,16 +119,18 @@ private:
 /* Per-caller window for sys_stats_line(), so the stats print and the mplane do not share one. */
 struct cpu_window
 {
+    /* Keyed by task number: names repeat (every pthread is "pthread"). */
     struct prev_t
     {
-        std::string name;
+        UBaseType_t num;
         uint32_t    rt;
     };
     std::vector<prev_t> prev;
     int64_t             prev_us = 0;
 };
 
-/* CPU per task since the previous call on w (percent of one core), then heap headroom. */
+/* CPU per task name since the previous call on w (percent of one core; tasks sharing a name
+ * are summed), then heap headroom. */
 std::string sys_stats_line(cpu_window *w)
 {
     using prev_t = cpu_window::prev_t;
@@ -138,26 +142,41 @@ std::string sys_stats_line(cpu_window *w)
     const UBaseType_t got = uxTaskGetSystemState(st.data(), n, &total);
     const int64_t     now = esp_timer_get_time();
     const double      dt = prev_us > 0 ? static_cast<double>(now - prev_us) : 0;
-    std::string       line;
     std::vector<prev_t> cur;
+    std::vector<std::pair<std::string, double>> by_name;
     for (UBaseType_t i = 0; i < got; ++i)
     {
-        const std::string name = st[i].pcTaskName;
-        const uint32_t    rt = st[i].ulRunTimeCounter;
-        cur.push_back({name, rt});
+        const UBaseType_t num = st[i].xTaskNumber;
+        const uint32_t    rt = static_cast<uint32_t>(st[i].ulRunTimeCounter);
+        cur.push_back({num, rt});
         for (const auto &p : prev)
         {
-            if (p.name == name && dt > 0)
+            if (p.num == num && dt > 0)
             {
                 const double pct = 100.0 * static_cast<uint32_t>(rt - p.rt) / dt;
-                if (pct >= 0.5 || 0 == name.rfind("IDLE", 0))
+                const std::string name = st[i].pcTaskName;
+                auto it = std::find_if(by_name.begin(), by_name.end(),
+                                       [&](const auto &e) { return e.first == name; });
+                if (it == by_name.end())
                 {
-                    char buf[64];
-                    std::snprintf(buf, sizeof(buf), " %s=%.1f%%", name.c_str(), pct);
-                    line += buf;
+                    by_name.emplace_back(name, pct);
+                }
+                else
+                {
+                    it->second += pct;
                 }
                 break;
             }
+        }
+    }
+    std::string line;
+    for (const auto &[name, pct] : by_name)
+    {
+        if (pct >= 0.5 || 0 == name.rfind("IDLE", 0))
+        {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), " %s=%.1f%%", name.c_str(), pct);
+            line += buf;
         }
     }
     prev = std::move(cur);
@@ -180,14 +199,31 @@ void print_sys_stats()
 }
 #endif
 
+/* TX thread time per stats interval: payloader calls, stream_sender input (FEC encode and
+ * queueing) and how often the sender pushed back. */
+std::atomic<int64_t>  g_pay_us {0};
+std::atomic<int64_t>  g_snd_us {0};
+std::atomic<uint64_t> g_snd_calls {0};
+std::atomic<uint64_t> g_snd_eagain {0};
+
 void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_sink *sender)
 {
     vstreamer::component_pdu out;
-    while (pay->output(out) == 0)
+    for (;;)
     {
+        const int64_t t_pay = esp_timer_get_time();
+        const int     pr = pay->output(out);
+        g_pay_us.fetch_add(esp_timer_get_time() - t_pay, std::memory_order_relaxed);
+        if (pr != 0)
+        {
+            break;
+        }
         while (true)
         {
-            const int r = sender->input(std::move(out));
+            const int64_t t_snd = esp_timer_get_time();
+            const int     r = sender->input(std::move(out));
+            g_snd_us.fetch_add(esp_timer_get_time() - t_snd, std::memory_order_relaxed);
+            g_snd_calls.fetch_add(1, std::memory_order_relaxed);
             if (0 == r)
             {
                 break;
@@ -197,6 +233,7 @@ void drain_pay_to_sender(vstreamer::component_coder *pay, vstreamer::component_s
                 std::printf("stream_sender input failed: %d\n", r);
                 return;
             }
+            g_snd_eagain.fetch_add(1, std::memory_order_relaxed);
             vTaskDelay(1);
         }
     }
@@ -249,7 +286,9 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
     for (;;)
     {
         drain_pay_to_sender(pay, sender);
-        const int r = pay->input(std::move(out));
+        const int64_t t_pay = esp_timer_get_time();
+        const int     r = pay->input(std::move(out));
+        g_pay_us.fetch_add(esp_timer_get_time() - t_pay, std::memory_order_relaxed);
         if (0 == r)
         {
             break;
@@ -404,6 +443,11 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         run_forever ? INT64_MAX : esp_timer_get_time() + k_seconds * 1000000LL;
     int64_t       last_stats_us = esp_timer_get_time();
     uint64_t      last_enc_frames = 0;
+    int64_t       last_enc_us = last_stats_us;
+    uint64_t      last_frames = 0;
+    uint64_t      last_bytes = 0;
+    uint64_t      last_fec_us = 0;
+    uint64_t      last_kern_us = 0;
 
     auto tx_fn = [&]() {
         while (!stop.load(std::memory_order_acquire))
@@ -446,26 +490,34 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             const int64_t  now_us = esp_timer_get_time();
             const double   stat_dt = (now_us - last_stats_us) / 1e6;
             last_stats_us = now_us;
+            /* Snapshot before the queries below: they can wait on the encoder. fps and kbps
+             * cover this interval; the totals since start are in "live TX done". */
+            const uint64_t f = frames.load(std::memory_order_relaxed);
+            const uint64_t b = bytes.load(std::memory_order_relaxed);
+            const double   win_fps = stat_dt > 0 ? (f - last_frames) / stat_dt : 0.0;
+            const double   win_kbps = stat_dt > 0 ? (b - last_bytes) * 8 / stat_dt / 1000 : 0.0;
+            last_frames = f;
+            last_bytes = b;
             std::string isp_stats;
             std::string snd_stats;
             std::string enc_frames_s;
             src->query("stats", &isp_stats);
             snd->query("stats", &snd_stats);
             (void)src->query("enc_frames", &enc_frames_s);
+            /* Timed on its own: the query returns after the encoder lets go of its mutex. */
+            const int64_t enc_us = esp_timer_get_time();
+            const double  enc_dt = (enc_us - last_enc_us) / 1e6;
+            last_enc_us = enc_us;
             uint64_t enc_total = 0;
             if (!enc_frames_s.empty())
             {
                 enc_total = std::strtoull(enc_frames_s.c_str(), nullptr, 10);
             }
             const double enc_fps =
-                stat_dt > 0 && enc_total >= last_enc_frames
-                    ? static_cast<double>(enc_total - last_enc_frames) / stat_dt
+                enc_dt > 0 && enc_total >= last_enc_frames
+                    ? static_cast<double>(enc_total - last_enc_frames) / enc_dt
                     : 0.0;
             last_enc_frames = enc_total;
-            const int64_t  t0 = t0_us.load(std::memory_order_relaxed);
-            const double   sec = t0 > 0 ? (esp_timer_get_time() - t0) / 1e6 : 0;
-            const uint64_t f = frames.load(std::memory_order_relaxed);
-            const uint64_t b = bytes.load(std::memory_order_relaxed);
             const int64_t age_n = g_age_n.exchange(0);
             const int64_t age_sum = g_age_sum_us.exchange(0);
             const int64_t age_max = g_age_max_us.exchange(0);
@@ -474,11 +526,30 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             std::string node_lat;
             (void)src->query("latency_ms", &lat);
             (void)src->query("node_latency_ms", &node_lat);
+            std::string fec_us_s;
+            (void)snd->query("fec_push_us", &fec_us_s);
+            const uint64_t fec_us_total = std::strtoull(fec_us_s.c_str(), nullptr, 10);
+            const uint64_t fec_us = fec_us_total - last_fec_us;
+            last_fec_us = fec_us_total;
+            std::string kern_s;
+            (void)snd->query("fec_kernel_us", &kern_s);
+            const uint64_t kern_total = std::strtoull(kern_s.c_str(), nullptr, 10);
+            const uint64_t kern_us = kern_total - last_kern_us;
+            last_kern_us = kern_total;
+            const int64_t  pay_us = g_pay_us.exchange(0);
+            const int64_t  snd_us = g_snd_us.exchange(0);
+            const uint64_t snd_calls = g_snd_calls.exchange(0);
+            const uint64_t snd_eagain = g_snd_eagain.exchange(0);
             std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f) "
-                        "latency_ms=%s node_latency_ms=%s; isp %s; snd %s\n",
-                        sec > 0 ? f / sec : 0.0, enc_fps, sec > 0 ? b * 8 / sec / 1000 : 0.0,
+                        "latency_ms=%s node_latency_ms=%s; tx pay=%.1f%% snd=%.1f%% fec=%.1f%% kernel=%.1f%% "
+                        "snd_calls=%" PRIu64 " snd_eagain=%" PRIu64 "; isp %s; snd %s\n",
+                        win_fps, enc_fps, win_kbps,
                         age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
                         age_n > 0 ? age_in / 1000.0 / age_n : 0.0, lat.c_str(), node_lat.c_str(),
+                        stat_dt > 0 ? pay_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? snd_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? fec_us / (stat_dt * 1e4) : 0.0,
+                        stat_dt > 0 ? kern_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
                         isp_stats.c_str(), snd_stats.c_str());
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
             print_sys_stats();

@@ -55,12 +55,20 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
     }
 }
 
-void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count)
+/* Post-FEC gaps are data shards given up; parity never seen is wire loss on top of the data
+ * sequence gaps. */
+void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count,
+                          std::atomic<uint64_t> &udp_gap_count)
 {
     const uint64_t n = fec.take_fail_lost_app_pkts();
     if (n > 0)
     {
         fec_gap_count.fetch_add(n, std::memory_order_relaxed);
+    }
+    const uint64_t parity = fec.take_missing_parity();
+    if (parity > 0)
+    {
+        udp_gap_count.fetch_add(parity, std::memory_order_relaxed);
     }
     (void)fec.take_fail_missing_shards();
     (void)fec.take_decode_fail();
@@ -73,15 +81,6 @@ namespace vstreamer
 
 namespace
 {
-
-size_t max_decoded_app_bytes_from_shard(size_t shard_max)
-{
-    if (shard_max <= rs_block_erasure::k_header_len + rs_block_erasure::k_len_prefix)
-    {
-        return 0;
-    }
-    return shard_max - rs_block_erasure::k_header_len - rs_block_erasure::k_len_prefix;
-}
 
 uint64_t monotonic_timestamp_us()
 {
@@ -197,7 +196,8 @@ void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads, size_t max
     payloads->clear();
 }
 
-bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
+bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len,
+                                      const bfc::shared_sized_buffer *owner)
 {
     fec_rx_payload_list payloads;
     bool                valid_media = false;
@@ -211,82 +211,54 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len)
             return false;
         }
 
-        stream_header hdr {};
-        const uint8_t *payload = nullptr;
-        size_t         payload_len = 0;
-        if (stream_header_parse(data, len, &hdr, &payload, &payload_len) < 0)
+        rs_block_erasure::shard_header hdr;
+        if (!rs_block_erasure::parse_header(data, len, &hdr))
         {
             recv_dropped++;
             rx_bad_header++;
             return false;
         }
-
-        if (!hdr.is_stream_data)
+        if (hdr.is_data)
         {
-            recv_dropped++;
-            rx_bad_header++;
-            return false;
-        }
-
-        const uint64_t dg = note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
-        if (dg > 0)
-        {
-            udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
-            discont_next_ = true;
+            if (0 == cached_max_app || len - hdr.header_len > cached_max_app)
+            {
+                recv_dropped++;
+                return false;
+            }
+            /* Data shards carry the only sequence on the wire; parity loss is counted per
+             * block by the decoder. */
+            const uint64_t dg =
+                note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
+            if (dg > 0)
+            {
+                udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
+                discont_next_ = true;
+            }
         }
         udp_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
 
-        const size_t shard_max = cached_max_fec_shard;
-
-        if (hdr.is_fec)
+        bfc::shared_sized_buffer shard;
+        if (nullptr != owner)
         {
-            if (payload_len < rs_block_erasure::k_header_len || 0 == shard_max ||
-                payload_len > shard_max)
-            {
-                recv_dropped++;
-                rx_bad_header++;
-                return false;
-            }
-            bfc::shared_sized_buffer shard = pool.acquire(payload_len);
-            if (0 == shard.capacity() || shard.size() != payload_len)
-            {
-                recv_dropped++;
-                return false;
-            }
-            std::memcpy(shard.u8(), payload, payload_len);
-            const uint64_t hdr_errors_before = fec.hdr_errors();
-            fec.push_air(std::move(shard), &payloads);
-            note_fec_output_gaps(fec, fec_gap_count);
-            fec_rec = fec.recovered();
-            fec_lost = fec.decode_fail();
-            valid_media = fec.hdr_errors() == hdr_errors_before;
-            enqueue_app_max = cached_max_decoded_app;
+            shard = owner->subview(static_cast<size_t>(data - owner->u8()), len);
         }
         else
         {
-            /* Raw path (fec none): one SDU per datagram; wire loss is payload loss too. */
-            if (0 == cached_max_raw_sdu || payload_len > cached_max_raw_sdu)
+            shard = pool.acquire(len);
+            if (0 == shard.capacity() || shard.size() != len)
             {
                 recv_dropped++;
                 return false;
             }
-            bfc::shared_sized_buffer sdu = pool.acquire(payload_len);
-            if (0 == sdu.capacity() || sdu.size() != payload_len)
-            {
-                recv_dropped++;
-                return false;
-            }
-            std::memcpy(sdu.u8(), payload, payload_len);
-            payloads.push_back(std::move(sdu));
-            if (dg > 0)
-            {
-                /* Without FEC, a UDP gap is an SDU gap (mode switches may miscount slightly). */
-                fec_gap_count.fetch_add(dg, std::memory_order_relaxed);
-            }
-            valid_media = true;
-            enqueue_app_max = cached_max_raw_sdu;
+            std::memcpy(shard.u8(), data, len);
         }
+        fec.push_air(std::move(shard), &payloads);
+        note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
+        fec_rec = fec.recovered();
+        fec_lost = fec.decode_fail();
+        valid_media = true;
+        enqueue_app_max = cached_max_app;
         account_payloads_locked(payloads, enqueue_app_max);
     }
     if (!payloads.empty() && enqueue_app_max > 0)
@@ -334,6 +306,8 @@ void stream_receiver::recv_thread_main()
     socklen_t     peer_len = 0;
     bool          have_peer = false;
     auto          next_report = std::chrono::steady_clock::now();
+    /* Set before open() and kept while open. */
+    const bool direct = static_cast<bool>(dgram_receive);
     while (!recv_stop)
     {
         int fd = -1;
@@ -341,16 +315,32 @@ void stream_receiver::recv_thread_main()
             std::lock_guard<std::mutex> lock(mu);
             fd = recv_fd;
         }
-        if (fd < 0)
+        if (fd < 0 && !direct)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
 
+        if (direct)
+        {
+            /* A bounded drain, so deadlines and reports go on under a steady producer. */
+            for (int burst = 0; burst < 64; burst++)
+            {
+                auto dgram = dgram_receive();
+                if (!dgram)
+                {
+                    break;
+                }
+                if (ingest_datagram(dgram->u8(), dgram->size(), &*dgram))
+                {
+                    have_peer = true;
+                }
+            }
+        }
         pollfd pfd {};
         pfd.fd = fd;
         pfd.events = POLLIN;
-        const int pr = poll(&pfd, 1, k_poll_ms);
+        const int pr = direct ? 0 : poll(&pfd, 1, k_poll_ms);
         if (recv_stop)
         {
             break;
@@ -437,8 +427,9 @@ void stream_receiver::recv_thread_main()
             stream_link_report_encode_payload(rep, wire + k_stream_header_len,
                                               k_stream_link_report_payload_len);
             const ssize_t sent =
-                sendto(fd, wire, sizeof(wire), MSG_DONTWAIT,
-                       reinterpret_cast<sockaddr *>(&peer_addr), peer_len);
+                direct ? (dgram_send(wire, sizeof(wire)) ? static_cast<ssize_t>(sizeof(wire)) : -1)
+                       : sendto(fd, wire, sizeof(wire), MSG_DONTWAIT,
+                                reinterpret_cast<sockaddr *>(&peer_addr), peer_len);
             if (sent == static_cast<ssize_t>(sizeof(wire)))
             {
                 telemetry_sent.fetch_add(1, std::memory_order_relaxed);
@@ -460,14 +451,18 @@ void stream_receiver::recv_thread_main()
         {
             std::lock_guard<std::mutex> lock(mu);
             fec.poll_rx(&payloads);
-            note_fec_output_gaps(fec, fec_gap_count);
+            note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
             fec_lost = fec.decode_fail();
-            decoded_max = cached_max_decoded_app;
+            decoded_max = cached_max_app;
             account_payloads_locked(payloads, decoded_max);
         }
         if (!payloads.empty() && decoded_max > 0)
         {
             enqueue_payloads(&payloads, decoded_max);
+        }
+        if (direct)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     }
 }
@@ -491,64 +486,70 @@ stream_link_report stream_receiver::link_report_snapshot() const
 int stream_receiver::open()
 {
     std::string spec_copy;
+    bool        direct = false;
     {
         std::lock_guard<std::mutex> lock(mu);
         if (opened)
         {
             return 0;
         }
-        if (listen_spec.empty())
+        direct = static_cast<bool>(dgram_receive);
+        if (listen_spec.empty() && !direct)
         {
             return -EINVAL;
         }
         spec_copy = listen_spec;
     }
 
-    char host[128];
+    char host[128] = "";
     int  port = 0;
-    if (parse_host_port(spec_copy, host, sizeof(host), &port) < 0)
+    int  fd = -1;
+    if (!direct)
     {
-        if (spec_copy.size() > 0 && spec_copy[0] == ':')
+        if (parse_host_port(spec_copy, host, sizeof(host), &port) < 0)
         {
-            std::string p = "0";
-            p += spec_copy;
-            if (parse_host_port(p, host, sizeof(host), &port) < 0)
+            if (spec_copy.size() > 0 && spec_copy[0] == ':')
+            {
+                std::string p = "0";
+                p += spec_copy;
+                if (parse_host_port(p, host, sizeof(host), &port) < 0)
+                {
+                    return -EINVAL;
+                }
+            }
+            else
             {
                 return -EINVAL;
             }
         }
-        else
+
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0)
         {
+            return -errno;
+        }
+
+        sockaddr_in addr {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(port));
+        if (resolve_ipv4_bind_addr(host, true, &addr.sin_addr) < 0)
+        {
+            ::close(fd);
             return -EINVAL;
         }
-    }
 
-    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0)
-    {
-        return -errno;
-    }
+        if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
+        {
+            const int err = errno;
+            std::fprintf(stderr, "stream_receiver: bind %s:%d failed: %s\n", host, port,
+                         std::strerror(err));
+            ::close(fd);
+            return -err;
+        }
 
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (resolve_ipv4_bind_addr(host, true, &addr.sin_addr) < 0)
-    {
-        ::close(fd);
-        return -EINVAL;
+        constexpr int k_sock_buf = 16 * 1024 * 1024;
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
     }
-
-    if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
-    {
-        const int err = errno;
-        std::fprintf(stderr, "stream_receiver: bind %s:%d failed: %s\n", host, port,
-                     std::strerror(err));
-        ::close(fd);
-        return -err;
-    }
-
-    constexpr int k_sock_buf = 16 * 1024 * 1024;
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &k_sock_buf, sizeof(k_sock_buf));
 
     uint32_t new_session = 0;
     {
@@ -567,7 +568,10 @@ int stream_receiver::open()
         std::lock_guard<std::mutex> lock(mu);
         if (opened)
         {
-            ::close(fd);
+            if (fd >= 0)
+            {
+                ::close(fd);
+            }
             return 0;
         }
         recv_fd = fd;
@@ -590,9 +594,7 @@ int stream_receiver::open()
         have_udp_seq = false;
         discont_next_ = false;
         rx_bad_header = 0;
-        cached_max_fec_shard = stream_max_fec_shard(static_cast<size_t>(max_datagram));
-        cached_max_decoded_app = max_decoded_app_bytes_from_shard(cached_max_fec_shard);
-        cached_max_raw_sdu = stream_max_raw_sdu(static_cast<size_t>(max_datagram));
+        cached_max_app = rs_block_erasure::max_data_payload(static_cast<size_t>(max_datagram));
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
@@ -605,7 +607,30 @@ int stream_receiver::open()
         stopping = false;
     }
 
-    std::fprintf(stderr, "stream_receiver: listen %s:%d\n", host, port);
+    if (direct)
+    {
+        std::fprintf(stderr, "stream_receiver: in-process datagrams\n");
+    }
+    else
+    {
+        std::fprintf(stderr, "stream_receiver: listen %s:%d\n", host, port);
+    }
+    return 0;
+}
+
+int stream_receiver::set_datagram_transport(datagram_receive receive, datagram_send send)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (opened)
+    {
+        return -EBUSY;
+    }
+    if (!receive || !send)
+    {
+        return -EINVAL;
+    }
+    dgram_receive = std::move(receive);
+    dgram_send = std::move(send);
     return 0;
 }
 
@@ -626,6 +651,8 @@ void stream_receiver::close()
         ::close(recv_fd);
         recv_fd = -1;
     }
+    /* Release the datagrams the decoder still holds (they may belong to the transport). */
+    fec.reset_rx();
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);

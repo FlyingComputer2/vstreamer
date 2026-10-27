@@ -264,7 +264,7 @@ int esp32_h264_isp_ng_src::configure(std::string_view key, std::string_view valu
     }
     if (encoder_key(key))
     {
-        // Encoder control can wait for hardware; leave output() free to run.
+        // Encoder control takes the encoder's own lock; leave output() free to run.
         lock.unlock();
         return encoder_->configure(key, value);
     }

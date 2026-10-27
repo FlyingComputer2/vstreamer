@@ -24,6 +24,21 @@ namespace
 {
 using namespace vstreamer;
 
+/* A data shard's sequence and payload; false for parity or a bad header. */
+bool data_payload(const bfc::shared_sized_buffer &wire, uint16_t *seq, const uint8_t **payload,
+                  size_t *len)
+{
+    rs_block_erasure::shard_header h;
+    if (!rs_block_erasure::parse_header(wire.u8(), wire.size(), &h) || !h.is_data)
+    {
+        return false;
+    }
+    *seq = h.sequence_number;
+    *payload = wire.u8() + h.header_len;
+    *len = wire.size() - h.header_len;
+    return true;
+}
+
 class QueueTransportTest : public ::testing::Test
 {
    protected:
@@ -200,20 +215,17 @@ TEST_F(QueueTransportTest, RawPacketsPreservePayloadAndWireSequence)
         ASSERT_EQ(0, sender.input(std::move(pdu)));
         auto wire = next_wire();
         ASSERT_TRUE(wire);
-        stream_header hdr{};
+        uint16_t seq = 0;
         const uint8_t *payload = nullptr;
         size_t len = 0;
-        ASSERT_EQ(0, stream_header_parse(wire->u8(), wire->size(), &hdr,
-                                         &payload, &len));
-        EXPECT_TRUE(hdr.is_stream_data);
-        EXPECT_FALSE(hdr.is_fec);
+        ASSERT_TRUE(data_payload(*wire, &seq, &payload, &len));
         ASSERT_EQ(expected.size(), len);
         EXPECT_EQ(0, std::memcmp(expected.u8(), payload, len));
         if (tag > 1)
         {
-            EXPECT_EQ(static_cast<uint16_t>(previous + 1), hdr.sequence_number);
+            EXPECT_EQ(static_cast<uint16_t>(previous + 1), seq);
         }
-        previous = hdr.sequence_number;
+        previous = seq;
     }
     const auto until =
         std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -221,7 +233,7 @@ TEST_F(QueueTransportTest, RawPacketsPreservePayloadAndWireSequence)
            std::chrono::steady_clock::now() < until)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_EQ(4u, vstreamer::test_query::tuple(sender, "pkt_sent").first);
-    EXPECT_EQ(4u * (64u + k_stream_header_len),
+    EXPECT_EQ(4u * (64u + rs_block_erasure::k_data_header_len),
               vstreamer::test_query::tuple(sender, "byt_sent").first);
     for (auto key : {"udp_transport", "queue_transport_tx",
                      "queue_transport_rx", "reactor"})
@@ -250,11 +262,10 @@ TEST_F(QueueTransportTest, QueueOverflowRetainsNewestWirePackets)
     {
         auto wire = tx->pop();
         ASSERT_TRUE(wire);
-        stream_header hdr{};
+        uint16_t seq = 0;
         const uint8_t *payload = nullptr;
         size_t len = 0;
-        ASSERT_EQ(0, stream_header_parse(wire->u8(), wire->size(), &hdr,
-                                         &payload, &len));
+        ASSERT_TRUE(data_payload(*wire, &seq, &payload, &len));
         EXPECT_EQ(tag, test_pdu::stream_dgram_counter_be32(payload, len));
     }
 }
@@ -305,12 +316,10 @@ TEST_F(QueueTransportTest, TxPushWakesRegisteredConsumer)
                 return;
             while (auto wire = queue->pop())
             {
-                stream_header hdr{};
+                uint16_t seq = 0;
                 const uint8_t *payload = nullptr;
                 size_t len = 0;
-                if (!state->complete &&
-                    stream_header_parse(wire->u8(), wire->size(), &hdr,
-                                        &payload, &len) == 0)
+                if (!state->complete && data_payload(*wire, &seq, &payload, &len))
                 {
                     state->complete = true;
                     state->received.set_value(
@@ -379,7 +388,6 @@ TEST_F(QueueTransportTest, FecWirePacketsRecoverLostShard)
     ASSERT_EQ(0, sender.configure("fec", "block"));
     ASSERT_EQ(0, sender.configure("fec_k", "3"));
     ASSERT_EQ(0, sender.configure("fec_n", "4"));
-    ASSERT_EQ(0, sender.configure("fec_timeout_ms", "1000"));
     ASSERT_EQ(0, sender.open());
     for (uint32_t tag = 1; tag <= 3; ++tag)
         ASSERT_EQ(0, sender.input(test_pdu::make_stream_dgram(tag, 64)));
@@ -389,17 +397,14 @@ TEST_F(QueueTransportTest, FecWirePacketsRecoverLostShard)
     {
         auto wire = next_wire();
         ASSERT_TRUE(wire);
-        stream_header hdr{};
-        const uint8_t *payload = nullptr;
-        size_t len = 0;
-        ASSERT_EQ(0, stream_header_parse(wire->u8(), wire->size(), &hdr,
-                                         &payload, &len));
-        ASSERT_TRUE(hdr.is_fec);
+        rs_block_erasure::shard_header h;
+        ASSERT_TRUE(rs_block_erasure::parse_header(wire->u8(), wire->size(), &h));
+        EXPECT_EQ(i < 3, h.is_data);
         // Lose an actual on-wire data shard and reconstruct it using parity.
         if (i != 1)
         {
             fec_rx_payload_list step;
-            decoder.push_air(payload, len, &step);
+            decoder.push_air(wire->u8(), wire->size(), &step);
             decoded.insert(decoded.end(), std::make_move_iterator(step.begin()),
                            std::make_move_iterator(step.end()));
         }

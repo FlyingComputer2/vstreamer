@@ -1,4 +1,4 @@
-/* rs_block_erasure receive side: sequencer, spread estimate and deadlines (see the header). */
+/* rs_block_erasure receive side: in-order release, block decode, spread estimate and give-up. */
 #include "core/rs_block_erasure.hpp"
 
 #include <algorithm>
@@ -11,11 +11,6 @@ namespace
 
 using vstreamer::rs_block_erasure;
 using clock_type = std::chrono::steady_clock;
-
-uint16_t load_be16(const uint8_t* p)
-{
-    return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
-}
 
 double median(std::vector<double>* v)
 {
@@ -30,6 +25,31 @@ double median(std::vector<double>* v)
     return 0.5 * (lo + hi);
 }
 
+std::chrono::nanoseconds seconds_ns(double s)
+{
+    return std::chrono::nanoseconds(static_cast<int64_t>(s * 1e9));
+}
+
+double seconds(clock_type::duration d)
+{
+    return std::chrono::duration<double>(d).count();
+}
+
+/* How far past a block's data the receiver looks for the next received data shard. */
+constexpr int k_close_scan = 64;
+
+/*
+ * When the last parity of a block is due, after its close. The sender releases parity row j of a
+ * block of c = k_total + n shards at max(close + j*g, first + (k_total + j)*g), g = spread / c
+ * (stream_sender), so a block that filled in a burst sends its parity over about the whole
+ * spread, and one that filled slowly sends it right after the close.
+ */
+double last_parity_after_close(double fill_s, int k_total, int n, double spread_s)
+{
+    const double g = spread_s / static_cast<double>(k_total + n);
+    return std::max(g * (n - 1), g * (k_total + n - 1) - fill_s);
+}
+
 }  // namespace
 
 std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::now() const
@@ -37,110 +57,22 @@ std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::now() const
     return clock ? clock() : clock_type::now();
 }
 
-int vstreamer::rs_block_erasure::ring_dist(uint16_t a, uint16_t b)
+int vstreamer::rs_block_erasure::seq_dist(uint16_t a, uint16_t b)
 {
     return static_cast<int>(static_cast<int16_t>(static_cast<uint16_t>(a - b)));
 }
 
-int vstreamer::rs_block_erasure::dist_from_emit(uint16_t sdu_base) const
+vstreamer::rs_block_erasure::rx_slot* vstreamer::rs_block_erasure::slot_for(uint16_t seq)
 {
-    return ring_dist(sdu_base, emit_next);
+    return &ring[seq & (k_rx_ring - 1)];
 }
 
-void vstreamer::rs_block_erasure::note_head_hole_sdus(int gap_sdus)
-{
-    if (gap_sdus > 0)
-    {
-        fail_lost_app_pkts_count += static_cast<uint64_t>(gap_sdus);
-    }
-}
-
-void vstreamer::rs_block_erasure::emit_payload(fec_rx_payload_list* out,
-                                               bfc::shared_sized_buffer&& app)
-{
-    if (nullptr == out || app.empty())
-    {
-        return;
-    }
-    out->push_back(std::move(app));
-}
-
-bool vstreamer::rs_block_erasure::frag_to_app(const bfc::shared_sized_buffer& shard,
-                                              bfc::shared_sized_buffer* app)
-{
-    if (nullptr == app || shard.size() < k_header_len + k_len_prefix)
-    {
-        return false;
-    }
-    const uint8_t* body = shard.u8() + k_header_len;
-    const size_t   body_len = shard.size() - k_header_len;
-    const uint16_t orig_len = load_be16(body);
-    if (0 == orig_len)
-    {
-        app->clear();
-        return true;
-    }
-    if (k_len_prefix + orig_len > body_len)
-    {
-        return false;
-    }
-    *app = shard.subview(k_header_len + k_len_prefix, orig_len);
-    return !app->empty();
-}
-
-void vstreamer::rs_block_erasure::account_missing_shards(const rx_block_s& block)
-{
-    const int sn = block.sdu_n > 0 ? block.sdu_n : block.k;
-    if (sn <= 0 || block.n <= 0 || block.k <= 0)
-    {
-        return;
-    }
-    const int expected = sn + (block.n - block.k);
-    const int got = static_cast<int>(block.frags.size());
-    if (expected > got)
-    {
-        missing_shards_count += static_cast<uint64_t>(expected - got);
-    }
-}
-
-void vstreamer::rs_block_erasure::note_rx_block_output_shortfall(int expected, int available)
-{
-    if (expected > available)
-    {
-        fail_lost_app_pkts_count += static_cast<uint64_t>(expected - available);
-    }
-}
-
-int vstreamer::rs_block_erasure::expected_sdus(const rx_block_s& block)
-{
-    return block.sdu_n > 0 ? block.sdu_n : block.k;
-}
-
-/* --- spread estimate and deadlines --- */
-
-/* The sender puts data shards 0..sdu_n-1 on air first (empty tail slots are not sent), then
- * parity k..n-1, and releases position p of c at t0 + p * spread / c. */
-int vstreamer::rs_block_erasure::air_pos(int index, int k, int sdu_n)
-{
-    return index < k ? index : sdu_n + (index - k);
-}
-
-int vstreamer::rs_block_erasure::air_count(int k, int n, int sdu_n)
-{
-    return sdu_n + (n - k);
-}
-
-std::chrono::nanoseconds vstreamer::rs_block_erasure::spread_now() const
-{
-    const double s = have_spread_estimate() ? spread_est_s : k_spread_cap_ms / 1000.0;
-    return std::chrono::nanoseconds(static_cast<int64_t>(s * 1e9));
-}
+/* --- spread estimate --- */
 
 std::chrono::nanoseconds vstreamer::rs_block_erasure::margin_now() const
 {
     const double floor_s = k_deadline_margin_min_ms / 1000.0;
-    const double s = have_spread_estimate() ? std::max(floor_s, 3.0 * jitter_est_s) : floor_s;
-    return std::chrono::nanoseconds(static_cast<int64_t>(s * 1e9));
+    return seconds_ns(have_spread_estimate() ? std::max(floor_s, 3.0 * jitter_est_s) : floor_s);
 }
 
 double vstreamer::rs_block_erasure::spread_estimate_ms() const
@@ -153,203 +85,383 @@ double vstreamer::rs_block_erasure::jitter_estimate_ms() const
     return have_spread_estimate() ? jitter_est_s * 1000.0 : 0.;
 }
 
-/* The block's start as its received shards imply it (arrival minus position x interval), taking
- * the median so one early or late shard does not move it. */
-std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::block_start(
-    const rx_block_s& block) const
+/* The block closed when its last data shard was pushed: that shard's arrival, else the first
+ * later data shard received (pushed after the close), else its first parity. */
+bool vstreamer::rs_block_erasure::close_time(uint16_t base, int k_total,
+                                             std::chrono::steady_clock::time_point* at) const
 {
-    if (block.arrivals.empty())
+    bool                   found = false;
+    clock_type::time_point best {};
+    const auto             consider = [&](clock_type::time_point t)
     {
-        return block.last_seen;
-    }
-    const int                           count = std::max(1, air_count(block.k, block.n, block.sdu_n));
-    const auto                          spread = spread_now();
-    std::vector<clock_type::time_point> starts;
-    starts.reserve(block.arrivals.size());
-    for (const auto& [pos, at] : block.arrivals)
-    {
-        starts.push_back(at - spread * pos / count);
-    }
-    const size_t mid = starts.size() / 2;
-    std::nth_element(starts.begin(), starts.begin() + static_cast<std::ptrdiff_t>(mid),
-                     starts.end());
-    return starts[mid];
-}
-
-/* When the block's last shard is due, plus the margin: from its fitted start, and never before
- * the highest-position shard received so far plus the positions still to come (a block the
- * link delayed as a whole keeps its time). */
-std::chrono::steady_clock::time_point vstreamer::rs_block_erasure::block_deadline(
-    const rx_block_s& block) const
-{
-    const int  count = std::max(1, air_count(block.k, block.n, block.sdu_n));
-    const auto spread = spread_now();
-    auto       last_due = block_start(block) + spread * (count - 1) / count;
-    int        top = -1;
-    auto       top_at = block.last_seen;
-    for (const auto& [pos, at] : block.arrivals)
-    {
-        if (pos > top)
+        if (!found || t < best)
         {
-            top = pos;
-            top_at = at;
+            best = t;
+            found = true;
+        }
+    };
+    for (int j = k_total - 1; j < k_total + k_close_scan; j++)
+    {
+        const uint16_t seq = static_cast<uint16_t>(base + j);
+        if (seq_dist(seq, highest_seen) > 0)
+        {
+            break;
+        }
+        const rx_slot& s = ring[seq & (k_rx_ring - 1)];
+        if (s.seq == seq && s.received)
+        {
+            consider(s.at);
+            break;
         }
     }
-    if (top >= 0)
+    if (const auto it = rx_blocks.find(base); it != rx_blocks.end())
     {
-        last_due = std::max(last_due, top_at + spread * (count - 1 - top) / count);
-    }
-    return last_due + margin_now();
-}
-
-/* Theil-Sen over the block's arrivals: the median of the pairwise slopes is the per-position
- * interval (one late shard cannot skew it), spread = interval * count. The jitter is the
- * largest residual around the fitted line. Blocks are weighted by how many shards they gave. */
-void vstreamer::rs_block_erasure::learn_spread(const rx_block_s& block)
-{
-    const auto& a = block.arrivals;
-    if (a.size() < 2)
-    {
-        return;
-    }
-    const int count = air_count(block.k, block.n, block.sdu_n);
-    if (count < 2)
-    {
-        return;
-    }
-    const auto t0 = a.front().second;
-    const auto sec = [t0](clock_type::time_point t)
-    { return std::chrono::duration<double>(t - t0).count(); };
-    std::vector<double> slopes;
-    slopes.reserve(a.size() * (a.size() - 1) / 2);
-    for (size_t i = 0; i < a.size(); i++)
-    {
-        for (size_t j = i + 1; j < a.size(); j++)
+        for (const auto& [row, t] : it->second.arrivals)
         {
-            if (a[i].first != a[j].first)
-            {
-                slopes.push_back((sec(a[j].second) - sec(a[i].second)) /
-                                 static_cast<double>(a[j].first - a[i].first));
-            }
+            (void)row;
+            consider(t);
         }
     }
-    if (slopes.empty())
+    if (found && nullptr != at)
     {
-        return;
+        *at = best;
     }
-    const double        b = std::max(0., median(&slopes));
-    std::vector<double> icepts;
-    icepts.reserve(a.size());
-    for (const auto& [pos, at] : a)
+    return found;
+}
+
+/* The block's first data shard's arrival, else its earliest data shard received. A later shard
+ * was pushed after the first, so the estimate errs toward a later deadline. */
+bool vstreamer::rs_block_erasure::first_time(uint16_t base, int k_total,
+                                             std::chrono::steady_clock::time_point* at) const
+{
+    bool found = false;
+    for (int j = 0; j < k_total; j++)
     {
-        icepts.push_back(sec(at) - b * pos);
+        const uint16_t seq = static_cast<uint16_t>(base + j);
+        const rx_slot& s = ring[seq & (k_rx_ring - 1)];
+        if (s.seq == seq && s.received && (!found || s.at < *at))
+        {
+            *at = s.at;
+            found = true;
+        }
     }
-    const double icept = median(&icepts);
-    double       resid = 0.;
-    for (const auto& [pos, at] : a)
+    return found;
+}
+
+bool vstreamer::rs_block_erasure::hole_deadline(uint16_t base, int k_total, int n,
+                                                std::chrono::steady_clock::time_point* at) const
+{
+    clock_type::time_point close {};
+    if (!close_time(base, k_total, &close))
     {
-        resid = std::max(resid, std::fabs(sec(at) - (icept + b * pos)));
+        return false;
     }
     const double cap = k_spread_cap_ms / 1000.0;
-    const double spread = std::min(cap, b * count);
-    const double weight = static_cast<double>(a.size()) / static_cast<double>(count);
+    double       after = cap;
+    if (have_spread_estimate())
+    {
+        /* Not knowing when the block started means a burst: the longest wait. */
+        clock_type::time_point first = close;
+        (void)first_time(base, k_total, &first);
+        const double fill = std::max(0., seconds(close - first));
+        after = std::clamp(last_parity_after_close(fill, k_total, n, spread_est_s) + bias_est_s,
+                           0., cap);
+    }
+    *at = close + seconds_ns(after) + margin_now();
+    return true;
+}
+
+/*
+ * Theil-Sen over the block's parity arrivals against row gives the row gap (the sender's spread
+ * over the block's shards) and where the last row lands. The difference from where the sender's
+ * release rule puts it, given the block's own close and fill time, is the bias; the scatter of
+ * both is the jitter. Blocks are weighted by the parity they gave.
+ */
+void vstreamer::rs_block_erasure::learn_block(uint16_t base, const rx_block& block)
+{
+    const auto& a = block.arrivals;
+    if (a.empty() || block.n < 1)
+    {
+        return;
+    }
+    /* Only a block whose first and last data shards were received has an exact fill and close. */
+    const uint16_t last = static_cast<uint16_t>(base + block.k_total - 1);
+    const rx_slot& ls = ring[last & (k_rx_ring - 1)];
+    const rx_slot& fs = ring[base & (k_rx_ring - 1)];
+    if (!(ls.seq == last && ls.received && fs.seq == base && fs.received))
+    {
+        return;
+    }
+    const auto   close = ls.at;
+    const double fill = std::max(0., seconds(close - fs.at));
+    const double c = static_cast<double>(block.k_total + block.n);
+    const auto   sec = [close](clock_type::time_point t) { return seconds(t - close); };
+    double       gap = -1.;
+    double       resid = 0.;
+    double       last_s = 0.;
+    if (a.size() >= 2)
+    {
+        std::vector<double> slopes;
+        for (size_t i = 0; i < a.size(); i++)
+        {
+            for (size_t j = i + 1; j < a.size(); j++)
+            {
+                if (a[i].first != a[j].first)
+                {
+                    slopes.push_back((sec(a[j].second) - sec(a[i].second)) /
+                                     static_cast<double>(a[j].first - a[i].first));
+                }
+            }
+        }
+        if (!slopes.empty())
+        {
+            gap = std::max(0., median(&slopes));
+            std::vector<double> icepts;
+            for (const auto& [row, at] : a)
+            {
+                icepts.push_back(sec(at) - gap * row);
+            }
+            const double icept = median(&icepts);
+            for (const auto& [row, at] : a)
+            {
+                resid = std::max(resid, std::fabs(sec(at) - (icept + gap * row)));
+            }
+            last_s = icept + gap * (block.n - 1);
+        }
+    }
+    const double cap = k_spread_cap_ms / 1000.0;
+    if (gap < 0.)
+    {
+        /* One row: place the last one with the spread learnt so far (none: same as this one). */
+        const double g = spread_blocks > 0 ? spread_est_s / c : 0.;
+        last_s = sec(a.front().second) + g * (block.n - 1 - a.front().first);
+    }
+    const double spread = gap >= 0. ? std::min(gap * c, cap) : spread_est_s;
+    const double err = std::clamp(last_s - last_parity_after_close(fill, block.k_total, block.n,
+                                                                   spread),
+                                  -cap, cap);
+    const double weight = static_cast<double>(a.size()) / static_cast<double>(block.n);
+    /* The second sample counts as much as the first; later ones move the estimate by up to half
+     * their difference, scaled by how much of the block's parity they saw. */
+    const auto alpha = [weight](int samples)
+    { return 1 == samples ? 0.5 * weight + 0.25 : 0.5 * weight; };
+    if (gap >= 0.)
+    {
+        spread_est_s = 0 == spread_blocks ? spread
+                                          : spread_est_s + alpha(spread_blocks) * (spread -
+                                                                                   spread_est_s);
+        spread_blocks++;
+    }
     if (0 == fitted_blocks)
     {
-        spread_est_s = spread;
+        bias_est_s = err;
         jitter_est_s = resid;
     }
     else
     {
-        /* The second fit counts as much as the first; later ones move the estimate by up to
-         * half their difference, scaled by how many of the block's shards they saw. */
-        const double alpha = 1 == fitted_blocks ? 0.5 * weight + 0.25 : 0.5 * weight;
-        spread_est_s += alpha * (spread - spread_est_s);
-        jitter_est_s += alpha * (resid - jitter_est_s);
+        const double scatter = std::max(resid, std::fabs(err - bias_est_s));
+        bias_est_s += alpha(fitted_blocks) * (err - bias_est_s);
+        jitter_est_s += alpha(fitted_blocks) * (scatter - jitter_est_s);
     }
     fitted_blocks++;
 }
 
+/* --- blocks --- */
+
+bool vstreamer::rs_block_erasure::block_of(uint16_t seq, uint16_t* base, int* k_total,
+                                           int* n) const
+{
+    for (const auto& [b, block] : rx_blocks)
+    {
+        const int d = seq_dist(seq, b);
+        if (d >= 0 && d < block.k_total)
+        {
+            *base = b;
+            *k_total = block.k_total;
+            *n = block.n;
+            return true;
+        }
+    }
+    if (!layout_known || layout_k < 1 || layout_step_k < 1)
+    {
+        return false;
+    }
+    /* Past the newest block seen, blocks follow it at the stream's steady k; a short block
+     * (flushed on a reconfigure) does not set the step. */
+    const uint16_t next = static_cast<uint16_t>(layout_base + layout_k);
+    const int      step = layout_step_k;
+    if (const int d = seq_dist(seq, next); d >= 0)
+    {
+        *base = static_cast<uint16_t>(next + (d / step) * step);
+        *k_total = step;
+    }
+    else if (seq_dist(seq, layout_base) >= 0)
+    {
+        *base = layout_base;
+        *k_total = layout_k;
+    }
+    else
+    {
+        const int back = -seq_dist(seq, layout_base);
+        *base = static_cast<uint16_t>(layout_base - ((back + step - 1) / step) * step);
+        *k_total = step;
+    }
+    *n = layout_n;
+    return true;
+}
+
+/* Counts the parity it never got and learns from it. The block stays as a finished marker while
+ * late parity for it can still arrive, so that parity is dropped instead of opening it again. */
+void vstreamer::rs_block_erasure::finish_block(uint16_t base, rx_block* block)
+{
+    if (block->finished)
+    {
+        return;
+    }
+    missing_parity_count += static_cast<uint64_t>(block->n - block->parity_have);
+    learn_block(base, *block);
+    block->finished = true;
+    block->done = true;
+    block->parity.clear();
+    block->arrivals.clear();
+}
+
+/* A block is done once all its data is behind the release point and its parity has all come
+ * (or stopped coming). It is forgotten once parity for it would be too late to look at. */
+void vstreamer::rs_block_erasure::prune_blocks()
+{
+    const auto t = now();
+    for (auto it = rx_blocks.begin(); it != rx_blocks.end();)
+    {
+        rx_block&  block = it->second;
+        const int  end = seq_dist(static_cast<uint16_t>(it->first + block.k_total), emit_next);
+        const bool stale = end < -k_max_lo_seq_deviation;
+        const bool quiet = t - block.last_seen > std::chrono::milliseconds(k_spread_cap_ms);
+        if (!block.finished && end <= 0 && (block.parity_have == block.n || quiet || stale))
+        {
+            finish_block(it->first, &block);
+        }
+        if (block.finished && stale)
+        {
+            it = rx_blocks.erase(it);
+            continue;
+        }
+        ++it;
+    }
+}
+
+void vstreamer::rs_block_erasure::try_decode(uint16_t base, rx_block* block)
+{
+    if (block->done)
+    {
+        return;
+    }
+    std::vector<bfc::shared_sized_buffer> data(static_cast<size_t>(block->k_total));
+    int                                   present = 0;
+    bool                                  needed = false;
+    for (int j = 0; j < block->k_total; j++)
+    {
+        const uint16_t seq = static_cast<uint16_t>(base + j);
+        const rx_slot* s = slot_for(seq);
+        if (s->seq == seq && !s->payload.empty())
+        {
+            data[static_cast<size_t>(j)] = s->payload;
+            present++;
+        }
+        else if (seq_dist(seq, emit_next) >= 0)
+        {
+            needed = true;
+        }
+    }
+    if (present == block->k_total)
+    {
+        block->done = true;
+        return;
+    }
+    if (!needed || present + block->parity_have < block->k_total)
+    {
+        return;
+    }
+    int rec = 0;
+    if (!decode_rows(block->k_total, block->n, &data, block->parity, &rec))
+    {
+        rs_failures_count++;
+        block->done = true;
+        return;
+    }
+    block->done = true;
+    blocks_count++;
+    const auto t = now();
+    for (int j = 0; j < block->k_total; j++)
+    {
+        const uint16_t seq = static_cast<uint16_t>(base + j);
+        rx_slot*       s = slot_for(seq);
+        if ((s->seq == seq && !s->payload.empty()) || seq_dist(seq, emit_next) < 0)
+        {
+            continue;
+        }
+        s->payload = std::move(data[static_cast<size_t>(j)]);
+        s->seq = seq;
+        s->received = false;
+        s->at = t;
+        recovered_count++;
+    }
+}
+
 /* --- sequencer --- */
 
-void vstreamer::rs_block_erasure::new_reference(uint16_t sdu_base)
+/* A block needing decode has data at or past the release point and is at most
+ * k_header_k_n_max long, so a payload further behind than that is never read again. */
+void vstreamer::rs_block_erasure::advance_emit()
 {
-    evicted_blocks_count += rx_blocks.size();
-    for (const auto& kv : rx_blocks)
+    emit_next++;
+    const uint16_t old = static_cast<uint16_t>(emit_next - 1 - k_header_k_n_max);
+    if (rx_slot* s = slot_for(old); s->seq == old)
     {
-        account_missing_shards(kv.second);
+        s->payload = {};
+    }
+}
+
+void vstreamer::rs_block_erasure::reset_rx()
+{
+    for (rx_slot& s : ring)
+    {
+        s = rx_slot {};
     }
     rx_blocks.clear();
-    ready_blocks.clear();
-    recent_released.clear();
-    emit_next = sdu_base;
+    emit_base_set = false;
+    hole_timed = false;
+    gave_up_any = false;
+    layout_known = false;
+    data_since_parity = 0;
+    parity_seen = false;
+}
+
+void vstreamer::rs_block_erasure::new_reference(uint16_t seq)
+{
+    /* The old session's blocks are over: count their missing parity while the ring still has
+     * their data. */
+    for (auto& [base, block] : rx_blocks)
+    {
+        finish_block(base, &block);
+    }
+    for (rx_slot& s : ring)
+    {
+        s = rx_slot {};
+    }
+    rx_blocks.clear();
+    emit_next = seq;
+    highest_seen = seq;
+    hole_timed = false;
+    gave_up_any = false;
+    /* A new session has its own block layout. */
+    layout_known = false;
+    data_since_parity = 0;
+    parity_seen = false;
     new_references_count++;
 }
 
-void vstreamer::rs_block_erasure::advance_head(int sdu_n)
-{
-    note_released(emit_next);
-    emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(sdu_n));
-}
-
-/* Ids of blocks already released (or already counted late), so the remaining parity of a
- * block delivered from its first k shards is not counted as a late block. */
-void vstreamer::rs_block_erasure::note_released(uint16_t sdu_base)
-{
-    recent_released.push_back(sdu_base);
-    if (recent_released.size() > k_recent_released_max)
-    {
-        recent_released.pop_front();
-    }
-}
-
-void vstreamer::rs_block_erasure::try_stream_head_systematic(rx_block_s& block,
-                                                             fec_rx_payload_list* out)
-{
-    const int sn = expected_sdus(block);
-    while (block.released < sn)
-    {
-        const auto it = block.frags.find(block.released);
-        if (it == block.frags.end())
-        {
-            break;
-        }
-        bfc::shared_sized_buffer app;
-        if (!frag_to_app(it->second, &app))
-        {
-            break;
-        }
-        emit_payload(out, std::move(app));
-        block.released++;
-    }
-}
-
-int vstreamer::rs_block_erasure::abandon_partial_block(const rx_block_s& block,
-                                                       fec_rx_payload_list* out)
-{
-    account_missing_shards(block);
-    const int sn = expected_sdus(block);
-    int       emitted = 0;
-    for (int i = block.released; i < sn; i++)
-    {
-        const auto it = block.frags.find(i);
-        if (it == block.frags.end())
-        {
-            continue;
-        }
-        bfc::shared_sized_buffer app;
-        if (!frag_to_app(it->second, &app))
-        {
-            continue;
-        }
-        emit_payload(out, std::move(app));
-        emitted++;
-    }
-    note_rx_block_output_shortfall(sn, block.released + emitted);
-    return std::max(0, sn - (block.released + emitted));
-}
-
-/* Releases everything that can go out in sequence, flushing the head block at its deadline
- * and skipping a run of ids never seen once the next block shows the sender is past them. */
+/* Releases everything that can go out in sequence and gives up holes past their deadline. */
 void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
 {
     if (!emit_base_set)
@@ -357,136 +469,209 @@ void vstreamer::rs_block_erasure::run_emit_engine(fec_rx_payload_list* out)
         return;
     }
     const auto t = now();
-    for (;;)
+    while (seq_dist(highest_seen, emit_next) >= 0)
     {
-        if (auto rit = ready_blocks.find(emit_next); rit != ready_blocks.end())
+        rx_slot* s = slot_for(emit_next);
+        if (s->seq == emit_next && !s->payload.empty())
         {
-            ready_block_s& rb = rit->second;
-            for (int i = rb.released; i < rb.sdu_n && i < static_cast<int>(rb.payloads.size());
-                 i++)
+            /* The ring keeps its own handle: the block may still need it to decode a later
+             * hole. */
+            if (nullptr != out)
             {
-                emit_payload(out, std::move(rb.payloads[static_cast<size_t>(i)]));
+                out->push_back(s->payload);
             }
-            const int sn = rb.sdu_n;
-            ready_blocks.erase(rit);
-            advance_head(sn);
+            advance_emit();
+            hole_timed = false;
             continue;
         }
-        if (auto rxit = rx_blocks.find(emit_next); rxit != rx_blocks.end())
+        /* A run of holes shares one wait: it starts at the first hole and ends at the next
+         * shard released. */
+        if (!hole_timed)
         {
-            try_stream_head_systematic(rxit->second, out);
-            if (t < block_deadline(rxit->second))
+            hole_timed = true;
+            hole_since = t;
+        }
+        uint16_t base = emit_next;
+        int      k_total = 0;
+        int      n = 0;
+        const bool have_block = block_of(emit_next, &base, &k_total, &n);
+        if (data_since_parity <= (parity_seen ? k_data_only_after : k_data_only_before_parity))
+        {
+            clock_type::time_point deadline = hole_since + std::chrono::milliseconds(k_spread_cap_ms);
+            if (have_block)
+            {
+                (void)hole_deadline(base, k_total, n, &deadline);
+            }
+            if (t < deadline)
             {
                 break;
             }
-            const rx_block_s snap = std::move(rxit->second);
-            rx_blocks.erase(rxit);
-            learn_spread(snap);
-            if (abandon_partial_block(snap, out) > 0)
-            {
-                given_up_blocks_count++;
-            }
-            advance_head(expected_sdus(snap));
-            continue;
         }
-        /* No shard of the head id yet: find the nearest later block. */
-        int                       best = 0;
-        bool                      found = false;
-        clock_type::time_point    next_start{};
-        for (const auto& kv : rx_blocks)
+        /* Given up: the sender is past it and its parity is overdue (or there is none). A run of
+         * holes with no known block counts as one block. */
+        missing_data_count++;
+        const bool same_block =
+            gave_up_any && (have_block ? gave_up_known && gave_up_base == base
+                                       : !gave_up_known &&
+                                             static_cast<uint16_t>(gave_up_last + 1) == emit_next);
+        if (!same_block)
         {
-            const int d = dist_from_emit(kv.first);
-            if (d > 0 && (!found || d < best))
-            {
-                found = true;
-                best = d;
-                next_start = block_start(kv.second);
-            }
+            given_up_blocks_count++;
         }
-        for (const auto& kv : ready_blocks)
-        {
-            const int d = dist_from_emit(kv.first);
-            if (d > 0 && (!found || d < best))
-            {
-                found = true;
-                best = d;
-                next_start = kv.second.start;
-            }
-        }
-        /* The missing blocks were closed before that one, so their last shard was due within
-         * one spread of its start. */
-        if (!found || t < next_start + spread_now() + margin_now())
-        {
-            break;
-        }
-        note_head_hole_sdus(best);
-        emit_next = static_cast<uint16_t>(emit_next + static_cast<uint16_t>(best));
+        gave_up_any = true;
+        gave_up_known = have_block;
+        gave_up_base = base;
+        gave_up_last = emit_next;
+        advance_emit();
     }
 }
 
-bool vstreamer::rs_block_erasure::try_decode_block(uint16_t sdu_base, rx_block_s* block,
-                                                   fec_rx_payload_list* out)
+void vstreamer::rs_block_erasure::push_data(const shard_header& h,
+                                            bfc::shared_sized_buffer&& shard,
+                                            fec_rx_payload_list* out)
 {
-    if (nullptr == block)
+    (void)out;
+    const uint16_t seq = h.sequence_number;
+    if (!emit_base_set)
     {
-        return false;
+        emit_base_set = true;
+        emit_next = seq;
+        highest_seen = static_cast<uint16_t>(seq - 1);
     }
-    if (static_cast<int>(block->frags.size()) < block->sdu_n)
+    if (data_since_parity <= k_data_only_after)
     {
-        return false;
+        data_since_parity++;
     }
-    size_t shard_slots = block->frags.size();
-    for (int i = block->sdu_n; i < block->k; i++)
+    const int d = seq_dist(seq, emit_next);
+    if (d < -k_max_lo_seq_deviation || d > k_max_hi_seq_deviation)
     {
-        if (block->frags.find(i) == block->frags.end())
+        new_reference(seq);
+        highest_seen = static_cast<uint16_t>(seq - 1);
+    }
+    rx_slot* s = slot_for(seq);
+    if (s->seq == seq && !s->payload.empty())
+    {
+        return; /* duplicate (or already recovered) */
+    }
+    if (seq_dist(seq, emit_next) < 0)
+    {
+        late_count++;
+        if (seq_dist(seq, emit_next) < -k_header_k_n_max)
         {
-            shard_slots++;
+            return; /* too far behind to help any block still decoding */
         }
     }
-    if (shard_slots < static_cast<size_t>(block->k))
+    s->payload = shard.subview(h.header_len, shard.size() - h.header_len);
+    s->seq = seq;
+    s->received = true;
+    s->at = now();
+    if (seq_dist(seq, highest_seen) > 0)
     {
-        return false;
+        highest_seen = seq;
     }
-    int                 rec = 0;
-    fec_rx_payload_list decoded;
-    const bool ok = decode_block(block->k, block->n, block->sdu_n, block->frags, &decoded, &rec);
-    const rx_block_s snap = std::move(*block);
-    rx_blocks.erase(sdu_base);
-    learn_spread(snap);
-    const int sn = expected_sdus(snap);
-    ready_block_s ready;
-    ready.released = snap.released;
-    ready.sdu_n = sn;
-    ready.start = block_start(snap);
-    if (ok)
+    uint16_t base = 0;
+    int      k_total = 0;
+    int      n = 0;
+    if (block_of(seq, &base, &k_total, &n))
     {
-        recovered_count += static_cast<uint64_t>(rec);
-        blocks_count++;
-        note_rx_block_output_shortfall(sn, static_cast<int>(decoded.size()));
-        ready.payloads = std::move(decoded);
-    }
-    else
-    {
-        /* Keep what arrived, in place, so it still leaves in sequence. */
-        rs_failures_count++;
-        account_missing_shards(snap);
-        ready.payloads.resize(static_cast<size_t>(sn));
-        int have = snap.released;
-        for (int i = snap.released; i < sn; i++)
+        if (const auto it = rx_blocks.find(base); it != rx_blocks.end())
         {
-            const auto it = snap.frags.find(i);
-            bfc::shared_sized_buffer app;
-            if (it != snap.frags.end() && frag_to_app(it->second, &app))
+            try_decode(base, &it->second);
+        }
+    }
+}
+
+void vstreamer::rs_block_erasure::push_parity(const shard_header& h,
+                                              bfc::shared_sized_buffer&& shard,
+                                              fec_rx_payload_list* out)
+{
+    (void)out;
+    const uint16_t base = h.sequence_number;
+    data_since_parity = 0;
+    parity_seen = true;
+    if (!emit_base_set)
+    {
+        emit_base_set = true;
+        emit_next = base;
+        highest_seen = static_cast<uint16_t>(base - 1);
+    }
+    const int d = seq_dist(base, emit_next);
+    if (d > k_max_hi_seq_deviation)
+    {
+        new_reference(base);
+        highest_seen = static_cast<uint16_t>(base - 1);
+    }
+    else if (d + h.k_total < -k_max_lo_seq_deviation)
+    {
+        /* Spread parity trails its block, so parity of a block far behind is late, not a new
+         * session: a new session behind the release point is found by its data. */
+        return;
+    }
+    /* The block's data all exists at the sender, so a lost last data shard is a hole too. */
+    if (const uint16_t last = static_cast<uint16_t>(base + h.k_total - 1);
+        seq_dist(last, highest_seen) > 0 && seq_dist(last, emit_next) <= k_max_hi_seq_deviation)
+    {
+        highest_seen = last;
+    }
+    if (!layout_known || seq_dist(base, layout_base) > 0)
+    {
+        const int prev_k = layout_known ? layout_k : h.k_total;
+        layout_known = true;
+        layout_base = base;
+        layout_k = h.k_total;
+        layout_n = h.n;
+        layout_step_k = std::max(layout_k, prev_k);
+    }
+    const auto t = now();
+    auto       it = rx_blocks.find(base);
+    if (it != rx_blocks.end() && it->second.finished)
+    {
+        return; /* duplicate or late parity of a block already counted */
+    }
+    if (it != rx_blocks.end() && (it->second.k_total != h.k_total || it->second.n != h.n))
+    {
+        kn_mismatch_count++;
+        finish_block(it->first, &it->second);
+        rx_blocks.erase(it);
+        it = rx_blocks.end();
+    }
+    if (it == rx_blocks.end())
+    {
+        if (rx_blocks.size() >= k_block_max)
+        {
+            /* Memory bound: drop the block furthest behind; one still open is evicted. */
+            auto old = rx_blocks.begin();
+            for (auto j = rx_blocks.begin(); j != rx_blocks.end(); ++j)
             {
-                ready.payloads[static_cast<size_t>(i)] = std::move(app);
-                have++;
+                if (seq_dist(j->first, emit_next) < seq_dist(old->first, emit_next))
+                {
+                    old = j;
+                }
             }
+            if (!old->second.finished)
+            {
+                evicted_blocks_count++;
+                finish_block(old->first, &old->second);
+            }
+            rx_blocks.erase(old);
         }
-        note_rx_block_output_shortfall(sn, have);
+        rx_block nb;
+        nb.k_total = h.k_total;
+        nb.n = h.n;
+        nb.parity.resize(static_cast<size_t>(h.n));
+        it = rx_blocks.emplace(base, std::move(nb)).first;
     }
-    ready_blocks[sdu_base] = std::move(ready);
-    run_emit_engine(out);
-    return true;
+    rx_block& block = it->second;
+    if (!block.parity[static_cast<size_t>(h.k_i)].empty())
+    {
+        return;
+    }
+    block.parity[static_cast<size_t>(h.k_i)] =
+        shard.subview(h.header_len, shard.size() - h.header_len);
+    block.parity_have++;
+    block.arrivals.emplace_back(h.k_i, t);
+    block.last_seen = t;
+    try_decode(base, &block);
 }
 
 void vstreamer::rs_block_erasure::poll_rx(fec_rx_payload_list* out)
@@ -495,6 +680,7 @@ void vstreamer::rs_block_erasure::poll_rx(fec_rx_payload_list* out)
     {
         out->clear();
     }
+    prune_blocks();
     run_emit_engine(out);
 }
 
@@ -515,100 +701,24 @@ void vstreamer::rs_block_erasure::push_air(bfc::shared_sized_buffer shard,
     {
         out->clear();
     }
-    if (out == nullptr || shard.empty())
+    if (shard.empty())
     {
         return;
     }
-    // RX is always FEC-aware: k/n come from the shard header. Encode still requires init().
-    uint16_t sdu_base = 0;
-    int      index = 0;
-    int      k = 0;
-    int      n = 0;
-    int      sdu_n = 0;
-    if (shard.size() < k_header_len ||
-        !unpack_header(shard.u8(), shard.size(), &sdu_base, &index, &k, &n, &sdu_n))
+    shard_header h;
+    if (!parse_header(shard.u8(), shard.size(), &h))
     {
         hdr_errors_count++;
         return;
     }
-    const auto t = now();
-    if (!emit_base_set)
+    if (h.is_data)
     {
-        emit_base_set = true;
-        emit_next = sdu_base;
+        push_data(h, std::move(shard), out);
     }
-    const int d = dist_from_emit(sdu_base);
-    if ((d < 0 && -d > k_max_lo_block_id_deviation) || d > k_max_hi_block_id_deviation)
+    else
     {
-        new_reference(sdu_base);
+        push_parity(h, std::move(shard), out);
     }
-    else if (d < 0)
-    {
-        if (std::find(recent_released.begin(), recent_released.end(), sdu_base) ==
-            recent_released.end())
-        {
-            late_blocks_count++;
-            note_released(sdu_base);
-        }
-        run_emit_engine(out);
-        return;
-    }
-    /* Already decoded and waiting for the head: a further (parity) shard is redundant. */
-    if (ready_blocks.find(sdu_base) != ready_blocks.end())
-    {
-        run_emit_engine(out);
-        return;
-    }
-
-    auto it = rx_blocks.find(sdu_base);
-    if (it == rx_blocks.end())
-    {
-        if (rx_blocks.size() >= k_block_max)
-        {
-            /* Memory bound: drop the block furthest ahead (it is the last to be released). */
-            auto far = rx_blocks.begin();
-            for (auto j = rx_blocks.begin(); j != rx_blocks.end(); ++j)
-            {
-                if (dist_from_emit(j->first) > dist_from_emit(far->first))
-                {
-                    far = j;
-                }
-            }
-            evicted_blocks_count++;
-            account_missing_shards(far->second);
-            rx_blocks.erase(far);
-        }
-        rx_block_s nb;
-        nb.k = k;
-        nb.n = n;
-        nb.sdu_n = sdu_n;
-        it = rx_blocks.emplace(sdu_base, std::move(nb)).first;
-    }
-    else if (it->second.k != k || it->second.n != n || it->second.sdu_n != sdu_n)
-    {
-        kn_mismatch_count++;
-        rx_blocks.erase(it);
-        run_emit_engine(out);
-        return;
-    }
-
-    rx_block_s* block = &it->second;
-    if (block->frags.count(index) != 0)
-    {
-        run_emit_engine(out);
-        return;
-    }
-    block->frags.emplace(index, std::move(shard));
-    block->arrivals.emplace_back(air_pos(index, k, sdu_n), t);
-    block->last_seen = t;
-
-    if (sdu_base == emit_next)
-    {
-        try_stream_head_systematic(*block, out);
-    }
-    if (try_decode_block(sdu_base, block, out))
-    {
-        return;
-    }
+    prune_blocks();
     run_emit_engine(out);
 }

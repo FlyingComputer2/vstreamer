@@ -63,15 +63,30 @@ private:
     bool              have_coded_caps_ = false;
     video_coded_caps  coded_caps_ {};
 
-    struct pending_datagram
+    /*
+     * An AU waiting to go out as datagrams. output() writes each datagram's RTP header (and
+     * FU-A bytes) into the AU in front of its payload, over bytes that already went out, and
+     * hands on a view of the AU: no copy. That needs the AU to be held only here (the PDU
+     * contract), so output() first drops the caller's previous datagram; if a consumer still
+     * holds one, or there is no room in front (the AU's first datagram), it copies instead.
+     */
+    struct pending_au
     {
-        std::vector<uint8_t> bytes;
-        uint64_t             ts_us = 0;
-        bool                 au_end = false;
+        bfc::shared_sized_buffer    au;
+        std::vector<rtp_h264_dgram> dgrams;
+        std::vector<uint8_t>        params; /* injected cached SPS/PPS; their dgrams point here */
+        size_t                      next = 0;
+        uint64_t                    ts_us = 0;
+        uint32_t                    rtp_ts = 0;
+        int64_t                     capture_rt = 0;
     };
 
-    std::deque<pending_datagram> pending;
-    static constexpr size_t      k_pending_cap = 2048;
+    std::deque<pending_au>      pending;
+    size_t                      pending_dgrams = 0;
+    std::vector<rtp_h264_dgram> plan_scratch;
+    uint64_t                    datagrams_in_place = 0;
+    uint64_t                    datagrams_copied = 0;
+    static constexpr size_t     k_pending_cap = 2048;
     uint64_t                     datagrams_dropped = 0;
     uint64_t                     out_seq_ = 0;
 

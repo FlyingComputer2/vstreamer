@@ -4,7 +4,6 @@
 #include "core/fec_spread.hpp"
 #include "core/rs_block_erasure.hpp"
 #include <bfc/shared_sized_buffer.hpp>
-#include "core/stream_header.hpp"
 
 #include <gtest/gtest.h>
 
@@ -47,10 +46,11 @@ public:
     struct shard
     {
         clock_type::time_point at;
-        uint16_t               wire_seq = 0;
-        uint16_t               sdu_base = 0;
-        int                    idx = -1;
-        int                    n_sent = 0;
+        bool                   is_data = false;
+        uint16_t               seq = 0; /* data: its sequence; parity: its block's first */
+        int                    k_i = -1;
+        int                    k_total = 0;
+        int                    n = 0;
     };
 
     wire_sniffer()
@@ -99,22 +99,19 @@ public:
             msg.msg_control = ctrl;
             msg.msg_controllen = sizeof(ctrl);
             const ssize_t n = recvmsg(fd_, &msg, MSG_DONTWAIT);
-            if (n < static_cast<ssize_t>(vstreamer::k_stream_header_len +
-                                         rs_block_erasure::k_header_len))
+            rs_block_erasure::shard_header h;
+            if (n <= 0 || !rs_block_erasure::parse_header(buf, static_cast<size_t>(n), &h))
             {
+                ADD_FAILURE() << "bad shard";
                 continue;
             }
             shard s;
             s.at = arrival_time(msg);
-            s.wire_seq = vstreamer::stream_header_sequence_be16(buf);
-            const uint8_t *fec = buf + vstreamer::k_stream_header_len;
-            int            k = 0;
-            int            n_total = 0;
-            int            sdu_n = 0;
-            EXPECT_TRUE(rs_block_erasure::unpack_header(
-                fec, static_cast<size_t>(n) - vstreamer::k_stream_header_len, &s.sdu_base,
-                &s.idx, &k, &n_total, &sdu_n));
-            s.n_sent = sdu_n + (n_total - k);
+            s.is_data = h.is_data;
+            s.seq = h.sequence_number;
+            s.k_i = h.k_i;
+            s.k_total = h.k_total;
+            s.n = h.n;
             out.push_back(s);
         }
         return out;
@@ -168,16 +165,21 @@ void open_fec_sender(vstreamer::stream_sender &sender, const std::string &dst, i
     ASSERT_EQ(0, sender.open());
 }
 
-std::vector<std::vector<uint8_t>> encode_tags(rs_block_erasure &enc, uint16_t sdu_base,
+/* One block's shards in send order: data at once, then parity. */
+std::vector<std::vector<uint8_t>> encode_tags(rs_block_erasure &enc,
                                               const std::vector<uint8_t> &tags)
 {
-    std::vector<std::vector<uint8_t>> apps;
+    std::vector<std::vector<uint8_t>> air;
     for (uint8_t t : tags)
     {
-        apps.push_back(std::vector<uint8_t>(32, t));
+        const std::vector<uint8_t> app(32, t);
+        rs_block_erasure::tx_out   out;
+        enc.push_app(app.data(), app.size(), &out);
+        for (const auto &b : out.shards)
+        {
+            air.emplace_back(b.u8(), b.u8() + b.size());
+        }
     }
-    std::vector<std::vector<uint8_t>> air;
-    EXPECT_TRUE(enc.encode_block(apps, sdu_base, &air));
     return air;
 }
 
@@ -243,8 +245,8 @@ TEST(FecSpreadTest, ConfigRangeAndQuery)
     EXPECT_EQ("250", v);
 }
 
-/* spread 0 is today's behaviour: a whole block leaves back to back. */
-TEST(FecSpreadTest, ZeroSendsBlockAtOnce)
+/* spread 0: parity leaves right behind the data shard that closes the block. */
+TEST(FecSpreadTest, ZeroSendsParityAtClose)
 {
     wire_sniffer             sniff;
     vstreamer::default_reactor_host sender_reactor;
@@ -258,81 +260,89 @@ TEST(FecSpreadTest, ZeroSendsBlockAtOnce)
     const auto got = sniff.collect(6, 1000);
     ASSERT_EQ(6u, got.size());
     EXPECT_LT(ms_between(got.front().at, got.back().at), 5.0);
+    for (size_t i = 0; i < 4; i++)
+    {
+        EXPECT_TRUE(got[i].is_data);
+        EXPECT_EQ(static_cast<uint16_t>(got[0].seq + i), got[i].seq);
+    }
+    for (size_t i = 4; i < 6; i++)
+    {
+        EXPECT_FALSE(got[i].is_data);
+        EXPECT_EQ(got[0].seq, got[i].seq);
+        EXPECT_EQ(static_cast<int>(i - 4), got[i].k_i);
+        EXPECT_EQ(4, got[i].k_total);
+        EXPECT_EQ(2, got[i].n);
+    }
     sender.close();
 }
 
-/* One block, spread 30 ms: shards leave in index order, about 30/6 = 5 ms apart. */
-TEST(FecSpreadTest, BlockSpreadOverWindowInOrder)
+/* Spread 30 ms over 4 + 2 shards: data leaves at once; parity takes slots 4 and 5 of the window
+ * (20 and 25 ms after the block's first data shard). */
+TEST(FecSpreadTest, DataAtOnceParityOnItsSlots)
 {
     wire_sniffer             sniff;
     vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
+    const auto t0 = clock_type::now();
     for (uint8_t t = 0; t < 4; t++)
     {
         ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     const auto got = sniff.collect(6, 1000);
     ASSERT_EQ(6u, got.size());
-    /* Measure each shard against the schedule set by the least-delayed shard. Against shard 0,
-     * a late first wakeup of the send thread (shard 0 then leaves with shard 1) reads as every
-     * later shard being early. Spread off would put shards up to 25 ms behind; allow 8. */
-    double origin_ms = 0.0;
-    for (size_t i = 0; i < got.size(); i++)
+    for (size_t i = 0; i < 4; i++)
     {
-        const double expect_ms = 30.0 * static_cast<double>(i) / 6.0;
-        origin_ms = std::min(origin_ms, ms_between(got.front().at, got[i].at) - expect_ms);
+        EXPECT_TRUE(got[i].is_data);
+        EXPECT_LT(ms_between(t0, got[i].at), 8.0) << "data shard " << i;
     }
-    for (size_t i = 0; i < got.size(); i++)
-    {
-        EXPECT_EQ(static_cast<int>(i), got[i].idx);
-        const double expect_ms = 30.0 * static_cast<double>(i) / 6.0;
-        const double late_ms = ms_between(got.front().at, got[i].at) - expect_ms - origin_ms;
-        EXPECT_LT(late_ms, 8.0) << "shard " << i;
-    }
+    EXPECT_NEAR(ms_between(t0, got[4].at), 20.0, 6.0);
+    EXPECT_NEAR(ms_between(t0, got[5].at), 25.0, 6.0);
+    EXPECT_GT(ms_between(got[4].at, got[5].at), 2.0);
     sender.close();
 }
 
-/* A timeout-flushed block keeps full parity and spreads over the same window. */
-TEST(FecSpreadTest, ShortBlockSpreadsFullParity)
+/* A block that fills slower than its window: parity follows the close one slot apart instead of
+ * leaving in a lump. */
+TEST(FecSpreadTest, LateCloseKeepsParitySpacing)
 {
     wire_sniffer             sniff;
     vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    open_fec_sender(sender, sniff.host_port(), 8, 12, 20);
-    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1))));  // flushed by the 20 ms timeout
-    const auto got = sniff.collect(5, 1000);
-    ASSERT_EQ(5u, got.size());  // 1 data + 4 parity
-    EXPECT_EQ(5, got.front().n_sent);
-    EXPECT_NEAR(ms_between(got.front().at, got.back().at), 20.0 * 4 / 5, 4.0);
-    sender.close();
-}
-
-/* fec_timeout_ms 0 never flushes a partial block: nothing leaves until k SDUs fill it. */
-TEST(FecTimeoutTest, ZeroWaitsForFullBlock)
-{
-    wire_sniffer             sniff;
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    ASSERT_EQ(0, cfg(sender, "fec_timeout_ms", "0"));
-    open_fec_sender(sender, sniff.host_port(), 4, 6, 0);
+    open_fec_sender(sender, sniff.host_port(), 4, 6, 30);
     ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0))));
-    EXPECT_TRUE(sniff.collect(1, 150).empty());  // 150 ms: 7x the default timeout
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    const auto close = clock_type::now();
     for (uint8_t t = 1; t < 4; t++)
     {
         ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(t))));
     }
     const auto got = sniff.collect(6, 1000);
-    ASSERT_EQ(6u, got.size());  // 4 data + 2 parity, one full block
-    EXPECT_EQ(6, got.front().n_sent);
+    ASSERT_EQ(6u, got.size());
+    EXPECT_LT(ms_between(close, got[4].at), 6.0);
+    EXPECT_NEAR(ms_between(got[4].at, got[5].at), 5.0, 3.0);
     sender.close();
 }
 
-/* Two blocks closed 10 ms apart with a 30 ms window overlap: their shards interleave on the
- * wire, and the wire sequence still counts up in send order. */
+/* No FEC timeout: an open block's data has already left; its parity waits for the block to
+ * fill. */
+TEST(FecSpreadTest, OpenBlockSendsDataNoParity)
+{
+    wire_sniffer             sniff;
+    vstreamer::default_reactor_host sender_reactor;
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
+    open_fec_sender(sender, sniff.host_port(), 8, 12, 0);
+    ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(1))));
+    const auto got = sniff.collect(5, 150);
+    ASSERT_EQ(1u, got.size());
+    EXPECT_TRUE(got[0].is_data);
+    sender.close();
+}
+
+/* Two blocks 10 ms apart with a 30 ms window: block B's data leaves before block A's parity. */
 TEST(FecSpreadTest, OverlappingBlocksInterleave)
 {
     wire_sniffer             sniff;
@@ -351,25 +361,27 @@ TEST(FecSpreadTest, OverlappingBlocksInterleave)
     }
     const auto got = sniff.collect(12, 1000);
     ASSERT_EQ(12u, got.size());
-    const uint16_t first_base = got.front().sdu_base;
-    size_t         last_a = 0;
+    const uint16_t first = got.front().seq;
+    size_t         last_a_parity = 0;
     size_t         first_b = got.size();
+    uint16_t       next_data = first;
     for (size_t i = 0; i < got.size(); i++)
     {
-        if (got[i].sdu_base == first_base)
+        if (!got[i].is_data && got[i].seq == first)
         {
-            last_a = i;
+            last_a_parity = i;
         }
-        else if (first_b == got.size())
+        if (got[i].is_data)
         {
-            first_b = i;
-        }
-        if (i > 0)
-        {
-            EXPECT_EQ(static_cast<uint16_t>(got[i - 1].wire_seq + 1), got[i].wire_seq);
+            EXPECT_EQ(next_data, got[i].seq);
+            next_data++;
+            if (got[i].seq == static_cast<uint16_t>(first + 4) && first_b == got.size())
+            {
+                first_b = i;
+            }
         }
     }
-    EXPECT_LT(first_b, last_a) << "block B should start before block A finishes";
+    EXPECT_LT(first_b, last_a_parity) << "block B should start before block A's parity is out";
     sender.close();
 }
 
@@ -407,10 +419,11 @@ TEST(FecSpreadTest, RawNotDelayed)
 TEST(FecSpreadTest, ReceiverDecodesInterleavedBlocks)
 {
     rs_block_erasure enc;
-    ASSERT_TRUE(enc.init(4, 6, 20));
-    const auto prior = encode_tags(enc, 96, {90, 91, 92, 93});
-    const auto a = encode_tags(enc, 100, {1, 2, 3, 4});
-    const auto b = encode_tags(enc, 104, {5, 6, 7, 8});
+    ASSERT_TRUE(enc.init(4, 6, 1476));
+    enc.set_tx_sequence(96);
+    const auto prior = encode_tags(enc, {90, 91, 92, 93});
+    const auto a = encode_tags(enc, {1, 2, 3, 4});
+    const auto b = encode_tags(enc, {5, 6, 7, 8});
     std::vector<std::vector<uint8_t>> wire;
     for (size_t i = 0; i < a.size(); i++)
     {
@@ -427,15 +440,15 @@ TEST(FecSpreadTest, ReceiverDecodesInterleavedBlocks)
     EXPECT_EQ((std::vector<uint8_t> {1, 2, 3, 4, 5, 6, 7, 8}), decode_order(dec, wire, lost));
 }
 
-/* Start-up edge case, the same with or without spreading: a fresh receiver anchors in-order
- * delivery on the first shard it sees. If the earlier block's first shard is lost and a later
- * block's arrives first, the earlier block is behind the reference: late, and ignored. */
+/* Start-up edge case: a fresh receiver anchors in-order delivery on the first data shard it
+ * sees. If the earlier block's first shard is lost and a later block's arrives first, the
+ * earlier block is behind the reference: late, and ignored. */
 TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
 {
     rs_block_erasure enc;
-    ASSERT_TRUE(enc.init(4, 6, 20));
-    const auto a = encode_tags(enc, 100, {1, 2, 3, 4});
-    const auto b = encode_tags(enc, 104, {5, 6, 7, 8});
+    ASSERT_TRUE(enc.init(4, 6, 1476));
+    const auto a = encode_tags(enc, {1, 2, 3, 4});
+    const auto b = encode_tags(enc, {5, 6, 7, 8});
     std::vector<std::vector<uint8_t>> wire;
     for (size_t i = 0; i < a.size(); i++)
     {
@@ -454,9 +467,10 @@ TEST(FecSpreadTest, FreshReceiverAnchorsOnFirstShardSeen)
 TEST(FecSpreadTest, InterleavingSurvivesBurst)
 {
     rs_block_erasure enc;
-    ASSERT_TRUE(enc.init(4, 6, 20));
-    const auto a = encode_tags(enc, 200, {1, 2, 3, 4});
-    const auto b = encode_tags(enc, 204, {5, 6, 7, 8});
+    ASSERT_TRUE(enc.init(4, 6, 1476));
+    const auto prior = encode_tags(enc, {90, 91, 92, 93});
+    const auto a = encode_tags(enc, {1, 2, 3, 4});
+    const auto b = encode_tags(enc, {5, 6, 7, 8});
 
     std::vector<std::vector<uint8_t>> serial(a);
     serial.insert(serial.end(), b.begin(), b.end());
@@ -471,12 +485,15 @@ TEST(FecSpreadTest, InterleavingSurvivesBurst)
     {
         burst[i] = true;
     }
+    const std::vector<bool> none(prior.size(), false);
 
     rs_block_erasure dec_serial;
-    const auto       got_serial = decode_order(dec_serial, serial, burst);
+    (void)decode_order(dec_serial, prior, none);
+    const auto got_serial = decode_order(dec_serial, serial, burst);
     EXPECT_LT(got_serial.size(), 8u);
 
     rs_block_erasure dec_mixed;
+    (void)decode_order(dec_mixed, prior, none);
     EXPECT_EQ((std::vector<uint8_t> {1, 2, 3, 4, 5, 6, 7, 8}),
               decode_order(dec_mixed, mixed, burst));
 }
@@ -530,28 +547,4 @@ TEST(FecSpreadTest, LoopbackInOrderWithSpread)
     }
     sender.close();
     receiver.close();
-}
-
-/* The timeout flush runs on the send thread. A packet that opens a new block while the thread
- * sleeps (no other traffic) must still be flushed about timeout_ms later, not when the thread's
- * older, longer sleep ends. Repeated so the packet lands at different points of that sleep. */
-TEST(FecSpreadTest, TimeoutFlushOnTimeWhenIdle)
-{
-    wire_sniffer             sniff;
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    open_fec_sender(sender, sniff.host_port(), 8, 12, 0);
-    double worst_ms = 0.;
-    for (int i = 0; i < 12; i++)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(7 * i % 50 + 60));
-        const auto t0 = clock_type::now();
-        ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(static_cast<uint8_t>(i)))));
-        const auto got = sniff.collect(5, 500);  // 1 data + 4 parity
-        ASSERT_EQ(5u, got.size());
-        worst_ms = std::max(worst_ms, ms_between(t0, got.front().at));
-    }
-    EXPECT_LT(worst_ms, 30.0) << "timeout is 20 ms";
-    sender.close();
 }
