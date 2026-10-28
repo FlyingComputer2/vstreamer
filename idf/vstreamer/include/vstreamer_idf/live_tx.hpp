@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,6 +23,12 @@ struct live_tx_config
     std::string queue_reactor;
     /* Stream this long once the first AU is out; 0 = until reset. */
     int seconds = 0;
+    /* While it reads true, coded AUs are dropped before the payloader: camera and encoder keep
+     * running, nothing is sent. On resume the encoder is asked for an IDR and AUs are dropped
+     * until one comes out. A pause, not a stop: reopening the 1080p encoder after a run fails
+     * (its reference frame needs one contiguous internal-RAM block, fragmented by then). Not
+     * owned. */
+    const std::atomic<bool> *pause_request = nullptr;
     /* UDP port of the management plane (get/set src|pay|snd <key>, get sys stats); 0 = none. */
     int mplane_port = 5090;
     /* Seconds between "live TX ..." stats lines; 0 = none. */

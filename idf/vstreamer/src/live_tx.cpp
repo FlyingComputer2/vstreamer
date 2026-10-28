@@ -450,6 +450,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     uint64_t      last_kern_us = 0;
 
     auto tx_fn = [&]() {
+        bool paused = false;
+        bool wait_key = false;
         while (!stop.load(std::memory_order_acquire))
         {
             vstreamer::component_pdu out;
@@ -463,6 +465,30 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             {
                 vTaskDelay(1);
                 continue;
+            }
+            const bool pause =
+                cfg.pause_request && cfg.pause_request->load(std::memory_order_acquire);
+            if (pause != paused)
+            {
+                paused = pause;
+                std::printf("live TX %s\n", paused ? "paused" : "resumed");
+                if (!paused)
+                {
+                    (void)src->configure("idr", "1");
+                    wait_key = true;
+                }
+            }
+            if (paused)
+            {
+                continue;
+            }
+            if (wait_key)
+            {
+                if (!vstreamer::has_flag(out, vstreamer::pdu_flag_e::KEY))
+                {
+                    continue;
+                }
+                wait_key = false;
             }
             if (out.sdu_type == vstreamer::sdu_type_e::H264_AU &&
                 0 == t0_us.load(std::memory_order_relaxed))
