@@ -192,6 +192,8 @@ thread. Raw caps must match `size`. Constrained Baseline; IDR AUs carry `KEY`.
 | `output_mode` | C Q | `filter` / `convert` |
 | `output_format` (`format`) | C Q | `nv12` |
 | `output_size_mode` | C | `stream` (use SPS size) / `config` (use `size`) |
+| `show_corrupt` | C Q | `off` (default: drop frames MPP flags with errinfo, i.e. freeze until the next IDR after a loss) / `on` (show them with artifacts; discarded frames are still dropped) |
+| `corrupt_frames` | Q | errinfo frames since open, shown or dropped |
 | `latency_ms`, `status` | Q | informational |
 
 **`rtp_h264_pay`** — H.264 AU → RTP datagrams (PT 96, SSRC `0xC0DE0001`, single NAL / STAP-A /
