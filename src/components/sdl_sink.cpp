@@ -348,6 +348,15 @@ int sdl_sink::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("present_latency_ms" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        const double ms = present.has_value() ? present->present_latency_ms() : -1.0;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%.3f", ms);
+        *value = buf;
+        return 0;
+    }
     if ("stats" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

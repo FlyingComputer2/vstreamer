@@ -53,6 +53,10 @@ public:
 
     void set_title(std::string_view title);
     void stats_string(char *buf, size_t buflen, uint64_t frames_in) const;
+    /* Mean capture age (now - ts_us) right after SDL_RenderPresent returned, over the last
+     * whole 1 s window; -1 before the first window. With vsync on KMSDRM the flip is queued
+     * then, so the frame is on screen up to one refresh later (plus the display's own lag). */
+    double present_latency_ms() const;
 
     [[nodiscard]] int live_width() const { return live_w; }
     [[nodiscard]] int live_height() const { return live_h; }
@@ -100,6 +104,10 @@ private:
     uint64_t present_ok_count = 0;
     uint64_t present_fail_count = 0;
     double   last_latency_ms = 0.0;
+    int64_t  present_window_start_ns = 0;
+    double   present_window_sum_ms = 0.0;
+    uint64_t present_window_n = 0;
+    double   present_latency_avg_ms = -1.0;
     mutable std::string last_err;
 
     static constexpr size_t k_default_queue_depth = 1;

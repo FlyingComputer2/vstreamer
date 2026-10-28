@@ -513,6 +513,28 @@ int sdl_nv12_presenter::present_nv12_locked(const nv12_present_sample &f, bool &
     }
 
     present_ok_count++;
+    if (f.ts_us > 0)
+    {
+        const int64_t now_ns = steady_mono_ns();
+        if (0 == present_window_start_ns)
+        {
+            present_window_start_ns = now_ns;
+        }
+        else if (now_ns - present_window_start_ns >= 1'000'000'000LL)
+        {
+            present_latency_avg_ms =
+                present_window_n ? present_window_sum_ms / static_cast<double>(present_window_n) : -1.0;
+            present_window_start_ns = now_ns;
+            present_window_sum_ms = 0.0;
+            present_window_n = 0;
+        }
+        const double ms = static_cast<double>(now_ns - static_cast<int64_t>(f.ts_us) * 1000LL) / 1e6;
+        if (ms >= 0.0 && ms < 10'000.0)
+        {
+            present_window_sum_ms += ms;
+            ++present_window_n;
+        }
+    }
     if (driver_is_kmsdrm(video_driver) && !console_kd_graphics && present_ok_count == 1)
     {
         std::fprintf(stderr,
@@ -806,6 +828,12 @@ int sdl_nv12_presenter::present(const nv12_present_sample &f, bool &session_open
         return -EBADF;
     }
     return present_nv12_locked(f, session_open, lock);
+}
+
+double sdl_nv12_presenter::present_latency_ms() const
+{
+    std::lock_guard<std::mutex> lock(mu);
+    return present_latency_avg_ms;
 }
 
 void sdl_nv12_presenter::stats_string(char *buf, size_t buflen, uint64_t frames_in) const
