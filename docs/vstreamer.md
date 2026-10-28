@@ -382,6 +382,7 @@ received caps take precedence. Keep presentation on the rendering thread, includ
 | `render_thread` | Q | recorded rendering thread ID as a string, empty before resource creation or after close |
 | `title` | C | window title, live |
 | `video_driver` | C Q | `auto` (default; SDL decides), `kmsdrm`, or any SDL driver name; before `open()` |
+| `present_latency_ms` | Q | mean capture age (`now − ts_us`) just after `SDL_RenderPresent` returned, over the last whole 1 s window; `-1.000` before the first. With vsync on KMSDRM the flip is queued then: the frame is on screen up to one refresh later, plus the display's own lag |
 | `stats` | Q | informational |
 
 ## Threading
