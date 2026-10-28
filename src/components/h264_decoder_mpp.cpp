@@ -332,7 +332,12 @@ int h264_decoder_mpp::handle_info_change_locked(void *mpp_frame)
 int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
 {
     auto *frame = static_cast<MppFrame>(mpp_frame);
-    if (mpp_frame_get_errinfo(frame) || mpp_frame_get_discard(frame))
+    const bool errinfo = mpp_frame_get_errinfo(frame) != 0;
+    if (errinfo)
+    {
+        ++corrupt_frames;
+    }
+    if ((errinfo && !show_corrupt) || mpp_frame_get_discard(frame))
     {
         if (log_errinfo_throttle++ < 5)
         {
@@ -566,6 +571,7 @@ int h264_decoder_mpp::open()
         }
         opened = true;
         cancel_io = false;
+        corrupt_frames = 0;
     }
     drain_stop_.store(false, std::memory_order_relaxed);
     if (!drain_thread_.joinable())
@@ -794,6 +800,20 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
         output_format = kind;
         return 0;
     }
+    if (key == "show_corrupt")
+    {
+        if (v == "on" || v == "1")
+        {
+            show_corrupt = true;
+            return 0;
+        }
+        if (v == "off" || v == "0")
+        {
+            show_corrupt = false;
+            return 0;
+        }
+        return -EINVAL;
+    }
     if (key == "output_size_mode")
     {
         if (v == "stream")
@@ -852,6 +872,16 @@ int h264_decoder_mpp::query(std::string_view key, std::string *value) const
     if (key == "output_mode")
     {
         *value = output_mode_name(output_mode);
+        return 0;
+    }
+    if (key == "show_corrupt")
+    {
+        *value = show_corrupt ? "on" : "off";
+        return 0;
+    }
+    if (key == "corrupt_frames")
+    {
+        *value = std::to_string(corrupt_frames);
         return 0;
     }
     if (key == "latency_ms")

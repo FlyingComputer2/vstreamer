@@ -82,6 +82,11 @@ private:
 
     static constexpr size_t k_max_ready_frames = 8;
     bool                      output_size_stream = false;
+    /* Output frames MPP flags with errinfo (decoded against a lost reference)
+     * instead of dropping them, so a loss shows artifacts rather than freezing
+     * until the next IDR. Discarded frames are still dropped. */
+    bool                      show_corrupt = false;
+    uint64_t                  corrupt_frames = 0;  // errinfo frames, shown or dropped
     std::deque<component_pdu> ready_frames;
     std::deque<component_pdu> pending_caps_out_;
 
