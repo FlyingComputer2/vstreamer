@@ -497,6 +497,7 @@ int esp32p4_csi_device::dequeue(component_pdu &out)
     };
     b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     b.memory = V4L2_MEMORY_MMAP;
+    const int64_t dq_start_ns = steady_mono_ns();
     if (ioctl(r->fd, VIDIOC_DQBUF, &b) != 0)
     {
         const int e = errno;
@@ -504,6 +505,36 @@ int esp32p4_csi_device::dequeue(component_pdu &out)
     }
     /* esp_video leaves the V4L2 timestamp at 0. */
     const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000);
+    {
+        const uint64_t wait_us = ts_us - static_cast<uint64_t>(dq_start_ns / 1000);
+        ++dq_count;
+        dq_wait_us_sum += wait_us;
+        if (wait_us < 1000)
+        {
+            ++dq_ready;
+        }
+        /* Finished frames still queued in the driver (V4L2_BUF_FLAG_DONE). */
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < r->ptr.size(); ++i)
+        {
+            struct v4l2_buffer q
+            {
+            };
+            q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            q.memory = V4L2_MEMORY_MMAP;
+            q.index = i;
+            if (i != b.index && ioctl(r->fd, VIDIOC_QUERYBUF, &q) == 0 &&
+                (q.flags & V4L2_BUF_FLAG_DONE))
+            {
+                ++done;
+            }
+        }
+        dq_done_sum += done;
+        uint32_t max = dq_done_max.load();
+        while (done > max && !dq_done_max.compare_exchange_weak(max, done))
+        {
+        }
+    }
     if (b.index >= r->ptr.size())
     {
         return -EIO;
@@ -610,6 +641,19 @@ int esp32p4_csi_device::query(std::string_view key, std::string *value) const
     if (key == "buffers")
     {
         return set_int(value, nbufs);
+    }
+    if (key == "dq_stats")
+    {
+        const uint32_t n = dq_count.exchange(0);
+        const uint32_t ready = dq_ready.exchange(0);
+        const uint32_t done = dq_done_sum.exchange(0);
+        const uint32_t done_max = dq_done_max.exchange(0);
+        const uint64_t wait = dq_wait_us_sum.exchange(0);
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "dq=%" PRIu32 " ready=%" PRIu32 " wait_avg_ms=%.2f done_avg=%.2f done_max=%" PRIu32,
+                      n, ready, n ? wait / 1000.0 / n : 0.0, n ? double(done) / n : 0.0, done_max);
+        *value = buf;
+        return 0;
     }
     if (key == "light_freq")
     {

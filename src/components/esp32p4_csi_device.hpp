@@ -1,6 +1,8 @@
 #ifndef VSTREAMER_COMPONENTS_ESP32P4_CSI_DEVICE_HPP
 #define VSTREAMER_COMPONENTS_ESP32P4_CSI_DEVICE_HPP
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -46,6 +48,13 @@ class esp32p4_csi_device
     int live_w = 0, live_h = 0;
     std::string driver;
     std::shared_ptr<ring> ring_;
+
+    /* DQBUF window stats, read and cleared by query("dq_stats"). A frame that
+     * was already waiting returns at once, so `ready` counts dequeues that
+     * found a finished frame queued (capture-to-stamp delay not seen by ts_us),
+     * and `done` sums the frames still finished in the driver after each one. */
+    mutable std::atomic<uint32_t> dq_count{0}, dq_ready{0}, dq_done_sum{0}, dq_done_max{0};
+    mutable std::atomic<uint64_t> dq_wait_us_sum{0};
 };
 }  // namespace vstreamer::detail
 #endif
