@@ -246,10 +246,27 @@ int esp32p4_csi_device::open()
         if (!s_video_init_done)
         {
             esp_video_init_csi_config_t csi{};
-            csi.sccb_config.init_sccb = true;
-            csi.sccb_config.i2c_config.port = static_cast<uint8_t>(sccb_port);
-            csi.sccb_config.i2c_config.scl_pin = static_cast<gpio_num_t>(sccb_scl);
-            csi.sccb_config.i2c_config.sda_pin = static_cast<gpio_num_t>(sccb_sda);
+            /* An I2C master bus the application already created on sccb_port
+             * (other devices share the camera's bus) is used as is; esp_video
+             * then neither creates nor deletes it, and sccb_scl / sccb_sda are
+             * ignored. */
+            i2c_master_bus_handle_t bus = nullptr;
+            if (i2c_master_get_bus_handle(static_cast<i2c_port_num_t>(sccb_port), &bus) ==
+                    ESP_OK &&
+                nullptr != bus)
+            {
+                csi.sccb_config.init_sccb = false;
+                csi.sccb_config.i2c_handle = bus;
+                std::printf("esp32p4_csi_camera_src: SCCB on the existing I2C%d bus\n",
+                            sccb_port);
+            }
+            else
+            {
+                csi.sccb_config.init_sccb = true;
+                csi.sccb_config.i2c_config.port = static_cast<uint8_t>(sccb_port);
+                csi.sccb_config.i2c_config.scl_pin = static_cast<gpio_num_t>(sccb_scl);
+                csi.sccb_config.i2c_config.sda_pin = static_cast<gpio_num_t>(sccb_sda);
+            }
             csi.sccb_config.freq = static_cast<uint32_t>(sccb_freq);
             csi.reset_pin = static_cast<gpio_num_t>(reset_pin);
             csi.pwdn_pin = static_cast<gpio_num_t>(pwdn_pin);

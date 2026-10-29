@@ -36,7 +36,9 @@ class esp32p4_csi_device;
  * hands it out after CAPS_VIDEO_RAW.
  *
  * esp_video_init() runs once per boot on the first open(); the sccb_* / *_pin
- * keys only matter before that. The sensor and its mode come from sdkconfig
+ * keys only matter before that. If the application already created an I2C
+ * master bus on sccb_port, the sensor goes on that bus (sccb_scl / sccb_sda
+ * ignored), so other devices can share it. The sensor and its mode come from sdkconfig
  * (esp_cam_sensor).
  */
 class esp32p4_csi_camera_src : public component_source
