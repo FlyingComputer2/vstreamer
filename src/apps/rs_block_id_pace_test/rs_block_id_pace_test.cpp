@@ -283,6 +283,12 @@ int main(int argc, char **argv)
                      missing, seq_errors);
         return 1;
     }
+    if (dec.decode_fail() != 0)
+    {
+        std::fprintf(stderr, "FAIL: lossless stream had %" PRIu64 " decode failures\n",
+                     dec.decode_fail());
+        return 1;
+    }
 
     std::printf("PASS: no sequence corruption through %" PRIu64 " wire id wraps "
                 "(%" PRIu64 " blocks)\n",

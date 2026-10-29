@@ -171,14 +171,49 @@ int main()
                 deliver(dec, w[i], &got);
             }
         }
+        if (!check_tags("lost block before deadline", got, 0, 4) ||
+            dec.given_up_blocks() != 0U || dec.take_fail_lost_app_pkts() != 0U)
+        {
+            std::fprintf(stderr, "lost block: released or counted loss before deadline\n");
+            return 1;
+        }
         now += std::chrono::milliseconds(past_deadline_ms);
         fec_rx_payload_list tail;
         dec.poll_rx(&tail);
         got.insert(got.end(), tail.begin(), tail.end());
-        if (got.size() != 8U || tag_of(got[4]) != 8U || dec.given_up_blocks() != 1U)
+        const uint64_t lost = dec.take_fail_lost_app_pkts();
+        if (got.size() != 8U || tag_of(got[4]) != 8U || dec.given_up_blocks() != 1U ||
+            lost != 4U)
         {
-            std::fprintf(stderr, "lost block: %zu payloads, given up %llu\n", got.size(),
-                         static_cast<unsigned long long>(dec.given_up_blocks()));
+            std::fprintf(stderr, "lost block: %zu payloads, given up %llu, lost %llu\n",
+                         got.size(), static_cast<unsigned long long>(dec.given_up_blocks()),
+                         static_cast<unsigned long long>(lost));
+            return 1;
+        }
+
+        /* Late data and parity from the skipped block must not replay its SDUs or losses. */
+        fec_rx_payload_list late;
+        const uint64_t late_before = dec.late_blocks();
+        for (size_t i = 6; i < 12; i++)
+        {
+            deliver(dec, w[i], &late);
+        }
+        const uint64_t late_loss = dec.take_fail_lost_app_pkts();
+        if (!late.empty() || dec.late_blocks() <= late_before || late_loss != 0U ||
+            dec.given_up_blocks() != 1U)
+        {
+            std::fprintf(stderr, "late skipped block: %zu payloads, late %llu, lost %llu\n",
+                         late.size(), static_cast<unsigned long long>(dec.late_blocks()),
+                         static_cast<unsigned long long>(late_loss));
+            return 1;
+        }
+        for (const auto &s : encode(enc, 12, 4))
+        {
+            deliver(dec, s, &late);
+        }
+        if (!check_tags("after late skipped block", late, 12, 4) ||
+            dec.take_fail_lost_app_pkts() != 0U)
+        {
             return 1;
         }
     }
