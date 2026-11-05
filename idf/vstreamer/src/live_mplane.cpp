@@ -75,7 +75,12 @@ void live_mplane::add_node(std::string name, vstreamer::component *node)
 
 void live_mplane::add_query(std::string name, std::string key, query_fn fn)
 {
-    queries.push_back({std::move(name), std::move(key), std::move(fn)});
+    queries.push_back({std::move(name), std::move(key), std::move(fn), {}});
+}
+
+void live_mplane::add_control(std::string name, std::string key, query_fn get, set_fn set)
+{
+    queries.push_back({std::move(name), std::move(key), std::move(get), std::move(set)});
 }
 
 std::string live_mplane::handle(std::string_view line)
@@ -110,15 +115,22 @@ std::string live_mplane::handle(std::string_view line)
         return "err usage: " + std::string(verb) + " <node> <key>" +
                ("set" == verb ? " <value>" : "") + "\n";
     }
-    if ("get" == verb)
+    for (const auto &q : queries)
     {
-        for (const auto &q : queries)
+        if (q.node != node || q.key != key)
         {
-            if (q.node == node && q.key == key)
-            {
-                return "ok " + q.fn() + "\n";
-            }
+            continue;
         }
+        if ("get" == verb)
+        {
+            return "ok " + q.fn() + "\n";
+        }
+        if (!q.set)
+        {
+            return err_reply(-ENOTSUP);
+        }
+        const int r = q.set(rest);
+        return r < 0 ? err_reply(r) : std::string("ok\n");
     }
     for (const auto &n : nodes)
     {

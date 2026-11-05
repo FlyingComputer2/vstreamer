@@ -397,9 +397,22 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     }
 
     /* Runtime control (FEC k/n, bitrate, ...) for bench sweeps. */
-    live_mplane mplane;
+    std::atomic<bool>  own_pause {false}; // outlives the mplane thread
+    std::atomic<bool> &pause_request = cfg.pause ? *cfg.pause : own_pause;
+    live_mplane        mplane;
     if (cfg.mplane_port > 0)
     {
+        mplane.add_control(
+            "tx", "pause",
+            [&pause_request] { return pause_request.load() ? std::string("1") : std::string("0"); },
+            [&pause_request](std::string_view v) {
+                if ("1" != v && "0" != v)
+                {
+                    return -EINVAL;
+                }
+                pause_request.store("1" == v, std::memory_order_release);
+                return 0;
+            });
         mplane.add_node("src", src.get());
         mplane.add_node("pay", pay.get());
         mplane.add_node("snd", snd.get());
@@ -466,8 +479,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
                 vTaskDelay(1);
                 continue;
             }
-            const bool pause =
-                cfg.pause_request && cfg.pause_request->load(std::memory_order_acquire);
+            const bool pause = pause_request.load(std::memory_order_acquire);
             if (pause != paused)
             {
                 paused = pause;
