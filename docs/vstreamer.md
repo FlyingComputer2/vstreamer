@@ -669,7 +669,8 @@ on the esp32p4 target (pulls `espressif/esp_h264`); no apps. Add it to `EXTRA_CO
 On esp32p4 it also has live TX (`vstreamer_idf/live_tx.hpp`): `vstreamer::idf::run_live_tx(cfg)`
 runs camera → ISP + hardware H.264 → `rtp_h264_pay` → `stream_sender` to `cfg.peer` with the P4
 thread layout and an optional UDP management plane (`vstreamer_idf/live_mplane.hpp`;
-`get/set src|pay|snd <key>`, `get sys stats`), taking each component's settings as key/value
+`get/set src|pay|snd <key>`, `get sys stats`, `set tx pause 1|0` to pause / resume sending
+without stopping camera or encoder, resuming from a fresh IDR), taking each component's settings as key/value
 lists. `idf/example` is an esp32p4 smoke test (UDP loopback through a pipeline, hardware encode, a
 base64 clip dump). On ESP-IDF, pipeline control must come from a pthread (`std::thread`), not
 `app_main`; raise

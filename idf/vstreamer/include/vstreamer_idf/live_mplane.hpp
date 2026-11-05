@@ -22,6 +22,7 @@ class component;
  *
  *   get <node> <key>
  *   set <node> <key> <value...>
+ *   ping                         "ok pong"
  *   nodes                        "ok <node>" per node
  *
  * There is no authentication: anyone on the LAN can reconfigure the stream.
@@ -30,6 +31,8 @@ class live_mplane
 {
 public:
     using query_fn = std::function<std::string()>;
+    /* Applies the value of "set <node> <key> <value>"; 0 or -errno. */
+    using set_fn = std::function<int(std::string_view value)>;
 
     live_mplane() = default;
     ~live_mplane();
@@ -39,6 +42,8 @@ public:
     void add_node(std::string name, vstreamer::component *node);
     /* A read-only node: "get <name> <key>" calls fn for that key. */
     void add_query(std::string name, std::string key, query_fn fn);
+    /* A read/write key not backed by a component: "get" calls get, "set" calls set. */
+    void add_control(std::string name, std::string key, query_fn get, set_fn set);
 
     /* Starts the server thread on `thread` (name, stack, core, priority); 0 or an error from
      * socket()/bind(). Nodes must outlive stop(). */
@@ -60,6 +65,7 @@ private:
         std::string node;
         std::string key;
         query_fn    fn;
+        set_fn      set; // empty: read-only
     };
     std::vector<query_entry> queries;
 };

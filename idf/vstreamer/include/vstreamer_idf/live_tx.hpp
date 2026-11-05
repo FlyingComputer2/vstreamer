@@ -26,10 +26,12 @@ struct live_tx_config
     /* While it reads true, coded AUs are dropped before the payloader: camera and encoder keep
      * running, nothing is sent. On resume the encoder is asked for an IDR and AUs are dropped
      * until one comes out. A pause, not a stop: reopening the 1080p encoder after a run fails
-     * (its reference frame needs one contiguous internal-RAM block, fragmented by then). Not
-     * owned. */
-    const std::atomic<bool> *pause_request = nullptr;
-    /* UDP port of the management plane (get/set src|pay|snd <key>, get sys stats); 0 = none. */
+     * (its reference frame needs one contiguous internal-RAM block, fragmented by then). The
+     * m-plane's "set tx pause 1|0" writes it, and so can the host (e.g. during an OTA); null =
+     * live TX keeps its own, reset on every run. Not owned; must outlive run_live_tx. */
+    std::atomic<bool> *pause = nullptr;
+    /* UDP port of the management plane (get/set src|pay|snd <key>, get sys stats, get/set tx
+     * pause); 0 = none. */
     int mplane_port = 5090;
     /* Seconds between "live TX ..." stats lines; 0 = none. */
     int stats_interval_s = 10;
