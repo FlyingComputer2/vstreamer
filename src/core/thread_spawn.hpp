@@ -15,6 +15,7 @@
 #include "core/thread_affinity.hpp"
 
 #if defined(ESP_PLATFORM)
+#include "esp_heap_caps.h"
 #include "esp_pthread.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -37,6 +38,11 @@ struct thread_opts
     /* FreeRTOS priority (0..configMAX_PRIORITIES-1); -1 keeps the pthread default. Ignored on
      * Linux (real-time priorities need privileges). */
     int prio = -1;
+    /* ESP-IDF: allocate the stack in PSRAM (MALLOC_CAP_SPIRAM). Internal RAM is scarce once
+     * live video runs; when it is full the allocator falls back to LP SRAM if
+     * CONFIG_ESP_SYSTEM_ALLOW_RTC_FAST_MEM_AS_HEAP is set, which the CPU reads several times
+     * slower. Not for threads that touch flash or NVS (the cache is off then). */
+    bool psram_stack = false;
 };
 
 /*
@@ -64,6 +70,10 @@ template <typename... Args>
     }
     cfg.thread_name = opts.name;
     cfg.inherit_cfg = false;
+    if (opts.psram_stack)
+    {
+        cfg.stack_alloc_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    }
     (void)esp_pthread_set_cfg(&cfg);
 
     std::thread t(std::forward<Args>(args)...);
