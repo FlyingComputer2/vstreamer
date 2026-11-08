@@ -45,6 +45,7 @@ class esp32p4_csi_device
     int sccb_port = 0, sccb_scl = 8, sccb_sda = 7, sccb_freq = 100000;
     int reset_pin = -1, pwdn_pin = -1;
     int width = 0, height = 0, fps = 30, light_freq = 60, nbufs = 4;
+    int rotate = 180; /* degrees: 0 or 180 */
     int live_w = 0, live_h = 0;
     std::string driver;
     std::shared_ptr<ring> ring_;

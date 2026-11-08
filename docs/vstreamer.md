@@ -731,7 +731,8 @@ the dequeued one. Both sources share driver setup, including OV5647 timing and
 anti-flicker fixes.
 
 Camera settings: `size` (`0x0` uses the sensor mode), `fps`, `buffers` (2–8, default 4;
-actual allocation is driver-dependent), `light_freq` (0, 50, 60), `sccb_port`,
+actual allocation is driver-dependent), `light_freq` (0, 50, 60), `rotate` (0 or 180, default
+180; the OV5647 flips both readout axes in hardware), `sccb_port`,
 `sccb_scl`, `sccb_sda`, `sccb_freq`, `reset_pin`, and `pwdn_pin`. Sensor selection is
 still through sdkconfig, and SCCB setup applies on the first video initialization
 per boot. Encoder settings: `bitrate` / `bps`, `gop`, `qp_min`, `qp_max`, `rc`

@@ -161,12 +161,36 @@ constexpr int k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t s_ov5647_fmt;
 
-void ov5647_fix_format(int fd, int fps, int light_freq)
+/* Set bit 1 (vertical flip in 0x3820, horizontal mirror in 0x3821) of every
+ * entry of a register in the table, adding the register before the end marker
+ * if absent. Absolute, not a toggle: cur.regs may already be a patched table
+ * from an earlier open. */
+void ov5647_set_bit1(std::vector<ov5647_reginfo_t> &regs, uint16_t reg, bool on)
+{
+    bool found = false;
+    for (auto &r : regs)
+    {
+        if (reg == r.reg)
+        {
+            r.val = static_cast<uint8_t>((r.val & ~0x02) | (on ? 0x02 : 0));
+            found = true;
+        }
+    }
+    if (!found)
+    {
+        const auto end = regs.empty() ? regs.end() : regs.end() - 1;
+        regs.insert(end, ov5647_reginfo_t{reg, static_cast<uint8_t>(on ? 0x02 : 0)});
+    }
+}
+
+void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
 {
     esp_cam_sensor_format_t cur{};
     if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
         std::strcmp(cur.name, "MIPI_2lane_24Minput_RAW10_1920x1080_30fps") != 0 || fps <= 0)
     {
+        std::fprintf(stderr, "esp32p4_csi_camera_src: ov5647 mode not patched (rotate %d ignored)\n",
+                     rotate);
         return;
     }
     /* cur.regs may already be s_ov5647_regs (a second open), so copy before
@@ -215,6 +239,10 @@ void ov5647_fix_format(int fd, int fps, int light_freq)
         r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling >> 8) : r.val;
         r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling & 0xff) : r.val;
     }
+    /* The table's native orientation is flip off, mirror on (0x3820 bit 1 = 0,
+     * 0x3821 bit 1 = 1); 180 degrees inverts both. */
+    ov5647_set_bit1(regs, 0x3820, 180 == rotate);
+    ov5647_set_bit1(regs, 0x3821, 180 != rotate);
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
     s_ov5647_fmt.regs = s_ov5647_regs.data();
@@ -315,7 +343,7 @@ int esp32p4_csi_device::open()
         driver = reinterpret_cast<const char *>(cap.driver);
     }
 #if CONFIG_CAMERA_OV5647
-    ov5647_fix_format(fd, fps, light_freq);
+    ov5647_fix_format(fd, fps, light_freq, rotate);
 #endif
 
     struct v4l2_format fmt
@@ -611,6 +639,16 @@ int esp32p4_csi_device::configure(std::string_view key, std::string_view value)
         light_freq = f;
         return 0;
     }
+    if (key == "rotate")
+    {
+        int r = 0;
+        if (parse_int(value, 0, 180, &r) < 0 || (0 != r && 180 != r))
+        {
+            return -EINVAL;
+        }
+        rotate = r;
+        return 0;
+    }
     if (key == "sccb_port")
     {
         return parse_int(value, 0, 1, &sccb_port);
@@ -675,6 +713,10 @@ int esp32p4_csi_device::query(std::string_view key, std::string *value) const
     if (key == "light_freq")
     {
         return set_int(value, light_freq);
+    }
+    if (key == "rotate")
+    {
+        return set_int(value, rotate);
     }
     if (key == "driver")
     {
