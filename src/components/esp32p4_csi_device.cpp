@@ -161,7 +161,23 @@ constexpr int k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t s_ov5647_fmt;
 
-void ov5647_fix_format(int fd, int fps, int light_freq)
+/* Toggle bit 1 (vertical flip in 0x3820, horizontal mirror in 0x3821) of a
+ * register in the table, adding the register before the end marker if absent. */
+void ov5647_toggle_bit1(std::vector<ov5647_reginfo_t> &regs, uint16_t reg)
+{
+    for (auto &r : regs)
+    {
+        if (reg == r.reg)
+        {
+            r.val ^= 0x02;
+            return;
+        }
+    }
+    const auto end = regs.empty() ? regs.end() : regs.end() - 1;
+    regs.insert(end, ov5647_reginfo_t{reg, 0x02});
+}
+
+void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
 {
     esp_cam_sensor_format_t cur{};
     if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
@@ -214,6 +230,13 @@ void ov5647_fix_format(int fd, int fps, int light_freq)
     {
         r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling >> 8) : r.val;
         r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling & 0xff) : r.val;
+    }
+    if (180 == rotate)
+    {
+        /* Flip both axes relative to the table (the module's native
+         * orientation). */
+        ov5647_toggle_bit1(regs, 0x3820);
+        ov5647_toggle_bit1(regs, 0x3821);
     }
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
@@ -315,7 +338,7 @@ int esp32p4_csi_device::open()
         driver = reinterpret_cast<const char *>(cap.driver);
     }
 #if CONFIG_CAMERA_OV5647
-    ov5647_fix_format(fd, fps, light_freq);
+    ov5647_fix_format(fd, fps, light_freq, rotate);
 #endif
 
     struct v4l2_format fmt
@@ -611,6 +634,16 @@ int esp32p4_csi_device::configure(std::string_view key, std::string_view value)
         light_freq = f;
         return 0;
     }
+    if (key == "rotate")
+    {
+        int r = 0;
+        if (parse_int(value, 0, 180, &r) < 0 || (0 != r && 180 != r))
+        {
+            return -EINVAL;
+        }
+        rotate = r;
+        return 0;
+    }
     if (key == "sccb_port")
     {
         return parse_int(value, 0, 1, &sccb_port);
@@ -675,6 +708,10 @@ int esp32p4_csi_device::query(std::string_view key, std::string *value) const
     if (key == "light_freq")
     {
         return set_int(value, light_freq);
+    }
+    if (key == "rotate")
+    {
+        return set_int(value, rotate);
     }
     if (key == "driver")
     {

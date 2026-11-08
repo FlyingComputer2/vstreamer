@@ -35,7 +35,7 @@ const std::vector<port_desc> &output_ports()
 bool camera_key(std::string_view key)
 {
     return key == "size" || key == "fps" || key == "buffers" || key == "light_freq" ||
-           key == "sccb_port" || key == "sccb_scl" || key == "sccb_sda" || key == "sccb_freq" ||
+           key == "rotate" || key == "sccb_port" || key == "sccb_scl" || key == "sccb_sda" || key == "sccb_freq" ||
            key == "reset_pin" || key == "pwdn_pin";
 }
 bool encoder_key(std::string_view key)
