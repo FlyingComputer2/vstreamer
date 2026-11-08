@@ -161,20 +161,26 @@ constexpr int k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t s_ov5647_fmt;
 
-/* Toggle bit 1 (vertical flip in 0x3820, horizontal mirror in 0x3821) of a
- * register in the table, adding the register before the end marker if absent. */
-void ov5647_toggle_bit1(std::vector<ov5647_reginfo_t> &regs, uint16_t reg)
+/* Set bit 1 (vertical flip in 0x3820, horizontal mirror in 0x3821) of every
+ * entry of a register in the table, adding the register before the end marker
+ * if absent. Absolute, not a toggle: cur.regs may already be a patched table
+ * from an earlier open. */
+void ov5647_set_bit1(std::vector<ov5647_reginfo_t> &regs, uint16_t reg, bool on)
 {
+    bool found = false;
     for (auto &r : regs)
     {
         if (reg == r.reg)
         {
-            r.val ^= 0x02;
-            return;
+            r.val = static_cast<uint8_t>((r.val & ~0x02) | (on ? 0x02 : 0));
+            found = true;
         }
     }
-    const auto end = regs.empty() ? regs.end() : regs.end() - 1;
-    regs.insert(end, ov5647_reginfo_t{reg, 0x02});
+    if (!found)
+    {
+        const auto end = regs.empty() ? regs.end() : regs.end() - 1;
+        regs.insert(end, ov5647_reginfo_t{reg, static_cast<uint8_t>(on ? 0x02 : 0)});
+    }
 }
 
 void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
@@ -183,6 +189,8 @@ void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
     if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
         std::strcmp(cur.name, "MIPI_2lane_24Minput_RAW10_1920x1080_30fps") != 0 || fps <= 0)
     {
+        std::fprintf(stderr, "esp32p4_csi_camera_src: ov5647 mode not patched (rotate %d ignored)\n",
+                     rotate);
         return;
     }
     /* cur.regs may already be s_ov5647_regs (a second open), so copy before
@@ -231,13 +239,10 @@ void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
         r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling >> 8) : r.val;
         r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling & 0xff) : r.val;
     }
-    if (180 == rotate)
-    {
-        /* Flip both axes relative to the table (the module's native
-         * orientation). */
-        ov5647_toggle_bit1(regs, 0x3820);
-        ov5647_toggle_bit1(regs, 0x3821);
-    }
+    /* The table's native orientation is flip off, mirror on (0x3820 bit 1 = 0,
+     * 0x3821 bit 1 = 1); 180 degrees inverts both. */
+    ov5647_set_bit1(regs, 0x3820, 180 == rotate);
+    ov5647_set_bit1(regs, 0x3821, 180 != rotate);
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
     s_ov5647_fmt.regs = s_ov5647_regs.data();
