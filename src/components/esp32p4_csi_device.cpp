@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -160,6 +161,9 @@ constexpr int k_ov5647_min_vts = 1104;       /* 1080 active lines + the Linux dr
 constexpr int k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t s_ov5647_fmt;
+/* ISP description with the Bayer order of the flipped readout. Placement-new
+ * storage: the struct has a const member, so it cannot be assigned. */
+alignas(esp_cam_sensor_isp_info_t) unsigned char s_ov5647_isp_storage[sizeof(esp_cam_sensor_isp_info_t)];
 
 /* Set bit 1 (vertical flip in 0x3820, horizontal mirror in 0x3821) of every
  * entry of a register in the table, adding the register before the end marker
@@ -243,6 +247,16 @@ void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
      * 0x3821 bit 1 = 1); 180 degrees inverts both. */
     ov5647_set_bit1(regs, 0x3820, 180 == rotate);
     ov5647_set_bit1(regs, 0x3821, 180 != rotate);
+    /* Rotating the mosaic 180 degrees turns the sensor's GBRG into GRBG; the ISP
+     * has to demosaic the order the sensor now outputs. Absolute, like the
+     * registers: the table's native order is GBRG. */
+    if (nullptr != cur.isp_info)
+    {
+        const esp_cam_sensor_isp_info_t native(*cur.isp_info);
+        auto *isp = new (s_ov5647_isp_storage) esp_cam_sensor_isp_info_t(native);
+        isp->isp_v1_info.bayer_type = 180 == rotate ? ESP_CAM_SENSOR_BAYER_GRBG : ESP_CAM_SENSOR_BAYER_GBRG;
+        cur.isp_info = isp;
+    }
     s_ov5647_regs = std::move(regs);
     s_ov5647_fmt = cur;
     s_ov5647_fmt.regs = s_ov5647_regs.data();
