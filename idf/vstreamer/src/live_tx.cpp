@@ -46,8 +46,11 @@ struct place_kv
 /* Live TX: vs_isp_tx runs the RS FEC encode (~10 ms of compute per block) on core 0, so the
  * send thread sits on core 1; sharing core 0 starved it and spread FEC blocks left in lumps.
  * The mplane is on core 1 so it answers under load. Measured and not worth it (2026-10-17):
- * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0). */
-constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13};
+ * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0).
+ * Its stack is in PSRAM: with live video internal RAM is nearly full, and a 16 KB internal
+ * request then lands in LP SRAM (slow for the CPU), which made the whole thread 6-8x slower
+ * (rover 14-20 fps, vs_isp_tx 95% of core 0). Check with `get sys stacks`. */
+constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13, true};
 constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
 // esp32_h264_isp_ng_src dequeues camera buffers and encodes them on the same worker.
 constexpr place_kv k_live_src_place[] = {{"encode_cpu", "1"}, {"encode_prio", "13"}};
@@ -196,6 +199,49 @@ void print_sys_stats()
 {
     static cpu_window w;
     std::printf("sys %s\n", sys_stats_line(&w).c_str());
+}
+/* Where each task's stack lives, for the mplane: "<task>@<region>:<base>/<free bytes at the
+ * low-water mark>". Region L2 (internal), PS (PSRAM), LP (LP SRAM, slow), TCM or ?? (other). A
+ * stack in LP means internal RAM ran out when the task was created. */
+std::string stacks_line()
+{
+    const UBaseType_t n = uxTaskGetNumberOfTasks();
+    auto *st = static_cast<TaskStatus_t *>(
+        heap_caps_malloc(sizeof(TaskStatus_t) * (n + 4), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (st == nullptr)
+    {
+        return "ENOMEM";
+    }
+    uint32_t          total = 0;
+    const UBaseType_t got = uxTaskGetSystemState(st, n + 4, &total);
+    std::string       out = "tasks=" + std::to_string(got);
+    char              b[96];
+    for (UBaseType_t i = 0; i < got; i++)
+    {
+        const auto  base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(st[i].pxStackBase));
+        const char *where = "??";
+        if (base >= 0x50108000u && base < 0x50110000u)
+        {
+            where = "LP";
+        }
+        else if (base >= 0x4ff00000u && base < 0x4ffc0000u)
+        {
+            where = "L2";
+        }
+        else if (base >= 0x48000000u && base < 0x4c000000u)
+        {
+            where = "PS";
+        }
+        else if (base >= 0x30100000u && base < 0x30102000u)
+        {
+            where = "TCM";
+        }
+        std::snprintf(b, sizeof(b), " %s@%s:%x/%u", st[i].pcTaskName, where,
+                      static_cast<unsigned>(base), static_cast<unsigned>(st[i].usStackHighWaterMark));
+        out += b;
+    }
+    heap_caps_free(st);
+    return out;
 }
 #endif
 
@@ -421,6 +467,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             static cpu_window w;
             return sys_stats_line(&w);
         });
+        mplane.add_query("sys", "stacks", [] { return stacks_line(); });
 #endif
         if (const int mr = mplane.start(cfg.mplane_port, k_live_mplane_thread); mr < 0)
         {
