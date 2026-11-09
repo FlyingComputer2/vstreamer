@@ -63,6 +63,9 @@ private:
     void drain_mpp_to_ready(int timeout_ms);
     int  fetch_one_mpp_frame(int timeout_ms);
     int  pack_mpp_to_ready_locked(void *mpp_frame);
+    int  apply_error_mode_locked();
+    bool recent_picture_locked(uint64_t hash) const;
+    void remember_picture_locked(uint64_t hash);
 
     mutable std::mutex mu;
     std::mutex         mpp_io_mu;
@@ -82,11 +85,20 @@ private:
 
     static constexpr size_t k_max_ready_frames = 8;
     bool                      output_size_stream = false;
-    /* Output frames MPP flags with errinfo (decoded against a lost reference)
-     * instead of dropping them, so a loss shows artifacts rather than freezing
-     * until the next IDR. Discarded frames are still dropped. */
+    /* Output frames MPP flags with errinfo instead of dropping them, so a loss shows artifacts
+     * rather than freezing until the next IDR. This also sets MPP base:disable_error so the
+     * hardware decodes frames with a damaged reference; otherwise MPP skips the decode and
+     * returns a recycled buffer that still holds an older picture. Frames MPP still skips
+     * (a damaged AU it cannot parse) come back the same way; they are recognised because their
+     * picture equals a recent output and are dropped (stale_frames). Discarded frames are
+     * still dropped. */
     bool                      show_corrupt = false;
     uint64_t                  corrupt_frames = 0;  // errinfo frames, shown or dropped
+    uint64_t                  stale_frames = 0;    // errinfo frames dropped as a recycled picture
+    static constexpr size_t   k_recent_hashes = 8;
+    uint64_t                  recent_hash_[k_recent_hashes] {};
+    size_t                    recent_hash_count_ = 0;
+    size_t                    recent_hash_next_ = 0;
     std::deque<component_pdu> ready_frames;
     std::deque<component_pdu> pending_caps_out_;
 

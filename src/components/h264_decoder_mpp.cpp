@@ -221,6 +221,10 @@ int h264_decoder_mpp::ensure_decoder_locked()
     {
         ret = mpp_dec_cfg_set_u32(cfg, "base:fast_out", 1);
     }
+    if (ret == MPP_OK)
+    {
+        ret = mpp_dec_cfg_set_u32(cfg, "base:disable_error", show_corrupt ? 1 : 0);
+    }
     if (ret != MPP_OK)
     {
         mpp_dec_cfg_deinit(cfg);
@@ -239,6 +243,57 @@ int h264_decoder_mpp::ensure_decoder_locked()
     ctx = mpp_ctx;
     mpi = mpp_mpi;
     return 0;
+}
+
+/* show_corrupt changed on an open decoder: MPP reads base:disable_error per frame. */
+int h264_decoder_mpp::apply_error_mode_locked()
+{
+    if (nullptr == ctx || nullptr == mpi)
+    {
+        return 0;
+    }
+    auto     *mpp_ctx = static_cast<MppCtx>(ctx);
+    auto     *mpp_mpi = static_cast<MppApi *>(mpi);
+    MppDecCfg cfg = nullptr;
+    mpp_dec_cfg_init(&cfg);
+    if (nullptr == cfg)
+    {
+        return -ENOMEM;
+    }
+    std::lock_guard<std::mutex> api_lock(mpp_io_mu);
+    MPP_RET ret = mpp_mpi->control(mpp_ctx, MPP_DEC_GET_CFG, cfg);
+    if (ret == MPP_OK)
+    {
+        ret = mpp_dec_cfg_set_u32(cfg, "base:disable_error", show_corrupt ? 1 : 0);
+    }
+    if (ret == MPP_OK)
+    {
+        ret = mpp_mpi->control(mpp_ctx, MPP_DEC_SET_CFG, cfg);
+    }
+    mpp_dec_cfg_deinit(cfg);
+    return ret == MPP_OK ? 0 : -EIO;
+}
+
+bool h264_decoder_mpp::recent_picture_locked(uint64_t hash) const
+{
+    for (size_t i = 0; i < recent_hash_count_; ++i)
+    {
+        if (recent_hash_[i] == hash)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void h264_decoder_mpp::remember_picture_locked(uint64_t hash)
+{
+    recent_hash_[recent_hash_next_] = hash;
+    recent_hash_next_ = (recent_hash_next_ + 1) % k_recent_hashes;
+    if (recent_hash_count_ < k_recent_hashes)
+    {
+        ++recent_hash_count_;
+    }
 }
 
 void h264_decoder_mpp::free_decoder_locked()
@@ -394,6 +449,27 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
     int hor = static_cast<int>(mpp_frame_get_hor_stride(frame));
     int ver = static_cast<int>(mpp_frame_get_ver_stride(frame));
 
+    /* With show_corrupt, an errinfo frame whose decode MPP skipped is a recycled buffer that
+     * still holds a picture shown a few frames ago; showing it flips the screen back in time.
+     * A sparse luma hash recognises it. Dropping a genuinely identical picture changes nothing
+     * on screen. */
+    uint64_t picture_hash = 0;
+    if (show_corrupt)
+    {
+        const size_t luma = static_cast<size_t>(hor) * static_cast<size_t>(src_h);
+        uint64_t     h = 1469598103934665603ULL;
+        for (size_t i = 0; i < luma; i += 61)
+        {
+            h = (h ^ base[i]) * 1099511628211ULL;
+        }
+        picture_hash = h;
+        if (errinfo && recent_picture_locked(picture_hash))
+        {
+            ++stale_frames;
+            return -EIO;
+        }
+    }
+
     const bool swap_chroma =
         (raw == MPP_FMT_YUV420SP_VU || raw == MPP_FMT_YUV422SP_VU);
     const int  out_w = output_size_stream ? src_w : width;
@@ -445,6 +521,10 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         {
             last_latency_ms = ms;
         }
+    }
+    if (show_corrupt)
+    {
+        remember_picture_locked(picture_hash);
     }
     ready_frames.push_back(std::move(pdu));
     notify_wakeup();
@@ -572,6 +652,9 @@ int h264_decoder_mpp::open()
         opened = true;
         cancel_io = false;
         corrupt_frames = 0;
+        stale_frames = 0;
+        recent_hash_count_ = 0;
+        recent_hash_next_ = 0;
     }
     drain_stop_.store(false, std::memory_order_relaxed);
     if (!drain_thread_.joinable())
@@ -805,14 +888,17 @@ int h264_decoder_mpp::configure(std::string_view key, std::string_view value)
         if (v == "on" || v == "1")
         {
             show_corrupt = true;
-            return 0;
         }
-        if (v == "off" || v == "0")
+        else if (v == "off" || v == "0")
         {
             show_corrupt = false;
-            return 0;
         }
-        return -EINVAL;
+        else
+        {
+            return -EINVAL;
+        }
+        recent_hash_count_ = 0;
+        return apply_error_mode_locked();
     }
     if (key == "output_size_mode")
     {
@@ -882,6 +968,11 @@ int h264_decoder_mpp::query(std::string_view key, std::string *value) const
     if (key == "corrupt_frames")
     {
         *value = std::to_string(corrupt_frames);
+        return 0;
+    }
+    if (key == "stale_frames")
+    {
+        *value = std::to_string(stale_frames);
         return 0;
     }
     if (key == "latency_ms")
