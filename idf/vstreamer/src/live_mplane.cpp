@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <future>
 #include <thread>
 
 #include <sys/time.h>
@@ -155,7 +157,7 @@ live_mplane::~live_mplane()
     stop();
 }
 
-int live_mplane::start(int port, const vstreamer::thread_opts &thread_cfg)
+int live_mplane::open_socket(int port, bool nonblocking)
 {
     fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0)
@@ -166,9 +168,16 @@ int live_mplane::start(int port, const vstreamer::thread_opts &thread_cfg)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(static_cast<uint16_t>(port));
-    /* stop() is noticed within one receive timeout. */
-    timeval tv {0, 200 * 1000};
-    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (nonblocking)
+    {
+        (void)fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    }
+    else
+    {
+        /* stop() is noticed within one receive timeout. */
+        timeval tv {0, 200 * 1000};
+        (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
     if (bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0)
     {
         const int err = -errno;
@@ -176,8 +185,45 @@ int live_mplane::start(int port, const vstreamer::thread_opts &thread_cfg)
         fd = -1;
         return err;
     }
+    return 0;
+}
+
+int live_mplane::start(int port, const vstreamer::thread_opts &thread_cfg)
+{
+    if (const int err = open_socket(port, false); err < 0)
+    {
+        return err;
+    }
     stopping.store(false);
     thread = vstreamer::spawn_thread(thread_cfg, [this] { serve(); });
+    return 0;
+}
+
+int live_mplane::start(int port, const std::string &reactor_name)
+{
+    auto r = vstreamer::default_reactor_registry::get_instance().get(reactor_name);
+    if (!r)
+    {
+        return -ENOENT;
+    }
+    if (const int err = open_socket(port, true); err < 0)
+    {
+        return err;
+    }
+    reactor = std::move(r);
+    /* Registration on the reactor's thread: bfc's poll reactor is not thread-safe for adds. */
+    auto added = std::make_shared<std::promise<bool>>();
+    auto is_added = added->get_future();
+    reactor->wake_up([this, added] {
+        added->set_value(reactor->add_read_rdy(fd, [this] { serve_ready(); }));
+    });
+    if (!is_added.get())
+    {
+        close(fd);
+        fd = -1;
+        reactor.reset();
+        return -EIO;
+    }
     return 0;
 }
 
@@ -188,10 +234,41 @@ void live_mplane::stop()
     {
         thread.join();
     }
+    if (reactor && fd >= 0)
+    {
+        /* Off the poll set on the reactor's thread; after this no callback runs. */
+        auto removed = std::make_shared<std::promise<void>>();
+        auto is_removed = removed->get_future();
+        reactor->wake_up([this, removed] {
+            reactor->rem_read_rdy(fd);
+            removed->set_value();
+        });
+        is_removed.wait();
+    }
+    reactor.reset();
     if (fd >= 0)
     {
         close(fd);
         fd = -1;
+    }
+}
+
+void live_mplane::serve_ready()
+{
+    char buf[512];
+    /* A bounded batch per wake, so a flood cannot hold the shared reactor. */
+    for (int i = 0; i < 8; ++i)
+    {
+        sockaddr_in src {};
+        socklen_t   len = sizeof(src);
+        const int   n = recvfrom(fd, buf, sizeof(buf) - 1, 0, reinterpret_cast<sockaddr *>(&src),
+                                 &len);
+        if (n <= 0)
+        {
+            return;
+        }
+        const std::string reply = handle(std::string_view(buf, static_cast<size_t>(n)));
+        (void)sendto(fd, reply.data(), reply.size(), 0, reinterpret_cast<sockaddr *>(&src), len);
     }
 }
 

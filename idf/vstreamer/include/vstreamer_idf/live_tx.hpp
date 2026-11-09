@@ -33,6 +33,9 @@ struct live_tx_config
     /* UDP port of the management plane (get/set src|pay|snd <key>, get sys stats, get/set tx
      * pause); 0 = none. */
     int mplane_port = 5090;
+    /* Serve the management plane on this running reactor (vstreamer::default_reactor_registry)
+     * instead of a vs_mplane thread of its own; empty = own thread. */
+    std::string mplane_reactor;
     /* Seconds between "live TX ..." stats lines; 0 = none. */
     int stats_interval_s = 10;
 

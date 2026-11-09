@@ -469,7 +469,10 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         });
         mplane.add_query("sys", "stacks", [] { return stacks_line(); });
 #endif
-        if (const int mr = mplane.start(cfg.mplane_port, k_live_mplane_thread); mr < 0)
+        const int mr = cfg.mplane_reactor.empty()
+                           ? mplane.start(cfg.mplane_port, k_live_mplane_thread)
+                           : mplane.start(cfg.mplane_port, cfg.mplane_reactor);
+        if (mr < 0)
         {
             std::printf("live TX mplane: bind :%d failed (%d)\n", cfg.mplane_port, mr);
         }
