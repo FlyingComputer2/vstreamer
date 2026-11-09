@@ -125,7 +125,7 @@ endif()
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/BfcFetch.cmake)
 target_include_directories(vstreamer_source PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${bfc_SOURCE_DIR}/src
+    ${BFC_INCLUDE_DIRS}
     ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 if(VSTREAMER_LIBS)

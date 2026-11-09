@@ -2,14 +2,14 @@
 #define VSTREAMER_CORE_DEFAULT_REACTOR_HPP
 
 #include <bfc/default_reactor.hpp>
-#include <functional>
 
 namespace vstreamer
 {
 
-using default_reactor = bfc::default_reactor<std::function<void()>>;
-using default_reactor_registry =
-    bfc::object_registry<bfc::object_tag<default_reactor>>;
+// The project's bfc default reactor (type and callback from its bfc_config.hpp)
+// and its one registry, shared with winject-l3 and the firmware.
+using default_reactor = bfc::default_reactor<>;
+using default_reactor_registry = bfc::default_reactor_registry;
 
 }  // namespace vstreamer
 
