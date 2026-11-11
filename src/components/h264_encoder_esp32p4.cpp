@@ -44,7 +44,8 @@ constexpr size_t   k_out_slot_count = 6;
 /* Buffered bits are repaid over this long; the buffer is clamped to [-0.5, +1] s of bitrate. */
 constexpr double k_rc_repay_s = 0.5;
 /* A P frame's size also depends on its reference's QP, so a full per-frame correction rings at
- * a 4-frame period; filter the size and move a quarter of the way, one QP per frame at most. */
+ * a 4-frame period; filter the size and move a quarter of the way, one QP per frame at most.
+ * IDR sizes use the same filter, sampled once per GOP. */
 constexpr double k_rc_ema = 0.25;
 constexpr double k_rc_gain = 0.25;
 constexpr int    k_rc_max_step = 1;
@@ -192,7 +193,7 @@ int h264_encoder_esp32p4::codec_open_locked()
         rc_qp_ = std::clamp((qp_min + qp_max) / 2, qp_min, qp_max);
         rc_buf_bits_ = 0;
         rc_p_bits_ = 0;
-        rc_idr_bits_ = 0;
+        rc_idr_q0_bits_ = 0;
     }
 
     /* PSRAM: internal RAM is kept for DMA, stacks and the network stack. */
@@ -382,11 +383,13 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
  * Frame-level rate control. The virtual buffer holds coded bits minus the budget; the next frame
  * aims at the budget less 1/(fps * repay) of the buffer. IDR and P sizes are filtered apart, and
  * the prediction is the mean frame of a GOP, (idr + (gop - 1) * p) / gop, so IDR bits count at
- * every GOP length: at GOP 1 it is the IDR size alone, at long GOPs nearly the P size. The QP
- * moves a fraction of the step that size needs (6 QP per halving), at most k_rc_max_step per
- * frame. gop_used is the GOP the frame was encoded with, not a later live change.
+ * every GOP length: at GOP 1 it is the IDR size alone, at long GOPs nearly the P size. An IDR
+ * comes once per GOP, maybe many QP steps ago, so its size is kept scaled to QP 0 (6 QP per
+ * halving) and predicted at the current QP. The QP moves a fraction of the step the predicted
+ * size needs, at most k_rc_max_step per frame, once both sizes the GOP needs are known.
+ * qp_used and gop_used are what the frame was encoded with, not later live changes.
  */
-void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr, int gop_used)
+void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr, int qp_used, int gop_used)
 {
     const double budget = static_cast<double>(bitrate) / fps;
     const double second = static_cast<double>(bitrate);
@@ -395,21 +398,23 @@ void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr, int gop_used)
     {
         return;
     }
-    double &filtered = idr ? rc_idr_bits_ : rc_p_bits_;
-    filtered = filtered > 0 ? filtered + k_rc_ema * (bits - filtered) : bits;
-    double mean = 0;
-    if (gop_used <= 1 || rc_p_bits_ <= 0)
+    if (idr)
     {
-        mean = rc_idr_bits_;
-    }
-    else if (rc_idr_bits_ <= 0)
-    {
-        mean = rc_p_bits_;
+        const double q0 = bits * std::exp2(qp_used / 6.0);
+        rc_idr_q0_bits_ =
+            rc_idr_q0_bits_ > 0 ? rc_idr_q0_bits_ + k_rc_ema * (q0 - rc_idr_q0_bits_) : q0;
     }
     else
     {
-        mean = (rc_idr_bits_ + (gop_used - 1) * rc_p_bits_) / gop_used;
+        rc_p_bits_ = rc_p_bits_ > 0 ? rc_p_bits_ + k_rc_ema * (bits - rc_p_bits_) : bits;
     }
+    const int g = std::max(gop_used, 1);
+    if (rc_idr_q0_bits_ <= 0 || (g > 1 && rc_p_bits_ <= 0))
+    {
+        return;
+    }
+    const double idr_bits = rc_idr_q0_bits_ * std::exp2(-rc_qp_ / 6.0);
+    const double mean = (idr_bits + (g - 1) * rc_p_bits_) / g;
     const double target = std::max(budget - rc_buf_bits_ / (fps * k_rc_repay_s), 0.25 * budget);
     const double step = k_rc_gain * 6.0 * std::log2(mean / target);
     const int    d = std::clamp(static_cast<int>(std::lround(step)), -k_rc_max_step, k_rc_max_step);
@@ -417,7 +422,8 @@ void h264_encoder_esp32p4::rc_update_locked(double bits, bool idr, int gop_used)
 }
 
 /* Called with hw_mu_ and lock (on mu) held; drops mu for the esp_h264 calls. */
-int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_lock<std::mutex> &lock)
+int h264_encoder_esp32p4::encode_locked(const component_pdu &in,
+                                        std::unique_lock<std::mutex> &lock)
 {
     if (reopen_req)
     {
@@ -541,7 +547,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in, std::unique_loc
     if (frame_rc_now)
     {
         rc_qp_sum_ += static_cast<uint64_t>(qp_used);
-        rc_update_locked(8.0 * out_frame.length, idr, gop_now);
+        rc_update_locked(8.0 * out_frame.length, idr, qp_used, gop_now);
     }
     pool->slots[out_index].handed_out = out_frame.length;
     au.flags = idr ? static_cast<uint8_t>(pdu_flag_e::KEY) : 0;
