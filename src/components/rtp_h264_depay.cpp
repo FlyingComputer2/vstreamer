@@ -286,6 +286,14 @@ int rtp_h264_depay::query(std::string_view key, std::string *value) const
         *value = buf;
         return 0;
     }
+    if ("rtp_resyncs" == key)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64, depay.rtp_resyncs());
+        *value = buf;
+        return 0;
+    }
     if ("au_dropped" == key)
     {
         std::lock_guard<std::mutex> lock(mu);

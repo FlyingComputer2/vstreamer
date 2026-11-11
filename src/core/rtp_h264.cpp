@@ -407,6 +407,9 @@ void rtp_h264_depacketizer::reset()
     need_idr_count = 0;
     nal_dropped_count = 0;
     rtp_reordered_count = 0;
+    rtp_resync_count = 0;
+    probation_pkt.clear();
+    have_probation = false;
     building_capture_rt_ns = 0;
     completed_aus.clear();
 }
@@ -687,29 +690,27 @@ int rtp_h264_depacketizer::process_payload(const parsed_rtp &rtp)
     return 0;
 }
 
-int rtp_h264_depacketizer::feed(const uint8_t *datagram, size_t len, std::vector<uint8_t> *au_out)
+/* The sender restarted (its sequence starts again, usually at 0): what is being built belongs
+ * to the old stream. Loss and counters carry on; the next packet starts the sequence afresh. */
+void rtp_h264_depacketizer::start_new_sequence()
 {
-    if (nullptr == datagram || nullptr == au_out)
+    if (fu_active || !building_au.empty())
     {
-        return -EINVAL;
+        nal_dropped_count++;
     }
+    fu_buf.clear();
+    fu_active = false;
+    building_au.clear();
+    have_building_ts = false;
+    building_key = false;
+    building_damaged = false;
+    building_capture_rt_ns = 0;
+    have_seq = false;
+    rtp_resync_count++;
+}
 
-    parsed_rtp rtp {};
-    if (!parse_rtp(datagram, len, &rtp))
-    {
-        return -EINVAL;
-    }
-
-    if (have_seq)
-    {
-        const int16_t diff = static_cast<int16_t>(rtp.seq - last_seq);
-        if (diff <= 0)
-        {
-            rtp_reordered_count++;
-            return pop_completed_au(au_out);
-        }
-    }
-
+int rtp_h264_depacketizer::accept_packet(const parsed_rtp &rtp)
+{
     if (have_building_ts && rtp.ts != building_ts)
     {
         finish_building_au(building_ts, building_capture_rt_ns);
@@ -734,7 +735,72 @@ int rtp_h264_depacketizer::feed(const uint8_t *datagram, size_t len, std::vector
     {
         finish_building_au(rtp.ts, building_capture_rt_ns);
     }
+    return 0;
+}
 
+int rtp_h264_depacketizer::feed(const uint8_t *datagram, size_t len, std::vector<uint8_t> *au_out)
+{
+    if (nullptr == datagram || nullptr == au_out)
+    {
+        return -EINVAL;
+    }
+
+    parsed_rtp rtp {};
+    if (!parse_rtp(datagram, len, &rtp))
+    {
+        return -EINVAL;
+    }
+
+    if (have_seq)
+    {
+        const int16_t diff = static_cast<int16_t>(rtp.seq - last_seq);
+        if (diff <= 0)
+        {
+            /* A late or duplicate packet is dropped. One far behind may be a restarted sender
+             * whose sequence starts below ours: dropping it until the new sequence catches up
+             * would blank the video for up to 32768 packets. Two in a row there (RFC 3550
+             * A.1 probation) switch to the new sequence; the first one is replayed. */
+            if (-diff <= k_max_misorder)
+            {
+                rtp_reordered_count++;
+                return pop_completed_au(au_out);
+            }
+            if (!have_probation || static_cast<uint16_t>(probation_seq + 1) != rtp.seq)
+            {
+                probation_pkt.assign(datagram, datagram + len);
+                probation_seq = rtp.seq;
+                have_probation = true;
+                rtp_reordered_count++;
+                return pop_completed_au(au_out);
+            }
+            start_new_sequence();
+            std::vector<uint8_t> first;
+            first.swap(probation_pkt);
+            have_probation = false;
+            parsed_rtp first_rtp {};
+            if (parse_rtp(first.data(), first.size(), &first_rtp))
+            {
+                const int r = accept_packet(first_rtp);
+                if (r < 0)
+                {
+                    return r;
+                }
+            }
+            const int r = accept_packet(rtp);
+            if (r < 0)
+            {
+                return r;
+            }
+            return pop_completed_au(au_out);
+        }
+    }
+    have_probation = false;
+
+    const int r = accept_packet(rtp);
+    if (r < 0)
+    {
+        return r;
+    }
     return pop_completed_au(au_out);
 }
 

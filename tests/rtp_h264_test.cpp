@@ -162,6 +162,81 @@ TEST(RtpH264Test, ReorderDoesNotInflatePacketLoss)
     EXPECT_EQ(0U, dep.rtp_lost());
 }
 
+namespace
+{
+
+/* Datagrams of one AU renumbered from first_seq, as a sender at that point in its sequence. */
+std::vector<std::vector<uint8_t>> with_seq(std::vector<std::vector<uint8_t>> dgrams,
+                                           uint16_t first_seq, uint32_t ts)
+{
+    uint16_t seq = first_seq;
+    for (auto &dg : dgrams)
+    {
+        dg[2] = static_cast<uint8_t>(seq >> 8);
+        dg[3] = static_cast<uint8_t>(seq);
+        dg[4] = static_cast<uint8_t>(ts >> 24);
+        dg[5] = static_cast<uint8_t>(ts >> 16);
+        dg[6] = static_cast<uint8_t>(ts >> 8);
+        dg[7] = static_cast<uint8_t>(ts);
+        ++seq;
+    }
+    return dgrams;
+}
+
+}  // namespace
+
+TEST(RtpH264Test, RestartedSenderBehindIsFollowed)
+{
+    const std::vector<uint8_t> src = make_idr_au_with_large_nal();
+    const auto                 dgrams = pack_au(src, 200);
+    ASSERT_GT(dgrams.size(), 3U);
+
+    rtp_h264_depacketizer dep(30);
+    EXPECT_EQ(src, depack_datagrams(dep, with_seq(dgrams, 30000, 1000)));
+    /* The sender restarts its sequence at 0, 30000 packets "behind": its first AU must come
+     * out whole (the probation packet is replayed), not be dropped as late packets. */
+    EXPECT_EQ(src, depack_datagrams(dep, with_seq(dgrams, 0, 5000)));
+    EXPECT_EQ(1U, dep.rtp_resyncs());
+    EXPECT_EQ(0U, dep.rtp_lost());
+    EXPECT_EQ(src, depack_datagrams(dep, with_seq(dgrams, static_cast<uint16_t>(dgrams.size()), 8000)));
+    EXPECT_EQ(1U, dep.rtp_resyncs());
+    EXPECT_EQ(0U, dep.rtp_lost());
+}
+
+TEST(RtpH264Test, StrayOldPacketDoesNotResync)
+{
+    const std::vector<uint8_t> src = make_idr_au_with_large_nal();
+    const auto                 dgrams = pack_au(src, 200);
+    ASSERT_GT(dgrams.size(), 3U);
+    const auto a = with_seq(dgrams, 30000, 1000);
+    const auto b = with_seq(dgrams, static_cast<uint16_t>(30000 + dgrams.size()), 4000);
+
+    rtp_h264_depacketizer dep(30);
+    EXPECT_EQ(src, depack_datagrams(dep, a));
+    /* One far-behind packet, then the current sequence carries on: no resync, AU intact. */
+    std::vector<std::vector<uint8_t>> mixed = with_seq({dgrams[0]}, 5, 99);
+    mixed.insert(mixed.end(), b.begin(), b.end());
+    EXPECT_EQ(src, depack_datagrams(dep, mixed));
+    EXPECT_EQ(0U, dep.rtp_resyncs());
+    EXPECT_EQ(1U, dep.rtp_reordered());
+    EXPECT_EQ(0U, dep.rtp_lost());
+}
+
+TEST(RtpH264Test, LatePacketWithinWindowStillDropped)
+{
+    const std::vector<uint8_t> src = make_idr_au_with_large_nal();
+    const auto                 dgrams = pack_au(src, 200);
+    ASSERT_GT(dgrams.size(), 3U);
+    auto a = with_seq(dgrams, 1000, 1000);
+    /* Duplicate the second packet after the third: late by one, dropped. */
+    a.insert(a.begin() + 3, a[1]);
+
+    rtp_h264_depacketizer dep(30);
+    EXPECT_EQ(src, depack_datagrams(dep, a));
+    EXPECT_EQ(1U, dep.rtp_reordered());
+    EXPECT_EQ(0U, dep.rtp_resyncs());
+}
+
 TEST(RtpH264Test, CsrcAndPaddingParsed)
 {
     const uint8_t nal[] = {0x65, 0x01, 0x02};
