@@ -20,7 +20,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
@@ -49,7 +48,7 @@ struct place_kv
  * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0).
  * Its stack is in PSRAM: with live video internal RAM is nearly full, and a 16 KB internal
  * request then lands in LP SRAM (slow for the CPU), which made the whole thread 6-8x slower
- * (rover 14-20 fps, vs_isp_tx 95% of core 0). Check with `get sys stacks`. */
+ * (rover 14-20 fps, vs_isp_tx 95% of core 0). Check with `get sys stack` (sys-applet-esp32p4). */
 constexpr vstreamer::thread_opts k_live_tx_thread {"vs_isp_tx", 16 * 1024, 0, 13, true};
 constexpr vstreamer::thread_opts k_live_mplane_thread {"vs_mplane", 6 * 1024, 1, 5};
 // esp32_h264_isp_ng_src dequeues camera buffers and encodes them on the same worker.
@@ -117,133 +116,6 @@ public:
 private:
     esp_pm_lock_handle_t lock = nullptr;
 };
-
-#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-/* Per-caller window for sys_stats_line(), so the stats print and the mplane do not share one. */
-struct cpu_window
-{
-    /* Keyed by task number: names repeat (every pthread is "pthread"). */
-    struct prev_t
-    {
-        UBaseType_t num;
-        uint32_t    rt;
-    };
-    std::vector<prev_t> prev;
-    int64_t             prev_us = 0;
-};
-
-/* CPU per task name since the previous call on w (percent of one core; tasks sharing a name
- * are summed), then heap headroom. */
-std::string sys_stats_line(cpu_window *w)
-{
-    using prev_t = cpu_window::prev_t;
-    std::vector<prev_t> &prev = w->prev;
-    int64_t             &prev_us = w->prev_us;
-    const UBaseType_t          n = uxTaskGetNumberOfTasks() + 4;
-    std::vector<TaskStatus_t>  st(n);
-    configRUN_TIME_COUNTER_TYPE total = 0;
-    const UBaseType_t got = uxTaskGetSystemState(st.data(), n, &total);
-    const int64_t     now = esp_timer_get_time();
-    const double      dt = prev_us > 0 ? static_cast<double>(now - prev_us) : 0;
-    std::vector<prev_t> cur;
-    std::vector<std::pair<std::string, double>> by_name;
-    for (UBaseType_t i = 0; i < got; ++i)
-    {
-        const UBaseType_t num = st[i].xTaskNumber;
-        const uint32_t    rt = static_cast<uint32_t>(st[i].ulRunTimeCounter);
-        cur.push_back({num, rt});
-        for (const auto &p : prev)
-        {
-            if (p.num == num && dt > 0)
-            {
-                const double pct = 100.0 * static_cast<uint32_t>(rt - p.rt) / dt;
-                const std::string name = st[i].pcTaskName;
-                auto it = std::find_if(by_name.begin(), by_name.end(),
-                                       [&](const auto &e) { return e.first == name; });
-                if (it == by_name.end())
-                {
-                    by_name.emplace_back(name, pct);
-                }
-                else
-                {
-                    it->second += pct;
-                }
-                break;
-            }
-        }
-    }
-    std::string line;
-    for (const auto &[name, pct] : by_name)
-    {
-        if (pct >= 0.5 || 0 == name.rfind("IDLE", 0))
-        {
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), " %s=%.1f%%", name.c_str(), pct);
-            line += buf;
-        }
-    }
-    prev = std::move(cur);
-    prev_us = now;
-    char heap[160];
-    std::snprintf(heap, sizeof(heap), "; int free=%u min=%u big=%u; psram free=%u min=%u big=%u",
-                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-                  heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                  heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                  heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
-                  heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    return "cpu" + line + heap;
-}
-
-void print_sys_stats()
-{
-    static cpu_window w;
-    std::printf("sys %s\n", sys_stats_line(&w).c_str());
-}
-/* Where each task's stack lives, for the mplane: "<task>@<region>:<base>/<free bytes at the
- * low-water mark>". Region L2 (internal), PS (PSRAM), LP (LP SRAM, slow), TCM or ?? (other). A
- * stack in LP means internal RAM ran out when the task was created. */
-std::string stacks_line()
-{
-    const UBaseType_t n = uxTaskGetNumberOfTasks();
-    auto *st = static_cast<TaskStatus_t *>(
-        heap_caps_malloc(sizeof(TaskStatus_t) * (n + 4), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (st == nullptr)
-    {
-        return "ENOMEM";
-    }
-    uint32_t          total = 0;
-    const UBaseType_t got = uxTaskGetSystemState(st, n + 4, &total);
-    std::string       out = "tasks=" + std::to_string(got);
-    char              b[96];
-    for (UBaseType_t i = 0; i < got; i++)
-    {
-        const auto  base = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(st[i].pxStackBase));
-        const char *where = "??";
-        if (base >= 0x50108000u && base < 0x50110000u)
-        {
-            where = "LP";
-        }
-        else if (base >= 0x4ff00000u && base < 0x4ffc0000u)
-        {
-            where = "L2";
-        }
-        else if (base >= 0x48000000u && base < 0x4c000000u)
-        {
-            where = "PS";
-        }
-        else if (base >= 0x30100000u && base < 0x30102000u)
-        {
-            where = "TCM";
-        }
-        std::snprintf(b, sizeof(b), " %s@%s:%x/%u", st[i].pcTaskName, where,
-                      static_cast<unsigned>(base), static_cast<unsigned>(st[i].usStackHighWaterMark));
-        out += b;
-    }
-    heap_caps_free(st);
-    return out;
-}
-#endif
 
 /* TX thread time per stats interval: payloader calls, stream_sender input (FEC encode and
  * queueing) and how often the sender pushed back. */
@@ -462,13 +334,6 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         mplane.add_node("src", src.get());
         mplane.add_node("pay", pay.get());
         mplane.add_node("snd", snd.get());
-#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-        mplane.add_query("sys", "stats", [] {
-            static cpu_window w;
-            return sys_stats_line(&w);
-        });
-        mplane.add_query("sys", "stacks", [] { return stacks_line(); });
-#endif
         const int mr = cfg.mplane_reactor.empty()
                            ? mplane.start(cfg.mplane_port, k_live_mplane_thread)
                            : mplane.start(cfg.mplane_port, cfg.mplane_reactor);
@@ -639,9 +504,6 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
                         stat_dt > 0 ? fec_us / (stat_dt * 1e4) : 0.0,
                         stat_dt > 0 ? kern_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
                         isp_stats.c_str(), snd_stats.c_str());
-#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
-            print_sys_stats();
-#endif
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
             esp_timer_get_time() >= stop_at)
