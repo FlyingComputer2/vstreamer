@@ -79,6 +79,7 @@ private:
     int      rc_qp_ = 0;          /* QP for the next frame */
     double   rc_buf_bits_ = 0;    /* coded bits minus budget, clamped */
     double   rc_p_bits_ = 0;      /* filtered P-frame size */
+    double   rc_idr_q0_bits_ = 0; /* filtered IDR size, scaled to QP 0 */
     uint64_t rc_qp_sum_ = 0;      /* for the stats average */
 
     /* esp_h264 handles; typed in the .cpp. */
@@ -116,7 +117,7 @@ private:
     };
     std::shared_ptr<slot_pool> pool_;
 
-    void rc_update_locked(double bits, bool idr);
+    void rc_update_locked(double bits, bool idr, int qp_used, int gop_used);
     int  acquire_out_slot_locked(size_t *index);
 
     bool             have_input_caps_ = false;
