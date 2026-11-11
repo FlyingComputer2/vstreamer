@@ -212,6 +212,7 @@ FU-A, capture-time header extension).
 |-----|-----|------------------|
 | `fps` | C | 1..120, default 30 |
 | `au_dropped`, `nal_dropped`, `loss`, `need_idr`, `rtp_reordered` | Q | counters |
+| `rtp_resyncs` | Q | times the sequence jumped more than 100 packets back and the next packet followed it (a restarted sender): the depay switched to the new sequence instead of dropping it as late packets |
 | `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
 **`stream_sender`** — UDP egress with RS block-erasure FEC and a bounded queue. No rate control:

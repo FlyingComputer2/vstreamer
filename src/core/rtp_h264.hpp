@@ -127,6 +127,13 @@ public:
 
     [[nodiscard]] uint64_t rtp_reordered() const { return rtp_reordered_count; }
 
+    /* Times the sequence jumped far back and stayed there (a restarted sender), so the depay
+     * followed the new sequence instead of dropping it as late packets. */
+    [[nodiscard]] uint64_t rtp_resyncs() const { return rtp_resync_count; }
+
+    /* A packet further behind than this is not a late one but a different sequence. */
+    static constexpr int k_max_misorder = 100;
+
 private:
     struct parsed_rtp
     {
@@ -147,6 +154,8 @@ private:
     void note_au_timestamps(uint32_t ts, int64_t capture_rt_ns);
     void finish_building_au(uint32_t ts, int64_t capture_rt_ns);
     int  pop_completed_au(std::vector<uint8_t> *au_out);
+    int  accept_packet(const parsed_rtp &rtp);
+    void start_new_sequence();
 
     struct completed_au_s
     {
@@ -180,6 +189,12 @@ private:
     uint64_t need_idr_count = 0;
     uint64_t nal_dropped_count = 0;
     uint64_t rtp_reordered_count = 0;
+    uint64_t rtp_resync_count = 0;
+
+    /* First packet of a possible new sequence, held until the next one confirms it. */
+    std::vector<uint8_t> probation_pkt;
+    uint16_t             probation_seq = 0;
+    bool                 have_probation = false;
 
     int64_t building_capture_rt_ns = 0;
     std::deque<completed_au_s> completed_aus;
