@@ -13,7 +13,7 @@ seconds.
 Columns: chan% is the channel's forward drop rate (all models); resid% is RTP packets missing
 after FEC (sequence gaps at the depacketizer) over RTP packets expected; fps is frames presented;
 idr is depacketizer resyncs (waits for an IDR); cpu% is the sender's busiest task (named in `task`), c0%/c1% the busy share of each
-core, when it answers `get sys stats` (P4 only).
+core, from the board's system applet (`--sys`, sys-applet-esp32p4's `get sys cpu`; P4 only).
 """
 
 from __future__ import annotations
@@ -146,11 +146,12 @@ def set_channel(chan: tuple[str, int], c: channel_point) -> None:
     ask_ok(chan, f"set link ge_p_gb {p_gb:g}")
 
 
-def cpu_usage(sys_stats: str) -> tuple[str, float, tuple[float, ...]]:
-    """Busiest task, its CPU %, and the busy % of each core (100 - IDLEn)."""
-    tasks = [(name, float(pct)) for name, pct in re.findall(r" (\w+)=([\d.]+)%", sys_stats)
-             if not name.startswith("IDLE")]
-    idle = sorted((name, float(pct)) for name, pct in re.findall(r"(IDLE\d)=([\d.]+)%", sys_stats))
+def cpu_usage(sys_cpu: str) -> tuple[str, float, tuple[float, ...]]:
+    """Busiest task, its CPU %, and the busy % of each core (100 - IDLEn), from `get sys cpu`
+    ("window_ms=<ms> <name>:<core>:<prio>:<percent> ...")."""
+    rows = [(name, float(pct)) for name, pct in re.findall(r" ([^\s:]+):[-\d]+:\d+:([\d.]+)", sys_cpu)]
+    tasks = [r for r in rows if not r[0].startswith("IDLE")]
+    idle = sorted(r for r in rows if re.fullmatch(r"IDLE\d", r[0]))
     top = max(tasks, key=lambda t: t[1]) if tasks else ("", 0.0)
     return top[0], top[1], tuple(100.0 - pct for _, pct in idle)
 
@@ -160,11 +161,13 @@ def core(r: result, i: int) -> str:
 
 
 def measure(args, sender, chan, rcv, f: fec_point, c: channel_point) -> result:
-    sys_ok = True
-    try:
-        ask_ok(sender, "get sys stats")  # opens the CPU window
-    except (RuntimeError, socket.timeout):
-        sys_ok = False
+    sys_addr = host_port(args.sys) if args.sys else None
+    sys_ok = sys_addr is not None
+    if sys_ok:
+        try:
+            ask_ok(sys_addr, "get sys cpu")  # opens the CPU window
+        except (RuntimeError, socket.timeout):
+            sys_ok = False
     m0 = receiver_metrics(rcv)
     ask_ok(chan, "set link stats reset")
     t0 = time.monotonic()
@@ -172,7 +175,7 @@ def measure(args, sender, chan, rcv, f: fec_point, c: channel_point) -> result:
     m1 = receiver_metrics(rcv)
     dt = time.monotonic() - t0
     st = kv(ask_ok(chan, "get link stats"))
-    task, task_pct, core_busy = cpu_usage(ask_ok(sender, "get sys stats")) if sys_ok else ("", 0.0, ())
+    task, task_pct, core_busy = cpu_usage(ask_ok(sys_addr, "get sys cpu")) if sys_ok else ("", 0.0, ())
 
     def d(name: str) -> float:
         return m1.get(name, 0.0) - m0.get(name, 0.0)
@@ -201,6 +204,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--sender", required=True, help="sender mplane host:port")
     ap.add_argument("--sender-node", default="snd", help="stream_sender node name (default snd)")
+    ap.add_argument("--sys", help="the sender board's system applet host:port (P4: 5130), for CPU columns")
     ap.add_argument("--channel", default="127.0.0.1:5095", help="channel_sim mplane")
     ap.add_argument("--receiver", default="127.0.0.1:5091", help="receiver console")
     ap.add_argument("--fec", default="none,10/12,8/12", help="none or k/n, comma separated")
