@@ -13,8 +13,7 @@ macro(vstreamer_fetch_isal)
     include(FetchContent)
     FetchContent_Declare(isa-l
         GIT_REPOSITORY https://github.com/intel/isa-l.git
-        GIT_TAG v2.31.1
-        GIT_SHALLOW TRUE
+        GIT_TAG 41a840a784040dc68b5363c0a6280e796382b707
     )
     FetchContent_GetProperties(isa-l)
     if(NOT isa-l_POPULATED)
