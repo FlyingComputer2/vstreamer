@@ -5,7 +5,7 @@ include(FetchContent)
 # before including this file. This repo's own builds (host tests, IDF examples
 # under it) fall back to its pin and to its default config in bfc_config/.
 # A mismatched pin, or an outside project without a config, stops the configure.
-set(VSTREAMER_BFC_PIN 3d68f8e61ef933718a51f248c76be8894d0cb491)
+set(VSTREAMER_BFC_PIN 8dc02add56771bf05f60519b3915c8fc9464d24b)
 get_filename_component(VSTREAMER_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 string(FIND "${CMAKE_SOURCE_DIR}/" "${VSTREAMER_ROOT}/" VSTREAMER_own_build)
 
