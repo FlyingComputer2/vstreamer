@@ -12,7 +12,6 @@
 #include <climits>
 #include <cstdio>
 
-#include "core/pdu_wakeup.hpp"
 
 namespace vstreamer
 {
@@ -66,10 +65,6 @@ public:
         return -ENOTSUP;
     }
 
-    void set_wakeup(std::shared_ptr<pdu_wakeup> w) { wakeup_ = std::move(w); }
-
-    [[nodiscard]] virtual int64_t next_deadline_ns() const { return INT64_MAX; }
-
 protected:
     /* For string query(): answers `key` from the typed u64 / i64 overloads, formatted as
      * decimal. Returns -ENOTSUP when neither knows the key, so the caller falls through
@@ -100,16 +95,6 @@ protected:
         return r;
     }
 
-    void notify_wakeup()
-    {
-        if (wakeup_)
-        {
-            wakeup_->notify();
-        }
-    }
-
-private:
-    std::shared_ptr<pdu_wakeup> wakeup_;
 };
 
 }  // namespace vstreamer

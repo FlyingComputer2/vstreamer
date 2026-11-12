@@ -32,7 +32,13 @@ Concrete components inherit `component_input` / `component_output` (or both via
 `input_ports()` / `output_ports()` (`port_desc` + `sdu_type_e`).
 
 **Return codes.** `0` on success, negative errno otherwise. `output()` returns `-EAGAIN` when
-nothing is ready; apps poll or wait on `pdu_wakeup` from `component::set_wakeup()`.
+nothing is ready; apps poll or wait on `pdu_wakeup` from `component_output::set_wakeup()`.
+
+**Scheduling hooks (producers only).** `component_output` carries `set_wakeup()`, the protected
+`notify_wakeup()` a component calls when `output()` has data that did not come from an `input()`
+call (camera frame, hardware encoder done, decoder thread), and `next_deadline_ns()` for
+time-driven producers (default `INT64_MAX`). Sinks have neither; `component` itself holds only
+`configure` / `query`.
 
 ### `configure` / `query` contract
 

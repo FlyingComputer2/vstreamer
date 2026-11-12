@@ -33,8 +33,8 @@ class pipeline_queue;
  * pushes each PDU into the input() of every linked node. A PDU that a node refuses with -EAGAIN
  * is held on its link and retried; the upstream node is not pulled again until that link is
  * empty (backpressure, no drops inside a pipeline). When nothing moves, the thread sleeps on a
- * pdu_wakeup shared by all nodes (component::set_wakeup) until a node notifies or the earliest
- * component::next_deadline_ns() is reached.
+ * pdu_wakeup shared by all producing nodes (component_output::set_wakeup) until one notifies or
+ * the earliest component_output::next_deadline_ns() is reached.
  *
  * Caps PDUs travel in-band like any other PDU; the pipeline does not negotiate formats.
  *

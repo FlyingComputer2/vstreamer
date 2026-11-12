@@ -83,10 +83,8 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
 {
     auto *stage_in = dynamic_cast<vstreamer::component_input *>(&stage);
     auto *stage_out = dynamic_cast<vstreamer::component_output *>(&stage);
-    auto *owner = dynamic_cast<vstreamer::component *>(&stage);
     ASSERT_NE(nullptr, stage_in);
     ASSERT_NE(nullptr, stage_out);
-    ASSERT_NE(nullptr, owner);
 
     std::shared_ptr<vstreamer::pdu_wakeup> wake = in_q.shared_wakeup();
     if (!wake)
@@ -95,7 +93,7 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
         in_q.bind_wakeup(wake);
     }
     stage.bind_wake(wake);
-    owner->set_wakeup(wake);
+    stage_out->set_wakeup(wake);
 
     vstreamer::component_pdu raw;
     bool                     holding = false;
@@ -157,7 +155,7 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
         }
         if (!progressed)
         {
-            vstreamer::apps::wait_for_pdu(*wake, *owner, run);
+            vstreamer::apps::wait_for_pdu(*wake, stage_out, run);
         }
     }
 }

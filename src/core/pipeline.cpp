@@ -251,7 +251,10 @@ int pipeline::impl::add_node(std::string node_name, std::unique_ptr<component> o
     n->is_source = is_source;
     n->open_fn = std::move(open_fn);
     n->close_fn = std::move(close_fn);
-    owner->set_wakeup(wake);
+    if (nullptr != out)
+    {
+        out->set_wakeup(wake);
+    }
     n->owner = std::move(owner);
     nodes.push_back(std::move(n));
     rebuild_order();
@@ -446,7 +449,11 @@ int64_t pipeline::impl::next_deadline() const
             deadline = std::min(deadline, now + k_held_retry_ns);
             continue;
         }
-        const int64_t d = n->owner->next_deadline_ns();
+        if (nullptr == n->out)
+        {
+            continue; /* sinks have no output to poll */
+        }
+        const int64_t d = n->out->next_deadline_ns();
         deadline = std::min(deadline, std::max(d, now + k_held_retry_ns));
     }
     return deadline;

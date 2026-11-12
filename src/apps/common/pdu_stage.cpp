@@ -107,14 +107,15 @@ void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
     }
 }
 
-void wait_for_pdu(pdu_wakeup &w, component &deadline_owner, const std::atomic<bool> &run_flag)
+void wait_for_pdu(pdu_wakeup &w, const component_output *deadline_source,
+                  const std::atomic<bool> &run_flag)
 {
     if (!run_flag.load(std::memory_order_relaxed))
     {
         return;
     }
     const int64_t now_ns = steady_mono_ns();
-    int64_t       deadline = deadline_owner.next_deadline_ns();
+    int64_t       deadline = nullptr != deadline_source ? deadline_source->next_deadline_ns() : INT64_MAX;
     const int64_t cap = now_ns + k_pdu_stage_wait_cap_ns;
     if (deadline > cap)
     {
