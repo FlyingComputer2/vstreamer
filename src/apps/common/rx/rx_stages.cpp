@@ -143,7 +143,7 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
     {
         (void)prepare_preview_sink(display, kmsdrm, width, height);
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
     present_queue->bind_wakeup(wake);
     auto *sink_pdu = dynamic_cast<component_input *>(display);
     while (g_run.load(std::memory_order_relaxed))
@@ -190,8 +190,8 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_q
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    rcv_out->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    rcv_out->set_output_ready(notify_fn(wake));
     uint64_t au_seq = 0;
     bool     have_au = false;
     while (g_run.load(std::memory_order_relaxed))
@@ -239,8 +239,8 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    dec->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    dec->set_output_ready(notify_fn(wake));
     au_in_queue->bind_wakeup(wake);
     component_pdu pdu;
     bool          holding = false;

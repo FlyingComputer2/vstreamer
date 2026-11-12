@@ -8,7 +8,7 @@
 #include "apps/common/stage_latency.hpp"
 #include "core/component_output.hpp"
 #include "core/component_pdu.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include "core/time_util.hpp"
 
 namespace vstreamer::apps
@@ -34,7 +34,7 @@ void note_pdu_sequence_gap(uint64_t seq, uint64_t &last_seq, bool &have_last,
                            std::atomic<uint64_t> *gap_counter);
 
 /* Waits for a notify on w, until deadline_source's next deadline (when not null) or a cap. */
-void wait_for_pdu(pdu_wakeup &w, const component_output *deadline_source,
+void wait_for_pdu(wake_event &w, const component_output *deadline_source,
                   const std::atomic<bool> &run_flag);
 
 }  // namespace vstreamer::apps

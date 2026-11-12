@@ -20,7 +20,7 @@
 #include "core/component_output.hpp"
 #include "core/component_sink.hpp"
 #include "core/component_source.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include "core/pipeline_queue.hpp"
 #include "core/thread_affinity.hpp"
 #include "core/thread_spawn.hpp"
@@ -104,7 +104,7 @@ struct pipeline::impl
         bool                       opened = false;
     };
 
-    explicit impl(std::string n) : name(std::move(n)), wake(std::make_shared<pdu_wakeup>()) {}
+    explicit impl(std::string n) : name(std::move(n)), wake(std::make_shared<wake_event>()) {}
 
     [[nodiscard]] node_entry *find(std::string_view node_name) const
     {
@@ -147,7 +147,7 @@ struct pipeline::impl
     /* Serializes build and control calls. */
     std::mutex ctl_mu;
 
-    std::shared_ptr<pdu_wakeup>   wake;
+    std::shared_ptr<wake_event>   wake;
     std::thread                   thread;
     std::atomic<std::thread::id>  thread_id {};
     std::atomic<pipeline_state_e> state {pipeline_state_e::STOPPED};
@@ -253,7 +253,7 @@ int pipeline::impl::add_node(std::string node_name, std::unique_ptr<component> o
     n->close_fn = std::move(close_fn);
     if (nullptr != out)
     {
-        out->set_wakeup(wake);
+        out->set_output_ready(notify_fn(wake));
     }
     n->owner = std::move(owner);
     nodes.push_back(std::move(n));

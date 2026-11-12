@@ -235,14 +235,14 @@ void source_selector::close()
     logged_camera = false;
 }
 
-void source_selector::bind_source_wakeups(std::shared_ptr<pdu_wakeup> w)
+void source_selector::bind_source_wakeups(std::shared_ptr<wake_event> w)
 {
     source_wake_ = w;
-    camera.set_wakeup(w);
-    noise.set_wakeup(w);
+    camera.set_output_ready(notify_fn(w));
+    noise.set_output_ready(notify_fn(w));
 }
 
-int source_selector::poll_active_pdu(component_pdu &out, pdu_wakeup &w)
+int source_selector::poll_active_pdu(component_pdu &out, wake_event &w)
 {
     component_source &active = source_kind::camera == kind ? camera : noise;
     while (apps::g_run.load(std::memory_order_relaxed))
@@ -261,7 +261,7 @@ int source_selector::poll_active_pdu(component_pdu &out, pdu_wakeup &w)
     return -ECANCELED;
 }
 
-int source_selector::poll_once_pdu(pdu_wakeup &w)
+int source_selector::poll_once_pdu(wake_event &w)
 {
     if (!push_pdu)
     {
@@ -325,7 +325,7 @@ int source_selector::poll_once(int timeout_ms)
     {
         return -EINVAL;
     }
-    pdu_wakeup &w = *source_wake_;
+    wake_event &w = *source_wake_;
     if (timeout_ms < 0)
     {
         return poll_once_pdu(w);

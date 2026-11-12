@@ -243,8 +243,8 @@ void source_stage_main(component_source *source, pipeline_pdu_queue *mjpeg_pipe,
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    po->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    po->set_output_ready(notify_fn(wake));
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
@@ -294,13 +294,13 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = mjpeg_pipe->shared_wakeup();
+    std::shared_ptr<wake_event> wake = mjpeg_pipe->shared_wakeup();
     if (!wake)
     {
-        wake = std::make_shared<pdu_wakeup>();
+        wake = std::make_shared<wake_event>();
         mjpeg_pipe->bind_wakeup(wake);
     }
-    jdec_out->set_wakeup(wake);
+    jdec_out->set_output_ready(notify_fn(wake));
     uint64_t last_seq = 0;
     bool     have_seq = false;
     int      inflight = 0;
@@ -395,14 +395,14 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> enc_wake = nv12_pipe->shared_wakeup();
+    std::shared_ptr<wake_event> enc_wake = nv12_pipe->shared_wakeup();
     if (!enc_wake)
     {
-        enc_wake = std::make_shared<pdu_wakeup>();
+        enc_wake = std::make_shared<wake_event>();
         nv12_pipe->bind_wakeup(enc_wake);
     }
-    enc_out->set_wakeup(enc_wake);
-    pay->set_wakeup(enc_wake);
+    enc_out->set_output_ready(notify_fn(enc_wake));
+    pay->set_output_ready(notify_fn(enc_wake));
     component_pdu nv12_pdu;
     int64_t       nv12_enqueue_mono_ns = 0;
     apps::pdu_stamp_map enc_in_mono;

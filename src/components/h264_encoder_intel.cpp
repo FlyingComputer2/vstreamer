@@ -254,7 +254,7 @@ int h264_encoder_intel::drain_packets_locked()
         au.sdu = std::move(payload);
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
-        notify_wakeup();
+        notify_output_ready();
         cv.notify_one();
     }
 }
@@ -899,7 +899,7 @@ int h264_encoder_intel::output(component_pdu &out)
     {
         out.seq = out_seq_++;
     }
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

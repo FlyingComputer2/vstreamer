@@ -1244,7 +1244,7 @@ int h264_encoder_mpp::output(component_pdu &out)
     {
         out.seq = out_seq_++;
     }
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

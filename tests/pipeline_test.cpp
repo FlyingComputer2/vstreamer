@@ -109,7 +109,7 @@ public:
             std::lock_guard<std::mutex> lock(mu_);
             count_ += n;
         }
-        notify_wakeup();
+        notify_output_ready();
     }
 
     int configure(std::string_view key, std::string_view value) override

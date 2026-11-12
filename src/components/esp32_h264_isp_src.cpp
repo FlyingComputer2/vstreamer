@@ -74,7 +74,7 @@ void esp32_h264_isp_src::drain_encoder_output()
          * at k_coded_backlog_max, far below this. */
         out_q_.push_back(std::move(out));
         out_cv_.notify_all();
-        notify_wakeup();
+        notify_output_ready();
     }
 }
 
@@ -99,7 +99,7 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
             }
             return r;
         }
-        notify_wakeup();
+        notify_output_ready();
         std::unique_lock<std::mutex> lock(mu);
         out_cv_.wait_for(lock, std::chrono::milliseconds(1),
                          [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
@@ -250,7 +250,7 @@ void esp32_h264_isp_src::close()
 {
     stop_.store(true, std::memory_order_release);
     out_cv_.notify_all();
-    notify_wakeup();
+    notify_output_ready();
     if (encode_thread_.joinable())
     {
         encode_thread_.join();

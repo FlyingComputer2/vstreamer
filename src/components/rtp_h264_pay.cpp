@@ -230,7 +230,7 @@ int rtp_h264_pay::output(component_pdu &out)
     {
         pending.pop_front();
     }
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

@@ -3,7 +3,7 @@
 
 #include "core/component_pdu.hpp"
 #include "core/component_source.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -31,14 +31,14 @@ public:
                     int noise_height, int noise_fps, on_switch_fn on_switch);
 
     void set_push_pdu_handler(push_pdu_fn push_pdu_in);
-    void bind_source_wakeups(std::shared_ptr<pdu_wakeup> w);
+    void bind_source_wakeups(std::shared_ptr<wake_event> w);
 
     int  open();
     void close();
 
     /* One source-thread iteration: may block up to timeout_ms on the active source. */
     int poll_once(int timeout_ms);
-    int poll_once_pdu(pdu_wakeup &w);
+    int poll_once_pdu(wake_event &w);
 
     [[nodiscard]] source_kind active_kind() const
     {
@@ -53,7 +53,7 @@ private:
     void switch_to_noise();
     void switch_to_camera(int width, int height, int fps);
     void emit_switch_caps(source_kind kind, int width, int height, int fps);
-    int  poll_active_pdu(component_pdu &out, pdu_wakeup &w);
+    int  poll_active_pdu(component_pdu &out, wake_event &w);
     bool read_camera_geometry(int *width, int *height, int *fps) const;
 
     component_source &camera;
@@ -63,7 +63,7 @@ private:
     int               noise_fps;
     on_switch_fn      on_switch;
     push_pdu_fn       push_pdu;
-    std::shared_ptr<pdu_wakeup> source_wake_;
+    std::shared_ptr<wake_event> source_wake_;
 
     source_kind kind = source_kind::camera;
     std::string camera_error;

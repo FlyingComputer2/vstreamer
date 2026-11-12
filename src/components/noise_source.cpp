@@ -404,7 +404,7 @@ int noise_source::emit_raw_caps_locked(component_pdu &out)
     const uint64_t ts_us = static_cast<uint64_t>(steady_mono_ns() / 1000LL);
     out = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps, ts_us, 0);
     out.seq = out_seq_++;
-    notify_wakeup();
+    notify_output_ready();
     caps_w = width;
     caps_h = height;
     return 0;
@@ -552,7 +552,7 @@ int noise_source::output(component_pdu &out)
                                              std::free(reinterpret_cast<uint8_t *>(p));
                                          });
     advance_pace_locked();
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

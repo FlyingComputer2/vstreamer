@@ -11,7 +11,7 @@
 #include <optional>
 
 #include "core/component_pdu.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 
 namespace vstreamer
 {
@@ -65,7 +65,7 @@ public:
     void reopen();
 
     /* Set by the consumer pipeline when its queue source node joins the graph. */
-    void bind_consumer_wakeup(std::shared_ptr<pdu_wakeup> w);
+    void bind_consumer_wakeup(std::shared_ptr<wake_event> w);
 
     /* Consumer pipeline (re)opened: puts the latest caps PDU of this producer session back at
      * the front unless a caps PDU is already next. A restarted consumer's nodes have forgotten
@@ -86,7 +86,7 @@ private:
     size_t                      capacity_;
     bool                        closed_ = false;
     std::optional<component_pdu> last_caps_;
-    std::shared_ptr<pdu_wakeup> consumer_wake_;
+    std::shared_ptr<wake_event> consumer_wake_;
     std::atomic<uint64_t>       pushed_ {0};
     std::atomic<uint64_t>       drops_ {0};
 };

@@ -216,7 +216,7 @@ int h264_encoder_esp32p4::codec_open_locked()
         }
         slot.cap = actual;
     }
-    pool->wake = [this] { notify_wakeup(); };
+    pool->wake = [this] { notify_output_ready(); };
     pool_ = std::move(pool);
 
     enc_ = enc;
@@ -375,7 +375,7 @@ int h264_encoder_esp32p4::input_caps_locked(const component_pdu &in)
         coded.fps_den = 1;
         out_q_.push_back(make_caps_pdu(sdu_type_e::CAPS_VIDEO_CODED, coded, in.ts_us, 0));
         caps_out_ = coded;
-        notify_wakeup();
+        notify_output_ready();
     }
     return 0;
 }
@@ -573,7 +573,7 @@ int h264_encoder_esp32p4::encode_locked(const component_pdu &in,
     {
         ++idr_frames_;
     }
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

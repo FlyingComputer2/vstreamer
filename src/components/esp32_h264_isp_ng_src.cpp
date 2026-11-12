@@ -121,7 +121,7 @@ void esp32_h264_isp_ng_src::close()
         opened_ = false;
         stop_.store(true, std::memory_order_release);
     }
-    notify_wakeup();
+    notify_output_ready();
     // DQBUF has a 100 ms driver timeout. No mappings are freed during encode.
     if (worker_.joinable())
     {
@@ -145,7 +145,7 @@ void esp32_h264_isp_ng_src::drain_encoder()
     }
     if (queued)
     {
-        notify_wakeup();
+        notify_output_ready();
     }
 }
 
@@ -210,7 +210,7 @@ void esp32_h264_isp_ng_src::encode_main()
             }
             if (enc_r != -EIO)
             {
-                notify_wakeup();
+                notify_output_ready();
                 break;
             }
             // Encoder recovers a bitstream overflow by requesting a fresh IDR.

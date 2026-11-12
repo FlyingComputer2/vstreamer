@@ -835,12 +835,12 @@ int main(int argc, char **argv)
     }
     apps::pipeline_pdu_queue  mjpeg_pipe(pipe_q_depth, g_run);
     apps::pipeline_pdu_queue  nv12_pipe(pipe_q_depth, g_run);
-    const std::shared_ptr<vstreamer::pdu_wakeup> source_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::wake_event> source_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> mjpeg_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> nv12_wake =
+        std::make_shared<vstreamer::wake_event>();
     mjpeg_pipe.bind_wakeup(mjpeg_wake);
     nv12_pipe.bind_wakeup(nv12_wake);
     g_tx.metrics_nv12_pipe = &nv12_pipe;

@@ -154,7 +154,7 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
         std::lock_guard<std::mutex> lock(mu);
         recv_dropped++;
     }
-    notify_wakeup();
+    notify_output_ready();
     q_cv.notify_all();
 }
 

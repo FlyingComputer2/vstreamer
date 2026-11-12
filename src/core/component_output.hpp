@@ -3,18 +3,19 @@
 
 #include <climits>
 #include <cstdint>
-#include <memory>
+#include <functional>
+#include <utility>
 
 #include "core/component_pdu.hpp"
-#include "core/pdu_wakeup.hpp"
 
 namespace vstreamer
 {
 
-/* Producer side of a component. Besides output(), it carries the two scheduling hooks a
- * single-thread pipeline needs from producers: a wakeup the component notifies when output()
- * has data that did not come from an input() call (a camera frame, a hardware encoder
- * finishing, a decoder thread), and the next time it wants output() polled without one. */
+/* Producer side of a component. Besides output(), it carries the two scheduling hooks whoever
+ * drives the component needs from a producer: an output-ready callback the component calls when
+ * output() has data that did not come from an input() call (a camera frame, a hardware encoder
+ * finishing, a decoder thread), and the next time it wants output() polled without one. How the
+ * driver waits (a pipeline's wake_event, a stage loop, a reactor) is not the component's concern. */
 class component_output
 {
 public:
@@ -22,24 +23,25 @@ public:
 
     virtual int output(component_pdu &out) = 0;
 
-    /* Shared by the nodes the caller schedules together; set before open(). */
-    void set_wakeup(std::shared_ptr<pdu_wakeup> w) { wakeup_ = std::move(w); }
+    /* Called, from any thread, when output() may have data. Set before open(); must be cheap and
+     * must not call back into the component. */
+    void set_output_ready(std::function<void()> cb) { output_ready_ = std::move(cb); }
 
     /* Steady-clock ns at which output() should be polled even without a notify, for
      * time-driven producers (paced sources); INT64_MAX when there is none. */
     [[nodiscard]] virtual int64_t next_deadline_ns() const { return INT64_MAX; }
 
 protected:
-    void notify_wakeup()
+    void notify_output_ready() const
     {
-        if (wakeup_)
+        if (output_ready_)
         {
-            wakeup_->notify();
+            output_ready_();
         }
     }
 
 private:
-    std::shared_ptr<pdu_wakeup> wakeup_;
+    std::function<void()> output_ready_;
 };
 
 }  // namespace vstreamer

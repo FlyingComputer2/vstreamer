@@ -9,7 +9,7 @@ set(VSTREAMER_TEST_SOURCES
     time_util_test.cpp
     component_pdu_test.cpp
     port_caps_test.cpp
-    pdu_wakeup_test.cpp
+    wake_event_test.cpp
     stage_queue_wakeup_test.cpp
     stage_loop_output_drain_test.cpp
     peer_link_metrics_test.cpp

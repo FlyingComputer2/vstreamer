@@ -154,7 +154,7 @@ void pipeline_queue::trim_locked(size_t limit)
 
 int pipeline_queue::push(component_pdu &&pdu)
 {
-    std::shared_ptr<pdu_wakeup> wake;
+    std::shared_ptr<wake_event> wake;
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (closed_)
@@ -191,7 +191,7 @@ int pipeline_queue::pop(component_pdu &out)
 
 void pipeline_queue::close()
 {
-    std::shared_ptr<pdu_wakeup> wake;
+    std::shared_ptr<wake_event> wake;
     {
         std::lock_guard<std::mutex> lock(mu_);
         closed_ = true;
@@ -223,7 +223,7 @@ void pipeline_queue::replay_caps()
     q_.push_front(*last_caps_);
 }
 
-void pipeline_queue::bind_consumer_wakeup(std::shared_ptr<pdu_wakeup> w)
+void pipeline_queue::bind_consumer_wakeup(std::shared_ptr<wake_event> w)
 {
     std::lock_guard<std::mutex> lock(mu_);
     consumer_wake_ = std::move(w);

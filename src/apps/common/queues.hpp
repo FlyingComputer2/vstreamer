@@ -12,7 +12,7 @@
 
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/time_util.hpp"
 
@@ -30,9 +30,9 @@ class pipeline_pdu_queue
 public:
     pipeline_pdu_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
 
-    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+    void bind_wakeup(std::shared_ptr<wake_event> w) { wake_ = std::move(w); }
 
-    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+    [[nodiscard]] std::shared_ptr<wake_event> shared_wakeup() const { return wake_; }
 
     bool push(component_pdu pkt, std::atomic<uint64_t> *drops = nullptr)
     {
@@ -108,7 +108,7 @@ private:
     std::mutex                   mu;
     std::condition_variable      cv_pop;
     std::deque<queued_pdu>       q;
-    std::shared_ptr<pdu_wakeup>  wake_;
+    std::shared_ptr<wake_event>  wake_;
 };
 
 class present_pdu_queue
@@ -116,9 +116,9 @@ class present_pdu_queue
 public:
     present_pdu_queue(size_t cap, std::atomic<bool> &run) : capacity(cap), run_(run) {}
 
-    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+    void bind_wakeup(std::shared_ptr<wake_event> w) { wake_ = std::move(w); }
 
-    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+    [[nodiscard]] std::shared_ptr<wake_event> shared_wakeup() const { return wake_; }
 
     bool push(component_pdu pkt, std::atomic<uint64_t> *drops = nullptr)
     {
@@ -171,7 +171,7 @@ private:
     std::mutex                   mu;
     std::condition_variable      cv_pop;
     std::deque<component_pdu>    q;
-    std::shared_ptr<pdu_wakeup>  wake_;
+    std::shared_ptr<wake_event>  wake_;
 };
 
 struct pdu_rx_au_queue
@@ -180,9 +180,9 @@ struct pdu_rx_au_queue
 
     size_t capacity = k_default_rx_au_queue_depth;
 
-    void bind_wakeup(std::shared_ptr<pdu_wakeup> w) { wake_ = std::move(w); }
+    void bind_wakeup(std::shared_ptr<wake_event> w) { wake_ = std::move(w); }
 
-    [[nodiscard]] std::shared_ptr<pdu_wakeup> shared_wakeup() const { return wake_; }
+    [[nodiscard]] std::shared_ptr<wake_event> shared_wakeup() const { return wake_; }
 
     void push(component_pdu pkt, std::atomic<uint64_t> *au_q_drop_counter = nullptr)
     {
@@ -232,7 +232,7 @@ struct pdu_rx_au_queue
     std::condition_variable      cv;
     std::deque<component_pdu>    q;
     std::atomic<bool>           &run_;
-    std::shared_ptr<pdu_wakeup>  wake_;
+    std::shared_ptr<wake_event>  wake_;
 };
 
 }  // namespace vstreamer::apps

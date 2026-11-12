@@ -15,7 +15,7 @@ TEST(StageQueueWakeTest, PopWaitsOnQueueWakeupNotFixedDelay)
 {
     std::atomic<bool> run {true};
     vstreamer::apps::pipeline_pdu_queue q(4, run);
-    const auto wake = std::make_shared<vstreamer::pdu_wakeup>();
+    const auto wake = std::make_shared<vstreamer::wake_event>();
     q.bind_wakeup(wake);
 
     std::mutex              mu;
@@ -60,7 +60,7 @@ TEST(StageQueueWakeTest, EnqueueMonoSurvivesOverflowDrops)
 {
     std::atomic<bool> run {true};
     vstreamer::apps::pipeline_pdu_queue q(2, run);
-    vstreamer::pdu_wakeup wake;
+    vstreamer::wake_event wake;
 
     for (int i = 0; i < 10'000; ++i)
     {
