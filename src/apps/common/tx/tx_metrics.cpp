@@ -340,10 +340,10 @@ int query_encoder_qp(component_coder &enc)
     return std::atoi(val.c_str());
 }
 
-int query_encoder_cbr_bps(component_coder &enc)
+int query_encoder_kbps(component_coder &enc)
 {
     std::string val;
-    if (enc.query("cbr", &val) < 0 || val.empty())
+    if (enc.query("bitrate", &val) < 0 || val.empty())
     {
         return -1;
     }

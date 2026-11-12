@@ -7,12 +7,29 @@
 #include <string>
 #include <string_view>
 
+#include <cerrno>
+#include <cinttypes>
 #include <climits>
+#include <cstdio>
 
-#include "core/pdu_wakeup.hpp"
 
 namespace vstreamer
 {
+
+/* Typed query key: 64-bit FNV-1a of the string key name, so one name serves both forms.
+ * Use it as a constant (`constexpr uint64_t k = query_key("dropped");`) to keep hashing
+ * off hot paths. Keys of one component that collide fail to compile as duplicate `case`
+ * labels when the component switches on them. */
+[[nodiscard]] constexpr uint64_t query_key(std::string_view name) noexcept
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (const char ch : name)
+    {
+        h ^= static_cast<uint8_t>(ch);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
 
 class component
 {
@@ -21,24 +38,75 @@ public:
 
     /* 0 on success, -ENOTSUP unknown key, -EINVAL bad value, other -errno. */
     virtual int configure(std::string_view key, std::string_view value) = 0;
+
+    /* Typed configure by keys::<name>.id (core/config_keys.hpp): no string formatting or
+     * parsing. Same validation and effect as the string form of the key; a component handles
+     * both through one setter. Components that override this must add
+     * `using component::configure;` (or the base they derive from) so the string overload
+     * stays visible. */
+    virtual int configure(uint64_t key, uint64_t value)
+    {
+        (void)key;
+        (void)value;
+        return -ENOTSUP;
+    }
     /* Fills *value (overwritten). 0 / -ENOTSUP / -EINVAL. Thread-safe. */
     virtual int query(std::string_view key, std::string *value) const = 0;
 
-    void set_wakeup(std::shared_ptr<pdu_wakeup> w) { wakeup_ = std::move(w); }
-
-    [[nodiscard]] virtual int64_t next_deadline_ns() const { return INT64_MAX; }
-
-protected:
-    void notify_wakeup()
+    /* Typed queries by query_key(): no string compare, formatting or allocation. Each
+     * typed key has exactly one value type; the other overloads return -ENOTSUP for it.
+     * Same semantics as the string form of the key (read-to-reset keys reset here too).
+     * Components that override these must add `using component::query;` (or the base
+     * they derive from) so the string overload stays visible. */
+    virtual int query(uint64_t key, uint64_t *value) const
     {
-        if (wakeup_)
-        {
-            wakeup_->notify();
-        }
+        (void)key;
+        (void)value;
+        return -ENOTSUP;
+    }
+    virtual int query(uint64_t key, int64_t *value) const
+    {
+        (void)key;
+        (void)value;
+        return -ENOTSUP;
+    }
+    virtual int query(uint64_t key, double *value) const
+    {
+        (void)key;
+        (void)value;
+        return -ENOTSUP;
     }
 
-private:
-    std::shared_ptr<pdu_wakeup> wakeup_;
+protected:
+    /* For string query(): answers `key` from the typed u64 / i64 overloads, formatted as
+     * decimal. Returns -ENOTSUP when neither knows the key, so the caller falls through
+     * to its string-only keys. Doubles need a per-key format, so the caller formats them. */
+    int query_typed_as_string(std::string_view key, std::string *value) const
+    {
+        const uint64_t k = query_key(key);
+        char           buf[24];
+        uint64_t       u = 0;
+        int            r = query(k, &u);
+        if (0 == r)
+        {
+            std::snprintf(buf, sizeof(buf), "%" PRIu64, u);
+            *value = buf;
+            return 0;
+        }
+        if (-ENOTSUP != r)
+        {
+            return r;
+        }
+        int64_t i = 0;
+        r = query(k, &i);
+        if (0 == r)
+        {
+            std::snprintf(buf, sizeof(buf), "%" PRId64, i);
+            *value = buf;
+        }
+        return r;
+    }
+
 };
 
 }  // namespace vstreamer

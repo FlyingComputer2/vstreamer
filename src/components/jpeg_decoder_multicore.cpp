@@ -394,7 +394,7 @@ void jpeg_decoder_multicore::worker_main(int worker_index)
             results[slot].ready = true;
             res_cv.notify_all();
         }
-        notify_wakeup();
+        notify_output_ready();
     }
 
     av_frame_free(&avf);

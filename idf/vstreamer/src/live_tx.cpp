@@ -11,6 +11,7 @@
 #include "core/component_pdu.hpp"
 #include "core/component_sink.hpp"
 #include "core/component_source.hpp"
+#include "core/config_keys.hpp"
 #include "core/thread_spawn.hpp"
 #include "core/time_util.hpp"
 
@@ -401,7 +402,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
                 std::printf("live TX %s\n", paused ? "paused" : "resumed");
                 if (!paused)
                 {
-                    (void)src->configure("idr", "1");
+                    (void)src->configure(vstreamer::keys::idr.id, 0);
                     wait_key = true;
                 }
             }

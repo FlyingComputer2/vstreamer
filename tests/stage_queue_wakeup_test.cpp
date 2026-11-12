@@ -10,25 +10,13 @@
 #include <mutex>
 #include <thread>
 
-namespace
-{
-
-class stub_component : public vstreamer::component
-{
-public:
-    int configure(std::string_view, std::string_view) override { return -ENOTSUP; }
-    int query(std::string_view, std::string *) const override { return -ENOTSUP; }
-};
-
-}  // namespace
 
 TEST(StageQueueWakeTest, PopWaitsOnQueueWakeupNotFixedDelay)
 {
     std::atomic<bool> run {true};
     vstreamer::apps::pipeline_pdu_queue q(4, run);
-    const auto wake = std::make_shared<vstreamer::pdu_wakeup>();
+    const auto wake = std::make_shared<vstreamer::wake_event>();
     q.bind_wakeup(wake);
-    stub_component owner;
 
     std::mutex              mu;
     std::condition_variable cv;
@@ -45,7 +33,7 @@ TEST(StageQueueWakeTest, PopWaitsOnQueueWakeupNotFixedDelay)
         const auto t0 = std::chrono::steady_clock::now();
         while (run.load(std::memory_order_relaxed) && !q.try_pop(pdu))
         {
-            vstreamer::apps::wait_for_pdu(*wake, owner, run);
+            vstreamer::apps::wait_for_pdu(*wake, nullptr, run);
         }
         ASSERT_TRUE(run.load(std::memory_order_relaxed));
         const auto t1 = std::chrono::steady_clock::now();
@@ -72,8 +60,7 @@ TEST(StageQueueWakeTest, EnqueueMonoSurvivesOverflowDrops)
 {
     std::atomic<bool> run {true};
     vstreamer::apps::pipeline_pdu_queue q(2, run);
-    stub_component owner;
-    vstreamer::pdu_wakeup wake;
+    vstreamer::wake_event wake;
 
     for (int i = 0; i < 10'000; ++i)
     {

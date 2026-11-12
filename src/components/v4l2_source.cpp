@@ -245,7 +245,7 @@ void v4l2_source::poll_watcher_main()
             if (!poll_edge_notified_)
             {
                 poll_edge_notified_ = true;
-                notify_wakeup();
+                notify_output_ready();
             }
         }
     }

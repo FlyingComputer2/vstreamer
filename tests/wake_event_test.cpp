@@ -1,4 +1,4 @@
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include "core/time_util.hpp"
 
 #include <gtest/gtest.h>
@@ -15,16 +15,16 @@ constexpr int64_t k_five_ms_ns = 5'000'000LL;
 
 }  // namespace
 
-TEST(PduWakeupTest, NotifyBeforeWaitIsNotLost)
+TEST(WakeEventTest, NotifyBeforeWaitIsNotLost)
 {
-    vstreamer::pdu_wakeup w;
+    vstreamer::wake_event w;
     w.notify();
     w.wait_until(INT64_MAX);
 }
 
-TEST(PduWakeupTest, WaitReturnsAtDeadlineWithoutNotify)
+TEST(WakeEventTest, WaitReturnsAtDeadlineWithoutNotify)
 {
-    vstreamer::pdu_wakeup w;
+    vstreamer::wake_event w;
     const int64_t start = vstreamer::steady_mono_ns();
     const int64_t deadline = start + 25'000'000LL;
     w.wait_until(deadline);
@@ -33,9 +33,9 @@ TEST(PduWakeupTest, WaitReturnsAtDeadlineWithoutNotify)
     EXPECT_LE(elapsed, 40'000'000LL + k_five_ms_ns);
 }
 
-TEST(PduWakeupTest, NotifyFromAnotherThreadWakesWaiter)
+TEST(WakeEventTest, NotifyFromAnotherThreadWakesWaiter)
 {
-    vstreamer::pdu_wakeup w;
+    vstreamer::wake_event w;
     std::atomic<bool> done {false};
     std::thread waiter([&]() {
         w.wait_until(INT64_MAX);
@@ -47,9 +47,9 @@ TEST(PduWakeupTest, NotifyFromAnotherThreadWakesWaiter)
     EXPECT_TRUE(done.load());
 }
 
-TEST(PduWakeupTest, ManyNotifiesCoalesce)
+TEST(WakeEventTest, ManyNotifiesCoalesce)
 {
-    vstreamer::pdu_wakeup w;
+    vstreamer::wake_event w;
     for (int i = 0; i < 100; ++i)
     {
         w.notify();
@@ -61,9 +61,9 @@ TEST(PduWakeupTest, ManyNotifiesCoalesce)
     EXPECT_GE(elapsed, 25'000'000LL - k_five_ms_ns);
 }
 
-TEST(PduWakeupTest, SpuriousWakeToleratedByCallerLoop)
+TEST(WakeEventTest, SpuriousWakeToleratedByCallerLoop)
 {
-    vstreamer::pdu_wakeup w;
+    vstreamer::wake_event w;
     int polls = 0;
     const int64_t deadline = vstreamer::steady_mono_ns() + 50'000'000LL;
     while (polls < 5 && vstreamer::steady_mono_ns() < deadline)

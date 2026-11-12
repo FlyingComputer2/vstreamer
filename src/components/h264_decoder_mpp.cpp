@@ -156,7 +156,7 @@ void h264_decoder_mpp::drain_thread_main()
             continue;
         }
         drain_mpp_to_ready(10);
-        notify_wakeup();
+        notify_output_ready();
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -527,7 +527,7 @@ int h264_decoder_mpp::pack_mpp_to_ready_locked(void *mpp_frame)
         remember_picture_locked(picture_hash);
     }
     ready_frames.push_back(std::move(pdu));
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 
@@ -673,7 +673,7 @@ void h264_decoder_mpp::close()
 {
     cancel_pending_io();
     drain_stop_.store(true, std::memory_order_relaxed);
-    notify_wakeup();
+    notify_output_ready();
     if (drain_thread_.joinable())
     {
         drain_thread_.join();

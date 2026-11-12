@@ -66,8 +66,8 @@ TEST(H264EncoderMppTest, ConcurrentInputOutputConfigure)
     });
 
     std::thread cfg_thr([&] {
-        const char *keys[] = {"qp", "gop", "cbr", "rc"};
-        const char *vals[] = {"32", "15", "2000000", "cbr"};
+        const char *keys[] = {"qp", "gop", "bitrate", "rc"};
+        const char *vals[] = {"32", "15", "2000", "cbr"};
         int         i = 0;
         while (run.load(std::memory_order_relaxed))
         {

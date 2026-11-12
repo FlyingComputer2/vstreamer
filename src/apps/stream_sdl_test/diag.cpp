@@ -130,9 +130,8 @@ void log_bench_rate_line(const pipeline_rate_state &rate, component_coder &enc,
     }
     const double enc_out_kbps =
         static_cast<double>(bytes - rate.enc_out_bytes) * 8.0 / dt / 1000.0;
-    const int cbr_bps = query_encoder_cbr_bps(enc);
-    const int cbr_kbps =
-        cbr_bps > 0 ? (cbr_bps + 500) / 1000 : test_app::k_encoder_default_cbr_kbps;
+    const int enc_kbps = query_encoder_kbps(enc);
+    const int cbr_kbps = enc_kbps > 0 ? enc_kbps : test_app::k_encoder_default_cbr_kbps;
     const int qp = query_encoder_qp(enc);
     std::fprintf(stderr, "bench_metrics: out_kbps=%.0f cbr=%d qp=%d dt=%.1f\n", enc_out_kbps,
                  cbr_kbps, qp >= 0 ? qp : 0, dt);

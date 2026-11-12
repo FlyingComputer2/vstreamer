@@ -19,6 +19,7 @@
 
 #include "components/components.hpp"
 #include "core/component_input.hpp"
+#include "core/config_keys.hpp"
 #include "core/component_output.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
@@ -70,9 +71,7 @@ void apply_pending_console_encoder_cfg(apps::tx::encoder_t &enc)
     const int kbps = g_tx.pending_console_cbr_kbps.exchange(-1, std::memory_order_acq_rel);
     if (kbps >= 100)
     {
-        char bps_buf[32];
-        std::snprintf(bps_buf, sizeof(bps_buf), "%d", kbps * 1000);
-        (void)enc.configure("cbr", std::string_view(bps_buf));
+        (void)enc.configure(keys::bitrate.id, static_cast<uint64_t>(kbps));
     }
     const int qp = g_tx.pending_console_qp.exchange(-1, std::memory_order_acq_rel);
     if (qp >= 0 && qp <= 51)
@@ -84,13 +83,11 @@ void apply_pending_console_encoder_cfg(apps::tx::encoder_t &enc)
     const int gop = g_tx.pending_console_gop.exchange(-1, std::memory_order_acq_rel);
     if (gop >= 1 && gop <= 255)
     {
-        char gop_buf[16];
-        std::snprintf(gop_buf, sizeof(gop_buf), "%d", gop);
-        (void)enc.configure("gop", std::string_view(gop_buf));
+        (void)enc.configure(keys::gop.id, static_cast<uint64_t>(gop));
     }
     if (g_tx.pending_console_idr.exchange(false, std::memory_order_acq_rel))
     {
-        (void)enc.configure("idr", "");
+        (void)enc.configure(keys::idr.id, 0);
     }
 }
 
@@ -242,13 +239,12 @@ void source_stage_main(component_source *source, pipeline_pdu_queue *mjpeg_pipe,
 {
     pin_current_thread_to_cpu(g_cpu_map.source);
     auto *po = dynamic_cast<component_output *>(source);
-    auto *owner = dynamic_cast<component *>(source);
-    if (nullptr == po || nullptr == owner)
+    if (nullptr == po)
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    owner->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    po->set_output_ready(notify_fn(wake));
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
@@ -260,7 +256,7 @@ void source_stage_main(component_source *source, pipeline_pdu_queue *mjpeg_pipe,
         }
         if (-EAGAIN == got)
         {
-            wait_for_pdu(*wake, *owner, g_run);
+            wait_for_pdu(*wake, po, g_run);
             continue;
         }
         if (!handle_source_poll_error(got))
@@ -294,18 +290,17 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
     }
     auto *jdec_in = dynamic_cast<component_input *>(jdec);
     auto *jdec_out = dynamic_cast<component_output *>(jdec);
-    auto *owner = dynamic_cast<component *>(jdec);
-    if (nullptr == jdec_in || nullptr == jdec_out || nullptr == owner)
+    if (nullptr == jdec_in || nullptr == jdec_out)
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = mjpeg_pipe->shared_wakeup();
+    std::shared_ptr<wake_event> wake = mjpeg_pipe->shared_wakeup();
     if (!wake)
     {
-        wake = std::make_shared<pdu_wakeup>();
+        wake = std::make_shared<wake_event>();
         mjpeg_pipe->bind_wakeup(wake);
     }
-    owner->set_wakeup(wake);
+    jdec_out->set_output_ready(notify_fn(wake));
     uint64_t last_seq = 0;
     bool     have_seq = false;
     int      inflight = 0;
@@ -385,7 +380,7 @@ void jpeg_stage_main(jpeg_decoder_multicore *jdec, pipeline_pdu_queue *mjpeg_pip
         }
         if (!progressed)
         {
-            wait_for_pdu(*wake, *owner, g_run);
+            wait_for_pdu(*wake, jdec_out, g_run);
         }
     }
 }
@@ -395,20 +390,19 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
 {
     pin_current_thread_to_cpu(g_cpu_map.encode);
     auto *enc_pdu_in = dynamic_cast<component_input *>(enc);
-    auto *owner = dynamic_cast<component *>(enc);
-    if (nullptr == owner)
+    auto *enc_out = dynamic_cast<component_output *>(enc);
+    if (nullptr == enc_out)
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> enc_wake = nv12_pipe->shared_wakeup();
+    std::shared_ptr<wake_event> enc_wake = nv12_pipe->shared_wakeup();
     if (!enc_wake)
     {
-        enc_wake = std::make_shared<pdu_wakeup>();
+        enc_wake = std::make_shared<wake_event>();
         nv12_pipe->bind_wakeup(enc_wake);
     }
-    owner->set_wakeup(enc_wake);
-    pay->set_wakeup(enc_wake);
-    sender->set_wakeup(enc_wake);
+    enc_out->set_output_ready(notify_fn(enc_wake));
+    pay->set_output_ready(notify_fn(enc_wake));
     component_pdu nv12_pdu;
     int64_t       nv12_enqueue_mono_ns = 0;
     apps::pdu_stamp_map enc_in_mono;
@@ -468,7 +462,7 @@ void encode_stage_main(apps::tx::encoder_t *enc, rtp_h264_pay *pay, stream_sende
         }
         if (!progressed)
         {
-            wait_for_pdu(*enc_wake, *owner, g_run);
+            wait_for_pdu(*enc_wake, enc_out, g_run);
         }
     }
 }

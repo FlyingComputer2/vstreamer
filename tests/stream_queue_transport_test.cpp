@@ -364,20 +364,26 @@ TEST_F(QueueTransportTest, QueriesAndTransportSwitchWhileClosed)
     sender.close();
 }
 
-TEST_F(QueueTransportTest, TelemetryOffLeavesRxQueueUntouched)
+/* The sender always reads the reverse queue: reports come every telemetry_ms and fast loss
+ * indications at once, and there is no key to stop it. */
+TEST_F(QueueTransportTest, RxQueueAlwaysRead)
 {
     stream_sender sender;
     configure(sender);
-    ASSERT_EQ(0, sender.configure("telemetry", "off"));
+    EXPECT_EQ(-ENOTSUP, sender.configure("telemetry", "off"));
     ASSERT_EQ(0, sender.open());
     post_report(1);
-    auto idle = std::make_shared<std::promise<void>>();
-    auto ready = idle->get_future();
-    reactor->wake_up([idle] { idle->set_value(); });
-    ASSERT_EQ(std::future_status::ready,
-              ready.wait_for(std::chrono::seconds(2)));
-    EXPECT_EQ(1u, rx->size());
-    EXPECT_FALSE(vstreamer::test_query::peer(sender).have);
+    bool have = false;
+    for (int i = 0; i < 200 && !have; ++i)
+    {
+        have = vstreamer::test_query::peer(sender).have;
+        if (!have)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    EXPECT_TRUE(have);
+    EXPECT_EQ(0u, rx->size());
     sender.close();
 }
 

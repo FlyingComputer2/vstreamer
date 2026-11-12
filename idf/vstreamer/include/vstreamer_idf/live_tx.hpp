@@ -39,10 +39,10 @@ struct live_tx_config
     /* Seconds between "live TX ..." stats lines; 0 = none. */
     int stats_interval_s = 10;
 
-    kv_list src {{"buffers", "6"}, {"fps", "30"},     {"bitrate", "10000000"},
+    kv_list src {{"buffers", "6"}, {"fps", "30"},     {"bitrate", "10000"},
                  {"gop", "30"},    {"qp_min", "20"}, {"qp_max", "51"}};
     kv_list pay {{"fps", "30"}, {"mtu", "1400"}};
-    kv_list snd {{"telemetry", "off"}, {"fec", "none"}};
+    kv_list snd {{"fec", "none"}};
 };
 
 /*

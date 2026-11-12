@@ -50,7 +50,9 @@ public:
     void                      close() override;
     int                       output(component_pdu &out) override;
 
+    using component::configure;
     int configure(std::string_view key, std::string_view value) override;
+    int configure(uint64_t key, uint64_t value) override;
     int query(std::string_view key, std::string *value) const override;
 
 private:
@@ -58,8 +60,11 @@ private:
     void encode_main();
     int  push_encoder_input(component_pdu &in);
     void drain_encoder_output();
-    /* configure() while open (mu held): the encoder keys the running encoder takes. */
-    int configure_live_locked(std::string_view key, std::string_view value);
+    /* Validating setters shared by the string and typed configure(); mu held. While open they
+     * also pass the value to the running encoder. */
+    int set_config_bitrate(uint64_t kbps);
+    int set_config_gop(uint64_t gop);
+    int set_config_idr();
 
     std::unique_ptr<esp32p4_csi_camera_src> cam_;
     std::unique_ptr<h264_encoder_esp32p4>     enc_;
@@ -83,7 +88,7 @@ private:
 
     int      fps = 30;
     int      gop = 30;
-    uint32_t bitrate = 4000000;
+    uint32_t bitrate_kbps = 4000;
     int      qp_min = 20;
     int      qp_max = 51;
     int      buffers = 6;

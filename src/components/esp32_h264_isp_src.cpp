@@ -3,6 +3,7 @@
 #include "components/esp32p4_csi_camera_src.hpp"
 #include "components/h264_encoder_esp32p4.hpp"
 
+#include "core/config_keys.hpp"
 #include "core/key_util.hpp"
 #include "core/latency_query.hpp"
 #include "core/time_util.hpp"
@@ -73,7 +74,7 @@ void esp32_h264_isp_src::drain_encoder_output()
          * at k_coded_backlog_max, far below this. */
         out_q_.push_back(std::move(out));
         out_cv_.notify_all();
-        notify_wakeup();
+        notify_output_ready();
     }
 }
 
@@ -98,7 +99,7 @@ int esp32_h264_isp_src::push_encoder_input(component_pdu &in)
             }
             return r;
         }
-        notify_wakeup();
+        notify_output_ready();
         std::unique_lock<std::mutex> lock(mu);
         out_cv_.wait_for(lock, std::chrono::milliseconds(1),
                          [&] { return out_q_.size() < k_out_q_max / 2U || stop_.load(); });
@@ -213,7 +214,7 @@ int esp32_h264_isp_src::open()
     cam_->query("size", &size);
     const auto num = [](int64_t v) { return std::to_string(v); };
     const std::pair<const char *, std::string> enc_cfg[] = {
-        {"size", size},          {"bitrate", num(bitrate)}, {"gop", num(gop)},
+        {"size", size},          {"bitrate", num(bitrate_kbps)}, {"gop", num(gop)},
         {"fps", num(fps)},       {"qp_min", "0"},           {"qp_max", num(qmax)},
         {"qp_min", num(qmin)},
     };
@@ -249,7 +250,7 @@ void esp32_h264_isp_src::close()
 {
     stop_.store(true, std::memory_order_release);
     out_cv_.notify_all();
-    notify_wakeup();
+    notify_output_ready();
     if (encode_thread_.joinable())
     {
         encode_thread_.join();
@@ -299,40 +300,60 @@ int esp32_h264_isp_src::output(component_pdu &out)
  * buffers, sensor settings), and qp_min / qp_max, which make the encoder reopen itself; at 1080p
  * that reopen cannot allocate its reference frames while in-flight AUs still hold the old
  * encoder's output buffers, and every following frame fails. */
-int esp32_h264_isp_src::configure_live_locked(std::string_view key, std::string_view value)
+int esp32_h264_isp_src::set_config_bitrate(uint64_t v)
 {
-    if (key == "idr")
+    if (v < 25 || v > 100000)
     {
-        return enc_->configure(key, value);
+        return -EINVAL;
     }
-    int64_t n = 0;
-    if (key == "bitrate" || key == "bps")
+    if (opened)
     {
-        if (key_parse_i64(value, &n) < 0 || n < 25000)
+        if (const int r = enc_->configure(keys::bitrate.id, v); 0 != r)
         {
-            return -EINVAL;
+            return r;
         }
-        const int r = enc_->configure("bitrate", value);
-        if (0 == r)
-        {
-            bitrate = static_cast<uint32_t>(n);
-        }
-        return r;
     }
-    if (key == "gop")
+    bitrate_kbps = static_cast<uint32_t>(v);
+    return 0;
+}
+
+int esp32_h264_isp_src::set_config_gop(uint64_t v)
+{
+    /* esp_h264 stores the GOP in 8 bits. */
+    if (v < 1 || v > 255)
     {
-        if (key_parse_i64(value, &n) < 0 || n < 1 || n > 255)
-        {
-            return -EINVAL;
-        }
-        const int r = enc_->configure(key, value);
-        if (0 == r)
-        {
-            gop = static_cast<int>(n);
-        }
-        return r;
+        return -EINVAL;
     }
-    return -EBUSY;
+    if (opened)
+    {
+        if (const int r = enc_->configure(keys::gop.id, v); 0 != r)
+        {
+            return r;
+        }
+    }
+    gop = static_cast<int>(v);
+    return 0;
+}
+
+int esp32_h264_isp_src::set_config_idr()
+{
+    return enc_->configure(keys::idr.id, 0);
+}
+
+int esp32_h264_isp_src::configure(uint64_t key, uint64_t value)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    switch (key)
+    {
+    case keys::bitrate.id:
+        return set_config_bitrate(value);
+    case keys::gop.id:
+        return set_config_gop(value);
+    case keys::idr.id:
+        return set_config_idr();
+    default:
+        return -ENOTSUP;
+    }
 }
 
 int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
@@ -344,9 +365,22 @@ int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
     {
         return pr;
     }
+    if (key == keys::bitrate.name || key == keys::gop.name)
+    {
+        uint64_t u = 0;
+        if (key_parse_u64(value, &u) < 0)
+        {
+            return -EINVAL;
+        }
+        return key == keys::bitrate.name ? set_config_bitrate(u) : set_config_gop(u);
+    }
+    if (key == keys::idr.name)
+    {
+        return set_config_idr();
+    }
     if (opened)
     {
-        return configure_live_locked(key, value);
+        return -EBUSY;
     }
     if (key == "fps")
     {
@@ -356,27 +390,6 @@ int esp32_h264_isp_src::configure(std::string_view key, std::string_view value)
             return -EINVAL;
         }
         fps = static_cast<int>(n);
-        return 0;
-    }
-    if (key == "gop")
-    {
-        int64_t n = 0;
-        /* esp_h264 stores the GOP in 8 bits. */
-        if (key_parse_i64(value, &n) < 0 || n < 1 || n > 255)
-        {
-            return -EINVAL;
-        }
-        gop = static_cast<int>(n);
-        return 0;
-    }
-    if (key == "bitrate" || key == "bps")
-    {
-        int64_t n = 0;
-        if (key_parse_i64(value, &n) < 0 || n < 25000)
-        {
-            return -EINVAL;
-        }
-        bitrate = static_cast<uint32_t>(n);
         return 0;
     }
     if (key == "qp_min")

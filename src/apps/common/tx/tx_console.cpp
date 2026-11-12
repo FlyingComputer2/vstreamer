@@ -2,6 +2,7 @@
 
 #include "components/stream_sender.hpp"
 #include "core/component_coder.hpp"
+#include "core/config_keys.hpp"
 
 #include <cstdio>
 #include <cstring>
@@ -79,10 +80,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     reply = k_bad_k_reply;
                     return true;
                 }
-                char buf[16];
-                std::snprintf(buf, sizeof(buf), "%ld", k);
-                std::string_view val = buf;
-                if (stream_tx->configure("fec_k", val) < 0)
+                if (stream_tx->configure(keys::fec_k.id, static_cast<uint64_t>(k)) < 0)
                 {
                     reply = k_bad_k_reply;
                     return true;
@@ -103,10 +101,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     reply = k_bad_n_reply;
                     return true;
                 }
-                char buf[16];
-                std::snprintf(buf, sizeof(buf), "%ld", n);
-                std::string_view val = buf;
-                if (stream_tx->configure("fec_n", val) < 0)
+                if (stream_tx->configure(keys::fec_n.id, static_cast<uint64_t>(n)) < 0)
                 {
                     reply = k_bad_n_reply;
                     return true;
@@ -129,10 +124,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 }
                 else if (nullptr != encode_target)
                 {
-                    char bps_buf[32];
-                    std::snprintf(bps_buf, sizeof(bps_buf), "%ld", kbps * 1000L);
-                    std::string_view val = bps_buf;
-                    ok = encode_target->configure("cbr", val) == 0;
+                    ok = encode_target->configure(keys::bitrate.id, static_cast<uint64_t>(kbps)) == 0;
                 }
                 if (!ok)
                 {
@@ -188,10 +180,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 }
                 else if (nullptr != encode_target)
                 {
-                    char gop_buf[16];
-                    std::snprintf(gop_buf, sizeof(gop_buf), "%ld", gop);
-                    std::string_view val = gop_buf;
-                    ok = encode_target->configure("gop", val) == 0;
+                    ok = encode_target->configure(keys::gop.id, static_cast<uint64_t>(gop)) == 0;
                 }
                 if (!ok)
                 {
@@ -210,14 +199,12 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                     return true;
                 }
                 long ms = 0;
-                char buf[16];
                 if (!parse_long(work + 15, &ms) || ms < 0)
                 {
                     reply = "err bad fec spread ms\n";
                     return true;
                 }
-                std::snprintf(buf, sizeof(buf), "%ld", ms);
-                if (stream_tx->configure("fec_spread_ms", std::string_view(buf)) < 0)
+                if (stream_tx->configure(keys::fec_spread_ms.id, static_cast<uint64_t>(ms)) < 0)
                 {
                     reply = "err bad fec spread ms\n";
                     return true;
@@ -234,7 +221,7 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
                 }
                 else if (nullptr != encode_target)
                 {
-                    ok = encode_target->configure("idr", "") == 0;
+                    ok = encode_target->configure(keys::idr.id, 0) == 0;
                 }
                 if (!ok)
                 {

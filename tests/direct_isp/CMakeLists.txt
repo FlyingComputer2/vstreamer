@@ -17,7 +17,7 @@ add_executable(direct_isp_contract_test direct_isp_test.cpp
     ${VSTREAMER_ROOT}/src/core/sdu_caps.cpp
     ${VSTREAMER_ROOT}/src/core/sdu_type.cpp
     ${VSTREAMER_ROOT}/src/core/port_caps.cpp
-    ${VSTREAMER_ROOT}/src/core/pdu_wakeup.cpp)
+    ${VSTREAMER_ROOT}/src/core/wake_event.cpp)
 target_include_directories(direct_isp_contract_test PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/generated" "${VSTREAMER_ROOT}/src" "${BFC_INCLUDE_DIR}")
 target_compile_options(direct_isp_contract_test PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter)

@@ -1,4 +1,5 @@
 #include "components/h264_encoder_intel.hpp"
+#include "core/config_keys.hpp"
 
 #include <bfc/shared_sized_buffer.hpp>
 
@@ -40,11 +41,13 @@ TEST(H264EncoderIntelTest, ConfigureQueryNoHardware)
     EXPECT_EQ(qry(enc, "rc", &rc), 0);
     EXPECT_EQ(rc, "cqp");
 
-    EXPECT_EQ(cfg(enc, "cbr", "5000000"), 0);
-    EXPECT_EQ(cfg(enc, "bps", "3000000"), 0);
-    std::string bps;
-    EXPECT_EQ(qry(enc, "bps", &bps), 0);
-    EXPECT_EQ(bps, "3000000");
+    EXPECT_EQ(cfg(enc, "bitrate", "5000"), 0);
+    EXPECT_EQ(enc.configure(vstreamer::keys::bitrate.id, 3000), 0);
+    std::string kbps;
+    EXPECT_EQ(qry(enc, "bitrate", &kbps), 0);
+    EXPECT_EQ(kbps, "3000");
+    EXPECT_EQ(cfg(enc, "cbr", "5000000"), -ENOTSUP);
+    EXPECT_EQ(cfg(enc, "bps", "5000000"), -ENOTSUP);
 
     EXPECT_EQ(cfg(enc, "low_power", "auto"), 0);
     EXPECT_EQ(cfg(enc, "low_power", "0"), 0);
@@ -55,6 +58,14 @@ TEST(H264EncoderIntelTest, ConfigureQueryNoHardware)
     EXPECT_EQ(cfg(enc, "vbv_ms", "0"), -EINVAL);
     EXPECT_EQ(cfg(enc, "vbv_ms", "2001"), -EINVAL);
 
-    EXPECT_EQ(cfg(enc, "cbr", "-1"), -EINVAL);
-    EXPECT_EQ(cfg(enc, "cbr", "200000001"), -EINVAL);
+    EXPECT_EQ(cfg(enc, "bitrate", "-1"), -EINVAL);
+    EXPECT_EQ(cfg(enc, "bitrate", "200001"), -EINVAL);
+    EXPECT_EQ(enc.configure(vstreamer::keys::bitrate.id, 200001), -EINVAL);
+    EXPECT_EQ(enc.configure(vstreamer::keys::gop.id, 0), -EINVAL);
+    EXPECT_EQ(enc.configure(vstreamer::keys::gop.id, 60), 0);
+    std::string gop;
+    EXPECT_EQ(qry(enc, "gop", &gop), 0);
+    EXPECT_EQ(gop, "60");
+    EXPECT_EQ(enc.configure(vstreamer::keys::idr.id, 0), 0);
+    EXPECT_EQ(enc.configure(vstreamer::keys::fec_k.id, 4), -ENOTSUP);
 }

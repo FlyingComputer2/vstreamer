@@ -18,7 +18,7 @@
 #include <cstring>
 #include <memory>
 
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include <string>
 #include <thread>
 
@@ -50,7 +50,6 @@ void usage(const char *prog)
                  "  --noise-bandwidth N 0..100 (default 100)\n"
                  "  --noise-block-size N legacy no-op (default 0)\n"
                  "  --noise-pregenerate N default 30 (0=live FFT)\n"
-                 "  --no-telemetry      disable reverse telemetry\n"
                  "  --diag\n"
                  "  --help\n",
                  prog);
@@ -78,7 +77,6 @@ int main(int argc, char **argv)
     int         mtu = 1400;
     int         noise_bandwidth = 100;
     int         noise_block_size = 0;
-    bool        no_telemetry = false;
     bool        diag = false;
 
     for (int i = 1; i < argc; i++)
@@ -169,11 +167,6 @@ int main(int argc, char **argv)
             pregenerate = std::atoi(argv[++i]);
             continue;
         }
-        if (0 == std::strcmp(argv[i], "--no-telemetry"))
-        {
-            no_telemetry = true;
-            continue;
-        }
         if (0 == std::strcmp(argv[i], "--diag"))
         {
             diag = true;
@@ -244,10 +237,6 @@ int main(int argc, char **argv)
     cfg(pay, "mtu", mtu_buf);
     sender.configure("reactor", sender_reactor.name());
     cfg(sender, "udp_transport", stream_buf);
-    if (no_telemetry)
-    {
-        cfg(sender, "telemetry", "off");
-    }
     char spread_buf[16];
     std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
     if (cfg(sender, "fec_spread_ms", spread_buf) < 0)
@@ -256,9 +245,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    char cbr_bps[24];
-    std::snprintf(cbr_bps, sizeof(cbr_bps), "%d", cbr_kbps * 1000);
-    if (cfg(enc, "cbr", cbr_bps) < 0 || cfg(enc, "rc", "cbr") < 0)
+    char kbps_buf[24];
+    std::snprintf(kbps_buf, sizeof(kbps_buf), "%d", cbr_kbps);
+    if (cfg(enc, "bitrate", kbps_buf) < 0 || cfg(enc, "rc", "cbr") < 0)
     {
         return 1;
     }
@@ -300,12 +289,12 @@ int main(int argc, char **argv)
     apps::pipeline_pdu_queue mjpeg_pipe(pipe_q, g_run);
     apps::pipeline_pdu_queue nv12_pipe(pipe_q, g_run);
     g_tx.metrics_nv12_pipe = &nv12_pipe;
-    const std::shared_ptr<vstreamer::pdu_wakeup> source_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::wake_event> source_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> mjpeg_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> nv12_wake =
+        std::make_shared<vstreamer::wake_event>();
     mjpeg_pipe.bind_wakeup(mjpeg_wake);
     nv12_pipe.bind_wakeup(nv12_wake);
 

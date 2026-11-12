@@ -143,16 +143,15 @@ void present_thread_main(component_sink *display, present_pdu_queue *present_que
     {
         (void)prepare_preview_sink(display, kmsdrm, width, height);
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
     present_queue->bind_wakeup(wake);
     auto *sink_pdu = dynamic_cast<component_input *>(display);
-    component &deadline_owner = *display;
     while (g_run.load(std::memory_order_relaxed))
     {
         component_pdu pdu;
         if (!present_queue->try_pop(pdu))
         {
-            wait_for_pdu(*wake, deadline_owner, g_run);
+            wait_for_pdu(*wake, nullptr, g_run); /* the display sink has no deadline */
             continue;
         }
         if (nullptr == sink_pdu)
@@ -186,14 +185,13 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_q
     auto *rcv_out = dynamic_cast<component_output *>(rcv);
     auto *depay_in = dynamic_cast<component_input *>(depay);
     auto *depay_out = dynamic_cast<component_output *>(depay);
-    auto *rcv_owner = dynamic_cast<component *>(rcv);
     if (nullptr == rcv || nullptr == depay || nullptr == rcv_out || nullptr == depay_in ||
-        nullptr == depay_out || nullptr == rcv_owner)
+        nullptr == depay_out)
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    rcv_owner->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    rcv_out->set_output_ready(notify_fn(wake));
     uint64_t au_seq = 0;
     bool     have_au = false;
     while (g_run.load(std::memory_order_relaxed))
@@ -208,7 +206,7 @@ void rx_net_thread_main(stream_receiver *rcv, rtp_h264_depay *depay, pdu_rx_au_q
             }
             if (-EAGAIN == got)
             {
-                wait_for_pdu(*wake, *rcv_owner, g_run);
+                wait_for_pdu(*wake, rcv_out, g_run);
             }
             continue;
         }
@@ -237,13 +235,12 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
                         bench_diag *diag)
 {
     pin_current_thread_to_cpu(g_cpu_map.rx);
-    auto *owner = dynamic_cast<component *>(dec);
-    if (nullptr == owner)
+    if (nullptr == dec)
     {
         return;
     }
-    std::shared_ptr<pdu_wakeup> wake = std::make_shared<pdu_wakeup>();
-    owner->set_wakeup(wake);
+    std::shared_ptr<wake_event> wake = std::make_shared<wake_event>();
+    dec->set_output_ready(notify_fn(wake));
     au_in_queue->bind_wakeup(wake);
     component_pdu pdu;
     bool          holding = false;
@@ -318,7 +315,7 @@ void decode_thread_main(h264_decoder_mpp *dec, present_pdu_queue *present_queue,
         }
         if (!progressed)
         {
-            wait_for_pdu(*wake, *owner, g_run);
+            wait_for_pdu(*wake, dec, g_run);
         }
     }
     drain_dec_pdus(dec, present_queue, *diag, &dec_in_mono);

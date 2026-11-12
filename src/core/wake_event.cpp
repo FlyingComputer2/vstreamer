@@ -1,4 +1,4 @@
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 
 #include <chrono>
 #include <climits>
@@ -8,7 +8,7 @@
 namespace vstreamer
 {
 
-void pdu_wakeup::notify()
+void wake_event::notify()
 {
     {
         std::lock_guard<std::mutex> lock(mu_);
@@ -17,7 +17,7 @@ void pdu_wakeup::notify()
     cv_.notify_one();
 }
 
-void pdu_wakeup::wait_until(int64_t deadline_mono_ns)
+void wake_event::wait_until(int64_t deadline_mono_ns)
 {
     std::unique_lock<std::mutex> lock(mu_);
     if (deadline_mono_ns == INT64_MAX)

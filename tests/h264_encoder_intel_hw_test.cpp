@@ -131,7 +131,7 @@ TEST(H264EncoderIntelHwTest, PreservesInputCaptureTsUs)
 {
     vstreamer::h264_encoder_intel enc;
     if (cfg(enc, "size", "640x480") < 0 || cfg(enc, "fps", "30") < 0 || cfg(enc, "rc", "cbr") < 0 ||
-        cfg(enc, "cbr", "2000000") < 0 || cfg(enc, "gop", "30") < 0)
+        cfg(enc, "bitrate", "2000") < 0 || cfg(enc, "gop", "30") < 0)
     {
         GTEST_SKIP() << "configure failed";
     }
@@ -174,7 +174,7 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
 {
     vstreamer::h264_encoder_intel enc;
     if (cfg(enc, "size", "1920x1080") < 0 || cfg(enc, "fps", "30") < 0 ||
-        cfg(enc, "rc", "cbr") < 0 || cfg(enc, "cbr", "1000000") < 0 || cfg(enc, "gop", "120") < 0)
+        cfg(enc, "rc", "cbr") < 0 || cfg(enc, "bitrate", "1000") < 0 || cfg(enc, "gop", "120") < 0)
     {
         GTEST_SKIP() << "configure failed";
     }
@@ -237,7 +237,7 @@ TEST(H264EncoderIntelHwTest, CbrGopAndLiveBitrate)
     ASSERT_GT(bps1, 0.0);
     EXPECT_NEAR(bps1, 1000000.0, 1000000.0 * 0.25);
 
-    ASSERT_EQ(cfg(enc, "cbr", "15000000"), 0);
+    ASSERT_EQ(cfg(enc, "bitrate", "15000"), 0);
     bool saw_key_after = false;
     for (int i = 300; i < 310; ++i)
     {

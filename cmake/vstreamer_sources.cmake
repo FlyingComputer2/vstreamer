@@ -7,7 +7,7 @@ list(APPEND VSTREAMER_SOURCES
     src/core/sdu_type.cpp
     src/core/sdu_caps.cpp
     src/core/port_caps.cpp
-    src/core/pdu_wakeup.cpp
+    src/core/wake_event.cpp
     src/core/buffer_pool.cpp
     src/core/rtp_h264.cpp
     src/core/pix_convert.cpp

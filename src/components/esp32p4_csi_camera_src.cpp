@@ -90,7 +90,7 @@ void esp32p4_csi_camera_src::capture_main()
         }
         /* stale's buffer is requeued here, outside mu. */
         stale.reset();
-        notify_wakeup();
+        notify_output_ready();
         out_cv_.notify_one();
 #if defined(ESP_PLATFORM)
         {

@@ -15,7 +15,7 @@ namespace vstreamer::test_app
 {
 
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
-using apps::tx::query_encoder_cbr_bps;
+using apps::tx::query_encoder_kbps;
 using apps::tx::query_encoder_qp;
 using apps::tx::query_source_metric_string;
 using apps::tx::store_source_pipeline_metrics;

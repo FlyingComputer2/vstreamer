@@ -156,7 +156,6 @@ void open_fec_sender(vstreamer::stream_sender &sender, const std::string &dst, i
                      int spread_ms)
 {
     ASSERT_EQ(0, cfg(sender, "udp_transport", dst));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     /* k first: the default n (12) must stay >= k at every step. */
     ASSERT_EQ(0, cfg(sender, "fec_k", std::to_string(k)));
@@ -400,7 +399,6 @@ TEST(FecSpreadTest, RawNotDelayed)
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "40"));
     ASSERT_EQ(0, sender.open());

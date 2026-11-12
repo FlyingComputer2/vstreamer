@@ -8,6 +8,7 @@
 
 #include "components/esp32p4_csi_device.hpp"
 #include "components/h264_encoder_esp32p4.hpp"
+#include "core/config_keys.hpp"
 #include "core/latency_query.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
@@ -40,8 +41,8 @@ bool camera_key(std::string_view key)
 }
 bool encoder_key(std::string_view key)
 {
-    return key == "bitrate" || key == "bps" || key == "gop" || key == "qp_min" || key == "qp_max" ||
-           key == "rc" || key == "idr";
+    return key == keys::bitrate.name || key == keys::gop.name || key == "qp_min" ||
+           key == "qp_max" || key == "rc" || key == keys::idr.name;
 }
 }  // namespace
 
@@ -120,7 +121,7 @@ void esp32_h264_isp_ng_src::close()
         opened_ = false;
         stop_.store(true, std::memory_order_release);
     }
-    notify_wakeup();
+    notify_output_ready();
     // DQBUF has a 100 ms driver timeout. No mappings are freed during encode.
     if (worker_.joinable())
     {
@@ -144,7 +145,7 @@ void esp32_h264_isp_ng_src::drain_encoder()
     }
     if (queued)
     {
-        notify_wakeup();
+        notify_output_ready();
     }
 }
 
@@ -209,7 +210,7 @@ void esp32_h264_isp_ng_src::encode_main()
             }
             if (enc_r != -EIO)
             {
-                notify_wakeup();
+                notify_output_ready();
                 break;
             }
             // Encoder recovers a bitstream overflow by requesting a fresh IDR.
@@ -258,7 +259,7 @@ int esp32_h264_isp_ng_src::configure(std::string_view key, std::string_view valu
     }
     // Reopening the encoder with live AUs can exhaust PSRAM. Only settings that
     // esp_h264 updates in place are accepted while streaming.
-    if (opened_ && key != "bitrate" && key != "bps" && key != "gop" && key != "idr")
+    if (opened_ && key != keys::bitrate.name && key != keys::gop.name && key != keys::idr.name)
     {
         return -EBUSY;
     }
@@ -269,6 +270,20 @@ int esp32_h264_isp_ng_src::configure(std::string_view key, std::string_view valu
         return encoder_->configure(key, value);
     }
     return camera_->configure(key, value);
+}
+
+int esp32_h264_isp_ng_src::configure(uint64_t key, uint64_t value)
+{
+    std::lock_guard<std::mutex> lifecycle(lifecycle_mu_);
+    switch (key)
+    {
+    case keys::bitrate.id:
+    case keys::gop.id:
+    case keys::idr.id:
+        return encoder_->configure(key, value);
+    default:
+        return -ENOTSUP;
+    }
 }
 
 int esp32_h264_isp_ng_src::query(std::string_view key, std::string *value) const

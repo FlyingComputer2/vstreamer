@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <type_traits>
+
+#include "core/component.hpp"
 
 namespace vstreamer
 {
@@ -80,8 +83,26 @@ template <typename Component>
 inline bool query_stream_u64(const Component &component, std::string_view key,
                              uint64_t *out)
 {
+    if (nullptr == out)
+    {
+        return false;
+    }
+    if constexpr (std::is_base_of_v<vstreamer::component, Component>)
+    {
+        // Typed path first; keys without a typed form fall back to parsing the string.
+        // Through the base: a derived string query() hides the typed overloads.
+        const int r = static_cast<const vstreamer::component &>(component).query(query_key(key), out);
+        if (0 == r)
+        {
+            return true;
+        }
+        if (-ENOTSUP != r)
+        {
+            return false;
+        }
+    }
     std::string value;
-    if (nullptr == out || component.query(key, &value) != 0 || value.empty())
+    if (component.query(key, &value) != 0 || value.empty())
     {
         return false;
     }

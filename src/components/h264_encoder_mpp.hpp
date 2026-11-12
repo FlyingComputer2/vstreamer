@@ -43,10 +43,16 @@ public:
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 
+    using component::configure;
     int configure(std::string_view key, std::string_view value) override;
+    int configure(uint64_t key, uint64_t value) override;
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    /* Validating setters shared by the string and typed configure(); mu held. */
+    int set_config_bitrate(uint64_t kbps);
+    int set_config_gop(uint64_t gop);
+    int set_config_idr();
     void cancel_pending_io();
     int  encoder_open_locked();
     void encoder_close_locked();

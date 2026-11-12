@@ -31,7 +31,7 @@ void sync_sender_peer_link_metrics_live(vstreamer::stream_sender &sender);
 void telemetry_thread_main(vstreamer::stream_sender *sender);
 
 int query_encoder_qp(vstreamer::component_coder &enc);
-int query_encoder_cbr_bps(vstreamer::component_coder &enc);
+int query_encoder_kbps(vstreamer::component_coder &enc);
 
 void sync_tx_cumulative_counters(const vstreamer::test_app::bench_diag &d,
                                 vstreamer::stream_sender *sender);

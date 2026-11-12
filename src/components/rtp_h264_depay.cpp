@@ -152,7 +152,7 @@ void rtp_h264_depay::push_au(au_item &&item)
         return;
     }
     out_queue.push_back(std::move(pdu));
-    notify_wakeup();
+    notify_output_ready();
 }
 
 int rtp_h264_depay::input(component_pdu &&in)

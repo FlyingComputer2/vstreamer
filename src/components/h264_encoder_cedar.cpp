@@ -1,6 +1,7 @@
 #include "components/h264_encoder_cedar.hpp"
 
 #include "core/component_pdu.hpp"
+#include "core/config_keys.hpp"
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
@@ -168,7 +169,7 @@ int h264_encoder_cedar::drain_packets_locked()
         au.sdu = std::move(payload);
         out_q.push_back(std::move(au));
         av_packet_unref(pkt);
-        notify_wakeup();
+        notify_output_ready();
         cv.notify_one();
     }
 }
@@ -367,30 +368,58 @@ int h264_encoder_cedar::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
-    if (key == "gop")
+    if (key == keys::gop.name)
     {
-        int64_t n = 0;
-        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 1 || n > 255)
+        uint64_t u = 0;
+        if (key_parse_u64(v, &u) < 0)
         {
             return -EINVAL;
         }
-        int nv = static_cast<int>(n);
-        if (nv != gop)
-        {
-            gop = nv;
-            if (opened)
-            {
-                reopen_req = true;
-            }
-        }
-        return 0;
+        return set_config_gop(u);
     }
-    if (key == "idr")
+    if (key == keys::idr.name)
     {
-        pending_idr = true;
-        return 0;
+        return set_config_idr();
     }
     return -ENOTSUP;
+}
+
+int h264_encoder_cedar::configure(uint64_t key, uint64_t value)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    switch (key)
+    {
+    case keys::gop.id:
+        return set_config_gop(value);
+    case keys::idr.id:
+        return set_config_idr();
+    default:
+        return -ENOTSUP;
+    }
+}
+
+int h264_encoder_cedar::set_config_gop(uint64_t n)
+{
+    if (n < 1 || n > 255)
+    {
+        return -EINVAL;
+    }
+    const int nv = static_cast<int>(n);
+    if (nv != gop)
+    {
+        gop = nv;
+        if (opened)
+        {
+            reopen_req = true;
+        }
+    }
+    return 0;
+}
+
+int h264_encoder_cedar::set_config_idr()
+{
+    pending_idr = true;
+    return 0;
 }
 
 namespace
@@ -562,7 +591,7 @@ int h264_encoder_cedar::output(component_pdu &out)
     {
         out.seq = out_seq_++;
     }
-    notify_wakeup();
+    notify_output_ready();
     return 0;
 }
 

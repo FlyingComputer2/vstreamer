@@ -556,11 +556,11 @@ void sync_pipeline_metrics_live(const bench_diag &d, stream_sender *sender, comp
                      enc_out_kbps);
         if (nullptr != enc)
         {
-            const int cbr_bps = query_encoder_cbr_bps(*enc);
-            if (cbr_bps >= 0)
+            const int enc_kbps = query_encoder_kbps(*enc);
+            if (enc_kbps >= 0)
             {
                 metric_store(*g_pipeline_metrics.get_metric("h264_encoder.cbr_kbps"),
-                             static_cast<uint64_t>((cbr_bps + 500) / 1000));
+                             static_cast<uint64_t>(enc_kbps));
             }
         }
     }

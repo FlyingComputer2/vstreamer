@@ -32,7 +32,15 @@ Concrete components inherit `component_input` / `component_output` (or both via
 `input_ports()` / `output_ports()` (`port_desc` + `sdu_type_e`).
 
 **Return codes.** `0` on success, negative errno otherwise. `output()` returns `-EAGAIN` when
-nothing is ready; apps poll or wait on `pdu_wakeup` from `component::set_wakeup()`.
+nothing is ready; the driver polls, or waits until the component reports output ready.
+
+**Scheduling hooks (producers only).** `component_output` carries `set_output_ready(cb)`, a
+callback the protected `notify_output_ready()` calls (from any thread) when `output()` has data
+that did not come from an `input()` call (camera frame, hardware encoder done, decoder thread),
+and `next_deadline_ns()` for time-driven producers (default `INT64_MAX`). The component does not
+know how its driver waits: the pipeline and the app stage loops pass `notify_fn(wake)` for their
+`wake_event` (`core/wake_event.hpp`, an auto-reset event with a deadline wait). Sinks have
+neither hook; `component` itself holds only `configure` / `query`.
 
 ### `configure` / `query` contract
 
@@ -49,6 +57,48 @@ virtual int query(std::string_view key, std::string *value) const = 0;
   `tests/component_contract_test.cpp` checks the unknown-key rule on every built component.
 - `configure` may be called from another thread (e.g. a console) while the pipeline runs;
   each component locks internally. Keys marked *live* below take effect without reopening.
+
+**Typed queries.** Numeric keys can also be read without string formatting:
+
+```cpp
+virtual int query(uint64_t key, uint64_t *value) const; // default -ENOTSUP
+virtual int query(uint64_t key, int64_t *value) const;
+virtual int query(uint64_t key, double *value) const;
+
+constexpr uint64_t k_dropped = vstreamer::query_key("dropped"); // FNV-1a 64 of the name
+uint64_t n = 0;
+snd->query(k_dropped, &n);
+```
+
+- The typed key is `query_key()` of the string name, and both forms return the same value,
+  including read-to-reset keys. Each typed key has one value type; the other overloads return
+  `-ENOTSUP`. Keys that have no typed form (strings, tuples) are string-only.
+- A component that overrides the typed overloads adds `using <base>::query;` and answers its
+  numeric string keys from them (`component::query_typed_as_string()`), so each key has one
+  implementation. `stream_sender` does this for all its scalar counters.
+- `query_stream_u64()` tries the typed path first and falls back to parsing the string.
+
+**Typed configure.** The keys a controller changes while streaming can also be set without
+formatting and parsing numbers:
+
+```cpp
+virtual int configure(uint64_t key, uint64_t value); // default -ENOTSUP
+
+#include "core/config_keys.hpp"
+enc->configure(vstreamer::keys::bitrate.id, 6000);
+snd->configure(vstreamer::keys::fec_k.id, 6);
+src->configure(vstreamer::keys::idr.id, 0);
+```
+
+- `core/config_keys.hpp` lists every typed configure key as `keys::<name>` with `.name` (the
+  string key) and `.id` (`query_key(name)`); a `static_assert` rejects colliding ids. Keys:
+  `bitrate` (encoder target, kbit/s), `gop`, `idr` (value ignored), `fec_k`, `fec_n`,
+  `fec_spread_ms`. Other keys are string-only.
+- Each typed key has one validating setter in the component (`set_config_<name>()`); the string
+  form parses the number and calls the same setter, so both forms accept and reject the same
+  values. A component that overrides it adds `using <base>::configure;`.
+- `bitrate` is in kbit/s on every encoder and encoding source (it was bit/s); the `bps` and `cbr`
+  aliases are gone.
 
 ### `component_pdu` and buffers
 
@@ -157,7 +207,7 @@ part of `v4l2_source`.
 | `qp` | C Q | 2..51, default 36, live |
 | `gop` | C Q | 1..255, default 30, live |
 | `rc` | C Q | `cbr` / `fixqp`, live |
-| `cbr` (`bps`) | C Q | bit/s 0..200 000 000, default 20 000 000, live in `cbr` mode |
+| `bitrate` | C Q | kbit/s 0..200 000, default 20 000, live in `cbr` mode |
 | `super_i_ratio`, `super_p_ratio` | C | ≥ 0, defaults 6.0 / 1.5 |
 | `idr` | C | request IDR on the next frame |
 | `latency_ms` | Q | capture → encoded AU |
@@ -165,7 +215,8 @@ part of `v4l2_source`.
 
 **`h264_encoder_cedar`** (libav `h264_cedrus`, width multiple of 32) and
 **`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
-Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
+Intel 0..52), `gop` (1..255), `idr`; Intel adds `bitrate` (0..200 000) and `device` (VA render
+node). Query adds `backend`,
 `status`.
 
 **`h264_encoder_esp32p4`** — ESP32-P4 hardware H.264 (`esp_h264`). Input is `O_UYY_E_VYY`, the
@@ -178,7 +229,7 @@ thread. Raw caps must match `size`. Constrained Baseline; IDR AUs carry `KEY`.
 | `size` | C Q | 80..1920 × 80..2032, both even, default `1920x1080`; reopens the encoder |
 | `fps` | C Q | 1..120, default 30, live |
 | `gop` | C Q | 1..255, default 30, live |
-| `bitrate` (`bps`) | C Q | 10 000..100 000 000, default 4 000 000, live |
+| `bitrate` | C Q | 10..100 000, default 4 000, live |
 | `qp_min`, `qp_max` | C Q | 0..51, defaults 20 / 40; reopens the encoder |
 | `idr` | C | IDR on the next frame |
 | `encode_ms` | Q | last / max encode time |
@@ -224,10 +275,9 @@ telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `udp_transport` | C Q | UDP destination `host:port` (hostnames resolved at `open()`) |
-| `telemetry` | C Q | `on` / `off` (default `on`), before `open()` only |
 | `queue_transport_tx` | C Q | Registered outgoing wire-datagram queue name; requires `queue_transport_rx`. Mutually exclusive with `udp_transport`. |
 | `queue_transport_rx` | C Q | Registered incoming reverse-report queue name; requires `queue_transport_tx`. |
-| `reactor` | C Q | Registered reactor name. UDP resolves vstreamer's `default_reactor_registry`; queue mode resolves BFC's `cv_reactor_registry`. Required in both modes, including when telemetry is off. Host-owned reactors must run until the sender closes; close only detaches this sender. |
+| `reactor` | C Q | Registered reactor name. UDP resolves vstreamer's `default_reactor_registry`; queue mode resolves BFC's `cv_reactor_registry`. Required in both modes; the sender always reads link reports from it. Host-owned reactors must run until the sender closes; close only detaches this sender. |
 | `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
 | `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 6 (parity header and coded length), the same for every k/n and for `fec none` |
 | `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
@@ -274,7 +324,7 @@ queued packets intact.
 Transport keys and `reactor` can only change while closed (`-EBUSY` otherwise).
 Clear the selected transport's value(s) before switching modes. Mixing modes,
 an incomplete pair, zero capacities, or using the same queue in both directions
-fails with `-EINVAL`; both modes require a named `reactor`, including when telemetry is off. Missing registered queues/reactors fail with `-ENOENT`.
+fails with `-EINVAL`; both modes require a named `reactor`. Missing registered queues/reactors fail with `-ENOENT`.
 The former sender keys `stream` and `reactor_name` are removed.
 
 **`stream_receiver`** — UDP ingress, strips the shard header, FEC-decodes and re-orders, outputs
@@ -283,8 +333,7 @@ one `STREAM_DGRAM` PDU per original datagram.
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `listen` | C Q | bind `host:port` |
-| `telemetry` | C Q | `on` / `off` (default `on`), live |
-| `telemetry_ms` | C Q | 20..5000, default 100, live |
+| `telemetry_ms` | C Q | 20..5000, default 100, live: link reports always go out at this interval once media has arrived |
 | `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id`, `rx_bad_header` | Q | reverse-path telemetry; `rx_bad_header` counts dropped invalid shard headers |
 | `max_datagram` | C Q | 64..65507, default 1472; before `open()` |
 | `recv_cpu`, `recv_prio` | C Q | thread placement, see Threading |
@@ -498,8 +547,8 @@ listing verbs answer one `ok …` line per item.
 | `ping`, `help` | `pong`, verb list |
 
 ```bash
-echo "get enc cbr" | nc -u -w1 127.0.0.1 5090
-echo "set enc cbr 2500000" | nc -u -w1 127.0.0.1 5090
+echo "get enc bitrate" | nc -u -w1 127.0.0.1 5090
+echo "set enc bitrate 2500" | nc -u -w1 127.0.0.1 5090
 ```
 
 ## Bench app: `stream_sdl_test`
@@ -567,8 +616,7 @@ Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
 `stream_sender.peer_*` packet/gap counters come from the link reports the sender received, never
 from the receiver object. The reports travel the emulator's reverse direction, so
 `set_constant_loss` affects them too. `peer_report_age_ms` (`-1` if never), `peer_reports_*` and
-`peer_session` diagnose the return path. `--no-telemetry` turns reports off on both ends (peer
-counters stay 0, age `-1`). Counters read 0 until the first report arrives.
+`peer_session` diagnose the return path. Counters read 0 (age `-1`) until the first report arrives.
 
 `scripts/cbr_controller.py` reads peer counters and `peer_report_age_ms`, holds bitrate increases
 when telemetry is stale, and adjusts `set_encode_cbr` (AIMD).
@@ -711,7 +759,7 @@ component layer exists today; the rest is still design.
 | Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl_test` |
 | External CBR controller (FEC-gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
 | Separate `stream_sender` / `stream_receiver` apps | **planned** | wire telemetry done |
-| Reverse telemetry datagram (receiver → sender) | **done** | `core/stream_telemetry.hpp`; `peer_*` from reports when telemetry on |
+| Reverse telemetry datagram (receiver → sender) | **done** | `core/stream_telemetry.hpp`; `peer_*` from the receiver's link reports |
 | Channel feedback plugin (`feedback_winject`, `feedback_none`) | **not started** | maps radio CI (`flow`, RSSI/SNR, `fec_lost`, `stream_request`) to QP/GOP/fps and controller delivery policy |
 | Config file loader (`key = value`, `source`/`sink`/`encoder`/`decoder`/`feedback`) | **not started** | |
 | Core console (verbs → `configure`/`query`, winject-connected client) | **not started** | bench uses `bench_console` |
@@ -739,7 +787,7 @@ actual allocation is driver-dependent), `light_freq` (0, 50, 60), `rotate` (0 or
 180; the OV5647 flips both readout axes in hardware), `sccb_port`,
 `sccb_scl`, `sccb_sda`, `sccb_freq`, `reset_pin`, and `pwdn_pin`. Sensor selection is
 still through sdkconfig, and SCCB setup applies on the first video initialization
-per boot. Encoder settings: `bitrate` / `bps`, `gop`, `qp_min`, `qp_max`, `rc`
+per boot. Encoder settings: `bitrate`, `gop`, `qp_min`, `qp_max`, `rc`
 (`frame` or `esp`), and `idr`. Worker placement uses `encode_cpu` / `encode_prio`;
 there is no separate capture worker. Only `bitrate`, `gop`, `idr`, and `reset_stats`
 can change while open; other configuration requires closing the source.

@@ -33,8 +33,8 @@ class pipeline_queue;
  * pushes each PDU into the input() of every linked node. A PDU that a node refuses with -EAGAIN
  * is held on its link and retried; the upstream node is not pulled again until that link is
  * empty (backpressure, no drops inside a pipeline). When nothing moves, the thread sleeps on a
- * pdu_wakeup shared by all nodes (component::set_wakeup) until a node notifies or the earliest
- * component::next_deadline_ns() is reached.
+ * wake_event shared by all producing nodes (component_output::set_output_ready) until one notifies or
+ * the earliest component_output::next_deadline_ns() is reached.
  *
  * Caps PDUs travel in-band like any other PDU; the pipeline does not negotiate formats.
  *
@@ -45,8 +45,8 @@ class pipeline_queue;
  *   output() -ENODEV             source lost its device and reconnects by itself; keep running
  *   anything else                fatal: pipeline goes to ERROR, the error handler is called
  * A component whose internal thread fails (socket gone, worker died) latches the error and
- * returns it from its next input() / output(), and calls notify_wakeup() so an idle pipeline
- * makes that call.
+ * returns it from its next input() / output(). A producer also calls notify_output_ready() so an
+ * idle pipeline makes that output() call; a sink's error surfaces on its next input().
  *
  * Example, rover TX in two pipelines (capture on its own thread, as today):
  *
@@ -70,7 +70,7 @@ class pipeline_queue;
  *     enc.start();
  *     cap.start();
  *     ...
- *     enc.configure("enc", "cbr", "4000000");   // any thread, while running
+ *     enc.configure("enc", "bitrate", "4000");   // any thread, while running
  *     std::string v;
  *     enc.query("snd", "max_input", &v);
  *     ...

@@ -4,7 +4,7 @@
 #include "core/component_input.hpp"
 #include "core/component_output.hpp"
 #include "core/component_pdu.hpp"
-#include "core/pdu_wakeup.hpp"
+#include "core/wake_event.hpp"
 #include "core/sdu_type.hpp"
 #include "core/time_util.hpp"
 
@@ -70,12 +70,12 @@ public:
         return 0;
     }
 
-    void bind_wake(std::shared_ptr<vstreamer::pdu_wakeup> w) { wake_ = std::move(w); }
+    void bind_wake(std::shared_ptr<vstreamer::wake_event> w) { wake_ = std::move(w); }
 
 private:
     mutable std::mutex                   mu_;
     std::deque<vstreamer::component_pdu> ready_;
-    std::shared_ptr<vstreamer::pdu_wakeup> wake_;
+    std::shared_ptr<vstreamer::wake_event> wake_;
 };
 
 void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stage &stage,
@@ -83,19 +83,17 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
 {
     auto *stage_in = dynamic_cast<vstreamer::component_input *>(&stage);
     auto *stage_out = dynamic_cast<vstreamer::component_output *>(&stage);
-    auto *owner = dynamic_cast<vstreamer::component *>(&stage);
     ASSERT_NE(nullptr, stage_in);
     ASSERT_NE(nullptr, stage_out);
-    ASSERT_NE(nullptr, owner);
 
-    std::shared_ptr<vstreamer::pdu_wakeup> wake = in_q.shared_wakeup();
+    std::shared_ptr<vstreamer::wake_event> wake = in_q.shared_wakeup();
     if (!wake)
     {
-        wake = std::make_shared<vstreamer::pdu_wakeup>();
+        wake = std::make_shared<vstreamer::wake_event>();
         in_q.bind_wakeup(wake);
     }
     stage.bind_wake(wake);
-    owner->set_wakeup(wake);
+    stage_out->set_output_ready(notify_fn(wake));
 
     vstreamer::component_pdu raw;
     bool                     holding = false;
@@ -157,7 +155,7 @@ void run_stage_loop(vstreamer::apps::pipeline_pdu_queue &in_q, delayed_nv12_stag
         }
         if (!progressed)
         {
-            vstreamer::apps::wait_for_pdu(*wake, *owner, run);
+            vstreamer::apps::wait_for_pdu(*wake, stage_out, run);
         }
     }
 }

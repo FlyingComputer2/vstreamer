@@ -135,7 +135,6 @@ void print_usage(const char *prog)
                  "  --cbr KBPS     encoder CBR target kb/s (default %d)\n"
                  "  --gop N        encoder GOP 1..255 (default: same as --fps; or VSTREAMER_ENC_GOP)\n"
                  "  --source ARG   noise (default) or V4L2 device e.g. /dev/video0\n"
-                 "  --no-telemetry stream_receiver/stream_sender link reports off\n"
                  "                 (peer_* metrics stay 0, peer_report_age_ms -1)\n",
                  prog, k_loopback_host, k_chan_fwd_ingress,
                  test_app::k_chan_default_drop_dt_ms,
@@ -235,7 +234,6 @@ int main(int argc, char **argv)
     const char *app_label = "stream_sdl";
     bool self_test = false;
     bool diag_log = false;
-    bool telemetry = true;
     int  encoder_cbr_kbps = test_app::k_encoder_default_cbr_kbps;
     int  encoder_gop = 0;
 
@@ -335,10 +333,6 @@ int main(int argc, char **argv)
         {
             self_test = true;
             diag_log = true;
-        }
-        else if (0 == std::strcmp(argv[i], "--no-telemetry"))
-        {
-            telemetry = false;
         }
         else if (0 == std::strcmp(argv[i], "--diag"))
         {
@@ -566,11 +560,6 @@ int main(int argc, char **argv)
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
     cfg_str(rcv, "max_datagram", "1476");
     cfg_str(rcv, "listen", listen_buf);
-    if (!telemetry)
-    {
-        cfg_str(rcv, "telemetry", "off");
-        cfg_str(sender, "telemetry", "off");
-    }
     {
         const char *fec = std::getenv("VSTREAMER_FEC");
         const bool  fec_off =
@@ -614,14 +603,14 @@ int main(int argc, char **argv)
         g_bench_metrics_log = true;
     }
 
-    char cbr_bps[24];
-    std::snprintf(cbr_bps, sizeof(cbr_bps), "%d", encoder_cbr_kbps * 1000);
+    char cbr_kbps[24];
+    std::snprintf(cbr_kbps, sizeof(cbr_kbps), "%d", encoder_cbr_kbps);
     const char *enc_rc = std::getenv("VSTREAMER_ENC_RC");
     if (nullptr == enc_rc || enc_rc[0] == '\0')
     {
         enc_rc = "cbr";
     }
-    if (open_stage("h264_encoder cbr", cfg_str(enc, "cbr", cbr_bps)) < 0 ||
+    if (open_stage("h264_encoder bitrate", cfg_str(enc, "bitrate", cbr_kbps)) < 0 ||
         open_stage("h264_encoder rc", cfg_str(enc, "rc", enc_rc)) < 0)
     {
         return 1;
@@ -693,9 +682,9 @@ int main(int argc, char **argv)
         return 1;
     }
     {
-        const int reported_bps = query_encoder_cbr_bps(enc);
+        const int reported_kbps = query_encoder_kbps(enc);
         std::fprintf(stderr, "%s: MPP rc=%s target %d kbps\n", app_label, enc_rc,
-                     reported_bps > 0 ? (reported_bps + 500) / 1000 : encoder_cbr_kbps);
+                     reported_kbps > 0 ? reported_kbps : encoder_cbr_kbps);
     }
     channel.set_encode_command_handlers(
         [](int kbps) -> bool {
@@ -795,9 +784,9 @@ int main(int argc, char **argv)
 
     std::fprintf(stderr,
                  "%s: %s @ %d fps | source %s | display %s | channel fwd :%d->:%d "
-                 "(rev = return path) | telemetry %s | console :%d\n",
+                 "(rev = return path) | console :%d\n",
                  app_label, size_buf, fps, use_v4l2 ? source_arg : "noise",
-                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port, telemetry ? "on" : "off",
+                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port,
                  console_port);
 #if defined(ENABLE_NOISE_SOURCE)
     if (!use_v4l2)
@@ -846,12 +835,12 @@ int main(int argc, char **argv)
     }
     apps::pipeline_pdu_queue  mjpeg_pipe(pipe_q_depth, g_run);
     apps::pipeline_pdu_queue  nv12_pipe(pipe_q_depth, g_run);
-    const std::shared_ptr<vstreamer::pdu_wakeup> source_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> mjpeg_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
-    const std::shared_ptr<vstreamer::pdu_wakeup> nv12_wake =
-        std::make_shared<vstreamer::pdu_wakeup>();
+    const std::shared_ptr<vstreamer::wake_event> source_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> mjpeg_wake =
+        std::make_shared<vstreamer::wake_event>();
+    const std::shared_ptr<vstreamer::wake_event> nv12_wake =
+        std::make_shared<vstreamer::wake_event>();
     mjpeg_pipe.bind_wakeup(mjpeg_wake);
     nv12_pipe.bind_wakeup(nv12_wake);
     g_tx.metrics_nv12_pipe = &nv12_pipe;
