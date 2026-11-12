@@ -1477,7 +1477,7 @@ int h264_encoder_mpp::query(std::string_view key, std::string *value) const
     }
     if (key == keys::bitrate.name)
     {
-        const int n = (bps_target > 0 ? bps_target : live_bps) / 1000;
+        const int n = ((bps_target > 0 ? bps_target : live_bps) + 500) / 1000;
         char buf[32];
         if (key_format_i64(n, buf, sizeof(buf)) < 0)
         {

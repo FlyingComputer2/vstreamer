@@ -45,8 +45,8 @@ class pipeline_queue;
  *   output() -ENODEV             source lost its device and reconnects by itself; keep running
  *   anything else                fatal: pipeline goes to ERROR, the error handler is called
  * A component whose internal thread fails (socket gone, worker died) latches the error and
- * returns it from its next input() / output(), and calls notify_output_ready() so an idle pipeline
- * makes that call.
+ * returns it from its next input() / output(). A producer also calls notify_output_ready() so an
+ * idle pipeline makes that output() call; a sink's error surfaces on its next input().
  *
  * Example, rover TX in two pipelines (capture on its own thread, as today):
  *

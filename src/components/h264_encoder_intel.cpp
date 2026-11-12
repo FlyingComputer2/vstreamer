@@ -971,7 +971,7 @@ int h264_encoder_intel::query(std::string_view key, std::string *value) const
     }
     if (key == keys::bitrate.name)
     {
-        const int n = (opened && live_bps > 0 ? live_bps : bps) / 1000;
+        const int n = ((opened && live_bps > 0 ? live_bps : bps) + 500) / 1000;
         char buf[32];
         if (key_format_i64(n, buf, sizeof(buf)) < 0)
         {

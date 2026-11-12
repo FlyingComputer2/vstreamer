@@ -4,6 +4,7 @@
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <utility>
 
 #include "core/component_pdu.hpp"
@@ -23,9 +24,14 @@ public:
 
     virtual int output(component_pdu &out) = 0;
 
-    /* Called, from any thread, when output() may have data. Set before open(); must be cheap and
-     * must not call back into the component. */
-    void set_output_ready(std::function<void()> cb) { output_ready_ = std::move(cb); }
+    /* Called, from any thread, when output() may have data. May be set or replaced at any time,
+     * also while the component's own threads are notifying (apps wire it after open()). The
+     * callback must be cheap and must not call back into the component. */
+    void set_output_ready(std::function<void()> cb)
+    {
+        std::lock_guard<std::mutex> lock(output_ready_mu_);
+        output_ready_ = std::move(cb);
+    }
 
     /* Steady-clock ns at which output() should be polled even without a notify, for
      * time-driven producers (paced sources); INT64_MAX when there is none. */
@@ -34,6 +40,7 @@ public:
 protected:
     void notify_output_ready() const
     {
+        std::lock_guard<std::mutex> lock(output_ready_mu_);
         if (output_ready_)
         {
             output_ready_();
@@ -41,6 +48,7 @@ protected:
     }
 
 private:
+    mutable std::mutex    output_ready_mu_;
     std::function<void()> output_ready_;
 };
 
