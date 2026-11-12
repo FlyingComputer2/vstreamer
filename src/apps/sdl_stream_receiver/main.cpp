@@ -32,7 +32,6 @@ void usage(const char *prog)
                  "  --display sdl|kmsdrm  default sdl\n"
                  "  --max-datagram N      default 1476\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5091\n"
-                 "  --no-telemetry\n"
                  "  --diag\n"
                  "  --help\n",
                  prog);
@@ -50,7 +49,6 @@ int main(int argc, char **argv)
     int         max_datagram = 1476;
     std::string console_host = "127.0.0.1";
     int         console_port = 5091;
-    bool        no_telemetry = false;
     bool        diag = false;
     int         width = 1920;
     int         height = 1080;
@@ -93,11 +91,6 @@ int main(int argc, char **argv)
             }
             continue;
         }
-        if (0 == std::strcmp(argv[i], "--no-telemetry"))
-        {
-            no_telemetry = true;
-            continue;
-        }
         if (0 == std::strcmp(argv[i], "--diag"))
         {
             diag = true;
@@ -124,10 +117,6 @@ int main(int argc, char **argv)
     if (cfg(rcv, "listen", listen) < 0 || cfg(rcv, "max_datagram", maxdg) < 0)
     {
         return 1;
-    }
-    if (no_telemetry)
-    {
-        cfg(rcv, "telemetry", "off");
     }
     char size_buf[32];
     char fps_buf[16];

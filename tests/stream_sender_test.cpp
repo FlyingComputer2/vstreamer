@@ -247,7 +247,6 @@ TEST(StreamSenderTest, QueuePacketCapHoldsWholeBlocksWhenSpreadBacksQueue)
     ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "21"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
 
     ASSERT_EQ(0, sender.open());
 
@@ -411,6 +410,46 @@ vstreamer::stream_link_report make_report(uint32_t session, uint16_t seq, uint64
 }
 
 }  // namespace
+
+TEST(StreamSenderTest, TypedQueryMatchesStringAndRejectsWrongType)
+{
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure("fec_k", "4"));
+
+    for (const char *key : {"fec_k", "fec_n", "max_datagram", "max_input", "dropped",
+                            "queue_packets", "peer_reports_received", "peer_session"})
+    {
+        uint64_t typed = 0;
+        ASSERT_EQ(0, sender.query(vstreamer::query_key(key), &typed)) << key;
+        std::string str;
+        ASSERT_EQ(0, sender.query(key, &str)) << key;
+        EXPECT_EQ(std::to_string(typed), str) << key;
+        int64_t i = 0;
+        EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key(key), &i)) << key;
+        double d = 0.0;
+        EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key(key), &d)) << key;
+    }
+
+    int64_t age = 0;
+    ASSERT_EQ(0, sender.query(vstreamer::query_key("peer_report_age_ms"), &age));
+    std::string age_s;
+    ASSERT_EQ(0, sender.query("peer_report_age_ms", &age_s));
+    EXPECT_EQ(std::to_string(age), age_s);
+
+    double late = -1.0;
+    ASSERT_EQ(0, sender.query(vstreamer::query_key("send_late_max_ms"), &late));
+    EXPECT_EQ(0.0, late);
+    std::string late_s;
+    ASSERT_EQ(0, sender.query("send_late_max_ms", &late_s));
+    EXPECT_EQ("0.0", late_s);
+
+    uint64_t u = 0;
+    EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key("no_such_key"), &u));
+    EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key("fec_mode"), &u));
+    std::string mode;
+    EXPECT_EQ(0, sender.query("fec_mode", &mode));
+    EXPECT_EQ(-EINVAL, sender.query(vstreamer::query_key("fec_k"), static_cast<uint64_t *>(nullptr)));
+}
 
 TEST(StreamSenderTest, PeerLinkReportSnapshot)
 {
@@ -721,7 +760,6 @@ TEST(StreamSenderTest, DataSequenceRunsAcrossFecModes)
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, cfg(sender, "fec", "block"));
     ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "2"));
@@ -809,7 +847,6 @@ TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, sender.open());
 
     std::vector<uint8_t> payload(1000, 0x5A);
@@ -872,7 +909,6 @@ TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
     ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
     ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
     ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     ASSERT_EQ(0, sender.open());
 
     int  rejects = 0;
@@ -990,7 +1026,6 @@ TEST(StreamSenderTest, TelemetryOffStillRequiresNamedReactor)
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:5091"));
     ASSERT_EQ(0, cfg(sender, "reactor", "missing-sender-test-reactor"));
-    ASSERT_EQ(0, cfg(sender, "telemetry", "off"));
     EXPECT_EQ(-ENOENT, sender.open());
     ASSERT_EQ(0, cfg(sender, "reactor", ""));
     EXPECT_EQ(-EINVAL, sender.open());

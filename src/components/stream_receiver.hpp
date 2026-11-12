@@ -122,7 +122,6 @@ private:
     thread_place      recv_place; /* keys recv_cpu / recv_prio */
     std::atomic<bool> recv_stop {false};
 
-    std::atomic<bool> telemetry_on {true};
     std::atomic<int>  telemetry_ms {100};
     std::atomic<uint32_t> session_id {0};
     std::atomic<uint32_t> report_seq {0};

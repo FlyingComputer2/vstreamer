@@ -400,40 +400,11 @@ TEST(StreamReceiverTest, TelemetrySessionResetsOnReopen)
 TEST(StreamReceiverTest, TelemetryConfigureValidation)
 {
     vstreamer::stream_receiver receiver;
-    ASSERT_EQ(0, receiver.configure("telemetry", "off"));
+    /* Reports always go out every telemetry_ms; there is no off switch. */
+    EXPECT_EQ(-ENOTSUP, receiver.configure("telemetry", "off"));
     ASSERT_LT(receiver.configure("telemetry_ms", "19"), 0);
     ASSERT_LT(receiver.configure("telemetry_ms", "5001"), 0);
     ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
-}
-
-TEST(StreamReceiverTest, TelemetryOffSuppressesReports)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    const int s = socket(AF_INET, SOCK_DGRAM, 0);
-    ASSERT_GE(s, 0);
-
-    vstreamer::stream_receiver receiver;
-    ASSERT_EQ(0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
-    ASSERT_EQ(0, receiver.configure("telemetry", "off"));
-    ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
-    ASSERT_EQ(0, receiver.open());
-
-    sockaddr_in dst {};
-    dst.sin_family = AF_INET;
-    dst.sin_port = htons(static_cast<uint16_t>(port));
-    ASSERT_EQ(1, inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr));
-
-    const std::vector<uint8_t> app(32, 0x44);
-    const auto                 wire = make_valid_media_datagram(1, app);
-    sendto(s, wire.data(), wire.size(), 0, reinterpret_cast<sockaddr *>(&dst), sizeof(dst));
-
-    vstreamer::stream_link_report rep {};
-    EXPECT_FALSE(recv_link_report_wire(s, &rep, 150));
-
-    receiver.close();
-    close(s);
 }
 
 /* Telemetry counters are per open(), like the link counters. */
@@ -626,7 +597,6 @@ TEST(StreamReceiverTest, PacketGapTuplesStayConsistentDuringReception)
     vstreamer::stream_receiver receiver;
     ASSERT_EQ(
         0, receiver.configure("listen", "127.0.0.1:" + std::to_string(port)));
-    ASSERT_EQ(0, receiver.configure("telemetry", "off"));
     ASSERT_EQ(0, receiver.open());
     sockaddr_in dst{};
     dst.sin_family = AF_INET;

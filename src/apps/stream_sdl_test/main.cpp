@@ -135,7 +135,6 @@ void print_usage(const char *prog)
                  "  --cbr KBPS     encoder CBR target kb/s (default %d)\n"
                  "  --gop N        encoder GOP 1..255 (default: same as --fps; or VSTREAMER_ENC_GOP)\n"
                  "  --source ARG   noise (default) or V4L2 device e.g. /dev/video0\n"
-                 "  --no-telemetry stream_receiver/stream_sender link reports off\n"
                  "                 (peer_* metrics stay 0, peer_report_age_ms -1)\n",
                  prog, k_loopback_host, k_chan_fwd_ingress,
                  test_app::k_chan_default_drop_dt_ms,
@@ -235,7 +234,6 @@ int main(int argc, char **argv)
     const char *app_label = "stream_sdl";
     bool self_test = false;
     bool diag_log = false;
-    bool telemetry = true;
     int  encoder_cbr_kbps = test_app::k_encoder_default_cbr_kbps;
     int  encoder_gop = 0;
 
@@ -335,10 +333,6 @@ int main(int argc, char **argv)
         {
             self_test = true;
             diag_log = true;
-        }
-        else if (0 == std::strcmp(argv[i], "--no-telemetry"))
-        {
-            telemetry = false;
         }
         else if (0 == std::strcmp(argv[i], "--diag"))
         {
@@ -566,11 +560,6 @@ int main(int argc, char **argv)
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
     cfg_str(rcv, "max_datagram", "1476");
     cfg_str(rcv, "listen", listen_buf);
-    if (!telemetry)
-    {
-        cfg_str(rcv, "telemetry", "off");
-        cfg_str(sender, "telemetry", "off");
-    }
     {
         const char *fec = std::getenv("VSTREAMER_FEC");
         const bool  fec_off =
@@ -795,9 +784,9 @@ int main(int argc, char **argv)
 
     std::fprintf(stderr,
                  "%s: %s @ %d fps | source %s | display %s | channel fwd :%d->:%d "
-                 "(rev = return path) | telemetry %s | console :%d\n",
+                 "(rev = return path) | console :%d\n",
                  app_label, size_buf, fps, use_v4l2 ? source_arg : "noise",
-                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port, telemetry ? "on" : "off",
+                 kmsdrm ? "kmsdrm" : "sdl", chan_in, rx_port,
                  console_port);
 #if defined(ENABLE_NOISE_SOURCE)
     if (!use_v4l2)

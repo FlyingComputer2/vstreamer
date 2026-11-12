@@ -410,7 +410,7 @@ void stream_receiver::recv_thread_main()
         }
 
         const auto now = std::chrono::steady_clock::now();
-        if (have_peer && telemetry_on.load(std::memory_order_relaxed) && now >= next_report)
+        if (have_peer && now >= next_report)
         {
             const int interval = telemetry_ms.load(std::memory_order_relaxed);
             stream_link_report rep = link_report_snapshot();
@@ -711,16 +711,6 @@ int stream_receiver::configure(std::string_view key, std::string_view value)
             return pr;
         }
     }
-    if ("telemetry" == key)
-    {
-        bool on = false;
-        if (!parse_on_off(value, &on))
-        {
-            return -EINVAL;
-        }
-        telemetry_on.store(on, std::memory_order_relaxed);
-        return 0;
-    }
     if ("telemetry_ms" == key)
     {
         int64_t v = 0;
@@ -894,11 +884,6 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         }
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
         *value = buf;
-        return 0;
-    }
-    if ("telemetry" == key)
-    {
-        *value = telemetry_on.load(std::memory_order_relaxed) ? "on" : "off";
         return 0;
     }
     if ("telemetry_ms" == key)

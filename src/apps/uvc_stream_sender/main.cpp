@@ -50,7 +50,6 @@ void usage(const char *prog)
                  "  --noise-bandwidth N 0..100 (default 100)\n"
                  "  --noise-block-size N legacy no-op (default 0)\n"
                  "  --noise-pregenerate N default 30 (0=live FFT)\n"
-                 "  --no-telemetry      disable reverse telemetry\n"
                  "  --diag\n"
                  "  --help\n",
                  prog);
@@ -78,7 +77,6 @@ int main(int argc, char **argv)
     int         mtu = 1400;
     int         noise_bandwidth = 100;
     int         noise_block_size = 0;
-    bool        no_telemetry = false;
     bool        diag = false;
 
     for (int i = 1; i < argc; i++)
@@ -169,11 +167,6 @@ int main(int argc, char **argv)
             pregenerate = std::atoi(argv[++i]);
             continue;
         }
-        if (0 == std::strcmp(argv[i], "--no-telemetry"))
-        {
-            no_telemetry = true;
-            continue;
-        }
         if (0 == std::strcmp(argv[i], "--diag"))
         {
             diag = true;
@@ -244,10 +237,6 @@ int main(int argc, char **argv)
     cfg(pay, "mtu", mtu_buf);
     sender.configure("reactor", sender_reactor.name());
     cfg(sender, "udp_transport", stream_buf);
-    if (no_telemetry)
-    {
-        cfg(sender, "telemetry", "off");
-    }
     char spread_buf[16];
     std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
     if (cfg(sender, "fec_spread_ms", spread_buf) < 0)

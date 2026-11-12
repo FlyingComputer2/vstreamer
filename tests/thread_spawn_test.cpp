@@ -136,7 +136,6 @@ TEST(ThreadPlaceTest, StreamSenderExposesSendKeysOnly)
 
     ASSERT_EQ(snd->configure("reactor", reactor.name()), 0);
     ASSERT_EQ(snd->configure("udp_transport", "127.0.0.1:9"), 0);
-    ASSERT_EQ(snd->configure("telemetry", "off"), 0);
     ASSERT_EQ(snd->open(), 0);
     EXPECT_EQ(snd->configure("send_cpu", "-1"), -EBUSY);
     EXPECT_EQ(snd->query("send_cpu", &v), 0);

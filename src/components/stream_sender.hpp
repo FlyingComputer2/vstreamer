@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -60,7 +61,11 @@ public:
     int input(component_pdu &&in) override;
 
     int configure(std::string_view key, std::string_view value) override;
+    using component_sink::query;
     int query(std::string_view key, std::string *value) const override;
+    int query(uint64_t key, uint64_t *value) const override;
+    int query(uint64_t key, int64_t *value) const override;
+    int query(uint64_t key, double *value) const override;
 
 private:
     [[nodiscard]] stream_peer_link peer_link_snapshot() const;
@@ -107,7 +112,6 @@ private:
     std::string queue_transport_rx_;
     std::shared_ptr<stream_transport_queue> transport_tx_;
     std::shared_ptr<stream_transport_queue> transport_rx_;
-    bool        telemetry_on = true;
 
     int         send_fd = -1;
     sockaddr_in dst_addr {};
