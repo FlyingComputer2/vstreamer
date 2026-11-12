@@ -1,6 +1,7 @@
 #include "components/h264_encoder_intel.hpp"
 
 #include "core/component_pdu.hpp"
+#include "core/config_keys.hpp"
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/sdu_caps.hpp"
@@ -584,42 +585,14 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
-    if (key == "gop")
+    if (key == keys::gop.name || key == keys::bitrate.name)
     {
-        int64_t n = 0;
-        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 1 || n > 255)
+        uint64_t u = 0;
+        if (key_parse_u64(v, &u) < 0)
         {
             return -EINVAL;
         }
-        int nv = static_cast<int>(n);
-        if (nv != gop)
-        {
-            gop = nv;
-            if (opened)
-            {
-                reopen_req = true;
-            }
-        }
-        return 0;
-    }
-    if (key == "cbr" || key == "bps")
-    {
-        int64_t n = 0;
-        if (key_parse_i64(tmp.c_str(), &n) < 0 || n < 0 || n > 200000000LL)
-        {
-            return -EINVAL;
-        }
-        const int nv = static_cast<int>(n);
-        if (nv != bps)
-        {
-            bps = nv;
-            if (opened && rc_cbr)
-            {
-                reopen_req = true;
-                pending_idr = true;
-            }
-        }
-        return 0;
+        return key == keys::gop.name ? set_config_gop(u) : set_config_bitrate(u);
     }
     if (key == "rc")
     {
@@ -676,12 +649,70 @@ int h264_encoder_intel::configure(std::string_view key, std::string_view value)
         }
         return 0;
     }
-    if (key == "idr")
+    if (key == keys::idr.name)
     {
-        pending_idr = true;
-        return 0;
+        return set_config_idr();
     }
     return -ENOTSUP;
+}
+
+int h264_encoder_intel::configure(uint64_t key, uint64_t value)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    switch (key)
+    {
+    case keys::bitrate.id:
+        return set_config_bitrate(value);
+    case keys::gop.id:
+        return set_config_gop(value);
+    case keys::idr.id:
+        return set_config_idr();
+    default:
+        return -ENOTSUP;
+    }
+}
+
+int h264_encoder_intel::set_config_bitrate(uint64_t kbps)
+{
+    if (kbps > 200000)
+    {
+        return -EINVAL;
+    }
+    const int nv = static_cast<int>(kbps * 1000);
+    if (nv != bps)
+    {
+        bps = nv;
+        if (opened && rc_cbr)
+        {
+            reopen_req = true;
+            pending_idr = true;
+        }
+    }
+    return 0;
+}
+
+int h264_encoder_intel::set_config_gop(uint64_t n)
+{
+    if (n < 1 || n > 255)
+    {
+        return -EINVAL;
+    }
+    const int nv = static_cast<int>(n);
+    if (nv != gop)
+    {
+        gop = nv;
+        if (opened)
+        {
+            reopen_req = true;
+        }
+    }
+    return 0;
+}
+
+int h264_encoder_intel::set_config_idr()
+{
+    pending_idr = true;
+    return 0;
 }
 
 namespace
@@ -938,9 +969,9 @@ int h264_encoder_intel::query(std::string_view key, std::string *value) const
         *value = cbr ? "cbr" : "cqp";
         return 0;
     }
-    if (key == "cbr" || key == "bps")
+    if (key == keys::bitrate.name)
     {
-        const int n = opened && live_bps > 0 ? live_bps : bps;
+        const int n = (opened && live_bps > 0 ? live_bps : bps) / 1000;
         char buf[32];
         if (key_format_i64(n, buf, sizeof(buf)) < 0)
         {

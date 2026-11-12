@@ -70,7 +70,7 @@ class pipeline_queue;
  *     enc.start();
  *     cap.start();
  *     ...
- *     enc.configure("enc", "cbr", "4000000");   // any thread, while running
+ *     enc.configure("enc", "bitrate", "4000");   // any thread, while running
  *     std::string v;
  *     enc.query("snd", "max_input", &v);
  *     ...

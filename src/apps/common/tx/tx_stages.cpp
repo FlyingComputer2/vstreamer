@@ -19,6 +19,7 @@
 
 #include "components/components.hpp"
 #include "core/component_input.hpp"
+#include "core/config_keys.hpp"
 #include "core/component_output.hpp"
 #include "core/sdu_caps.hpp"
 #include "core/sdu_type.hpp"
@@ -70,9 +71,7 @@ void apply_pending_console_encoder_cfg(apps::tx::encoder_t &enc)
     const int kbps = g_tx.pending_console_cbr_kbps.exchange(-1, std::memory_order_acq_rel);
     if (kbps >= 100)
     {
-        char bps_buf[32];
-        std::snprintf(bps_buf, sizeof(bps_buf), "%d", kbps * 1000);
-        (void)enc.configure("cbr", std::string_view(bps_buf));
+        (void)enc.configure(keys::bitrate.id, static_cast<uint64_t>(kbps));
     }
     const int qp = g_tx.pending_console_qp.exchange(-1, std::memory_order_acq_rel);
     if (qp >= 0 && qp <= 51)
@@ -84,13 +83,11 @@ void apply_pending_console_encoder_cfg(apps::tx::encoder_t &enc)
     const int gop = g_tx.pending_console_gop.exchange(-1, std::memory_order_acq_rel);
     if (gop >= 1 && gop <= 255)
     {
-        char gop_buf[16];
-        std::snprintf(gop_buf, sizeof(gop_buf), "%d", gop);
-        (void)enc.configure("gop", std::string_view(gop_buf));
+        (void)enc.configure(keys::gop.id, static_cast<uint64_t>(gop));
     }
     if (g_tx.pending_console_idr.exchange(false, std::memory_order_acq_rel))
     {
-        (void)enc.configure("idr", "");
+        (void)enc.configure(keys::idr.id, 0);
     }
 }
 

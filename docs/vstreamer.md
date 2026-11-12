@@ -76,6 +76,28 @@ snd->query(k_dropped, &n);
   implementation. `stream_sender` does this for all its scalar counters.
 - `query_stream_u64()` tries the typed path first and falls back to parsing the string.
 
+**Typed configure.** The keys a controller changes while streaming can also be set without
+formatting and parsing numbers:
+
+```cpp
+virtual int configure(uint64_t key, uint64_t value); // default -ENOTSUP
+
+#include "core/config_keys.hpp"
+enc->configure(vstreamer::keys::bitrate.id, 6000);
+snd->configure(vstreamer::keys::fec_k.id, 6);
+src->configure(vstreamer::keys::idr.id, 0);
+```
+
+- `core/config_keys.hpp` lists every typed configure key as `keys::<name>` with `.name` (the
+  string key) and `.id` (`query_key(name)`); a `static_assert` rejects colliding ids. Keys:
+  `bitrate` (encoder target, kbit/s), `gop`, `idr` (value ignored), `fec_k`, `fec_n`,
+  `fec_spread_ms`. Other keys are string-only.
+- Each typed key has one validating setter in the component (`set_config_<name>()`); the string
+  form parses the number and calls the same setter, so both forms accept and reject the same
+  values. A component that overrides it adds `using <base>::configure;`.
+- `bitrate` is in kbit/s on every encoder and encoding source (it was bit/s); the `bps` and `cbr`
+  aliases are gone.
+
 ### `component_pdu` and buffers
 
 Wires carry `component_pdu` ([component_pdu.hpp](../src/core/component_pdu.hpp)): SDU bytes in
@@ -183,7 +205,7 @@ part of `v4l2_source`.
 | `qp` | C Q | 2..51, default 36, live |
 | `gop` | C Q | 1..255, default 30, live |
 | `rc` | C Q | `cbr` / `fixqp`, live |
-| `cbr` (`bps`) | C Q | bit/s 0..200 000 000, default 20 000 000, live in `cbr` mode |
+| `bitrate` | C Q | kbit/s 0..200 000, default 20 000, live in `cbr` mode |
 | `super_i_ratio`, `super_p_ratio` | C | ≥ 0, defaults 6.0 / 1.5 |
 | `idr` | C | request IDR on the next frame |
 | `latency_ms` | Q | capture → encoded AU |
@@ -191,7 +213,8 @@ part of `v4l2_source`.
 
 **`h264_encoder_cedar`** (libav `h264_cedrus`, width multiple of 32) and
 **`h264_encoder_intel`** (libav `h264_vaapi`): `size`, `fps` (1..120), `qp` (Cedar 2..47,
-Intel 0..52), `gop` (1..255), `idr`; Intel adds `device` (VA render node). Query adds `backend`,
+Intel 0..52), `gop` (1..255), `idr`; Intel adds `bitrate` (0..200 000) and `device` (VA render
+node). Query adds `backend`,
 `status`.
 
 **`h264_encoder_esp32p4`** — ESP32-P4 hardware H.264 (`esp_h264`). Input is `O_UYY_E_VYY`, the
@@ -204,7 +227,7 @@ thread. Raw caps must match `size`. Constrained Baseline; IDR AUs carry `KEY`.
 | `size` | C Q | 80..1920 × 80..2032, both even, default `1920x1080`; reopens the encoder |
 | `fps` | C Q | 1..120, default 30, live |
 | `gop` | C Q | 1..255, default 30, live |
-| `bitrate` (`bps`) | C Q | 10 000..100 000 000, default 4 000 000, live |
+| `bitrate` | C Q | 10..100 000, default 4 000, live |
 | `qp_min`, `qp_max` | C Q | 0..51, defaults 20 / 40; reopens the encoder |
 | `idr` | C | IDR on the next frame |
 | `encode_ms` | Q | last / max encode time |
@@ -522,8 +545,8 @@ listing verbs answer one `ok …` line per item.
 | `ping`, `help` | `pong`, verb list |
 
 ```bash
-echo "get enc cbr" | nc -u -w1 127.0.0.1 5090
-echo "set enc cbr 2500000" | nc -u -w1 127.0.0.1 5090
+echo "get enc bitrate" | nc -u -w1 127.0.0.1 5090
+echo "set enc bitrate 2500" | nc -u -w1 127.0.0.1 5090
 ```
 
 ## Bench app: `stream_sdl_test`
@@ -762,7 +785,7 @@ actual allocation is driver-dependent), `light_freq` (0, 50, 60), `rotate` (0 or
 180; the OV5647 flips both readout axes in hardware), `sccb_port`,
 `sccb_scl`, `sccb_sda`, `sccb_freq`, `reset_pin`, and `pwdn_pin`. Sensor selection is
 still through sdkconfig, and SCCB setup applies on the first video initialization
-per boot. Encoder settings: `bitrate` / `bps`, `gop`, `qp_min`, `qp_max`, `rc`
+per boot. Encoder settings: `bitrate`, `gop`, `qp_min`, `qp_max`, `rc`
 (`frame` or `esp`), and `idr`. Worker placement uses `encode_cpu` / `encode_prio`;
 there is no separate capture worker. Only `bitrate`, `gop`, `idr`, and `reset_stats`
 can change while open; other configuration requires closing the source.

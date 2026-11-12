@@ -38,10 +38,15 @@ public:
     int input(component_pdu &&in) override;
     int output(component_pdu &out) override;
 
+    using component::configure;
     int configure(std::string_view key, std::string_view value) override;
+    int configure(uint64_t key, uint64_t value) override;
     int query(std::string_view key, std::string *value) const override;
 
 private:
+    /* Validating setters shared by the string and typed configure(); mu held. */
+    int set_config_gop(uint64_t gop);
+    int set_config_idr();
     [[nodiscard]] int nv12_size_locked() const;
     int  codec_open_locked();
     void codec_close_locked();

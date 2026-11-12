@@ -60,7 +60,9 @@ public:
     void close() override;
     int input(component_pdu &&in) override;
 
+    using component_sink::configure;
     int configure(std::string_view key, std::string_view value) override;
+    int configure(uint64_t key, uint64_t value) override;
     using component_sink::query;
     int query(std::string_view key, std::string *value) const override;
     int query(uint64_t key, uint64_t *value) const override;
@@ -68,6 +70,10 @@ public:
     int query(uint64_t key, double *value) const override;
 
 private:
+    /* Validating setters shared by the string and typed configure(). */
+    int set_config_fec_spread_ms(uint64_t ms);
+    int set_config_fec_k(uint64_t k);
+    int set_config_fec_n(uint64_t n);
     [[nodiscard]] stream_peer_link peer_link_snapshot() const;
     struct send_thread_wdt;
     void send_thread_main();

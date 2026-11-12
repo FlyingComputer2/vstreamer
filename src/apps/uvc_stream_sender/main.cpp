@@ -245,9 +245,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    char cbr_bps[24];
-    std::snprintf(cbr_bps, sizeof(cbr_bps), "%d", cbr_kbps * 1000);
-    if (cfg(enc, "cbr", cbr_bps) < 0 || cfg(enc, "rc", "cbr") < 0)
+    char kbps_buf[24];
+    std::snprintf(kbps_buf, sizeof(kbps_buf), "%d", cbr_kbps);
+    if (cfg(enc, "bitrate", kbps_buf) < 0 || cfg(enc, "rc", "cbr") < 0)
     {
         return 1;
     }

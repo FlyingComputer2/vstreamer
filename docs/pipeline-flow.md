@@ -35,7 +35,7 @@ byte queries return `-ENODATA` for them. Old senders reject the new report lengt
 `scripts/cbr_controller.py` holds AIMD increases when `peer_report_age_ms` is stale (> 3×
 `telemetry_ms`, or no report yet). In the `stream_sdl` bench the reports cross `link_emulator`'s
 reverse direction, the NAT-style return path of the forward flow, so reverse-path loss is
-emulated too. Encoder rate: `configure("cbr")` or bench `set_encode_cbr`.
+emulated too. Encoder rate: `configure("bitrate")` in kbit/s (or typed `keys::bitrate`) or bench `set_encode_cbr`.
 
 Factory names: `v4l2_source`, `jpeg_decoder_multicore`, `h264_encoder_cedar`,
 `rtp_h264_pay`, `stream_sender`.

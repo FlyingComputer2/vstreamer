@@ -106,7 +106,7 @@ void check_output_during_encoder_control(const char *key, bool configure)
     auto control = std::async(std::launch::async, [&]
     {
         std::string value;
-        return configure ? source->configure(key, "8000000") : source->query(key, &value);
+        return configure ? source->configure(key, "8000") : source->query(key, &value);
     });
     eventually(
         [&] { return count(&fake_hardware::encoder_control_calls) > calls_before; },
@@ -312,7 +312,7 @@ int main()
     }
     check(source->configure("fps", "30") == -EBUSY, "live camera change rejected");
     check(source->configure("qp_min", "10") == -EBUSY, "live reopen rejected");
-    check(source->configure("bitrate", "8000000") == 0, "live bitrate accepted");
+    check(source->configure("bitrate", "8000") == 0, "live bitrate accepted");
     check(source->configure("idr", "1") == 0, "live IDR accepted");
     check(source->configure("unknown", "1") == -ENOTSUP, "unknown key rejected");
     hw.feed();

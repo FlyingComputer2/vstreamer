@@ -1,5 +1,6 @@
 #include "components/h264_encoder_esp32p4.hpp"
 
+#include "core/config_keys.hpp"
 #include "core/key_util.hpp"
 #include "core/latency_query.hpp"
 #include "core/time_util.hpp"
@@ -656,25 +657,14 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         return 0;
     }
     /* gop, bitrate and fps reach a live codec from the encode thread before its next frame. */
-    if (key == "gop")
+    if (key == keys::gop.name || key == keys::bitrate.name)
     {
-        if (parse_int(value, 1, 255, &n) < 0)
+        uint64_t u = 0;
+        if (key_parse_u64(value, &u) < 0)
         {
             return -EINVAL;
         }
-        gop = static_cast<int>(n);
-        hw_dirty_ |= opened ? k_hw_gop : 0;
-        return 0;
-    }
-    if (key == "bitrate" || key == "bps")
-    {
-        if (parse_int(value, 10000, 100000000, &n) < 0)
-        {
-            return -EINVAL;
-        }
-        bitrate = static_cast<uint32_t>(n);
-        hw_dirty_ |= opened ? k_hw_bitrate : 0;
-        return 0;
+        return key == keys::gop.name ? set_config_gop(u) : set_config_bitrate(u);
     }
     if (key == "qp_min" || key == "qp_max")
     {
@@ -697,10 +687,9 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         }
         return 0;
     }
-    if (key == "idr")
+    if (key == keys::idr.name)
     {
-        pending_idr = true;
-        return 0;
+        return set_config_idr();
     }
     if (key == "rc")
     {
@@ -727,6 +716,50 @@ int h264_encoder_esp32p4::configure(std::string_view key, std::string_view value
         return 0;
     }
     return -ENOTSUP;
+}
+
+int h264_encoder_esp32p4::configure(uint64_t key, uint64_t value)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    switch (key)
+    {
+    case keys::bitrate.id:
+        return set_config_bitrate(value);
+    case keys::gop.id:
+        return set_config_gop(value);
+    case keys::idr.id:
+        return set_config_idr();
+    default:
+        return -ENOTSUP;
+    }
+}
+
+int h264_encoder_esp32p4::set_config_bitrate(uint64_t kbps)
+{
+    if (kbps < 10 || kbps > 100000)
+    {
+        return -EINVAL;
+    }
+    bitrate = static_cast<uint32_t>(kbps * 1000);
+    hw_dirty_ |= opened ? k_hw_bitrate : 0;
+    return 0;
+}
+
+int h264_encoder_esp32p4::set_config_gop(uint64_t n)
+{
+    if (n < 1 || n > 255)
+    {
+        return -EINVAL;
+    }
+    gop = static_cast<int>(n);
+    hw_dirty_ |= opened ? k_hw_gop : 0;
+    return 0;
+}
+
+int h264_encoder_esp32p4::set_config_idr()
+{
+    pending_idr = true;
+    return 0;
 }
 
 int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
@@ -772,9 +805,9 @@ int h264_encoder_esp32p4::query(std::string_view key, std::string *value) const
     {
         return set_int(value, gop);
     }
-    if (key == "bitrate" || key == "bps")
+    if (key == keys::bitrate.name)
     {
-        return set_int(value, bitrate);
+        return set_int(value, bitrate / 1000);
     }
     if (key == "qp_min")
     {

@@ -38,6 +38,18 @@ public:
 
     /* 0 on success, -ENOTSUP unknown key, -EINVAL bad value, other -errno. */
     virtual int configure(std::string_view key, std::string_view value) = 0;
+
+    /* Typed configure by keys::<name>.id (core/config_keys.hpp): no string formatting or
+     * parsing. Same validation and effect as the string form of the key; a component handles
+     * both through one setter. Components that override this must add
+     * `using component::configure;` (or the base they derive from) so the string overload
+     * stays visible. */
+    virtual int configure(uint64_t key, uint64_t value)
+    {
+        (void)key;
+        (void)value;
+        return -ENOTSUP;
+    }
     /* Fills *value (overwritten). 0 / -ENOTSUP / -EINVAL. Thread-safe. */
     virtual int query(std::string_view key, std::string *value) const = 0;
 

@@ -37,7 +37,10 @@ class esp32_h264_isp_ng_src : public component_source
     int open() override;
     void close() override;
     int output(component_pdu &out) override;
+    using component::configure;
     int configure(std::string_view key, std::string_view value) override;
+    /* bitrate, gop and idr go straight to the encoder, which validates them; live while open. */
+    int configure(uint64_t key, uint64_t value) override;
     int query(std::string_view key, std::string *value) const override;
 
    private:

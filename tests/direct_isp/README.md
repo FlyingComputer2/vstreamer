@@ -15,7 +15,7 @@ factory, caps, and wakeup code. Deterministic device/encoder doubles verify buff
 buffer return while encoding, raw-frame drops under backpressure, configuration
 routing, close during encoding, reopening, and error recovery/propagation. Encoder
 doubles hold the production encode mutex across a paused encode; concurrent stats,
-forwarded queries, bitrate changes, and stats resets must leave empty `output()`
+forwarded queries, `bitrate` changes, and stats resets must leave empty `output()`
 reads free to return `-EAGAIN` before encoding resumes. It also
 checks that the existing camera node retains a buffer until the last shared PDU
 reference is released.

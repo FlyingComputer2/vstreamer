@@ -603,14 +603,14 @@ int main(int argc, char **argv)
         g_bench_metrics_log = true;
     }
 
-    char cbr_bps[24];
-    std::snprintf(cbr_bps, sizeof(cbr_bps), "%d", encoder_cbr_kbps * 1000);
+    char cbr_kbps[24];
+    std::snprintf(cbr_kbps, sizeof(cbr_kbps), "%d", encoder_cbr_kbps);
     const char *enc_rc = std::getenv("VSTREAMER_ENC_RC");
     if (nullptr == enc_rc || enc_rc[0] == '\0')
     {
         enc_rc = "cbr";
     }
-    if (open_stage("h264_encoder cbr", cfg_str(enc, "cbr", cbr_bps)) < 0 ||
+    if (open_stage("h264_encoder bitrate", cfg_str(enc, "bitrate", cbr_kbps)) < 0 ||
         open_stage("h264_encoder rc", cfg_str(enc, "rc", enc_rc)) < 0)
     {
         return 1;
@@ -682,9 +682,9 @@ int main(int argc, char **argv)
         return 1;
     }
     {
-        const int reported_bps = query_encoder_cbr_bps(enc);
+        const int reported_kbps = query_encoder_kbps(enc);
         std::fprintf(stderr, "%s: MPP rc=%s target %d kbps\n", app_label, enc_rc,
-                     reported_bps > 0 ? (reported_bps + 500) / 1000 : encoder_cbr_kbps);
+                     reported_kbps > 0 ? reported_kbps : encoder_cbr_kbps);
     }
     channel.set_encode_command_handlers(
         [](int kbps) -> bool {

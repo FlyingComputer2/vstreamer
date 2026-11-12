@@ -1,4 +1,5 @@
 #include "components/stream_sender.hpp"
+#include "core/config_keys.hpp"
 
 #include <arpa/inet.h>
 #include <gtest/gtest.h>
@@ -449,6 +450,35 @@ TEST(StreamSenderTest, TypedQueryMatchesStringAndRejectsWrongType)
     std::string mode;
     EXPECT_EQ(0, sender.query("fec_mode", &mode));
     EXPECT_EQ(-EINVAL, sender.query(vstreamer::query_key("fec_k"), static_cast<uint64_t *>(nullptr)));
+}
+
+TEST(StreamSenderTest, TypedConfigureMatchesString)
+{
+    namespace keys = vstreamer::keys;
+    vstreamer::stream_sender sender;
+    ASSERT_EQ(0, sender.configure(keys::fec_k.id, 6));
+    ASSERT_EQ(0, sender.configure(keys::fec_n.id, 8));
+    ASSERT_EQ(0, sender.configure(keys::fec_spread_ms.id, 4));
+    uint64_t v = 0;
+    ASSERT_EQ(0, sender.query(keys::fec_k.id, &v));
+    EXPECT_EQ(6U, v);
+    ASSERT_EQ(0, sender.query(keys::fec_n.id, &v));
+    EXPECT_EQ(8U, v);
+    ASSERT_EQ(0, sender.query(keys::fec_spread_ms.id, &v));
+    EXPECT_EQ(4U, v);
+
+    /* Same validation as the string form: k <= n, range, spread cap. */
+    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_k.id, 9));
+    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_n.id, 5));
+    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_n.id, 32));
+    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_spread_ms.id,
+                                        vstreamer::stream_sender::k_fec_spread_max_ms + 1));
+    EXPECT_EQ(-EINVAL, sender.configure("fec_k", "9"));
+    ASSERT_EQ(0, sender.query(keys::fec_k.id, &v));
+    EXPECT_EQ(6U, v);
+
+    EXPECT_EQ(-ENOTSUP, sender.configure(keys::bitrate.id, 1000));
+    EXPECT_EQ(-ENOTSUP, sender.configure(vstreamer::query_key("fec"), 1));
 }
 
 TEST(StreamSenderTest, PeerLinkReportSnapshot)

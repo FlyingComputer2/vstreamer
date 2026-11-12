@@ -38,6 +38,24 @@ inline int key_parse_i64(std::string_view s, int64_t *out)
     return 0;
 }
 
+/* Unsigned decimal integer, whole string, no sign. */
+inline int key_parse_u64(std::string_view s, uint64_t *out)
+{
+    if (nullptr == out || s.empty() || '+' == s.front() || '-' == s.front())
+    {
+        return -EINVAL;
+    }
+    uint64_t    v = 0;
+    const auto *end = s.data() + s.size();
+    const std::from_chars_result r = std::from_chars(s.data(), end, v, 10);
+    if (r.ec != std::errc() || r.ptr != end)
+    {
+        return -EINVAL;
+    }
+    *out = v;
+    return 0;
+}
+
 /* C-string overload: base 10 only (no octal/hex surprises). */
 inline int key_parse_i64(const char *s, int64_t *out)
 {

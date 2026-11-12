@@ -19,6 +19,7 @@
 #include <thread>
 #include <vector>
 
+#include "core/config_keys.hpp"
 #include "core/fec_spread.hpp"
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
@@ -908,29 +909,16 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         target.assign(value.data(), value.size());
         return 0;
     }
-    if ("fec_spread_ms" == key)
+    if (key == keys::fec_spread_ms.name || key == keys::fec_k.name || key == keys::fec_n.name)
     {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < 0 || v > k_fec_spread_max_ms ||
-            value.size() > 31)
+        uint64_t u = 0;
+        if (key_parse_u64(value, &u) < 0)
         {
             return -EINVAL;
         }
-        fec_spread_ms.store(static_cast<int>(v), std::memory_order_relaxed);
-        /* Shards already queued under a longer spread would otherwise keep their old release
-         * times: after a huge value they fill the queue for that long and stall the stream even
-         * once the spread is lowered. Pull them in to the new spread; release times stay sorted
-         * because the clamp is monotonic. */
-        {
-            const auto latest = std::chrono::steady_clock::now() + std::chrono::milliseconds(v);
-            std::lock_guard<std::mutex> lock(q_mu);
-            for (auto &q : queue)
-            {
-                q.release = std::min(q.release, latest);
-            }
-        }
-        q_cv.notify_one();
-        return 0;
+        return key == keys::fec_spread_ms.name ? set_config_fec_spread_ms(u)
+             : key == keys::fec_k.name         ? set_config_fec_k(u)
+                                               : set_config_fec_n(u);
     }
     if ("fec" == key)
     {
@@ -953,61 +941,99 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         }
         return -EINVAL;
     }
-    if ("fec_k" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < rs_block_erasure::k_header_k_n_min ||
-            v > rs_block_erasure::k_header_k_n_max || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        int old_k = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (static_cast<int>(v) > fec_n)
-            {
-                return -EINVAL;
-            }
-            old_k = fec_k;
-            fec_k = static_cast<int>(v);
-            fec_mode = fec_mode_e::block;
-        }
-        if (reinit_fec_if_active() < 0)
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            fec_k = old_k;
-            return -EINVAL;
-        }
-        return 0;
-    }
-    if ("fec_n" == key)
-    {
-        int64_t v = 0;
-        if (key_parse_i64(value, &v) < 0 || v < rs_block_erasure::k_header_k_n_min ||
-            v > rs_block_erasure::k_header_k_n_max || value.size() > 31)
-        {
-            return -EINVAL;
-        }
-        int old_n = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (fec_k > static_cast<int>(v))
-            {
-                return -EINVAL;
-            }
-            old_n = fec_n;
-            fec_n = static_cast<int>(v);
-            fec_mode = fec_mode_e::block;
-        }
-        if (reinit_fec_if_active() < 0)
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            fec_n = old_n;
-            return -EINVAL;
-        }
-        return 0;
-    }
     return -ENOTSUP;
+}
+
+int stream_sender::configure(uint64_t key, uint64_t value)
+{
+    switch (key)
+    {
+    case keys::fec_spread_ms.id:
+        return set_config_fec_spread_ms(value);
+    case keys::fec_k.id:
+        return set_config_fec_k(value);
+    case keys::fec_n.id:
+        return set_config_fec_n(value);
+    default:
+        return -ENOTSUP;
+    }
+}
+
+int stream_sender::set_config_fec_spread_ms(uint64_t v)
+{
+    if (v > static_cast<uint64_t>(k_fec_spread_max_ms))
+    {
+        return -EINVAL;
+    }
+    fec_spread_ms.store(static_cast<int>(v), std::memory_order_relaxed);
+    /* Shards already queued under a longer spread would otherwise keep their old release
+     * times: after a huge value they fill the queue for that long and stall the stream even
+     * once the spread is lowered. Pull them in to the new spread; release times stay sorted
+     * because the clamp is monotonic. */
+    {
+        const auto latest = std::chrono::steady_clock::now() + std::chrono::milliseconds(v);
+        std::lock_guard<std::mutex> lock(q_mu);
+        for (auto &q : queue)
+        {
+            q.release = std::min(q.release, latest);
+        }
+    }
+    q_cv.notify_one();
+    return 0;
+}
+
+int stream_sender::set_config_fec_k(uint64_t v)
+{
+    if (v < static_cast<uint64_t>(rs_block_erasure::k_header_k_n_min) ||
+        v > static_cast<uint64_t>(rs_block_erasure::k_header_k_n_max))
+    {
+        return -EINVAL;
+    }
+    int old_k = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (static_cast<int>(v) > fec_n)
+        {
+            return -EINVAL;
+        }
+        old_k = fec_k;
+        fec_k = static_cast<int>(v);
+        fec_mode = fec_mode_e::block;
+    }
+    if (reinit_fec_if_active() < 0)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        fec_k = old_k;
+        return -EINVAL;
+    }
+    return 0;
+}
+
+int stream_sender::set_config_fec_n(uint64_t v)
+{
+    if (v < static_cast<uint64_t>(rs_block_erasure::k_header_k_n_min) ||
+        v > static_cast<uint64_t>(rs_block_erasure::k_header_k_n_max))
+    {
+        return -EINVAL;
+    }
+    int old_n = 0;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (fec_k > static_cast<int>(v))
+        {
+            return -EINVAL;
+        }
+        old_n = fec_n;
+        fec_n = static_cast<int>(v);
+        fec_mode = fec_mode_e::block;
+    }
+    if (reinit_fec_if_active() < 0)
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        fec_n = old_n;
+        return -EINVAL;
+    }
+    return 0;
 }
 
 int stream_sender::query(std::string_view key, std::string *value) const
