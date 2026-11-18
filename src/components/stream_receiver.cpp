@@ -19,8 +19,8 @@
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
-#include "core/sequence_gap.hpp"
 #include "core/stream_header.hpp"
+#include "core/stream_media_header.hpp"
 #include "core/stream_metrics.hpp"
 #include "core/stream_telemetry.hpp"
 #include "core/thread_spawn.hpp"
@@ -53,25 +53,6 @@ void update_kbps_window(double &t0, uint64_t &acc, float &kbps, size_t nbytes)
         t0 = t;
         acc = 0;
     }
-}
-
-/* Post-FEC gaps are data shards given up; parity never seen is wire loss on top of the data
- * sequence gaps. */
-void note_fec_output_gaps(vstreamer::rs_block_erasure &fec, std::atomic<uint64_t> &fec_gap_count,
-                          std::atomic<uint64_t> &udp_gap_count)
-{
-    const uint64_t n = fec.take_fail_lost_app_pkts();
-    if (n > 0)
-    {
-        fec_gap_count.fetch_add(n, std::memory_order_relaxed);
-    }
-    const uint64_t parity = fec.take_missing_parity();
-    if (parity > 0)
-    {
-        udp_gap_count.fetch_add(parity, std::memory_order_relaxed);
-    }
-    (void)fec.take_fail_missing_shards();
-    (void)fec.take_decode_fail();
 }
 
 }  // namespace
@@ -118,16 +99,8 @@ std::string stream_receiver::name() const
 
 
 
-void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
-                                             size_t max_app_bytes, bool discont)
+void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, bool discont)
 {
-    if (payload.empty() || 0 == max_app_bytes || payload.size() > max_app_bytes)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        recv_dropped++;
-        return;
-    }
-
     component_pdu pdu;
     pdu.ts_us = monotonic_timestamp_us();
     pdu.sdu_type = sdu_type_e::STREAM_DGRAM;
@@ -142,12 +115,15 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
     bool evicted = false;
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        if (pdu_queue.size() >= k_queue_depth)
+        pdu_queue.push_back(std::move(pdu));
+        if (pdu_queue.size() > k_queue_depth)
         {
+            /* The consumer fell behind: the oldest goes, and what follows it is a
+             * discontinuity now (whether or not the evicted one was). */
             pdu_queue.pop_front();
+            pdu_queue.front().flags |= static_cast<uint8_t>(pdu_flag_e::DISCONT);
             evicted = true;
         }
-        pdu_queue.push_back(std::move(pdu));
     }
     if (evicted)
     {
@@ -158,50 +134,11 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
     q_cv.notify_all();
 }
 
-// Commit reconstruction counts alongside the gaps from that decode/poll
-// operation. Queueing and downstream consumption do not change the post-FEC
-// accounting boundary.
-void stream_receiver::account_payloads_locked(
-    const fec_rx_payload_list &payloads, size_t max_app_bytes)
-{
-    for (const auto &payload : payloads)
-    {
-        if (!payload.empty() && payload.size() <= max_app_bytes)
-        {
-            fec_packet_received.fetch_add(1, std::memory_order_relaxed);
-            recv_bytes.fetch_add(payload.size(), std::memory_order_relaxed);
-        }
-    }
-}
-
-void stream_receiver::enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes)
-{
-    if (nullptr == payloads)
-    {
-        return;
-    }
-    for (auto &payload : *payloads)
-    {
-        bool discont = false;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            if (discont_next_)
-            {
-                discont = true;
-                discont_next_ = false;
-            }
-        }
-        enqueue_payload_buffer(std::move(payload), max_app_bytes, discont);
-    }
-    payloads->clear();
-}
-
 bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len,
                                       const bfc::shared_sized_buffer *owner)
 {
-    fec_rx_payload_list payloads;
-    bool                valid_media = false;
-    size_t              enqueue_app_max = 0;
+    bfc::shared_sized_buffer payload;
+    bool                     discont = false;
     {
         std::lock_guard<std::mutex> lock(mu);
         if (len > static_cast<size_t>(max_datagram))
@@ -210,62 +147,67 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len,
             recv_dropped++;
             return false;
         }
-
-        rs_block_erasure::shard_header hdr;
-        if (!rs_block_erasure::parse_header(data, len, &hdr))
+        uint16_t seq = 0;
+        if (!media_header_parse(data, len, &seq))
         {
             recv_dropped++;
             rx_bad_header++;
             return false;
         }
-        if (hdr.is_data)
-        {
-            if (0 == cached_max_app || len - hdr.header_len > cached_max_app)
-            {
-                recv_dropped++;
-                return false;
-            }
-            /* Data shards carry the only sequence on the wire; parity loss is counted per
-             * block by the decoder. */
-            const uint64_t dg =
-                note_u16_forward_gap(hdr.sequence_number, last_udp_seq, have_udp_seq);
-            if (dg > 0)
-            {
-                udp_gap_count.fetch_add(dg, std::memory_order_relaxed);
-                discont_next_ = true;
-            }
-        }
-        udp_packet_received.fetch_add(1, std::memory_order_relaxed);
-        recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
-
-        bfc::shared_sized_buffer shard;
+        const size_t plen = len - k_media_header_len;
+        const uint8_t *p = data + k_media_header_len;
         if (nullptr != owner)
         {
-            shard = owner->subview(static_cast<size_t>(data - owner->u8()), len);
+            /* The SDU stays in the transport's buffer: no copy. */
+            payload = owner->subview(static_cast<size_t>(p - owner->u8()), plen);
         }
         else
         {
-            shard = pool.acquire(len);
-            if (0 == shard.capacity() || shard.size() != len)
+            payload = pool.acquire(plen);
+            if (0 == payload.capacity() || payload.size() != plen)
             {
                 recv_dropped++;
                 return false;
             }
-            std::memcpy(shard.u8(), data, len);
+            std::memcpy(payload.u8(), p, plen);
         }
-        fec.push_air(std::move(shard), &payloads);
-        note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
-        fec_rec = fec.recovered();
-        fec_lost = fec.decode_fail();
-        valid_media = true;
-        enqueue_app_max = cached_max_app;
-        account_payloads_locked(payloads, enqueue_app_max);
+        /* In order: hand on. A jump ahead within the window: the numbers in between are lost.
+         * Behind within the late window (a duplicate or a straggler): drop it, the stream has
+         * moved on. Anything further either way is a new sender session (a restart starts at a
+         * random number): take it as the new reference, without counting a gap. */
+        if (have_udp_seq)
+        {
+            const uint16_t ahead = static_cast<uint16_t>(seq - last_udp_seq - 1U);
+            const uint16_t behind = static_cast<uint16_t>(last_udp_seq - seq);
+            if (behind <= k_late_window)
+            {
+                rx_late.fetch_add(1, std::memory_order_relaxed);
+                recv_dropped++;
+                return true; /* valid media: the telemetry peer stays */
+            }
+            if (ahead < k_gap_window)
+            {
+                if (ahead > 0)
+                {
+                    media_gap_count.fetch_add(ahead, std::memory_order_relaxed);
+                    discont = true;
+                }
+            }
+            else
+            {
+                rx_resyncs.fetch_add(1, std::memory_order_relaxed);
+                discont = true;
+            }
+        }
+        last_udp_seq = seq;
+        have_udp_seq = true;
+        media_packet_received.fetch_add(1, std::memory_order_relaxed);
+        recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
+        recv_bytes.fetch_add(plen, std::memory_order_relaxed);
+        update_kbps_window(egress_rate_t0, egress_rate_bytes, egress_kbps, plen);
     }
-    if (!payloads.empty() && enqueue_app_max > 0)
-    {
-        enqueue_payloads(&payloads, enqueue_app_max);
-    }
-    return valid_media;
+    enqueue_payload_buffer(std::move(payload), discont);
+    return true;
 }
 
 void stream_receiver::stop_recv_thread()
@@ -297,8 +239,7 @@ void stream_receiver::stop_recv_thread()
 
 void stream_receiver::recv_thread_main()
 {
-    /* Bounded wait so block expiry and the in-order emit queue advance even
-     * when the wire goes quiet (e.g. tail of a burst loss). */
+    /* Bounded wait so link reports go on when the wire goes quiet. */
     constexpr int k_poll_ms = 10;
     /* Largest UDP datagram; on the heap, not the thread stack (small on ESP-IDF). */
     std::vector<uint8_t> buf(65536);
@@ -446,20 +387,6 @@ void stream_receiver::recv_thread_main()
             }
         }
 
-        fec_rx_payload_list payloads;
-        size_t              decoded_max = 0;
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            fec.poll_rx(&payloads);
-            note_fec_output_gaps(fec, fec_gap_count, udp_gap_count);
-            fec_lost = fec.decode_fail();
-            decoded_max = cached_max_app;
-            account_payloads_locked(payloads, decoded_max);
-        }
-        if (!payloads.empty() && decoded_max > 0)
-        {
-            enqueue_payloads(&payloads, decoded_max);
-        }
         if (direct)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -469,17 +396,37 @@ void stream_receiver::recv_thread_main()
 
 stream_link_report stream_receiver::link_report_snapshot() const
 {
-    std::lock_guard<std::mutex> lock(mu);
+    std::shared_ptr<const link_counters_fn> link;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        link = link_counters_src;
+    }
     stream_link_report report;
     report.session_id = session_id.load(std::memory_order_relaxed);
     report.timestamp_us = monotonic_timestamp_us();
     auto &c = report.counters;
-    c.udp_packet_received = udp_packet_received.load(std::memory_order_relaxed);
-    c.fec_packet_received = fec_packet_received.load(std::memory_order_relaxed);
-    c.udp_gap_count = udp_gap_count.load(std::memory_order_relaxed);
-    c.fec_gap_count = fec_gap_count.load(std::memory_order_relaxed);
-    c.udp_bytes_received = recv_wire_bytes.load(std::memory_order_relaxed);
+    c.fec_packet_received = media_packet_received.load(std::memory_order_relaxed);
+    c.fec_gap_count = media_gap_count.load(std::memory_order_relaxed);
     c.fec_bytes_received = recv_bytes.load(std::memory_order_relaxed);
+    if (link)
+    {
+        /* Always the link's, zeros until it has counters: never the receiver's own, which
+         * count from another base and would look like a jump when the link's arrive. */
+        link_counters lc;
+        if ((*link)(&lc))
+        {
+            c.udp_packet_received = lc.packets;
+            c.udp_gap_count = lc.gaps;
+            c.udp_bytes_received = lc.bytes;
+        }
+    }
+    else
+    {
+        /* No link counters: the link is this receiver's socket or queue. */
+        c.udp_packet_received = c.fec_packet_received;
+        c.udp_gap_count = c.fec_gap_count;
+        c.udp_bytes_received = recv_wire_bytes.load(std::memory_order_relaxed);
+    }
     return report;
 }
 
@@ -584,17 +531,15 @@ int stream_receiver::open()
             std::lock_guard<std::mutex> plock(peer_display_mu);
             telemetry_peer_str.clear();
         }
-        udp_packet_received.store(0, std::memory_order_relaxed);
-        fec_packet_received.store(0, std::memory_order_relaxed);
-        udp_gap_count.store(0, std::memory_order_relaxed);
-        fec_gap_count.store(0, std::memory_order_relaxed);
+        media_packet_received.store(0, std::memory_order_relaxed);
+        media_gap_count.store(0, std::memory_order_relaxed);
         recv_bytes.store(0, std::memory_order_relaxed);
         recv_wire_bytes.store(0, std::memory_order_relaxed);
         last_udp_seq = 0;
         have_udp_seq = false;
-        discont_next_ = false;
+        rx_late.store(0, std::memory_order_relaxed);
+        rx_resyncs.store(0, std::memory_order_relaxed);
         rx_bad_header = 0;
-        cached_max_app = rs_block_erasure::max_data_payload(static_cast<size_t>(max_datagram));
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
         recv_stop = false;
@@ -615,6 +560,17 @@ int stream_receiver::open()
     {
         std::fprintf(stderr, "stream_receiver: listen %s:%d\n", host, port);
     }
+    return 0;
+}
+
+int stream_receiver::set_link_counters(link_counters_fn fn)
+{
+    std::lock_guard<std::mutex> lock(mu);
+    if (opened)
+    {
+        return -EBUSY;
+    }
+    link_counters_src = fn ? std::make_shared<const link_counters_fn>(std::move(fn)) : nullptr;
     return 0;
 }
 
@@ -651,8 +607,6 @@ void stream_receiver::close()
         ::close(recv_fd);
         recv_fd = -1;
     }
-    /* Release the datagrams the decoder still holds (they may belong to the transport). */
-    fec.reset_rx();
 
     {
         std::lock_guard<std::mutex> qlock(q_mu);
@@ -800,88 +754,25 @@ int stream_receiver::query(std::string_view key, std::string *value) const
     if ("udp_packet_received" == key || "fec_packet_received" == key || "udp_gap_count" == key ||
         "fec_gap_count" == key)
     {
+        const auto c = link_report_snapshot().counters;
         uint64_t n = 0;
         if ("udp_packet_received" == key)
         {
-            n = udp_packet_received.load(std::memory_order_relaxed);
+            n = c.udp_packet_received;
         }
         else if ("fec_packet_received" == key)
         {
-            n = fec_packet_received.load(std::memory_order_relaxed);
+            n = c.fec_packet_received;
         }
         else if ("udp_gap_count" == key)
         {
-            n = udp_gap_count.load(std::memory_order_relaxed);
+            n = c.udp_gap_count;
         }
         else
         {
-            n = fec_gap_count.load(std::memory_order_relaxed);
+            n = c.fec_gap_count;
         }
         char buf[32];
-        std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
-        *value = buf;
-        return 0;
-    }
-    if ("fec_spread_est_ms" == key || "fec_jitter_est_ms" == key)
-    {
-        /* The sender's spread and arrival jitter measured from receive times; the spread is the
-         * cap (rs_block_erasure::k_spread_cap_ms) until two blocks have been fitted. */
-        std::lock_guard<std::mutex> lock(mu);
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%.1f",
-                      "fec_spread_est_ms" == key ? fec.spread_estimate_ms()
-                                                 : fec.jitter_estimate_ms());
-        *value = buf;
-        return 0;
-    }
-    if ("fec_recovered" == key || "fec_failures" == key || "fec_hdr_errors" == key ||
-        "fec_kn_mismatch" == key || "fec_evicted_blocks" == key || "fec_rs_failures" == key ||
-        "fec_missing_shards" == key || "fec_late_blocks" == key ||
-        "fec_given_up_blocks" == key || "fec_new_references" == key)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        char           buf[32];
-        uint64_t       n = 0;
-        if ("fec_recovered" == key)
-        {
-            n = fec_rec;
-        }
-        else if ("fec_failures" == key)
-        {
-            n = fec_lost;
-        }
-        else if ("fec_hdr_errors" == key)
-        {
-            n = fec.hdr_errors();
-        }
-        else if ("fec_kn_mismatch" == key)
-        {
-            n = fec.kn_mismatch();
-        }
-        else if ("fec_evicted_blocks" == key)
-        {
-            n = fec.evicted_blocks();
-        }
-        else if ("fec_rs_failures" == key)
-        {
-            n = fec.rs_failures();
-        }
-        else if ("fec_missing_shards" == key)
-        {
-            n = fec.missing_shards();
-        }
-        else if ("fec_given_up_blocks" == key)
-        {
-            n = fec.given_up_blocks();
-        }
-        else if ("fec_new_references" == key)
-        {
-            n = fec.new_references();
-        }
-        else
-        {
-            n = fec.late_blocks();
-        }
         std::snprintf(buf, sizeof(buf), "%" PRIu64, n);
         *value = buf;
         return 0;
@@ -932,6 +823,7 @@ int stream_receiver::query(std::string_view key, std::string *value) const
     }
     if ("stats" == key)
     {
+        const auto c = link_report_snapshot().counters;
         std::lock_guard<std::mutex> lock(mu);
         char buf[420];
         std::snprintf(buf, sizeof(buf),
@@ -939,17 +831,13 @@ int stream_receiver::query(std::string_view key, std::string *value) const
                       " udp_gap_count=%" PRIu64 " fec_gap_count=%" PRIu64
                       " telemetry_sent=%" PRIu64 " telemetry_send_errors=%" PRIu64
                       " bytes=%" PRIu64 " wire_bytes=%" PRIu64 " dropped=%" PRIu64
-                      " out_rate=%.1f fec_recovered=%" PRIu64 " fec_failures=%" PRIu64,
-                      udp_packet_received.load(std::memory_order_relaxed),
-                      fec_packet_received.load(std::memory_order_relaxed),
-                      udp_gap_count.load(std::memory_order_relaxed),
-                      fec_gap_count.load(std::memory_order_relaxed),
-                      telemetry_sent.load(std::memory_order_relaxed),
+                      " out_rate=%.1f",
+                      c.udp_packet_received, c.fec_packet_received, c.udp_gap_count,
+                      c.fec_gap_count, telemetry_sent.load(std::memory_order_relaxed),
                       telemetry_send_errors.load(std::memory_order_relaxed),
                       recv_bytes.load(std::memory_order_relaxed),
                       recv_wire_bytes.load(std::memory_order_relaxed), recv_dropped,
-                      static_cast<double>(egress_kbps), fec_rec,
-                      fec_lost);
+                      static_cast<double>(egress_kbps));
         *value = buf;
         return 0;
     }
@@ -974,6 +862,14 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, rx_bad_header);
+        *value = buf;
+        return 0;
+    }
+    if ("rx_late" == key || "rx_resyncs" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      ("rx_late" == key ? rx_late : rx_resyncs).load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }

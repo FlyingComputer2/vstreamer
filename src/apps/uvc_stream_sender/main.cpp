@@ -44,7 +44,6 @@ void usage(const char *prog)
                  "  --fps N             default 30\n"
                  "  --cbr KBPS          default 4000\n"
                  "  --gop N             default fps\n"
-                 "  --fec-spread-ms N   spread each FEC block over N ms (>=0, default 0)\n"
                  "  --console [HOST:]PORT default 127.0.0.1:5090\n"
                  "  --mtu N             RTP MTU (default 1400)\n"
                  "  --noise-bandwidth N 0..100 (default 100)\n"
@@ -70,7 +69,6 @@ int main(int argc, char **argv)
     int         fps = 30;
     int         cbr_kbps = 4000;
     int         gop = 0;
-    int         fec_spread_ms = 0;
     std::string console_host = "127.0.0.1";
     int         console_port = 5090;
     int         pregenerate = 30;
@@ -118,11 +116,6 @@ int main(int argc, char **argv)
         if (0 == std::strcmp(argv[i], "--gop") && i + 1 < argc)
         {
             gop = std::atoi(argv[++i]);
-            continue;
-        }
-        if (0 == std::strcmp(argv[i], "--fec-spread-ms") && i + 1 < argc)
-        {
-            fec_spread_ms = std::atoi(argv[++i]);
             continue;
         }
         if (0 == std::strcmp(argv[i], "--console") && i + 1 < argc)
@@ -237,13 +230,6 @@ int main(int argc, char **argv)
     cfg(pay, "mtu", mtu_buf);
     sender.configure("reactor", sender_reactor.name());
     cfg(sender, "udp_transport", stream_buf);
-    char spread_buf[16];
-    std::snprintf(spread_buf, sizeof(spread_buf), "%d", fec_spread_ms);
-    if (cfg(sender, "fec_spread_ms", spread_buf) < 0)
-    {
-        std::fprintf(stderr, "uvc_stream_sender: --fec-spread-ms must be >= 0\n");
-        return 1;
-    }
 
     char kbps_buf[24];
     std::snprintf(kbps_buf, sizeof(kbps_buf), "%d", cbr_kbps);

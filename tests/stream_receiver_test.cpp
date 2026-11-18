@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "core/component_pdu.hpp"
-#include "core/rs_block_erasure.hpp"
+#include "core/stream_media_header.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 #include "stream_query_test_helpers.hpp"
@@ -130,14 +130,13 @@ TEST(StreamReceiverTest, LoopbackRxTruncatedZero)
 namespace
 {
 
-/* A data shard: the wire for one app datagram, FEC or not. */
+/* The wire for one app datagram. */
 std::vector<uint8_t> make_valid_media_datagram(uint16_t stream_seq,
                                               const std::vector<uint8_t> &app)
 {
-    std::vector<uint8_t> wire(vstreamer::rs_block_erasure::k_data_header_len + app.size());
-    vstreamer::rs_block_erasure::write_data_header(wire.data(), stream_seq);
-    std::memcpy(wire.data() + vstreamer::rs_block_erasure::k_data_header_len, app.data(),
-                app.size());
+    std::vector<uint8_t> wire(vstreamer::k_media_header_len + app.size());
+    vstreamer::media_header_write(wire.data(), stream_seq);
+    std::memcpy(wire.data() + vstreamer::k_media_header_len, app.data(), app.size());
     return wire;
 }
 
@@ -648,29 +647,32 @@ TEST(StreamReceiverTest, PacketGapTuplesStayConsistentDuringReception)
     close(fd);
 }
 
-TEST(StreamReceiverTest, InProcessDatagramsRecoverAndReport)
+/* In-process datagrams with the link's own counters: the report's "udp" half is the link's,
+ * its "fec" half this receiver's; a lost datagram is a gap and marks the next one DISCONT. An
+ * FEC parity shard from an older sender is not media. */
+TEST(StreamReceiverTest, InProcessDatagramsReportLinkCounters)
 {
-    vstreamer::rs_block_erasure enc;
-    ASSERT_TRUE(enc.init(4, 6, 1476));
-    std::mutex                                 mu;
-    std::deque<bfc::shared_sized_buffer>       wire;
-    std::vector<std::vector<uint8_t>>          apps;
+    std::mutex                           mu;
+    std::deque<bfc::shared_sized_buffer> wire;
+    std::vector<std::vector<uint8_t>>    apps;
     for (uint8_t i = 0; i < 8; i++)
     {
         apps.emplace_back(40 + i, static_cast<uint8_t>(0x30 + i));
-        vstreamer::rs_block_erasure::tx_out out;
-        enc.push_app(apps.back().data(), apps.back().size(), &out);
-        for (size_t j = 0; j < out.shards.size(); j++)
+        if (2 == i)
         {
-            /* Lose data shard 2: the block's parity recovers it. */
-            if (!(2 == i && 0 == j))
-            {
-                wire.push_back(out.shards[j]);
-            }
+            continue; /* lost on the link */
         }
+        const auto w = make_valid_media_datagram(static_cast<uint16_t>(100 + i), apps.back());
+        wire.push_back(bfc::shared_sized_buffer::copy_from(w.data(), w.size()));
     }
-    std::atomic<int> reports {0};
-    std::atomic<int> report_len {0};
+    const uint8_t parity[] = {0x10, 0x23, 0x00, 0x64, 1, 2, 3};
+    wire.push_back(bfc::shared_sized_buffer::copy_from(parity, sizeof(parity)));
+    std::vector<std::vector<uint8_t>> expect = apps;
+    expect.erase(expect.begin() + 2);
+
+    std::mutex                    report_mu;
+    vstreamer::stream_link_report last {};
+    std::atomic<int>              reports {0};
 
     vstreamer::stream_receiver receiver;
     ASSERT_EQ(-EINVAL, receiver.set_datagram_transport(nullptr, nullptr));
@@ -686,34 +688,180 @@ TEST(StreamReceiverTest, InProcessDatagramsRecoverAndReport)
                          wire.pop_front();
                          return b;
                      },
-                     [&](const uint8_t *, size_t len)
+                     [&](const uint8_t *data, size_t len)
                      {
-                         report_len = static_cast<int>(len);
-                         reports++;
+                         vstreamer::stream_header hdr {};
+                         const uint8_t           *payload = nullptr;
+                         size_t                   payload_len = 0;
+                         vstreamer::stream_link_report rep {};
+                         if (0 == vstreamer::stream_header_parse(data, len, &hdr, &payload,
+                                                                 &payload_len) &&
+                             0 == vstreamer::stream_link_report_decode(payload, payload_len, &rep))
+                         {
+                             std::lock_guard<std::mutex> lock(report_mu);
+                             last = rep;
+                             reports++;
+                         }
+                         return true;
+                     }));
+    ASSERT_EQ(0, receiver.set_link_counters(
+                     [](vstreamer::stream_receiver::link_counters *c)
+                     {
+                         c->packets = 1000;
+                         c->gaps = 7;
+                         c->bytes = 123456;
                          return true;
                      }));
     ASSERT_EQ(0, receiver.configure("telemetry_ms", "20"));
     ASSERT_EQ(0, receiver.open()); /* no listen needed */
     EXPECT_EQ(-EBUSY, receiver.set_datagram_transport([] { return std::nullopt; },
                                                       [](const uint8_t *, size_t) { return true; }));
+    EXPECT_EQ(-EBUSY, receiver.set_link_counters(nullptr));
 
     std::vector<std::vector<uint8_t>> got;
+    std::vector<bool>                 discont;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (std::chrono::steady_clock::now() < deadline && (got.size() < apps.size() || reports < 1))
+    while (std::chrono::steady_clock::now() < deadline && (got.size() < expect.size() || reports < 2))
     {
         vstreamer::component_pdu pdu;
         while (0 == receiver.output(pdu))
         {
             got.emplace_back(pdu.sdu.u8(), pdu.sdu.u8() + pdu.sdu.size());
+            discont.push_back(0 != (pdu.flags & static_cast<uint8_t>(vstreamer::pdu_flag_e::DISCONT)));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     receiver.close();
-    EXPECT_EQ(got, apps);
-    EXPECT_GE(reports.load(), 1);
-    EXPECT_EQ(static_cast<size_t>(report_len.load()),
-              vstreamer::k_stream_header_len + vstreamer::k_stream_link_report_payload_len);
-    std::string recovered;
-    ASSERT_EQ(0, receiver.query("fec_recovered", &recovered));
-    EXPECT_EQ("1", recovered);
+    EXPECT_EQ(got, expect);
+    ASSERT_EQ(discont.size(), expect.size());
+    for (size_t i = 0; i < discont.size(); i++)
+    {
+        EXPECT_EQ(2 == i, discont[i]) << i;
+    }
+    std::lock_guard<std::mutex> lock(report_mu);
+    EXPECT_EQ(1000u, last.counters.udp_packet_received);
+    EXPECT_EQ(7u, last.counters.udp_gap_count);
+    EXPECT_EQ(123456u, last.counters.udp_bytes_received);
+    EXPECT_EQ(7u, last.counters.fec_packet_received);
+    EXPECT_EQ(1u, last.counters.fec_gap_count);
+    std::string bad;
+    ASSERT_EQ(0, receiver.query("rx_bad_header", &bad));
+    EXPECT_EQ("1", bad);
+}
+
+namespace
+{
+
+/* Feeds in-process media datagrams with the given sequence numbers and returns what came out:
+ * each SDU's first byte (the datagram's index in seqs) and whether it was marked DISCONT. */
+struct seq_run
+{
+    std::vector<int>  out;
+    std::vector<bool> discont;
+    std::string       late, resyncs, gaps;
+};
+
+seq_run run_seqs(const std::vector<uint16_t> &seqs)
+{
+    std::mutex                           mu;
+    std::deque<bfc::shared_sized_buffer> wire;
+    for (size_t i = 0; i < seqs.size(); i++)
+    {
+        const auto w = make_valid_media_datagram(seqs[i], {static_cast<uint8_t>(i), 1, 2});
+        wire.push_back(bfc::shared_sized_buffer::copy_from(w.data(), w.size()));
+    }
+    vstreamer::stream_receiver receiver;
+    EXPECT_EQ(0, receiver.set_datagram_transport(
+                     [&]() -> std::optional<bfc::shared_sized_buffer>
+                     {
+                         std::lock_guard<std::mutex> lock(mu);
+                         if (wire.empty())
+                         {
+                             return std::nullopt;
+                         }
+                         auto b = std::move(wire.front());
+                         wire.pop_front();
+                         return b;
+                     },
+                     [](const uint8_t *, size_t) { return true; }));
+    EXPECT_EQ(0, receiver.open());
+    seq_run r;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (wire.empty())
+            {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    vstreamer::component_pdu pdu;
+    while (0 == receiver.output(pdu))
+    {
+        r.out.push_back(pdu.sdu.u8()[0]);
+        r.discont.push_back(0 != (pdu.flags & static_cast<uint8_t>(vstreamer::pdu_flag_e::DISCONT)));
+    }
+    EXPECT_EQ(0, receiver.query("rx_late", &r.late));
+    EXPECT_EQ(0, receiver.query("rx_resyncs", &r.resyncs));
+    EXPECT_EQ(0, receiver.query("fec_gap_count", &r.gaps));
+    receiver.close();
+    return r;
+}
+
+}  // namespace
+
+/* A duplicate or a straggler behind the last datagram is dropped, not handed on out of order. */
+TEST(StreamReceiverTest, LateAndDuplicateDatagramsDropped)
+{
+    const auto r = run_seqs({10, 12, 11, 12, 13});
+    EXPECT_EQ((std::vector<int> {0, 1, 4}), r.out);
+    EXPECT_EQ((std::vector<bool> {false, true, false}), r.discont);
+    EXPECT_EQ("2", r.late);
+    EXPECT_EQ("1", r.gaps);
+}
+
+/* A restarted sender starts at a random number: a far jump either way is a new session, not
+ * 30000 lost datagrams and not a frozen stream. */
+TEST(StreamReceiverTest, SenderRestartResyncsWithoutCountingLoss)
+{
+    for (const uint16_t restart : {static_cast<uint16_t>(30000), static_cast<uint16_t>(40000)})
+    {
+        const auto r = run_seqs({35000, 35001, restart, static_cast<uint16_t>(restart + 1)});
+        EXPECT_EQ((std::vector<int> {0, 1, 2, 3}), r.out) << restart;
+        EXPECT_EQ((std::vector<bool> {false, false, true, false}), r.discont) << restart;
+        EXPECT_EQ("1", r.resyncs) << restart;
+        EXPECT_EQ("0", r.gaps) << restart;
+    }
+}
+
+/* With link counters set, the report's link half is always the link's: zeros until it has
+ * counters, never the receiver's own (another base). */
+TEST(StreamReceiverTest, LinkHalfIsZeroUntilTheLinkHasCounters)
+{
+    std::atomic<bool> have {false};
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.set_datagram_transport([] { return std::nullopt; },
+                                                 [](const uint8_t *, size_t) { return true; }));
+    ASSERT_EQ(0, receiver.set_link_counters(
+                     [&](vstreamer::stream_receiver::link_counters *c)
+                     {
+                         if (!have)
+                         {
+                             return false;
+                         }
+                         c->packets = 500;
+                         return true;
+                     }));
+    ASSERT_EQ(0, receiver.open());
+    std::string v;
+    ASSERT_EQ(0, receiver.query("udp_packet_received", &v));
+    EXPECT_EQ("0", v);
+    have = true;
+    ASSERT_EQ(0, receiver.query("udp_packet_received", &v));
+    EXPECT_EQ("500", v);
+    receiver.close();
 }

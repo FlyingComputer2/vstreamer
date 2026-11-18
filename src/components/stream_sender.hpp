@@ -26,7 +26,6 @@
 #include "core/component_input.hpp"
 #include "core/default_reactor.hpp"
 #include "core/port_caps.hpp"
-#include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
 #include "core/stream_queue_transport.hpp"
 #include "core/thread_spawn.hpp"
@@ -34,18 +33,16 @@
 namespace vstreamer
 {
 
-enum class fec_mode_e
-{
-    none,
-    block,
-};
-
-/* Pad 0 (sink): STREAM_DGRAM or RTP in → UDP or queue egress (payload is opaque). */
+/*
+ * Pad 0 (sink): STREAM_DGRAM or RTP in → UDP or queue egress (payload is opaque).
+ *
+ * Each SDU goes out as one media datagram, [stream_media_header][SDU], in input order. There is
+ * no FEC here: the link protects the stream (winject-l3 runs FEC per upstream). Link reports from
+ * the receiver come back on the reverse path and are kept for queries.
+ */
 class stream_sender : public component_sink
 {
 public:
-    /* Largest fec_spread_ms: the receiver assumes this spread until it has measured one. */
-    static constexpr int k_fec_spread_max_ms = rs_block_erasure::k_spread_cap_ms;
     /* Fixed UDP payload ceiling (winject MPDU path). Pay/encoder must packetize within this. */
     static constexpr int k_wire_datagram_bytes = 1476;
 
@@ -62,7 +59,6 @@ public:
 
     using component_sink::configure;
     int configure(std::string_view key, std::string_view value) override;
-    int configure(uint64_t key, uint64_t value) override;
     using component_sink::query;
     int query(std::string_view key, std::string *value) const override;
     int query(uint64_t key, uint64_t *value) const override;
@@ -70,10 +66,6 @@ public:
     int query(uint64_t key, double *value) const override;
 
 private:
-    /* Validating setters shared by the string and typed configure(). */
-    int set_config_fec_spread_ms(uint64_t ms);
-    int set_config_fec_k(uint64_t k);
-    int set_config_fec_n(uint64_t n);
     [[nodiscard]] stream_peer_link peer_link_snapshot() const;
     struct send_thread_wdt;
     void send_thread_main();
@@ -83,32 +75,14 @@ private:
     void ingest_link_report(const uint8_t *data, size_t len);
     void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
-    /* Built wire datagrams (rs_block_erasure shards, headers included). */
-    void enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
-                          std::chrono::steady_clock::time_point release);
-    /* Enqueues without evicting; -EAGAIN when the queue is full, unless force is set. */
-    [[nodiscard]] int try_enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
-                                           std::chrono::steady_clock::time_point release,
-                                           bool force = false);
-    [[nodiscard]] bool wire_fits(size_t len);
-    void evict_for_room();
-    void queue_wire(bfc::shared_sized_buffer &&buf, std::chrono::steady_clock::time_point release);
-    /* True when the queue has room for every wire packet one app SDU can produce. */
-    [[nodiscard]] bool queue_has_room_for_sdu() const;
-    /* Queues one push's shards: the data shard at once, parity on the spread schedule. */
-    void enqueue_tx_out(rs_block_erasure::tx_out *out, bool no_evict);
-
-    [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict);
+    /* Under one q_mu hold: refuses (-EAGAIN) when the queue is full or the sender is closing,
+     * else stamps the next sequence number into buf's header and queues it. */
+    [[nodiscard]] int queue_wire(bfc::shared_sized_buffer &&buf);
+    [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len);
 
     static const std::vector<port_desc> &input_ports();
 
-    [[nodiscard]] int effective_fec_k() const;
-    [[nodiscard]] int effective_fec_n() const;
     [[nodiscard]] static size_t max_input_bytes();
-    /* Flush the open block, (re)init with the current k/n. No locks held. */
-    int  reinit_fec_if_active();
-    /* Flush partial block and stop encoding. No locks held. */
-    void disable_fec();
 
     mutable std::mutex mu;
     bool               opened = false;
@@ -125,18 +99,23 @@ private:
 
     buffer_pool pool;
 
-    /* A wire datagram and the earliest time the send thread may send it. */
-    struct queued_wire
-    {
-        bfc::shared_sized_buffer                   buf;
-        std::chrono::steady_clock::time_point release {};
-    };
-
     mutable std::mutex      q_mu;
     std::condition_variable q_cv;
-    /* Ordered by release time (ties keep enqueue order). */
+    /* A wire datagram and when it was queued. */
+    struct queued_wire
+    {
+        bfc::shared_sized_buffer              buf;
+        std::chrono::steady_clock::time_point at {};
+    };
+    /* Wire datagrams in send order. */
     std::deque<queued_wire> queue;
     size_t                  queue_bytes = 0;
+    /* Next media sequence number; stamped under q_mu, so wire order is sequence order. Starts
+     * at a random value: a restarted sender does not replay recent numbers. */
+    uint16_t                tx_seq = 0;
+    /* Set by open(), cleared by close(), both under q_mu: a push that races close() is
+     * refused, never left queued for the next session. */
+    bool                    accepting = false;
     /* Fixed send-queue capacity in packets (= buffer pool size); input() gets -EAGAIN past it. */
     static constexpr size_t k_queue_packet_cap = 1024;
 
@@ -164,35 +143,19 @@ private:
 
     /* Local tuple fields are updated and sampled under metrics_mu. */
     mutable std::mutex metrics_mu;
-    uint64_t           fec_pkts_sent = 0;
-    uint64_t           fec_bytes_sent = 0;
+    /* App SDUs queued for sending. */
+    uint64_t           sdu_pkts_sent = 0;
+    uint64_t           sdu_bytes_sent = 0;
     std::atomic<uint64_t> pkts_sent {0};
     std::atomic<uint64_t> bytes_sent {0};
     std::atomic<uint64_t> dropped {0};
+    /* SDUs larger than max_input (also counted in dropped). */
+    std::atomic<uint64_t> oversized {0};
     std::atomic<uint64_t> queue_full_rejects {0};
-    /* Send queue: packets evicted to make room (also counted in dropped). */
-    std::atomic<uint64_t> queue_evicted {0};
     /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
     std::atomic<uint64_t> transport_dropped {0};
-    std::atomic<uint64_t> fec_push_us {0}; /* time in fec.push_app (RS encode included) */
-
-    /* FEC spreading: a block's k + p shards span this window. Data shards never wait; parity
-     * keeps its slot in the window and at least its row's offset after the block closes, so it
-     * is never sent in a lump. 0 sends parity at once. Capped at k_fec_spread_max_ms. Parity
-     * waits in the send queue until due, against k_queue_packet_cap. */
-    std::atomic<int> fec_spread_ms {0};
-    /* Largest delay of a datagram past its release time since the last query (us). */
+    /* Largest time a datagram waited in the send queue since the last query (us). */
     mutable std::atomic<int64_t> send_late_max_us {0};
-
-    /* Guards fec (touched by input(), the send thread and configure()).
-     * Lock order: mu -> fec_mu; never hold fec_mu while taking mu/q_mu. */
-    mutable std::mutex fec_mu;
-    rs_block_erasure   fec;
-    fec_mode_e        fec_mode = fec_mode_e::block;
-    int               fec_k = 10;
-    int               fec_n = 12;
-    uint64_t          fec_oversized = 0;
-
 };
 
 }  // namespace vstreamer

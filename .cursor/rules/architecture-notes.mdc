@@ -5,18 +5,18 @@ alwaysApply: true
 
 # vstreamer architecture notes
 
-- Link: `stream_sender` → UDP (loopback bench or winject radio) → `stream_receiver`.
-  FEC is `rs_block_erasure` (RS block erasure) on both ends; the receiver
-  reads k/n from each shard header.
-- `stream_sender` is multi-threaded: `input()` (encoder thread), the send thread
-  (`on_tick`, pacing) and `configure()` (channel_controller console thread) run
-  concurrently. FEC state is guarded by `fec_mu`; lock order is `mu` → `fec_mu`.
-- `scripts/cbr_controller.py` changes encode rate **and** `fec_n` at runtime via the
-  UDP console (`set_fec_k` / `set_fec_n`) → `stream_sender::configure()` → FEC
-  reinit mid-stream. `sdu_base` must keep counting across reinit (raw SDUs do not advance it).
-- The forward path prepends the v2 `stream_header` (4 B) on every egress datagram; FEC shards and
-  raw SDUs set `is_fec` accordingly. `stream_receiver` parses it for UDP gap telemetry.
-  Radio winject must preserve the same layout if it sits in the path.
+- Link: `stream_sender` → UDP (loopback bench) or a queue (winject-l3 upstream) →
+  `stream_receiver`. There is no FEC in vstreamer: the link runs it (winject-l3 uses winject-fec
+  per upstream and delivers in sequence). Every media datagram is `[0x80][u16 seq][SDU]`
+  (`core/stream_media_header.hpp`); the receiver counts gaps in that sequence and marks the next
+  SDU `DISCONT`.
+- `stream_sender` is multi-threaded: `input()` (encoder thread), the send thread and
+  `configure()` (console thread) run concurrently. The sequence number is stamped under the
+  queue lock, so wire order is sequence order.
+- `scripts/cbr_controller.py` changes the encode rate at runtime via the UDP console
+  (`set_encode_cbr`), from the post-recovery gaps in the link reports.
+- The reverse path (link reports) has its own 4-byte `stream_header`; reports never set `is_fec`.
+  Radio winject must preserve the layout if it sits in the path.
 - Loss metrics (`stream_sender.peer_loss_udp_pct`, `peer_loss_fec_pct`, and the four
   `peer_*_packet_received` / `peer_*_gap_count` counters) come from **reverse UDP link reports**
   (`core/stream_telemetry.hpp`): `stream_receiver` sends cumulative counters to the source of the
@@ -27,9 +27,10 @@ alwaysApply: true
   `peer_report_age_ms` / `peer_reports_*` show return-path health; `cbr_controller.py` holds
   increases while telemetry is stale.
   They are not ground truth; check the data path before changing how they are computed.
-- FEC checks: `build/rs_fec_test` (unit), plus a loopback
-  `stream_sender` → `stream_receiver` run with runtime `fec_n` changes and
-  peer restarts for anything touching the pipeline.
+- Link reports: the `udp_*` counters are the link's own (`stream_receiver::set_link_counters`,
+  e.g. the l3 upstream's air RX counters on the ground P4), else the receiver's; the `fec_*`
+  counters are the stream's after the link's recovery. Check with a loopback
+  `stream_sender` → `stream_receiver` run with peer restarts for anything touching the pipeline.
 - **Node independence:** every component validates only its own limits and never includes or
   assumes another component (not even in comments). Link-specific values (e.g. winject 1476-byte
   cap) and neighbor sizing belong to the pipeline creator (`stream_sdl`), which reads limits via

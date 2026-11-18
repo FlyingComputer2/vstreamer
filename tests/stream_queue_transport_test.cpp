@@ -1,3 +1,4 @@
+#include "core/stream_media_header.hpp"
 #include "core/stream_queue_transport.hpp"
 
 #include <gtest/gtest.h>
@@ -24,18 +25,16 @@ namespace
 {
 using namespace vstreamer;
 
-/* A data shard's sequence and payload; false for parity or a bad header. */
+/* A media datagram's sequence and payload; false for a bad header. */
 bool data_payload(const bfc::shared_sized_buffer &wire, uint16_t *seq, const uint8_t **payload,
                   size_t *len)
 {
-    rs_block_erasure::shard_header h;
-    if (!rs_block_erasure::parse_header(wire.u8(), wire.size(), &h) || !h.is_data)
+    if (!media_header_parse(wire.u8(), wire.size(), seq))
     {
         return false;
     }
-    *seq = h.sequence_number;
-    *payload = wire.u8() + h.header_len;
-    *len = wire.size() - h.header_len;
+    *payload = wire.u8() + k_media_header_len;
+    *len = wire.size() - k_media_header_len;
     return true;
 }
 
@@ -87,7 +86,6 @@ class QueueTransportTest : public ::testing::Test
         ASSERT_EQ(0,
                   sender.configure("queue_transport_rx", "transport-test-rx"));
         ASSERT_EQ(0, sender.configure("reactor", "transport-test-reactor"));
-        ASSERT_EQ(0, sender.configure("fec", "none"));
     }
 
     std::optional<bfc::shared_sized_buffer> next_wire()
@@ -233,7 +231,7 @@ TEST_F(QueueTransportTest, RawPacketsPreservePayloadAndWireSequence)
            std::chrono::steady_clock::now() < until)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     EXPECT_EQ(4u, vstreamer::test_query::tuple(sender, "pkt_sent").first);
-    EXPECT_EQ(4u * (64u + rs_block_erasure::k_data_header_len),
+    EXPECT_EQ(4u * (64u + k_media_header_len),
               vstreamer::test_query::tuple(sender, "byt_sent").first);
     for (auto key : {"udp_transport", "queue_transport_tx",
                      "queue_transport_rx", "reactor"})
@@ -387,52 +385,11 @@ TEST_F(QueueTransportTest, RxQueueAlwaysRead)
     sender.close();
 }
 
-TEST_F(QueueTransportTest, FecWirePacketsRecoverLostShard)
+TEST_F(QueueTransportTest, UnifiedLocalMetricsCountWireAndPayloadSeparately)
 {
-    stream_sender sender;
-    configure(sender);
-    ASSERT_EQ(0, sender.configure("fec", "block"));
-    ASSERT_EQ(0, sender.configure("fec_k", "3"));
-    ASSERT_EQ(0, sender.configure("fec_n", "4"));
-    ASSERT_EQ(0, sender.open());
-    for (uint32_t tag = 1; tag <= 3; ++tag)
-        ASSERT_EQ(0, sender.input(test_pdu::make_stream_dgram(tag, 64)));
-    rs_block_erasure decoder;
-    fec_rx_payload_list decoded;
-    for (int i = 0; i < 4; ++i)
-    {
-        auto wire = next_wire();
-        ASSERT_TRUE(wire);
-        rs_block_erasure::shard_header h;
-        ASSERT_TRUE(rs_block_erasure::parse_header(wire->u8(), wire->size(), &h));
-        EXPECT_EQ(i < 3, h.is_data);
-        // Lose an actual on-wire data shard and reconstruct it using parity.
-        if (i != 1)
-        {
-            fec_rx_payload_list step;
-            decoder.push_air(wire->u8(), wire->size(), &step);
-            decoded.insert(decoded.end(), std::make_move_iterator(step.begin()),
-                           std::make_move_iterator(step.end()));
-        }
-    }
-    ASSERT_EQ(3u, decoded.size());
-    for (size_t i = 0; i < decoded.size(); ++i)
-        EXPECT_EQ(i + 1, test_pdu::stream_dgram_counter_be32(
-                             decoded[i].u8(), decoded[i].size()));
-}
-
-TEST_F(QueueTransportTest, UnifiedLocalMetricsCountPayloadAndParitySeparately)
-{
-    for (const char *mode : {"none", "block"})
     {
         stream_sender sender;
         configure(sender);
-        ASSERT_EQ(0, sender.configure("fec", mode));
-        if (std::string(mode) == "block")
-        {
-            ASSERT_EQ(0, sender.configure("fec_k", "3"));
-            ASSERT_EQ(0, sender.configure("fec_n", "5"));
-        }
         ASSERT_EQ(0, sender.open());
         const auto before_ms = stream_metric_timestamp_ms();
         size_t payload_bytes = 0;
@@ -442,7 +399,7 @@ TEST_F(QueueTransportTest, UnifiedLocalMetricsCountPayloadAndParitySeparately)
             payload_bytes += len;
             ASSERT_EQ(0, sender.input(test_pdu::make_stream_dgram(tag, len)));
         }
-        const size_t wire_packets = std::string(mode) == "block" ? 5 : 3;
+        const size_t wire_packets = 3;
         size_t wire_bytes = 0;
         for (size_t i = 0; i < wire_packets; ++i)
         {

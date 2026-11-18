@@ -9,7 +9,7 @@ namespace vstreamer
 {
 
 /* Header of the reverse path only (receiver link reports to the sender). Media datagrams carry
- * the rs_block_erasure shard header instead. */
+ * stream_media_header instead. The is_fec flag is kept on the wire; reports never set it. */
 inline constexpr uint8_t k_stream_wire_version = 2;
 inline constexpr size_t k_stream_header_len = 4;
 

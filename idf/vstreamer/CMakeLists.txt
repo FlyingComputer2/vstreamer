@@ -31,34 +31,22 @@ if(IDF_TARGET STREQUAL "esp32p4")
     list(APPEND VSTREAMER_SOURCES src/live_tx.cpp)
 endif()
 
-# ISA-L's portable erasure code; not fetched during IDF's early requirement scan.
-set(VSTREAMER_IDF_ISAL_SOURCES)
-set(VSTREAMER_IDF_ISAL_INCLUDES)
 # bfc (header-only: shared_sized_buffer); public, component_pdu.hpp includes it.
 set(VSTREAMER_IDF_BFC_INCLUDES)
 if(NOT CMAKE_BUILD_EARLY_EXPANSION)
     include(${VSTREAMER_ROOT}/cmake/BfcFetch.cmake)
     set(VSTREAMER_IDF_BFC_INCLUDES ${BFC_INCLUDE_DIRS})
-    if(VSTREAMER_NEEDS_ISAL)
-        include(${VSTREAMER_ROOT}/cmake/isal_ec.cmake)
-        vstreamer_fetch_isal()
-        set(VSTREAMER_IDF_ISAL_SOURCES ${VSTREAMER_ISAL_ROOT}/erasure_code/ec_base.c)
-        set(VSTREAMER_IDF_ISAL_INCLUDES ${VSTREAMER_ISAL_ROOT}/include
-                                        ${VSTREAMER_ISAL_ROOT}/erasure_code)
-    endif()
     configure_file(${VSTREAMER_ROOT}/src/components/components_config.hpp.in
                    ${CMAKE_CURRENT_BINARY_DIR}/generated/components/components_config.hpp)
 endif()
 
 idf_component_register(
     SRCS ${VSTREAMER_SOURCES}
-         ${VSTREAMER_IDF_ISAL_SOURCES}
     INCLUDE_DIRS ${VSTREAMER_ROOT}/src
                  include
                  ${CMAKE_CURRENT_BINARY_DIR}/generated
                  ${VSTREAMER_IDF_BFC_INCLUDES}
     PRIV_INCLUDE_DIRS compat
-                      ${VSTREAMER_IDF_ISAL_INCLUDES}
     REQUIRES lwip pthread
     PRIV_REQUIRES vfs esp_timer esp_pm esp_mm
 )
@@ -69,7 +57,3 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     # off a throw aborts.
     $<$<COMPILE_LANGUAGE:CXX>:-fexceptions>
 )
-if(VSTREAMER_IDF_ISAL_SOURCES)
-    set_source_files_properties(${VSTREAMER_IDF_ISAL_SOURCES}
-        PROPERTIES COMPILE_DEFINITIONS NDEBUG)
-endif()

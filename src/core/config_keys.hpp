@@ -18,8 +18,8 @@
  *   bitrate         encoder target bitrate in kbit/s (encoders and encoding sources)
  *   gop             encoder GOP length in frames
  *   idr             request an IDR on the next frame; the value is ignored
- *   fec_k / fec_n   stream_sender block FEC data / total shards
- *   fec_spread_ms   stream_sender FEC shard spread window in ms
+ *
+ * FEC is not a vstreamer key: the link runs it (winject-l3, per upstream).
  */
 namespace vstreamer::keys
 {
@@ -35,11 +35,8 @@ struct key
 inline constexpr key bitrate {"bitrate"};
 inline constexpr key gop {"gop"};
 inline constexpr key idr {"idr"};
-inline constexpr key fec_k {"fec_k"};
-inline constexpr key fec_n {"fec_n"};
-inline constexpr key fec_spread_ms {"fec_spread_ms"};
 
-inline constexpr key all[] = {bitrate, gop, idr, fec_k, fec_n, fec_spread_ms};
+inline constexpr key all[] = {bitrate, gop, idr};
 
 namespace detail
 {

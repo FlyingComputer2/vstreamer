@@ -1,7 +1,8 @@
 # VStreamer
 
 VStreamer is a C++17 library of independent video **components** (sources, coders, sinks) and
-the bench apps that wire them into a low-latency H.264-over-UDP path with Reed–Solomon FEC.
+the bench apps that wire them into a low-latency H.264-over-UDP path. Loss protection (FEC) is
+the link's: winject-l3 runs it per upstream, so vstreamer sends each RTP packet once.
 The target is a rover camera (UVC → H.264 → radio) and a ground-station viewer (radio → decode
 → display). Today the loopback bench binary `stream_sdl_test` runs both ends in one process over loopback.
 
@@ -12,7 +13,7 @@ loader, core console, rover/winject wiring) are listed under
 ```mermaid
 flowchart LR
   src[source] --> jdec[jpeg_decoder] --> enc[h264_encoder] --> pay[rtp_h264_pay] --> snd[stream_sender]
-  snd -- UDP + RS FEC --> rcv[stream_receiver]
+  snd -- UDP or queue --> rcv[stream_receiver]
   rcv --> dep[rtp_h264_depay] --> dec[h264_decoder_mpp] --> sdl[sdl_sink]
 ```
 
@@ -86,14 +87,13 @@ virtual int configure(uint64_t key, uint64_t value); // default -ENOTSUP
 
 #include "core/config_keys.hpp"
 enc->configure(vstreamer::keys::bitrate.id, 6000);
-snd->configure(vstreamer::keys::fec_k.id, 6);
 src->configure(vstreamer::keys::idr.id, 0);
 ```
 
 - `core/config_keys.hpp` lists every typed configure key as `keys::<name>` with `.name` (the
   string key) and `.id` (`query_key(name)`); a `static_assert` rejects colliding ids. Keys:
-  `bitrate` (encoder target, kbit/s), `gop`, `idr` (value ignored), `fec_k`, `fec_n`,
-  `fec_spread_ms`. Other keys are string-only.
+  `bitrate` (encoder target, kbit/s), `gop`, `idr` (value ignored). Other keys are
+  string-only.
 - Each typed key has one validating setter in the component (`set_config_<name>()`); the string
   form parses the number and calls the same setter, so both forms accept and reject the same
   values. A component that overrides it adds `using <base>::configure;`.
@@ -266,11 +266,12 @@ FU-A, capture-time header extension).
 | `rtp_resyncs` | Q | times the sequence jumped more than 100 packets back and the next packet followed it (a restarted sender): the depay switched to the new sequence instead of dropping it as late packets |
 | `capture_ts_rejected`, `capture_skew_ms` | Q | wire capture-time validation (diagnostic) |
 
-**`stream_sender`** — UDP egress with RS block-erasure FEC and a bounded queue. No rate control:
-the send queue holds at most 1024 packets; `input()` returns `-EAGAIN` when it cannot take every
-packet the SDU can produce (all n shards of a block it completes), counted in `queue_full_rejects`. Threads:
-`input()` (caller), the send thread, the host's named default or CV reactor for reverse
-telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
+**`stream_sender`** — UDP or queue egress with a bounded queue: each SDU leaves as one media
+datagram, `[0x80][u16 sequence][SDU]` ([packet model](packet-model.md)), in input order. No FEC
+(the link runs it) and no rate control: the send queue holds at most 1024 packets; `input()`
+returns `-EAGAIN` when it is full, counted in `queue_full_rejects`. Threads: `input()` (caller),
+the send thread, the host's named default or CV reactor for reverse telemetry, and
+`configure()`.
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
@@ -279,18 +280,14 @@ telemetry, and `configure()`. Lock order `mu` → `fec_mu`.
 | `queue_transport_rx` | C Q | Registered incoming reverse-report queue name; requires `queue_transport_tx`. |
 | `reactor` | C Q | Registered reactor name. UDP resolves vstreamer's `default_reactor_registry`; queue mode resolves BFC's `cv_reactor_registry`. Required in both modes; the sender always reads link reports from it. Host-owned reactors must run until the sender closes; close only detaches this sender. |
 | `max_datagram` | Q | fixed 1476-byte UDP payload ceiling (winject MPDU path) |
-| `max_input` | Q | largest `input()` SDU for this ceiling: `max_datagram` − 6 (parity header and coded length), the same for every k/n and for `fec none` |
-| `fec` | C | `block` (`RS_BLOCK_ERASURE`, default) / `none` (k = n = 1), live |
-| `fec` | C | `block` (RS FEC) or `none` (raw SDU path, no RS k=n=1) |
-| `fec_k`, `fec_n` | C Q | 1 ≤ k ≤ 31, k ≤ n, n − k ≤ 31, default 10 / 12, live (the open block is flushed; the data sequence keeps counting) |
-| `fec_spread_ms` | C Q | 0..250, default 0. Data shards always leave at once; parity row j of a block of c shards leaves at the later of t0 + (k + j) × spread / c (t0 = its first data shard) and close + j × spread / c (close = its last data shard), so a burst-filled block spreads its parity over the window and parity never leaves in a lump. Blocks overlap on the wire. Capped at 250: the receiver assumes that spread until it has measured one. The receiver measures the spread from arrival times and sets each block's deadline from it (see `stream_receiver`). Each shard leaves at its release time; a send thread that fell behind sends the shards already due back to back until it is on schedule again. `send_late_max_ms` shows how late datagrams left. Shards wait in the send queue until due and count against its fixed 1024-packet capacity. Lowering it pulls already-queued shards in to the new spread. On the ESP32-P4 the PIE FEC encoder (`CONFIG_VSTREAMER_RS_PIE`, default on) sends parity in tighter bursts that compete with the H.264 encoder for PSRAM: about 1 encoder fps lost at spread 0, 0.1–0.3 fps at 25 ms or more |
+| `max_input` | Q | largest `input()` SDU: `max_datagram` − 3 (the media header). Larger SDUs are dropped and counted in `oversized` |
 | `send_cpu`, `send_prio` | C Q | send-thread placement, see Threading |
-| `pkt_sent`, `byt_sent` | Q | `ts,udp,fec` cumulative packets/bytes; monotonic milliseconds |
+| `pkt_sent`, `byt_sent` | Q | `ts,wire,sdu` cumulative packets/bytes (wire datagrams, app SDUs); monotonic milliseconds |
 | `peer_udp_pkt_recv`, `peer_fec_pkt_recv` | Q | `ts,rcv,gap` from the last receiver report; `-ENODATA` before one arrives |
 | `peer_byt_recv` | Q | `ts,udp,fec` byte totals from the receiver report; `-ENODATA` for legacy reports without bytes |
 | `peer_udp_packet_received`, `peer_fec_packet_received`, `peer_udp_gap_count`, `peer_fec_gap_count`, `peer_report_age_ms`, `peer_report_interval_ms`, `peer_reports_received`, `peer_reports_lost`, `peer_reports_rejected`, `peer_session` | Q | last reverse link report (when telemetry received one) |
-| `fec_mode`, `stats`, `dropped`, `queue_full_rejects`, `queue_evicted`, `fec_oversized`, `pool_misses`, `queue_packets`, `queue_bytes`, `transport_dropped` | Q | state / counters |
-| `send_late_max_ms` | Q | largest delay of a datagram past its release time since the previous query |
+| `stats`, `dropped`, `queue_full_rejects`, `oversized`, `pool_misses`, `queue_packets`, `queue_bytes`, `transport_dropped` | Q | state / counters |
+| `send_late_max_ms` | Q | longest time a datagram waited in the send queue since the previous query |
 
 `stream_sender` transmits data delivered to it while open. The controller owns data delivery policy.
 
@@ -298,14 +295,11 @@ Queue transport setup (before `open()`):
 register two distinct, nonzero-capacity `stream_transport_queue` instances using
 `stream_transport_queue_registry` from `core/stream_queue_transport.hpp`.
 These are BFC reactive circular lossy queues of `bfc::shared_sized_buffer`;
-each entry contains one complete wire packet (one FEC shard, header included).
+each entry contains one complete wire packet (one media datagram, header included).
 Set `queue_transport_tx` and `queue_transport_rx` to their registry names.
 The host owns capacity and queue lifetime. A full queue evicts its oldest packet;
 the sender's wire counters count packets submitted to the transport, not peer delivery;
 `query("transport_dropped")` counts the packets a full TX queue evicted.
-`query("queue_evicted")` counts send-queue packets evicted to make room for a forced push,
-such as a reconfigure flush (one count per packet, also included in `dropped`); input itself
-never evicts.
 
 UDP hosts register a `vstreamer::default_reactor` in `vstreamer::default_reactor_registry`
 and configure its name with `reactor`. Applications can use `default_reactor_host`
@@ -327,85 +321,57 @@ an incomplete pair, zero capacities, or using the same queue in both directions
 fails with `-EINVAL`; both modes require a named `reactor`. Missing registered queues/reactors fail with `-ENOENT`.
 The former sender keys `stream` and `reactor_name` are removed.
 
-**`stream_receiver`** — UDP ingress, strips the shard header, FEC-decodes and re-orders, outputs
-one `STREAM_DGRAM` PDU per original datagram.
+**`stream_receiver`** — UDP or in-process ingress: strips the media header and outputs one
+`STREAM_DGRAM` PDU per datagram, at once; the one after a gap in the sequence carries `DISCONT`.
+No FEC: the link recovers loss (winject-l3 delivers in sequence after its own FEC).
 
 | Key | C/Q | Values / default |
 |-----|-----|------------------|
 | `listen` | C Q | bind `host:port` |
 | `telemetry_ms` | C Q | 20..5000, default 100, live: link reports always go out at this interval once media has arrived |
-| `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id`, `rx_bad_header` | Q | reverse-path telemetry; `rx_bad_header` counts dropped invalid shard headers |
+| `telemetry_sent`, `telemetry_send_errors`, `telemetry_peer`, `telemetry_peer_changes`, `session_id`, `rx_bad_header` | Q | reverse-path telemetry; `rx_bad_header` counts dropped datagrams that are not media (a short one, or a flag other than `0x80`, such as a parity shard from an older sender) |
 | `max_datagram` | C Q | 64..65507, default 1472; before `open()` |
 | `recv_cpu`, `recv_prio` | C Q | thread placement, see Threading |
 | `udp_pkt_recv`, `fec_pkt_recv` | Q | `ts,rcv,gap` cumulative packets and gaps; monotonic milliseconds |
 | `byt_recv` | Q | `ts,udp,fec` cumulative bytes; monotonic milliseconds |
-| `udp_packet_received`, `udp_gap_count` | Q | wire counters (pre-FEC) |
-| `fec_packet_received`, `fec_gap_count` | Q | post-FEC counters |
-| `fec_recovered`, `fec_failures`, `fec_rs_failures`, `fec_missing_shards`, `fec_evicted_blocks`, `fec_given_up_blocks`, `fec_late_blocks`, `fec_new_references`, `fec_hdr_errors`, `fec_kn_mismatch`, `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
-| `fec_spread_est_ms`, `fec_jitter_est_ms` | Q | sender spread (from the parity row gap) and arrival jitter measured from receive times (spread = 250 until two blocks are fitted). A hole is given up when its block's last parity is due under the sender's release rule, from that block's own fill time, plus a jitter margin |
+| `udp_packet_received`, `udp_gap_count` | Q | link counters: the link's own (`set_link_counters`), else this receiver's |
+| `fec_packet_received`, `fec_gap_count` | Q | stream counters: datagrams that reached this receiver and the sequence numbers missing between them |
+| `rx_oversize`, `rx_truncated`, `pool_misses`, `out_rate`, `stats` | Q | counters |
 
 In-process input: `set_datagram_transport(receive, send)` (before `open()`) replaces the listen
 socket. `receive` returns the next wire datagram or nothing and must not block; the receive
 thread drains up to 64 per pass and polls about every millisecond. `send` takes each reverse
-link report. Received datagrams are kept as views, not copied. Embedded builds can raise the
-deadline margin floor with `VSTREAMER_RX_DEADLINE_MARGIN_MIN_MS` (5..100, default 5) and put
-FEC decode rows in PSRAM with `CONFIG_VSTREAMER_RX_PSRAM`.
+link report. Received datagrams are kept as views, not copied.
+
+Link counters: `set_link_counters(fn)` (before `open()`) gives the receiver the link's own receive
+counters, packets, gaps and bytes before the link's loss recovery. They become the `udp_*` half
+of each link report and of the queries; the `fec_*` half stays the receiver's own, after the
+link's recovery. The function runs on the receive and query threads and must not block. On the
+ground P4 it returns the winject-l3 video upstream's air RX counters, so the rover's sender sees
+both the loss on the air and what was left after l3's FEC. Without it both halves are the
+receiver's own.
 
 Stream metrics use the eight tuple queries above. Each value contains three decimal integers,
-with no spaces. Reads do not reset counters. UDP totals count valid stream transport datagrams
-and their complete wire payload bytes, including the shard headers, padding and
-parity; they exclude IP/UDP headers and reverse reports. Queue transport sender totals count
-submissions, including packets later evicted by the host queue. FEC send totals count payload
-SDUs accepted before encapsulation; receive totals count payloads after reconstruction, before
-downstream consumption. With `fec=none`, both layers count the same payload packets, while UDP
-bytes additionally include the shard headers. Sender local totals accumulate for the object's
-lifetime; receiver packet and byte totals reset on `open()`, identified by `session_id`.
+with no spaces. Reads do not reset counters. Receiver wire bytes include the 3-byte media
+header; payload bytes do not. They exclude IP/UDP headers and reverse reports. Queue transport
+sender totals count submissions, including packets later evicted by the host queue. Sender local
+totals accumulate for the object's lifetime; receiver packet and byte totals reset on `open()`,
+identified by `session_id`.
 
 Each tuple is sampled under its component's metrics lock. Local timestamps are sampled with
 the counters; all peer timestamps use the receiver's report timestamp divided by 1000.
 Separate queries can cross samples or reports, even within the same millisecond. For peer loss
 calculations, bracket the packet queries with unchanged `peer_reports_received` and
 `peer_session` values and require equal timestamps. Reset delta windows on session changes or
-counter rollback. Use tuple timestamp deltas for rates; retain the last valid metric and rate
-baseline when queries fail. The app uses this interface; no public atomic-counter references or
-typed metrics snapshots remain. Legacy scalar counter query names remain compatible for
-existing scripts and consoles; `stats` retains its existing format.
+counter rollback (a link restart, such as an l3 upstream hot-swap, also rolls the link
+counters back). Use tuple timestamp deltas for rates; retain the last valid metric and rate
+baseline when queries fail. Legacy scalar counter query names remain compatible for existing
+scripts and consoles.
 
 Receivers send a versioned 64-byte report payload (68 bytes with the stream header), including
-UDP and FEC byte totals. New senders also accept the legacy 44-byte payload, but return
-`-ENODATA` for `peer_byt_recv` for those reports. Old senders reject the new payload length;
-upgrade both ends to obtain current telemetry. Unknown versions and invalid reserved bits are
-rejected. See [packet model](packet-model.md) for the wire layout.
-
-FEC receive sequencing (`rs_block_erasure`). One reference, the next data sequence number to
-deliver:
-
-| Data shard vs reference | Action |
-|---|---|
-| behind by ≤ 128 | late: kept for decoding only (`fec_late_blocks`) |
-| behind by > 128, or ahead by > 1024 | new reference: a new sender session; old state dropped (`fec_new_references`) |
-| ahead by ≤ 1024 | same session; sequence numbers in between are waited for |
-
-Parity of a block that ended more than 128 behind the reference is dropped as late: spread
-parity trails its block, so only data starts a new reference from behind. Parity for a block
-already done (all parity in, or quiet for 250 ms) is dropped too.
-
-Data shards in sequence go out at once; a hole waits for its block's parity and goes out when FEC
-recovers it. A hole that cannot be recovered is given up at its deadline (`fec_given_up_blocks`,
-one per block; a run of holes with no known block counts once). Deadlines come only from receive
-times and the sender's release rule: parity row j of a block of c shards leaves at the later of
-first + (k + j) × spread / c and close + j × spread / c. Each finished block's parity arrivals are
-fitted against row (median of pairwise slopes, so one late shard does not skew it), which gives
-the spread; the last row's offset from the rule gives a bias and, with the fit residual, the
-jitter. Two blocks give the first estimate; later blocks update it weighted by how much of their
-parity they had. A hole's deadline is when its block's last parity is due, from that block's own
-first and last data arrivals (an unknown start is taken as a burst: the longest wait), plus the
-bias and a margin (3 × jitter, at least 5 ms). Holes past the newest block with parity are placed
-in blocks of the stream's steady k, so a short block flushed on reconfigure does not cut the next
-block's wait. Before an estimate the wait is 250 ms after the block's close. A stream with no
-parity gives up a hole as soon as later data shows the sender is past it. A restarted sender
-landing within 128 behind the reference is read as late until its sequence numbers pass it (odds
-128 / 65536 per restart).
+the byte totals. New senders also accept the legacy 44-byte payload, but return `-ENODATA` for
+`peer_byt_recv` for those reports. Unknown versions and invalid reserved bits are rejected. See
+[packet model](packet-model.md) for the wire layout.
 
 **`mkv_sink`** — MJPEG or H.264 (Annex-B AUs) → Matroska through `core/mkv_writer` (stdio, no
 libav). Clusters of ~1 s start on keyframes and are flushed and fsync'ed as they close; the
@@ -442,8 +408,8 @@ Components do not start pipeline threads; the app does. Threads inside component
 
 | Component | Internal threads | Placement keys |
 |-----------|------------------|----------------|
-| `stream_sender` | send thread (pacing, FEC flush timer); host-owned named reactor handles telemetry | `send_*` |
-| `stream_receiver` | receive thread (poll, FEC decode, reverse telemetry `sendto`) | `recv_*` |
+| `stream_sender` | send thread; host-owned named reactor handles telemetry | `send_*` |
+| `stream_receiver` | receive thread (poll, reverse telemetry `sendto`) | `recv_*` |
 | `mkv_sink` | mux thread (`mkv_writer` file I/O) | `mux_*` |
 | `esp32p4_csi_camera_src` | capture thread | `capture_*` |
 | `esp32_h264_isp_ng_src` | one worker: camera dequeue + synchronous encode | `encode_*` |
@@ -459,8 +425,8 @@ is closed (`-EBUSY` while open: ESP-IDF cannot move a running task to another co
 configures the nodes stops them first. On Linux the new thread is pinned before it runs and
 threads it starts inherit the pin; the pipeline thread (`set_cpu`) is pinned only after its nodes
 are open. The ESP32-P4 live TX layout is at the top of `idf/vstreamer/src/live_tx.cpp`:
-the FEC encode (`vs_isp_tx`) has core 0 with capture, and the send thread is on core 1, since
-sharing a core with the ~10 ms-per-block encode starved it and spread blocks left in lumps.
+camera, encode and payloader (`vs_isp_tx`) have core 0, and the send thread is on core 1, since
+sharing core 0 starved it.
 
 Lock-order rules are stated next to the mutexes in each header (`stream_sender`,
 `h264_encoder_mpp`, `h264_decoder_mpp`). Shutdown order everywhere: signal → join → close.
@@ -583,8 +549,8 @@ out/full/src/apps/stream_sdl_test/stream_sdl_test --diag                        
 out/full/src/apps/stream_sdl_test/stream_sdl_test --display kmsdrm --source /dev/video0  # UVC on DRM/KMS
 ```
 
-`--help` lists every flag. Main environment variables: `VSTREAMER_FEC` (`none` disables FEC),
-`VSTREAMER_FEC_K` / `_N`, `VSTREAMER_WIRE_PACE_KBPS`, `VSTREAMER_CHAN_MAX_KBPS`,
+`--help` lists every flag. Main environment variables: `VSTREAMER_WIRE_PACE_KBPS`,
+`VSTREAMER_CHAN_MAX_KBPS`,
 `VSTREAMER_ENC_QP` / `_GOP` / `_RC`, `VSTREAMER_PIPE_QUEUE_DEPTH` (8),
 `VSTREAMER_PRESENT_QUEUE_DEPTH` (1), `VSTREAMER_RX_AU_QUEUE_DEPTH` (4),
 `VSTREAMER_SKIP_DECODE`, `VSTREAMER_BENCH_METRICS`, `VSTREAMER_LOG_STAGE_LATENCY`.
@@ -606,7 +572,6 @@ Rover H3 example: `source=1;jpeg=1;jpeg_workers=1,2;encode=3;rx=-1`.
 | `get_metric <name>` | one metric |
 | `stats` | link emulator counters |
 | `set_max_kbps <kbps>`, `set_drop_dt_ms <ms>`, `set_constant_loss <pct>` | link emulator |
-| `set_fec none`, `set_fec_k <k>`, `set_fec_n <n>`, `set_fec_spread <ms>` | `stream_sender` FEC |
 | `set_encode_cbr <kbps>`, `set_encode_qp <qp>`, `set_gop <gop>`, `force_idr` | encoder |
 
 Metric names are stable (scripts depend on them), e.g. `h264_encoder.cbr_kbps`,
@@ -672,16 +637,14 @@ that same socket (NAT-style return path).
 The sender binds `0.0.0.0:0` (ephemeral port). The upstream's `txbus`/`rxbus` must pair in both
 directions on both managers, or the reports are not carried back. In **server** mode winject replies to the last app that sent to its
 `rx` port, so another app sending there takes over the return path until `stream_sender` sends
-again (within one frame while media flows). winject's upstream FEC passes the 68-byte reports
-through unchanged. The return path costs about 5.4 kbit/s at the default 100 ms interval.
+again (within one frame while media flows). winject's upstream FEC (when the upstream has it on)
+passes the 68-byte reports through unchanged. The return path costs about 5.4 kbit/s at the default 100 ms interval.
 
 ### Other test programs
 
 | Target | Built when | Purpose |
 |--------|-----------|---------|
 | `noise_fft_bench_test` | `ENABLE_NOISE_SOURCE` | noise IFFT throughput |
-| `rs_fec_test` | sender or receiver | RS FEC unit checks (also a ctest) |
-| `rs_block_id_pace_test` | sender or receiver | block-id / pacing checks (also a ctest) |
 | `vstreamer_tests` | `VSTREAMER_BUILD_TESTS` | GoogleTest suite (`ctest`) |
 | `h264_{encoder,decoder}_mpp_hw_test` | tests + MPP | hardware tests, ctest label `hw` |
 
@@ -702,7 +665,7 @@ defines the same `ENABLE_*` macros for `#ifdef` in app code, and
 | `ENABLE_H264_ENCODER_INTEL` | OFF | `h264_encoder_intel` (libavcodec `h264_vaapi`) |
 | `ENABLE_MKV_SINK` | ON | `mkv_sink` (no external deps) |
 | `ENABLE_SDL_SINK` | OFF | `sdl_sink` (SDL2) |
-| `ENABLE_STREAM_SENDER` | ON | `stream_sender`; with the receiver, builds ISA-L EC and `rs_block_erasure` |
+| `ENABLE_STREAM_SENDER` | ON | `stream_sender` |
 | `ENABLE_STREAM_RECEIVER` | ON | `stream_receiver` |
 | `ENABLE_RTP_H264_PAY` | ON | `rtp_h264_pay` |
 | `ENABLE_RTP_H264_DEPAY` | ON | `rtp_h264_depay` |
@@ -754,10 +717,10 @@ component layer exists today; the rest is still design.
 | Item | Status | Notes |
 |------|--------|-------|
 | Component layer (`component_*`, `component_pdu`, factory) | **done** | this page |
-| `stream_sender` / `stream_receiver` + RS block-erasure FEC | **done** | |
+| `stream_sender` / `stream_receiver` | **done** | FEC is the link's (winject-l3, winject-fec) |
 | `rtp_h264_pay` / `rtp_h264_depay` | **done** | |
 | Loopback bench + link emulator + UDP console | **bench-only** | `stream_sdl_test` |
-| External CBR controller (FEC-gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
+| External CBR controller (post-recovery gap AIMD) | **bench-only** | `scripts/cbr_controller.py` |
 | Separate `stream_sender` / `stream_receiver` apps | **planned** | wire telemetry done |
 | Reverse telemetry datagram (receiver → sender) | **done** | `core/stream_telemetry.hpp`; `peer_*` from the receiver's link reports |
 | Channel feedback plugin (`feedback_winject`, `feedback_none`) | **not started** | maps radio CI (`flow`, RSSI/SNR, `fec_lost`, `stream_request`) to QP/GOP/fps and controller delivery policy |

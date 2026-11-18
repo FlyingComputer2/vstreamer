@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -22,7 +23,6 @@
 #include "core/buffer_pool.hpp"
 #include "core/component_output.hpp"
 #include "core/port_caps.hpp"
-#include "core/rs_block_erasure.hpp"
 #include "core/stream_telemetry.hpp"
 #include "core/thread_spawn.hpp"
 
@@ -33,7 +33,16 @@
 namespace vstreamer
 {
 
-/* Pad 0 (source): STREAM_DGRAM out. */
+/*
+ * Pad 0 (source): STREAM_DGRAM out.
+ *
+ * Takes media datagrams ([stream_media_header][SDU]) and hands each SDU on as it comes; the one
+ * after a gap in the sequence is marked DISCONT. There is no FEC here: the link recovers loss
+ * (winject-l3 runs FEC per upstream and delivers in sequence). Link reports go back to the sender
+ * every telemetry_ms with two sets of counters: "udp" for the link (what reached the link's
+ * receiver, before its recovery) and "fec" for the stream (what reached this receiver, after it).
+ * Without link counters (set_link_counters) both are this receiver's own.
+ */
 class stream_receiver : public component_source
 {
 public:
@@ -57,6 +66,22 @@ public:
     using datagram_receive = std::function<std::optional<bfc::shared_sized_buffer>()>;
     using datagram_send = std::function<bool(const uint8_t *, size_t)>;
     int set_datagram_transport(datagram_receive receive, datagram_send send);
+
+    /*
+     * The link's own receive counters for the "udp" half of the link report and the queries:
+     * frames that reached the link's receiver, frames missing from its sequence, and their
+     * bytes, before the link's loss recovery (for winject-l3: the upstream's air RX counters).
+     * Cumulative; a drop (the link restarted) starts a new count at the sender. Called on the
+     * receive and query threads, so it must not block. Set before open().
+     */
+    struct link_counters
+    {
+        uint64_t packets = 0;
+        uint64_t gaps = 0;
+        uint64_t bytes = 0;
+    };
+    using link_counters_fn = std::function<bool(link_counters *)>;
+    int set_link_counters(link_counters_fn fn);
     int output(component_pdu &out) override;
 
     int configure(std::string_view key, std::string_view value) override;
@@ -70,10 +95,7 @@ private:
      * data lies in it and is kept instead of copied. */
     bool ingest_datagram(const uint8_t *data, size_t len,
                          const bfc::shared_sized_buffer *owner = nullptr);
-    void account_payloads_locked(const fec_rx_payload_list &payloads, size_t max_app_bytes);
-    void enqueue_payloads(fec_rx_payload_list *payloads, size_t max_app_bytes);
-    void enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, size_t max_app_bytes,
-                                bool discont);
+    void enqueue_payload_buffer(bfc::shared_sized_buffer &&payload, bool discont);
 
     static const std::vector<port_desc> &output_ports();
 
@@ -82,6 +104,8 @@ private:
 
     datagram_receive dgram_receive;
     datagram_send    dgram_send;
+    /* Set before open() only; shared so a report takes it without copying the function. */
+    std::shared_ptr<const link_counters_fn> link_counters_src;
     std::string      listen_spec;
     int         max_datagram = 1472;
     int         recv_fd = -1;
@@ -93,14 +117,18 @@ private:
     bool                    stopping = false;
     std::deque<component_pdu> pdu_queue;
     static constexpr size_t k_queue_depth = 4096;
-    bool                    discont_next_ = false;
+    /* Sequence windows: a datagram up to k_late_window behind the last is late (dropped), up
+     * to k_gap_window ahead a gap; further either way, a new sender session. */
+    static constexpr uint16_t k_late_window = 128;
+    static constexpr uint16_t k_gap_window = 1024;
 
-    std::atomic<uint64_t> udp_packet_received {0};
-    std::atomic<uint64_t> fec_packet_received {0};
-    std::atomic<uint64_t> udp_gap_count {0};
-    /* Post-FEC output: undelivered app packets after RS (see take_fail_lost_app_pkts). */
-    std::atomic<uint64_t> fec_gap_count {0};
-    /* Wire air shards before RS (stream_sequence loss uses udp_gap_count). */
+    /* Media datagrams taken and the stream sequence numbers missing between them. */
+    std::atomic<uint64_t> media_packet_received {0};
+    std::atomic<uint64_t> media_gap_count {0};
+    /* Datagrams behind the last one taken (late or duplicate), dropped. */
+    std::atomic<uint64_t> rx_late {0};
+    /* Sequence jumps taken as a new sender session (restart): new reference, no gap. */
+    std::atomic<uint64_t> rx_resyncs {0};
 
     std::atomic<uint64_t> recv_bytes {0};
     std::atomic<uint64_t> recv_wire_bytes {0};
@@ -116,7 +144,6 @@ private:
     uint16_t last_udp_seq = 0;
     bool     have_udp_seq = false;
 
-    size_t cached_max_app = 0;
 
     std::thread       recv_thread;
     thread_place      recv_place; /* keys recv_cpu / recv_prio */
@@ -131,9 +158,6 @@ private:
     mutable std::mutex    peer_display_mu;
     std::string           telemetry_peer_str;
 
-    rs_block_erasure fec;
-    uint64_t           fec_rec = 0;
-    uint64_t           fec_lost = 0;
 };
 
 }  // namespace vstreamer

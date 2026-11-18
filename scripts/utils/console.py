@@ -10,9 +10,7 @@ class Console:
         self._timeout = timeout
 
     def __call__(self, command: str, value: float | int) -> bool:
-        if command == "set_fec_n":
-            line = f"set_fec_n {int(round(value))}"
-        elif command == "set_encode_cbr":
+        if command == "set_encode_cbr":
             line = f"set_encode_cbr {int(round(value))}"
         else:
             line = f"{command} {value}"
