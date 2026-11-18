@@ -75,11 +75,10 @@ private:
     void ingest_link_report(const uint8_t *data, size_t len);
     void on_telemetry_socket_read();
     void handle_link_report(const stream_link_report &report);
-    [[nodiscard]] bool wire_fits(size_t len);
-    void evict_for_room();
-    /* Stamps the next sequence number into buf's header and queues it. */
-    void queue_wire(bfc::shared_sized_buffer &&buf);
-    [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict);
+    /* Under one q_mu hold: refuses (-EAGAIN) when the queue is full or the sender is closing,
+     * else stamps the next sequence number into buf's header and queues it. */
+    [[nodiscard]] int queue_wire(bfc::shared_sized_buffer &&buf);
+    [[nodiscard]] int ingest_app_sdu(const uint8_t *data, size_t len);
 
     static const std::vector<port_desc> &input_ports();
 
@@ -114,8 +113,9 @@ private:
     /* Next media sequence number; stamped under q_mu, so wire order is sequence order. Starts
      * at a random value: a restarted sender does not replay recent numbers. */
     uint16_t                tx_seq = 0;
-    /* Set by open(), cleared by close(): input() checks it without taking mu. */
-    std::atomic<bool>       accepting {false};
+    /* Set by open(), cleared by close(), both under q_mu: a push that races close() is
+     * refused, never left queued for the next session. */
+    bool                    accepting = false;
     /* Fixed send-queue capacity in packets (= buffer pool size); input() gets -EAGAIN past it. */
     static constexpr size_t k_queue_packet_cap = 1024;
 
@@ -152,8 +152,6 @@ private:
     /* SDUs larger than max_input (also counted in dropped). */
     std::atomic<uint64_t> oversized {0};
     std::atomic<uint64_t> queue_full_rejects {0};
-    /* Send queue: packets evicted to make room (also counted in dropped). */
-    std::atomic<uint64_t> queue_evicted {0};
     /* Queue transport: packets the full TX queue evicted (still counted in pkts_sent). */
     std::atomic<uint64_t> transport_dropped {0};
     /* Largest time a datagram waited in the send queue since the last query (us). */

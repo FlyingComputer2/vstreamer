@@ -19,7 +19,6 @@
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
-#include "core/sequence_gap.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_media_header.hpp"
 #include "core/stream_metrics.hpp"
@@ -116,12 +115,15 @@ void stream_receiver::enqueue_payload_buffer(bfc::shared_sized_buffer &&payload,
     bool evicted = false;
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        if (pdu_queue.size() >= k_queue_depth)
+        pdu_queue.push_back(std::move(pdu));
+        if (pdu_queue.size() > k_queue_depth)
         {
+            /* The consumer fell behind: the oldest goes, and what follows it is a
+             * discontinuity now (whether or not the evicted one was). */
             pdu_queue.pop_front();
+            pdu_queue.front().flags |= static_cast<uint8_t>(pdu_flag_e::DISCONT);
             evicted = true;
         }
-        pdu_queue.push_back(std::move(pdu));
     }
     if (evicted)
     {
@@ -169,12 +171,36 @@ bool stream_receiver::ingest_datagram(const uint8_t *data, size_t len,
             }
             std::memcpy(payload.u8(), p, plen);
         }
-        const uint64_t dg = note_u16_forward_gap(seq, last_udp_seq, have_udp_seq);
-        if (dg > 0)
+        /* In order: hand on. A jump ahead within the window: the numbers in between are lost.
+         * Behind within the late window (a duplicate or a straggler): drop it, the stream has
+         * moved on. Anything further either way is a new sender session (a restart starts at a
+         * random number): take it as the new reference, without counting a gap. */
+        if (have_udp_seq)
         {
-            media_gap_count.fetch_add(dg, std::memory_order_relaxed);
-            discont = true;
+            const uint16_t ahead = static_cast<uint16_t>(seq - last_udp_seq - 1U);
+            const uint16_t behind = static_cast<uint16_t>(last_udp_seq - seq);
+            if (behind <= k_late_window)
+            {
+                rx_late.fetch_add(1, std::memory_order_relaxed);
+                recv_dropped++;
+                return true; /* valid media: the telemetry peer stays */
+            }
+            if (ahead < k_gap_window)
+            {
+                if (ahead > 0)
+                {
+                    media_gap_count.fetch_add(ahead, std::memory_order_relaxed);
+                    discont = true;
+                }
+            }
+            else
+            {
+                rx_resyncs.fetch_add(1, std::memory_order_relaxed);
+                discont = true;
+            }
         }
+        last_udp_seq = seq;
+        have_udp_seq = true;
         media_packet_received.fetch_add(1, std::memory_order_relaxed);
         recv_wire_bytes.fetch_add(len, std::memory_order_relaxed);
         recv_bytes.fetch_add(plen, std::memory_order_relaxed);
@@ -370,7 +396,7 @@ void stream_receiver::recv_thread_main()
 
 stream_link_report stream_receiver::link_report_snapshot() const
 {
-    link_counters_fn link;
+    std::shared_ptr<const link_counters_fn> link;
     {
         std::lock_guard<std::mutex> lock(mu);
         link = link_counters_src;
@@ -382,12 +408,17 @@ stream_link_report stream_receiver::link_report_snapshot() const
     c.fec_packet_received = media_packet_received.load(std::memory_order_relaxed);
     c.fec_gap_count = media_gap_count.load(std::memory_order_relaxed);
     c.fec_bytes_received = recv_bytes.load(std::memory_order_relaxed);
-    link_counters lc;
-    if (link && link(&lc))
+    if (link)
     {
-        c.udp_packet_received = lc.packets;
-        c.udp_gap_count = lc.gaps;
-        c.udp_bytes_received = lc.bytes;
+        /* Always the link's, zeros until it has counters: never the receiver's own, which
+         * count from another base and would look like a jump when the link's arrive. */
+        link_counters lc;
+        if ((*link)(&lc))
+        {
+            c.udp_packet_received = lc.packets;
+            c.udp_gap_count = lc.gaps;
+            c.udp_bytes_received = lc.bytes;
+        }
     }
     else
     {
@@ -506,7 +537,8 @@ int stream_receiver::open()
         recv_wire_bytes.store(0, std::memory_order_relaxed);
         last_udp_seq = 0;
         have_udp_seq = false;
-        discont_next_ = false;
+        rx_late.store(0, std::memory_order_relaxed);
+        rx_resyncs.store(0, std::memory_order_relaxed);
         rx_bad_header = 0;
         rx_oversize.store(0, std::memory_order_relaxed);
         opened = true;
@@ -538,7 +570,7 @@ int stream_receiver::set_link_counters(link_counters_fn fn)
     {
         return -EBUSY;
     }
-    link_counters_src = std::move(fn);
+    link_counters_src = fn ? std::make_shared<const link_counters_fn>(std::move(fn)) : nullptr;
     return 0;
 }
 
@@ -830,6 +862,14 @@ int stream_receiver::query(std::string_view key, std::string *value) const
         std::lock_guard<std::mutex> lock(mu);
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%" PRIu64, rx_bad_header);
+        *value = buf;
+        return 0;
+    }
+    if ("rx_late" == key || "rx_resyncs" == key)
+    {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%" PRIu64,
+                      ("rx_late" == key ? rx_late : rx_resyncs).load(std::memory_order_relaxed));
         *value = buf;
         return 0;
     }

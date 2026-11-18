@@ -37,7 +37,6 @@ void register_tx_console_handlers(app_console &console, const tx_console_targets
 
     console.add_handler(
         [&targets](const char *work, std::string &reply) -> bool {
-            vstreamer::stream_sender *const stream_tx = targets.sender;
             vstreamer::component_coder *const encode_target = targets.encoder;
             if (0 == std::strncmp(work, "set_encode_cbr ", 15))
             {

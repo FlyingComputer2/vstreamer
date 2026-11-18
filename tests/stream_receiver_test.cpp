@@ -748,3 +748,120 @@ TEST(StreamReceiverTest, InProcessDatagramsReportLinkCounters)
     ASSERT_EQ(0, receiver.query("rx_bad_header", &bad));
     EXPECT_EQ("1", bad);
 }
+
+namespace
+{
+
+/* Feeds in-process media datagrams with the given sequence numbers and returns what came out:
+ * each SDU's first byte (the datagram's index in seqs) and whether it was marked DISCONT. */
+struct seq_run
+{
+    std::vector<int>  out;
+    std::vector<bool> discont;
+    std::string       late, resyncs, gaps;
+};
+
+seq_run run_seqs(const std::vector<uint16_t> &seqs)
+{
+    std::mutex                           mu;
+    std::deque<bfc::shared_sized_buffer> wire;
+    for (size_t i = 0; i < seqs.size(); i++)
+    {
+        const auto w = make_valid_media_datagram(seqs[i], {static_cast<uint8_t>(i), 1, 2});
+        wire.push_back(bfc::shared_sized_buffer::copy_from(w.data(), w.size()));
+    }
+    vstreamer::stream_receiver receiver;
+    EXPECT_EQ(0, receiver.set_datagram_transport(
+                     [&]() -> std::optional<bfc::shared_sized_buffer>
+                     {
+                         std::lock_guard<std::mutex> lock(mu);
+                         if (wire.empty())
+                         {
+                             return std::nullopt;
+                         }
+                         auto b = std::move(wire.front());
+                         wire.pop_front();
+                         return b;
+                     },
+                     [](const uint8_t *, size_t) { return true; }));
+    EXPECT_EQ(0, receiver.open());
+    seq_run r;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            if (wire.empty())
+            {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    vstreamer::component_pdu pdu;
+    while (0 == receiver.output(pdu))
+    {
+        r.out.push_back(pdu.sdu.u8()[0]);
+        r.discont.push_back(0 != (pdu.flags & static_cast<uint8_t>(vstreamer::pdu_flag_e::DISCONT)));
+    }
+    EXPECT_EQ(0, receiver.query("rx_late", &r.late));
+    EXPECT_EQ(0, receiver.query("rx_resyncs", &r.resyncs));
+    EXPECT_EQ(0, receiver.query("fec_gap_count", &r.gaps));
+    receiver.close();
+    return r;
+}
+
+}  // namespace
+
+/* A duplicate or a straggler behind the last datagram is dropped, not handed on out of order. */
+TEST(StreamReceiverTest, LateAndDuplicateDatagramsDropped)
+{
+    const auto r = run_seqs({10, 12, 11, 12, 13});
+    EXPECT_EQ((std::vector<int> {0, 1, 4}), r.out);
+    EXPECT_EQ((std::vector<bool> {false, true, false}), r.discont);
+    EXPECT_EQ("2", r.late);
+    EXPECT_EQ("1", r.gaps);
+}
+
+/* A restarted sender starts at a random number: a far jump either way is a new session, not
+ * 30000 lost datagrams and not a frozen stream. */
+TEST(StreamReceiverTest, SenderRestartResyncsWithoutCountingLoss)
+{
+    for (const uint16_t restart : {static_cast<uint16_t>(30000), static_cast<uint16_t>(40000)})
+    {
+        const auto r = run_seqs({35000, 35001, restart, static_cast<uint16_t>(restart + 1)});
+        EXPECT_EQ((std::vector<int> {0, 1, 2, 3}), r.out) << restart;
+        EXPECT_EQ((std::vector<bool> {false, false, true, false}), r.discont) << restart;
+        EXPECT_EQ("1", r.resyncs) << restart;
+        EXPECT_EQ("0", r.gaps) << restart;
+    }
+}
+
+/* With link counters set, the report's link half is always the link's: zeros until it has
+ * counters, never the receiver's own (another base). */
+TEST(StreamReceiverTest, LinkHalfIsZeroUntilTheLinkHasCounters)
+{
+    std::atomic<bool> have {false};
+    vstreamer::stream_receiver receiver;
+    ASSERT_EQ(0, receiver.set_datagram_transport([] { return std::nullopt; },
+                                                 [](const uint8_t *, size_t) { return true; }));
+    ASSERT_EQ(0, receiver.set_link_counters(
+                     [&](vstreamer::stream_receiver::link_counters *c)
+                     {
+                         if (!have)
+                         {
+                             return false;
+                         }
+                         c->packets = 500;
+                         return true;
+                     }));
+    ASSERT_EQ(0, receiver.open());
+    std::string v;
+    ASSERT_EQ(0, receiver.query("udp_packet_received", &v));
+    EXPECT_EQ("0", v);
+    have = true;
+    ASSERT_EQ(0, receiver.query("udp_packet_received", &v));
+    EXPECT_EQ("500", v);
+    receiver.close();
+}

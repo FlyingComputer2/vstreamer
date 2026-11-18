@@ -117,45 +117,24 @@ std::string stream_sender::name() const
     return "stream_sender";
 }
 
-bool stream_sender::wire_fits(size_t len)
+int stream_sender::queue_wire(bfc::shared_sized_buffer &&buf)
 {
-    if (0 == len || len > static_cast<size_t>(k_wire_datagram_bytes))
-    {
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    return true;
-}
-
-/* One push evicts the oldest packets until there is room. */
-void stream_sender::evict_for_room()
-{
-    uint64_t evicted = 0;
     {
         std::lock_guard<std::mutex> lock(q_mu);
-        while (!queue.empty() && queue.size() >= k_queue_packet_cap)
+        if (!accepting)
         {
-            queue_bytes -= wire_packet_bytes(queue.front().buf);
-            queue.pop_front();
-            ++evicted;
+            return -EPIPE;
         }
-    }
-    if (evicted > 0)
-    {
-        queue_evicted.fetch_add(evicted, std::memory_order_relaxed);
-        dropped.fetch_add(evicted, std::memory_order_relaxed);
-    }
-}
-
-void stream_sender::queue_wire(bfc::shared_sized_buffer &&buf)
-{
-    {
-        std::lock_guard<std::mutex> lock(q_mu);
+        if (!queue.empty() && queue.size() >= k_queue_packet_cap)
+        {
+            return -EAGAIN;
+        }
         media_header_write(buf.u8(), tx_seq++);
         queue_bytes += buf.size();
         queue.push_back(queued_wire {std::move(buf), std::chrono::steady_clock::now()});
     }
     q_cv.notify_one();
+    return 0;
 }
 
 void stream_sender::stop_send_thread()
@@ -538,7 +517,10 @@ int stream_sender::open()
     }
     reactor_running_ = reverse_path;
     opened = true;
-    accepting.store(true, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> qlock(q_mu);
+        accepting = true;
+    }
     send_stop = false;
     send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
                                &stream_sender::send_thread_main, this);
@@ -547,7 +529,10 @@ int stream_sender::open()
 
 void stream_sender::close()
 {
-    accepting.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> qlock(q_mu);
+        accepting = false;
+    }
     stop_send_thread();
     stop_reactor();
 
@@ -578,33 +563,15 @@ void stream_sender::close()
     q_cv.notify_all();
 }
 
-int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict)
+int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len)
 {
-    if (!accepting.load(std::memory_order_acquire))
-    {
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return 0;
-    }
     if (len > max_input_bytes())
     {
         oversized.fetch_add(1, std::memory_order_relaxed);
         dropped.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
-    if (pdu_no_evict)
-    {
-        std::lock_guard<std::mutex> lock(q_mu);
-        if (!queue.empty() && queue.size() >= k_queue_packet_cap)
-        {
-            queue_full_rejects.fetch_add(1, std::memory_order_relaxed);
-            return -EAGAIN;
-        }
-    }
-    const size_t wire_len = k_media_header_len + len;
-    if (!wire_fits(wire_len))
-    {
-        return 0;
-    }
+    const size_t             wire_len = k_media_header_len + len;
     bfc::shared_sized_buffer buf = pool.acquire(wire_len);
     if (0 == buf.capacity() || buf.size() != wire_len)
     {
@@ -612,11 +579,18 @@ int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_e
         return 0;
     }
     std::memcpy(buf.u8() + k_media_header_len, data, len);
-    if (!pdu_no_evict)
+    const int rc = queue_wire(std::move(buf));
+    if (-EAGAIN == rc)
     {
-        evict_for_room();
+        queue_full_rejects.fetch_add(1, std::memory_order_relaxed);
+        return -EAGAIN;
     }
-    queue_wire(std::move(buf));
+    if (rc < 0)
+    {
+        /* Not open (or closing): dropped, not queued for a later session. */
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(metrics_mu);
     ++sdu_pkts_sent;
     sdu_bytes_sent += len;
@@ -634,7 +608,7 @@ int stream_sender::input(component_pdu &&in)
     {
         return -EINVAL;
     }
-    return ingest_app_sdu(in.sdu.u8(), in.sdu.size(), true);
+    return ingest_app_sdu(in.sdu.u8(), in.sdu.size());
 }
 
 namespace
@@ -897,9 +871,6 @@ int stream_sender::query(uint64_t key, uint64_t *value) const
     }
     case query_key("dropped"):
         *value = dropped.load(std::memory_order_relaxed);
-        return 0;
-    case query_key("queue_evicted"):
-        *value = queue_evicted.load(std::memory_order_relaxed);
         return 0;
     case query_key("transport_dropped"):
         *value = transport_dropped.load(std::memory_order_relaxed);

@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -103,7 +104,8 @@ private:
 
     datagram_receive dgram_receive;
     datagram_send    dgram_send;
-    link_counters_fn link_counters_src;
+    /* Set before open() only; shared so a report takes it without copying the function. */
+    std::shared_ptr<const link_counters_fn> link_counters_src;
     std::string      listen_spec;
     int         max_datagram = 1472;
     int         recv_fd = -1;
@@ -115,11 +117,18 @@ private:
     bool                    stopping = false;
     std::deque<component_pdu> pdu_queue;
     static constexpr size_t k_queue_depth = 4096;
-    bool                    discont_next_ = false;
+    /* Sequence windows: a datagram up to k_late_window behind the last is late (dropped), up
+     * to k_gap_window ahead a gap; further either way, a new sender session. */
+    static constexpr uint16_t k_late_window = 128;
+    static constexpr uint16_t k_gap_window = 1024;
 
     /* Media datagrams taken and the stream sequence numbers missing between them. */
     std::atomic<uint64_t> media_packet_received {0};
     std::atomic<uint64_t> media_gap_count {0};
+    /* Datagrams behind the last one taken (late or duplicate), dropped. */
+    std::atomic<uint64_t> rx_late {0};
+    /* Sequence jumps taken as a new sender session (restart): new reference, no gap. */
+    std::atomic<uint64_t> rx_resyncs {0};
 
     std::atomic<uint64_t> recv_bytes {0};
     std::atomic<uint64_t> recv_wire_bytes {0};
