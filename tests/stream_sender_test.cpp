@@ -22,7 +22,7 @@
 #include "core/component.hpp"
 #include "core/component_pdu.hpp"
 #include "core/default_reactor_host.hpp"
-#include "core/rs_block_erasure.hpp"
+#include "core/stream_media_header.hpp"
 #include "core/stream_header.hpp"
 #include "core/stream_telemetry.hpp"
 #include "stream_query_test_helpers.hpp"
@@ -65,8 +65,7 @@ bool open_sender_with_reply_addr(vstreamer::stream_sender &sender, sockaddr_in *
     }
     const std::string stream =
         "127.0.0.1:" + std::to_string(ntohs(bind_addr.sin_port));
-    if (0 != cfg(sender, "udp_transport", stream) || 0 != cfg(sender, "fec", "none") ||
-        0 != sender.open())
+    if (0 != cfg(sender, "udp_transport", stream) || 0 != sender.open())
     {
         close(rx);
         return false;
@@ -112,7 +111,6 @@ TEST(StreamSenderTest, OpenWithHostnameDoesNotHang)
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     const std::string        stream = "localhost:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "udp_transport", stream));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
 
     auto fut = std::async(std::launch::async, [&sender]() { return sender.open(); });
     EXPECT_EQ(std::future_status::ready, fut.wait_for(std::chrono::seconds(2)));
@@ -135,13 +133,24 @@ TEST(StreamSenderTest, BogusHostnameReturnsQuickly)
     EXPECT_LT(fut.get(), 0);
 }
 
-TEST(StreamSenderTest, ConfigureLongValueRejected)
+/* FEC is the link's job: the sender takes none of the old FEC keys. */
+TEST(StreamSenderTest, FecKeysRejected)
 {
     vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        long_ms(200, '9');
-    EXPECT_LT(cfg(sender, "fec_spread_ms", long_ms), 0);
+    for (const char *key : {"fec", "fec_k", "fec_n", "fec_spread_ms"})
+    {
+        EXPECT_EQ(-ENOTSUP, cfg(sender, key, "1")) << key;
+    }
+    uint64_t v = 0;
+    for (const char *key : {"fec_k", "fec_n", "fec_spread_ms", "fec_push_us", "fec_kernel_us"})
+    {
+        EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key(key), &v)) << key;
+    }
+    std::string mode;
+    EXPECT_EQ(-ENOTSUP, sender.query("fec_mode", &mode));
+    EXPECT_EQ(-ENOTSUP, sender.configure(vstreamer::query_key("bitrate"), 1000));
 }
 
 namespace
@@ -198,181 +207,6 @@ TEST(StreamSenderTest, NoRateDerivedQueueKeys)
     EXPECT_LT(sender.query("in_rate", &v), 0);
 }
 
-/* A keyframe's data and parity are enqueued at once. None of it may be evicted, or the
- * receiver gets the missing data shards back from parity only after later packets. */
-TEST(StreamSenderTest, KeyframeBurstWithFecNotEvicted)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "15"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "8"));
-    ASSERT_EQ(0, sender.open());
-
-    constexpr int    k_packets = 32;
-    constexpr size_t k_payload = 1400;
-    for (int i = 0; i < k_packets; ++i)
-    {
-        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
-        ASSERT_EQ(0, sender.input(std::move(pkt)));
-    }
-
-    std::string dropped_s;
-    ASSERT_EQ(0, sender.query("dropped", &dropped_s));
-    EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
-    std::string evicted_s;
-    ASSERT_EQ(0, sender.query("queue_evicted", &evicted_s));
-    EXPECT_EQ(0ULL, std::strtoull(evicted_s.c_str(), nullptr, 10));
-
-    sender.close();
-}
-
-/* The SDU that completes a block releases its data shard and all of the block's parity at once.
- * The room check must reserve them all, or the forced enqueue pushes the queue past its packet
- * capacity. Spread parity is what backs the queue up here. */
-TEST(StreamSenderTest, QueuePacketCapHoldsWholeBlocksWhenSpreadBacksQueue)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "21"));
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-
-    ASSERT_EQ(0, sender.open());
-
-    constexpr size_t k_payload = 128;
-
-    bool saw_eagain = false;
-    for (int i = 0; i < 6000; ++i)
-    {
-        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
-        const int rc = sender.input(std::move(pkt));
-        if (-EAGAIN == rc)
-        {
-            saw_eagain = true;
-            break;
-        }
-        ASSERT_EQ(0, rc);
-        EXPECT_LE(query_size_t(sender, "queue_packets"), 1024U);
-    }
-    EXPECT_TRUE(saw_eagain);
-
-    std::string dropped_s;
-    ASSERT_EQ(0, sender.query("dropped", &dropped_s));
-    EXPECT_EQ(0ULL, std::strtoull(dropped_s.c_str(), nullptr, 10));
-    std::string evicted_s;
-    ASSERT_EQ(0, sender.query("queue_evicted", &evicted_s));
-    EXPECT_EQ(0ULL, std::strtoull(evicted_s.c_str(), nullptr, 10));
-
-    sender.close();
-}
-
-TEST(StreamSenderTest, FecReconfigureWhileSendingSurvivesExtremes)
-{
-    /* M-plane misconfiguration must never crash the sender: k/n (1/31 is a 31x amplification),
-     * and spread change from another thread while full-size PDUs stream through. */
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
-    ASSERT_EQ(0, sender.open());
-
-    std::atomic<bool> stop {false};
-    std::thread       hammer([&]() {
-        const char *steps[][2] = {
-            {"fec_n", "31"},          {"fec_k", "10"},        {"fec_k", "1"},
-            {"fec_spread_ms", "250"}, {"fec_k", "2"},
-            {"fec_n", "2"},           {"fec_k", "2"},         {"fec_n", "31"},
-            {"fec_k", "1"},           {"fec", "none"},        {"fec_n", "31"},
-            {"fec_k", "31"},          {"fec_spread_ms", "0"},
-            {"fec_k", "21"},
-        };
-        while (!stop.load())
-        {
-            for (const auto &st : steps)
-            {
-                (void)cfg(sender, st[0], st[1]);
-                std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            }
-        }
-    });
-
-    for (int i = 0; i < 4000; ++i)
-    {
-        auto pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 1200);
-        (void)sender.input(std::move(pkt));
-    }
-    stop = true;
-    hammer.join();
-    sender.close();
-}
-
-TEST(StreamSenderTest, LoweringFecSpreadReleasesQueuedShards)
-{
-    /* A long fec_spread_ms parks shards in the send queue for that long; lowering it again must
-     * pull them in instead of leaving the stream stalled until the old release times. */
-    const int rx = socket(AF_INET, SOCK_DGRAM, 0);
-    ASSERT_GE(rx, 0);
-    sockaddr_in addr {};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ASSERT_EQ(0, bind(rx, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
-    socklen_t alen = sizeof(addr);
-    ASSERT_EQ(0, getsockname(rx, reinterpret_cast<sockaddr *>(&addr), &alen));
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:" + std::to_string(ntohs(addr.sin_port))));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "4"));
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, sender.open());
-    for (int i = 0; i < 8; ++i)
-    {
-        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 200)));
-    }
-
-    const auto drain = [rx](int ms) {
-        int got = 0;
-        pollfd pfd {rx, POLLIN, 0};
-        const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-        while (std::chrono::steady_clock::now() < end)
-        {
-            if (poll(&pfd, 1, 10) > 0)
-            {
-                uint8_t b[2048];
-                got += recv(rx, b, sizeof(b), 0) > 0 ? 1 : 0;
-            }
-        }
-        return got;
-    };
-    const int early = drain(30);
-    EXPECT_LT(early, 16) << "spread 250 ms should hold most shards back";
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "0"));
-    EXPECT_EQ(16, early + drain(500)) << "4 blocks x n=4 shards";
-
-    sender.close();
-    close(rx);
-}
-
 TEST(StreamSenderTest, RemovedEgressKnobsConfigureRejected)
 {
     vstreamer::default_reactor_host sender_reactor;
@@ -415,9 +249,8 @@ vstreamer::stream_link_report make_report(uint32_t session, uint16_t seq, uint64
 TEST(StreamSenderTest, TypedQueryMatchesStringAndRejectsWrongType)
 {
     vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("fec_k", "4"));
 
-    for (const char *key : {"fec_k", "fec_n", "max_datagram", "max_input", "dropped",
+    for (const char *key : {"oversized", "max_datagram", "max_input", "dropped",
                             "queue_packets", "peer_reports_received", "peer_session"})
     {
         uint64_t typed = 0;
@@ -446,39 +279,8 @@ TEST(StreamSenderTest, TypedQueryMatchesStringAndRejectsWrongType)
 
     uint64_t u = 0;
     EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key("no_such_key"), &u));
-    EXPECT_EQ(-ENOTSUP, sender.query(vstreamer::query_key("fec_mode"), &u));
-    std::string mode;
-    EXPECT_EQ(0, sender.query("fec_mode", &mode));
-    EXPECT_EQ(-EINVAL, sender.query(vstreamer::query_key("fec_k"), static_cast<uint64_t *>(nullptr)));
-}
-
-TEST(StreamSenderTest, TypedConfigureMatchesString)
-{
-    namespace keys = vstreamer::keys;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure(keys::fec_k.id, 6));
-    ASSERT_EQ(0, sender.configure(keys::fec_n.id, 8));
-    ASSERT_EQ(0, sender.configure(keys::fec_spread_ms.id, 4));
-    uint64_t v = 0;
-    ASSERT_EQ(0, sender.query(keys::fec_k.id, &v));
-    EXPECT_EQ(6U, v);
-    ASSERT_EQ(0, sender.query(keys::fec_n.id, &v));
-    EXPECT_EQ(8U, v);
-    ASSERT_EQ(0, sender.query(keys::fec_spread_ms.id, &v));
-    EXPECT_EQ(4U, v);
-
-    /* Same validation as the string form: k <= n, range, spread cap. */
-    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_k.id, 9));
-    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_n.id, 5));
-    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_n.id, 32));
-    EXPECT_EQ(-EINVAL, sender.configure(keys::fec_spread_ms.id,
-                                        vstreamer::stream_sender::k_fec_spread_max_ms + 1));
-    EXPECT_EQ(-EINVAL, sender.configure("fec_k", "9"));
-    ASSERT_EQ(0, sender.query(keys::fec_k.id, &v));
-    EXPECT_EQ(6U, v);
-
-    EXPECT_EQ(-ENOTSUP, sender.configure(keys::bitrate.id, 1000));
-    EXPECT_EQ(-ENOTSUP, sender.configure(vstreamer::query_key("fec"), 1));
+    EXPECT_EQ(-EINVAL,
+              sender.query(vstreamer::query_key("dropped"), static_cast<uint64_t *>(nullptr)));
 }
 
 TEST(StreamSenderTest, PeerLinkReportSnapshot)
@@ -629,7 +431,6 @@ TEST(StreamSenderTest, CloseJoinsTelemetryQuickly)
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
     ASSERT_EQ(0, sender.open());
     const auto t0 = std::chrono::steady_clock::now();
     sender.close();
@@ -699,7 +500,6 @@ TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
     const std::string          host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg(receiver, "listen", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.input(std::move(vstreamer::test_pdu::make_stream_dgram(0, 64))));
@@ -727,52 +527,24 @@ TEST(StreamSenderTest, RawInputBeforeOpenNotQueued)
     receiver.close();
 }
 
-TEST(StreamSenderTest, MaxInputRawAndFecModes)
+TEST(StreamSenderTest, MaxInputIsDatagramLessMediaHeader)
 {
     constexpr size_t k_dg = static_cast<size_t>(vstreamer::stream_sender::k_wire_datagram_bytes);
-
     vstreamer::default_reactor_host sender_reactor;
     vstreamer::stream_sender sender;
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "10"));
     ASSERT_EQ(0, sender.open());
-    /* Parity header (4) and its coded length (2) bound every mode alike. */
-    const size_t fec_in = query_size_t(sender, "max_input");
-    EXPECT_EQ(k_dg - 6U, fec_in);
-    sender.close();
-
-    vstreamer::default_reactor_host raw_reactor;
-    vstreamer::stream_sender raw;
-    ASSERT_EQ(0, raw.configure("reactor", raw_reactor.name()));
-    ASSERT_EQ(0, cfg(raw, "udp_transport", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(raw, "fec", "none"));
-    ASSERT_EQ(0, raw.open());
-    const size_t raw_in = query_size_t(raw, "max_input");
-    EXPECT_EQ(k_dg - 6U, raw_in);
-    raw.close();
-}
-
-TEST(StreamSenderTest, FecKnAccept31Reject32)
-{
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    ASSERT_EQ(0, cfg(sender, "udp_transport", "127.0.0.1:9"));
-    ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "31"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "31"));
-    ASSERT_EQ(0, sender.open());
-    EXPECT_LT(cfg(sender, "fec_n", "32"), 0);
-    EXPECT_LT(cfg(sender, "fec_k", "32"), 0);
+    EXPECT_EQ(k_dg - vstreamer::k_media_header_len, query_size_t(sender, "max_input"));
+    /* One byte more is dropped and counted, not sent. */
+    ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(
+                     0, k_dg - vstreamer::k_media_header_len + 1)));
+    EXPECT_EQ(1U, query_size_t(sender, "oversized"));
     sender.close();
 }
 
-/* Data shards carry one running sequence whatever the FEC mode; parity names its block's first
- * data shard and takes no sequence of its own. */
-TEST(StreamSenderTest, DataSequenceRunsAcrossFecModes)
+/* Every SDU is one media datagram, [0x80][u16 seq][SDU], and the sequence runs by one. */
+TEST(StreamSenderTest, MediaDatagramsCarryOneRunningSequence)
 {
     const int port = ephemeral_udp_port();
     ASSERT_GT(port, 0);
@@ -790,44 +562,24 @@ TEST(StreamSenderTest, DataSequenceRunsAcrossFecModes)
     ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
     const std::string        host_port = "127.0.0.1:" + std::to_string(port);
     ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "1"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "2"));
     ASSERT_EQ(0, sender.open());
 
-    uint8_t                                wire[2048];
-    size_t                                 wire_len = 0;
-    vstreamer::rs_block_erasure::shard_header h;
-    const auto next = [&]() {
-        EXPECT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
-        EXPECT_TRUE(vstreamer::rs_block_erasure::parse_header(wire, wire_len, &h));
-    };
-
-    ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(0, 32)));
-    next();
-    ASSERT_TRUE(h.is_data);
-    const uint16_t seq0 = h.sequence_number;
-    EXPECT_EQ(wire_len, 3U + 32U);
-    next();
-    ASSERT_FALSE(h.is_data);
-    EXPECT_EQ(seq0, h.sequence_number);
-    EXPECT_EQ(1, h.k_total);
-    EXPECT_EQ(1, h.n);
-
-    ASSERT_EQ(0, cfg(sender, "fec", "none"));
-    for (uint16_t i = 1; i <= 5; ++i)
+    uint8_t  wire[2048];
+    size_t   wire_len = 0;
+    uint16_t seq = 0;
+    uint16_t seq0 = 0;
+    for (uint16_t i = 0; i < 6; ++i)
     {
         ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(i, 32)));
-        next();
-        ASSERT_TRUE(h.is_data);
-        EXPECT_EQ(static_cast<uint16_t>(seq0 + i), h.sequence_number);
+        ASSERT_TRUE(recv_one_udp(sniff, wire, sizeof(wire), &wire_len, 500));
+        ASSERT_TRUE(vstreamer::media_header_parse(wire, wire_len, &seq));
+        EXPECT_EQ(wire_len, vstreamer::k_media_header_len + 32U);
+        if (0 == i)
+        {
+            seq0 = seq;
+        }
+        EXPECT_EQ(static_cast<uint16_t>(seq0 + i), seq);
     }
-
-    ASSERT_EQ(0, cfg(sender, "fec", "block"));
-    ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(99, 32)));
-    next();
-    ASSERT_TRUE(h.is_data);
-    EXPECT_EQ(static_cast<uint16_t>(seq0 + 6), h.sequence_number);
 
     close(sniff);
     sender.close();
@@ -861,107 +613,6 @@ TEST(StreamSenderTest, AcceptsRtpPdus)
     auto other = vstreamer::test_pdu::make_stream_dgram(2, 64);
     other.sdu_type = vstreamer::sdu_type_e::H264_AU;
     EXPECT_EQ(-EINVAL, sender.input(std::move(other)));
-    sender.close();
-}
-
-TEST(StreamSenderTest, PduInputEagainWhenQueueFull)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, sender.open());
-
-    std::vector<uint8_t> payload(1000, 0x5A);
-    bool                 saw_eagain = false;
-    for (int i = 0; i < 400; ++i)
-    {
-        vstreamer::component_pdu pdu;
-        pdu.sdu_type = vstreamer::sdu_type_e::STREAM_DGRAM;
-        pdu.port = 0;
-        pdu.sdu = bfc::shared_sized_buffer::copy_from(payload.data(), payload.size());
-        const int rc = sender.input(std::move(pdu));
-        if (-EAGAIN == rc)
-        {
-            saw_eagain = true;
-            break;
-        }
-        ASSERT_EQ(0, rc);
-    }
-    EXPECT_TRUE(saw_eagain);
-
-    /* The send thread may drain a slot between the EAGAIN above and this push; retry until one is
-     * refused. */
-    bool refused = false;
-    for (int attempt = 0; attempt < 50 && !refused; ++attempt)
-    {
-        std::string dropped_before;
-        ASSERT_EQ(0, sender.query("dropped", &dropped_before));
-        const uint64_t dropped0 = std::strtoull(dropped_before.c_str(), nullptr, 10);
-        auto overflow_pkt = vstreamer::test_pdu::make_stream_dgram(9999, 64);
-        const int rc = sender.input(std::move(overflow_pkt));
-        if (0 == rc)
-        {
-            continue;
-        }
-        ASSERT_EQ(-EAGAIN, rc);
-        refused = true;
-        std::string dropped_after;
-        ASSERT_EQ(0, sender.query("dropped", &dropped_after));
-        EXPECT_EQ(dropped0, std::strtoull(dropped_after.c_str(), nullptr, 10));
-    }
-    EXPECT_TRUE(refused);
-
-    sender.close();
-}
-
-/* With FEC on, an SDU that closes a block produces its data shard plus all of the block's parity.
- * A full queue must refuse the whole SDU before it enters the FEC block; queueing some shards and
- * then returning -EAGAIN sends a block without part of its data or parity while the caller drops
- * the datagram as not taken. */
-TEST(StreamSenderTest, PduInputFecQueueFullRefusesWholeSdu)
-{
-    const int port = ephemeral_udp_port();
-    ASSERT_GT(port, 0);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    const std::string        host_port = "127.0.0.1:" + std::to_string(port);
-    ASSERT_EQ(0, cfg(sender, "udp_transport", host_port));
-    ASSERT_EQ(0, cfg(sender, "fec_k", "2"));
-    ASSERT_EQ(0, cfg(sender, "fec_n", "12"));
-    ASSERT_EQ(0, cfg(sender, "fec_spread_ms", "250"));
-    ASSERT_EQ(0, sender.open());
-
-    int  rejects = 0;
-    for (int i = 0; i < 400 && rejects < 20; ++i)
-    {
-        const size_t before = query_size_t(sender, "queue_bytes");
-        auto         pkt = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 1000);
-        const int    rc = sender.input(std::move(pkt));
-        const size_t after = query_size_t(sender, "queue_bytes");
-        if (-EAGAIN == rc)
-        {
-            rejects++;
-            EXPECT_LE(after, before) << "refused SDU " << i << " still queued packets";
-            continue;
-        }
-        ASSERT_EQ(0, rc);
-    }
-    EXPECT_GT(rejects, 0);
-
-    std::string rejects_s;
-    ASSERT_EQ(0, sender.query("queue_full_rejects", &rejects_s));
-    EXPECT_EQ(static_cast<uint64_t>(rejects), std::strtoull(rejects_s.c_str(), nullptr, 10));
-
     sender.close();
 }
 

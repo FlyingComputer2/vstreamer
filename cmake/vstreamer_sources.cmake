@@ -1,6 +1,6 @@
 # Core sources and the components that build on every platform (Linux and ESP-IDF),
 # relative to the repository root. Reads the ENABLE_* switches; appends to
-# VSTREAMER_SOURCES. ISA-L is the caller's job when VSTREAMER_NEEDS_ISAL is set.
+# VSTREAMER_SOURCES.
 
 list(APPEND VSTREAMER_SOURCES
     src/core/metrics.cpp
@@ -19,14 +19,8 @@ list(APPEND VSTREAMER_SOURCES
     src/core/pipeline_queue.cpp
 )
 
-set(VSTREAMER_NEEDS_ISAL OFF)
 if(ENABLE_MKV_SINK)
     list(APPEND VSTREAMER_SOURCES src/components/mkv_sink.cpp)
-endif()
-if(ENABLE_STREAM_SENDER OR ENABLE_STREAM_RECEIVER)
-    list(APPEND VSTREAMER_SOURCES src/core/rs_block_erasure.cpp src/core/rs_block_erasure_rx.cpp
-                                  src/core/rs_encode_scalar.cpp)
-    set(VSTREAMER_NEEDS_ISAL ON)
 endif()
 if(ENABLE_STREAM_SENDER)
     list(APPEND VSTREAMER_SOURCES src/components/stream_sender.cpp)

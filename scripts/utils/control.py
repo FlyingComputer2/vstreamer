@@ -302,12 +302,3 @@ class LossRateControl:
         self.cbr = self._clamp(self.cbr)
         return self.cbr
 
-
-class FecMap:
-    def __init__(self, k: float, gain: float) -> None:
-        self._k = k
-        self._gain = gain
-
-    def __call__(self, loss_rate: float) -> float:
-        p = min(max(loss_rate, 0.0), 0.999999)
-        return self._gain * self._k / (1.0 - p)

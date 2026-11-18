@@ -19,9 +19,7 @@ set(VSTREAMER_TEST_SOURCES
     stream_telemetry_test.cpp
     stream_metrics_test.cpp
     pix_convert_test.cpp
-    rs_block_erasure_emit_test.cpp
     thread_spawn_test.cpp
-    rs_encode_scalar_test.cpp
 )
 
 if(ENABLE_V4L2_SOURCE)
@@ -40,7 +38,6 @@ endif()
 
 if(ENABLE_STREAM_SENDER AND ENABLE_STREAM_RECEIVER)
     list(APPEND VSTREAMER_TEST_SOURCES
-        fec_spread_test.cpp
         loopback_test.cpp
         stream_sender_test.cpp
         stream_queue_transport_test.cpp

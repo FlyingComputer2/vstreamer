@@ -67,5 +67,5 @@ TEST(H264EncoderIntelTest, ConfigureQueryNoHardware)
     EXPECT_EQ(qry(enc, "gop", &gop), 0);
     EXPECT_EQ(gop, "60");
     EXPECT_EQ(enc.configure(vstreamer::keys::idr.id, 0), 0);
-    EXPECT_EQ(enc.configure(vstreamer::keys::fec_k.id, 4), -ENOTSUP);
+    EXPECT_EQ(enc.configure(vstreamer::query_key("fec_k"), 4), -ENOTSUP);
 }

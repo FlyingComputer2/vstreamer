@@ -43,8 +43,8 @@ struct place_kv
     const char *value;
 };
 
-/* Live TX: vs_isp_tx runs the RS FEC encode (~10 ms of compute per block) on core 0, so the
- * send thread sits on core 1; sharing core 0 starved it and spread FEC blocks left in lumps.
+/* Live TX: vs_isp_tx (camera, H.264, payloader) runs on core 0 and the send thread on core 1;
+ * sharing core 0 starved the send thread.
  * The mplane is on core 1 so it answers under load. Measured and not worth it (2026-10-17):
  * capture on core 1 (no change) and lwIP's tiT pinned to core 1 (vs_isp_tx +3% of core 0).
  * Its stack is in PSRAM: with live video internal RAM is nearly full, and a 16 KB internal
@@ -118,8 +118,8 @@ private:
     esp_pm_lock_handle_t lock = nullptr;
 };
 
-/* TX thread time per stats interval: payloader calls, stream_sender input (FEC encode and
- * queueing) and how often the sender pushed back. */
+/* TX thread time per stats interval: payloader calls, stream_sender input (queueing) and how
+ * often the sender pushed back. */
 std::atomic<int64_t>  g_pay_us {0};
 std::atomic<int64_t>  g_snd_us {0};
 std::atomic<uint64_t> g_snd_calls {0};
@@ -315,7 +315,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         return -1;
     }
 
-    /* Runtime control (FEC k/n, bitrate, ...) for bench sweeps. */
+    /* Runtime control (bitrate, gop, ...) for bench sweeps. */
     std::atomic<bool>  own_pause {false}; // outlives the mplane thread
     std::atomic<bool> &pause_request = cfg.pause ? *cfg.pause : own_pause;
     live_mplane        mplane;
@@ -375,8 +375,6 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     int64_t       last_enc_us = last_stats_us;
     uint64_t      last_frames = 0;
     uint64_t      last_bytes = 0;
-    uint64_t      last_fec_us = 0;
-    uint64_t      last_kern_us = 0;
 
     auto tx_fn = [&]() {
         bool paused = false;
@@ -480,30 +478,18 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             std::string node_lat;
             (void)src->query("latency_ms", &lat);
             (void)src->query("node_latency_ms", &node_lat);
-            std::string fec_us_s;
-            (void)snd->query("fec_push_us", &fec_us_s);
-            const uint64_t fec_us_total = std::strtoull(fec_us_s.c_str(), nullptr, 10);
-            const uint64_t fec_us = fec_us_total - last_fec_us;
-            last_fec_us = fec_us_total;
-            std::string kern_s;
-            (void)snd->query("fec_kernel_us", &kern_s);
-            const uint64_t kern_total = std::strtoull(kern_s.c_str(), nullptr, 10);
-            const uint64_t kern_us = kern_total - last_kern_us;
-            last_kern_us = kern_total;
             const int64_t  pay_us = g_pay_us.exchange(0);
             const int64_t  snd_us = g_snd_us.exchange(0);
             const uint64_t snd_calls = g_snd_calls.exchange(0);
             const uint64_t snd_eagain = g_snd_eagain.exchange(0);
             std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f) "
-                        "latency_ms=%s node_latency_ms=%s; tx pay=%.1f%% snd=%.1f%% fec=%.1f%% kernel=%.1f%% "
+                        "latency_ms=%s node_latency_ms=%s; tx pay=%.1f%% snd=%.1f%% "
                         "snd_calls=%" PRIu64 " snd_eagain=%" PRIu64 "; isp %s; snd %s\n",
                         win_fps, enc_fps, win_kbps,
                         age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
                         age_n > 0 ? age_in / 1000.0 / age_n : 0.0, lat.c_str(), node_lat.c_str(),
                         stat_dt > 0 ? pay_us / (stat_dt * 1e4) : 0.0,
-                        stat_dt > 0 ? snd_us / (stat_dt * 1e4) : 0.0,
-                        stat_dt > 0 ? fec_us / (stat_dt * 1e4) : 0.0,
-                        stat_dt > 0 ? kern_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
+                        stat_dt > 0 ? snd_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
                         isp_stats.c_str(), snd_stats.c_str());
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&

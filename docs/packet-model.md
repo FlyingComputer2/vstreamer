@@ -24,32 +24,32 @@ latency accounting downstream.
 PTP). Residual clock offset adds directly to reported end-to-end latency; the stack does not
 estimate or correct offset in-band.
 
-## Forward datagram (streaming FEC wire)
+## Forward datagram (media)
 
-Every media datagram is one FEC shard. Data shards leave as soon as the app datagram arrives;
-every `fec_k` data shards close a block, and its `fec_n - fec_k` parity shards follow, spread
-over `fec_spread_ms`. Bits are MSB-first; multi-byte fields are big-endian.
+Every app SDU goes out as one media datagram, as soon as it arrives. Bits are MSB-first;
+multi-byte fields are big-endian.
 
 ```text
-data shard:   | flag (1) | sequence_number (2) | RTP hdr (12) | RTP ext (16) | H.264 |
-parity shard: | flag (2) | sequence_number (2) | parity |
+| flag (1) | sequence_number (2) | RTP hdr (12) | RTP ext (16) | H.264 |
 ```
 
 | Region | Size | Notes |
 |--------|------|--------|
-| data `flag` | 1 | `is_data`=1, 7 spare bits = 0 |
-| data `sequence_number` | 2 | one counter over data shards only; the payload length is the datagram's |
-| parity `flag` | 2 | `is_data`=0, `n`(5) parity shards in the block, `k_total`(5) data shards, `k_i`(5) this row |
-| parity `sequence_number` | 2 | the block's first data shard; the block covers `[sequence_number, sequence_number + k_total)` |
-| parity body | var | RS parity over rows of `[u16 data length | data | zero pad]`, so a recovered shard carries its length |
+| `flag` | 1 | `0x80`: bit 7 set, 7 spare bits = 0 |
+| `sequence_number` | 2 | one counter over the stream's datagrams, starting at a random value |
 | RTP fixed header | 12 | PT 96, marker on AU boundary; SSRC from payloader |
 | RTP extension | 16 | RFC 5285: id 2, 8 B CLOCK_REALTIME capture ns (BE) |
 | Payload | var | Single NAL, STAP-A, or FU-A |
 
-`fec none` sends data shards only (no parity). Per-packet overhead is 3 bytes for data and 4 for
-parity; parity is 2 bytes longer than the block's longest data payload.
+The overhead is 3 bytes per datagram ([`stream_media_header.hpp`](../src/core/stream_media_header.hpp)).
+The layout is the data shard of the winject-fec wire, so a vstreamer that still had its own FEC,
+set to `none`, sent the same bytes. There is no FEC in vstreamer: the link protects the stream
+(winject-l3 runs winject-fec per upstream and delivers in sequence). A datagram whose flag is
+not exactly `0x80` (such as a parity shard from an older sender) is dropped and counted in
+`rx_bad_header`.
 
-`stream_receiver` strips the shard header and FEC, then emits **`STREAM_DGRAM`** PDUs.
+`stream_receiver` strips the header and emits each SDU as a **`STREAM_DGRAM`** PDU at once;
+the one after a sequence gap carries `DISCONT`.
 `rtp_h264_depay` accepts `RTP` or `STREAM_DGRAM` and outputs `H264_AU` (and `CAPS_VIDEO_CODED`
 when SPS dimensions change).
 
@@ -83,8 +83,12 @@ is the header `sequence_number`. The complete UDP payload is 68 bytes. Payload f
 | 48 | 8 | `udp_bytes_received` |
 | 56 | 8 | `fec_bytes_received` |
 
-All six counters and the sampling timestamp are taken under the receiver's state lock.
-UDP bytes include the stream/FEC headers and parity; FEC bytes count reconstructed payloads.
+The `udp_*` counters are the link's: what reached the link's receiver before its loss
+recovery, when the host gives the receiver link counters (`set_link_counters`; on the ground P4,
+the winject-l3 upstream's air RX counters). Without them they are the receiver's own datagrams,
+gaps and wire bytes. The `fec_*` counters are the stream's: datagrams that reached the receiver
+after the link's recovery, the stream sequence numbers missing between them, and their payload
+bytes. The field names stay for wire compatibility.
 Telemetry itself is excluded from media totals.
 
 New decoders also accept the legacy 44-byte payload (48 bytes with stream header): it has no

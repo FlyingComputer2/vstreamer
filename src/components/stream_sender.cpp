@@ -19,12 +19,11 @@
 #include <thread>
 #include <vector>
 
-#include "core/config_keys.hpp"
-#include "core/fec_spread.hpp"
 #include "core/host_util.hpp"
 #include "core/key_util.hpp"
 #include "core/port_caps.hpp"
 #include "core/stream_header.hpp"
+#include "core/stream_media_header.hpp"
 #include "core/stream_metrics.hpp"
 #include "core/thread_spawn.hpp"
 
@@ -99,31 +98,13 @@ const std::vector<port_desc> &stream_sender::input_ports()
 stream_sender::stream_sender()
     : pool(static_cast<size_t>(1500), k_queue_packet_cap)
 {
-    /* Shards are built in pool buffers, headers included: no copy to send. */
-    fec.set_tx_buffers(0, [this](size_t cap) { return pool.acquire(cap); });
-}
-
-int stream_sender::effective_fec_k() const
-{
-    if (fec_mode == fec_mode_e::none)
-    {
-        return 1;
-    }
-    return fec_k;
-}
-
-int stream_sender::effective_fec_n() const
-{
-    if (fec_mode == fec_mode_e::none)
-    {
-        return 1;
-    }
-    return fec_n;
+    std::random_device rd;
+    tx_seq = static_cast<uint16_t>(rd());
 }
 
 size_t stream_sender::max_input_bytes()
 {
-    return rs_block_erasure::max_app_payload(static_cast<size_t>(k_wire_datagram_bytes));
+    return static_cast<size_t>(k_wire_datagram_bytes) - k_media_header_len;
 }
 
 stream_sender::~stream_sender()
@@ -136,20 +117,6 @@ std::string stream_sender::name() const
     return "stream_sender";
 }
 
-
-
-bool stream_sender::queue_has_room_for_sdu() const
-{
-    /* One SDU leaves as its data shard, plus the block's parity when it closes the block. */
-    size_t pkts = 1;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        pkts += static_cast<size_t>(std::max(0, effective_fec_n() - effective_fec_k()));
-    }
-    std::lock_guard<std::mutex> lock(q_mu);
-    return queue.empty() || queue.size() + pkts <= k_queue_packet_cap;
-}
-
 bool stream_sender::wire_fits(size_t len)
 {
     if (0 == len || len > static_cast<size_t>(k_wire_datagram_bytes))
@@ -160,7 +127,7 @@ bool stream_sender::wire_fits(size_t len)
     return true;
 }
 
-/* Forced input can leave the queue past its cap, so one push may evict several. */
+/* One push evicts the oldest packets until there is room. */
 void stream_sender::evict_for_room()
 {
     uint64_t evicted = 0;
@@ -180,92 +147,15 @@ void stream_sender::evict_for_room()
     }
 }
 
-void stream_sender::queue_wire(bfc::shared_sized_buffer &&buf,
-                               std::chrono::steady_clock::time_point release)
+void stream_sender::queue_wire(bfc::shared_sized_buffer &&buf)
 {
     {
         std::lock_guard<std::mutex> lock(q_mu);
+        media_header_write(buf.u8(), tx_seq++);
         queue_bytes += buf.size();
-        /* Usually the newest release time, so the search ends at the back. */
-        auto pos = queue.end();
-        while (pos != queue.begin() && std::prev(pos)->release > release)
-        {
-            --pos;
-        }
-        queue.insert(pos, queued_wire {std::move(buf), release});
+        queue.push_back(queued_wire {std::move(buf), std::chrono::steady_clock::now()});
     }
     q_cv.notify_one();
-}
-
-int stream_sender::try_enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
-                                        std::chrono::steady_clock::time_point release, bool force)
-{
-    if (!wire_fits(buf.size()))
-    {
-        return -EINVAL;
-    }
-    {
-        std::lock_guard<std::mutex> lock(q_mu);
-        if (!force && !queue.empty() && queue.size() >= k_queue_packet_cap)
-        {
-            return -EAGAIN;
-        }
-    }
-    queue_wire(std::move(buf), release);
-    return 0;
-}
-
-void stream_sender::enqueue_wire_buf(bfc::shared_sized_buffer &&buf,
-                                     std::chrono::steady_clock::time_point release)
-{
-    if (!wire_fits(buf.size()))
-    {
-        return;
-    }
-    evict_for_room();
-    queue_wire(std::move(buf), release);
-}
-
-/*
- * The data shard leaves at once. Parity row j of a closed block of c = k + p shards keeps the
- * spread: no earlier than slot k + j of the window that started with the block's first data
- * shard, and at least j slots after the close, so parity is never sent in a lump. Blocks overlap,
- * so their shards interleave on the wire.
- */
-void stream_sender::enqueue_tx_out(rs_block_erasure::tx_out *out, bool no_evict)
-{
-    if (nullptr == out)
-    {
-        return;
-    }
-    const auto   now = std::chrono::steady_clock::now();
-    const int    spread = fec_spread_ms.load(std::memory_order_relaxed);
-    const size_t parity = static_cast<size_t>(out->parity);
-    const size_t data = out->shards.size() - parity;
-    const size_t c = static_cast<size_t>(out->block_k) + parity;
-    for (size_t i = 0; i < out->shards.size(); i++)
-    {
-        auto release = now;
-        if (i >= data)
-        {
-            const size_t j = i - data;
-            release = std::max(now + fec_spread_offset(j, c, spread),
-                               out->block_start +
-                                   fec_spread_offset(static_cast<size_t>(out->block_k) + j, c,
-                                                     spread));
-        }
-        if (no_evict)
-        {
-            /* Room was checked before the push; a failure here is oversize, which drops only
-             * this shard and is counted in dropped. */
-            (void)try_enqueue_wire_buf(std::move(out->shards[i]), release, true);
-        }
-        else
-        {
-            enqueue_wire_buf(std::move(out->shards[i]), release);
-        }
-    }
-    out->shards.clear();
 }
 
 void stream_sender::stop_send_thread()
@@ -447,43 +337,20 @@ void stream_sender::send_thread_main()
 
         bfc::shared_sized_buffer wire_buf;
         {
-            /* Wake for the earliest release, a new enqueue, or the watchdog. */
+            /* Wake for a new enqueue, or the watchdog. */
             std::unique_lock<std::mutex> lock(q_mu);
-            const auto tick_at =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-            for (;;)
-            {
-                wdt.feed();
-                if (send_stop)
-                {
-                    break;
-                }
-                const auto t = std::chrono::steady_clock::now();
-                if (!queue.empty() && queue.front().release <= t)
-                {
-                    break;
-                }
-                if (t >= tick_at)
-                {
-                    break;
-                }
-                auto until = tick_at;
-                if (!queue.empty() && queue.front().release < until)
-                {
-                    until = queue.front().release;
-                }
-                q_cv.wait_until(lock, until);
-            }
+            q_cv.wait_for(lock, std::chrono::milliseconds(50),
+                          [this] { return send_stop || !queue.empty(); });
             if (send_stop)
             {
                 break;
             }
-            if (queue.empty() || queue.front().release > std::chrono::steady_clock::now())
+            if (queue.empty())
             {
                 continue;
             }
             const int64_t late_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                        std::chrono::steady_clock::now() - queue.front().release)
+                                        std::chrono::steady_clock::now() - queue.front().at)
                                         .count();
             if (late_us > send_late_max_us.load(std::memory_order_relaxed))
             {
@@ -623,21 +490,6 @@ int stream_sender::open()
         }
         return 0;
     }
-    {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        fec_oversized = 0;
-        /* fec none is the same wire without parity (k = n = 1). */
-        if (!fec.init(effective_fec_k(), effective_fec_n(),
-                      static_cast<size_t>(k_wire_datagram_bytes)))
-        {
-            if (fd >= 0)
-            {
-                ::close(fd);
-            }
-            return -EINVAL;
-        }
-    }
-
     send_fd = fd;
     dst_addr = dst;
     have_dst = !queue_mode;
@@ -686,6 +538,7 @@ int stream_sender::open()
     }
     reactor_running_ = reverse_path;
     opened = true;
+    accepting.store(true, std::memory_order_release);
     send_stop = false;
     send_thread = spawn_thread(send_place.opts("vs_send", k_send_stack_bytes),
                                &stream_sender::send_thread_main, this);
@@ -694,9 +547,9 @@ int stream_sender::open()
 
 void stream_sender::close()
 {
+    accepting.store(false, std::memory_order_release);
     stop_send_thread();
     stop_reactor();
-    disable_fec();
 
     std::lock_guard<std::mutex> lock(mu);
     if (send_fd >= 0)
@@ -727,46 +580,46 @@ void stream_sender::close()
 
 int stream_sender::ingest_app_sdu(const uint8_t *data, size_t len, bool pdu_no_evict)
 {
-    /* Accept the whole SDU or none of it: once it is in an FEC block, every shard it produces
-     * must reach the queue, or the block goes out without some of its data or parity. */
-    if (pdu_no_evict && !queue_has_room_for_sdu())
+    if (!accepting.load(std::memory_order_acquire))
     {
-        queue_full_rejects.fetch_add(1, std::memory_order_relaxed);
-        return -EAGAIN;
-    }
-    bool                     oversized = false;
-    rs_block_erasure::tx_out out;
-    {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        if (!fec.enabled())
-        {
-            /* Not open: dropped is atomic; taking mu here would invert the mu -> fec_mu order. */
-            dropped.fetch_add(1, std::memory_order_relaxed);
-            return 0;
-        }
-        const uint64_t before = fec.oversized();
-        const auto     push_t0 = std::chrono::steady_clock::now();
-        fec.push_app(data, len, &out);
-        fec_push_us.fetch_add(static_cast<uint64_t>(
-                                  std::chrono::duration_cast<std::chrono::microseconds>(
-                                      std::chrono::steady_clock::now() - push_t0)
-                                      .count()),
-                              std::memory_order_relaxed);
-        oversized = fec.oversized() != before;
-    }
-    enqueue_tx_out(&out, pdu_no_evict);
-    if (oversized)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        fec_oversized++;
         dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
-    else
+    if (len > max_input_bytes())
     {
-        std::lock_guard<std::mutex> lock(metrics_mu);
-        ++fec_pkts_sent;
-        fec_bytes_sent += len;
+        oversized.fetch_add(1, std::memory_order_relaxed);
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
+    if (pdu_no_evict)
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        if (!queue.empty() && queue.size() >= k_queue_packet_cap)
+        {
+            queue_full_rejects.fetch_add(1, std::memory_order_relaxed);
+            return -EAGAIN;
+        }
+    }
+    const size_t wire_len = k_media_header_len + len;
+    if (!wire_fits(wire_len))
+    {
+        return 0;
+    }
+    bfc::shared_sized_buffer buf = pool.acquire(wire_len);
+    if (0 == buf.capacity() || buf.size() != wire_len)
+    {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    std::memcpy(buf.u8() + k_media_header_len, data, len);
+    if (!pdu_no_evict)
+    {
+        evict_for_room();
+    }
+    queue_wire(std::move(buf));
+    std::lock_guard<std::mutex> lock(metrics_mu);
+    ++sdu_pkts_sent;
+    sdu_bytes_sent += len;
     return 0;
 }
 
@@ -782,61 +635,6 @@ int stream_sender::input(component_pdu &&in)
         return -EINVAL;
     }
     return ingest_app_sdu(in.sdu.u8(), in.sdu.size(), true);
-}
-
-
-int stream_sender::reinit_fec_if_active()
-{
-    int k = 0;
-    int n = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        if (!opened)
-        {
-            return 0;
-        }
-        k = effective_fec_k();
-        n = effective_fec_n();
-    }
-    if (k > n || k > rs_block_erasure::k_header_k_n_max || n > rs_block_erasure::k_header_k_n_max)
-    {
-        return -EINVAL;
-    }
-
-    /* Close the open block under the old k/n so its data keeps its parity; the data sequence
-     * keeps counting so the receiver's order state stays valid. */
-    rs_block_erasure::tx_out out;
-    bool                     ok = true;
-    {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        fec.flush(&out);
-        ok = fec.init(k, n, static_cast<size_t>(k_wire_datagram_bytes));
-    }
-    enqueue_tx_out(&out, false);
-    if (!ok)
-    {
-        return -EINVAL;
-    }
-    if (n > k)
-    {
-        std::fprintf(stderr, "stream_sender: fec RS_BLOCK_ERASURE k=%d n=%d\n", k, n);
-    }
-    return 0;
-}
-
-void stream_sender::disable_fec()
-{
-    rs_block_erasure::tx_out out;
-    {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        if (!fec.enabled())
-        {
-            return;
-        }
-        fec.flush(&out);
-        fec.disable();
-    }
-    enqueue_tx_out(&out, false);
 }
 
 namespace
@@ -909,131 +707,7 @@ int stream_sender::configure(std::string_view key, std::string_view value)
         target.assign(value.data(), value.size());
         return 0;
     }
-    if (key == keys::fec_spread_ms.name || key == keys::fec_k.name || key == keys::fec_n.name)
-    {
-        uint64_t u = 0;
-        if (key_parse_u64(value, &u) < 0)
-        {
-            return -EINVAL;
-        }
-        return key == keys::fec_spread_ms.name ? set_config_fec_spread_ms(u)
-             : key == keys::fec_k.name         ? set_config_fec_k(u)
-                                               : set_config_fec_n(u);
-    }
-    if ("fec" == key)
-    {
-        std::string mode(value.data(), value.size());
-        if ("none" == mode || "NONE" == mode)
-        {
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                fec_mode = fec_mode_e::none;
-            }
-            return reinit_fec_if_active();
-        }
-        if ("block" == mode || "RS_BLOCK_ERASURE" == mode)
-        {
-            {
-                std::lock_guard<std::mutex> lock(mu);
-                fec_mode = fec_mode_e::block;
-            }
-            return reinit_fec_if_active();
-        }
-        return -EINVAL;
-    }
     return -ENOTSUP;
-}
-
-int stream_sender::configure(uint64_t key, uint64_t value)
-{
-    switch (key)
-    {
-    case keys::fec_spread_ms.id:
-        return set_config_fec_spread_ms(value);
-    case keys::fec_k.id:
-        return set_config_fec_k(value);
-    case keys::fec_n.id:
-        return set_config_fec_n(value);
-    default:
-        return -ENOTSUP;
-    }
-}
-
-int stream_sender::set_config_fec_spread_ms(uint64_t v)
-{
-    if (v > static_cast<uint64_t>(k_fec_spread_max_ms))
-    {
-        return -EINVAL;
-    }
-    fec_spread_ms.store(static_cast<int>(v), std::memory_order_relaxed);
-    /* Shards already queued under a longer spread would otherwise keep their old release
-     * times: after a huge value they fill the queue for that long and stall the stream even
-     * once the spread is lowered. Pull them in to the new spread; release times stay sorted
-     * because the clamp is monotonic. */
-    {
-        const auto latest = std::chrono::steady_clock::now() + std::chrono::milliseconds(v);
-        std::lock_guard<std::mutex> lock(q_mu);
-        for (auto &q : queue)
-        {
-            q.release = std::min(q.release, latest);
-        }
-    }
-    q_cv.notify_one();
-    return 0;
-}
-
-int stream_sender::set_config_fec_k(uint64_t v)
-{
-    if (v < static_cast<uint64_t>(rs_block_erasure::k_header_k_n_min) ||
-        v > static_cast<uint64_t>(rs_block_erasure::k_header_k_n_max))
-    {
-        return -EINVAL;
-    }
-    int old_k = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        if (static_cast<int>(v) > fec_n)
-        {
-            return -EINVAL;
-        }
-        old_k = fec_k;
-        fec_k = static_cast<int>(v);
-        fec_mode = fec_mode_e::block;
-    }
-    if (reinit_fec_if_active() < 0)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        fec_k = old_k;
-        return -EINVAL;
-    }
-    return 0;
-}
-
-int stream_sender::set_config_fec_n(uint64_t v)
-{
-    if (v < static_cast<uint64_t>(rs_block_erasure::k_header_k_n_min) ||
-        v > static_cast<uint64_t>(rs_block_erasure::k_header_k_n_max))
-    {
-        return -EINVAL;
-    }
-    int old_n = 0;
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        if (fec_k > static_cast<int>(v))
-        {
-            return -EINVAL;
-        }
-        old_n = fec_n;
-        fec_n = static_cast<int>(v);
-        fec_mode = fec_mode_e::block;
-    }
-    if (reinit_fec_if_active() < 0)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        fec_n = old_n;
-        return -EINVAL;
-    }
-    return 0;
 }
 
 int stream_sender::query(std::string_view key, std::string *value) const
@@ -1073,7 +747,7 @@ int stream_sender::query(std::string_view key, std::string *value) const
             stream_metric_timestamp_ms(),
             key == "pkt_sent" ? pkts_sent.load(std::memory_order_relaxed)
                               : bytes_sent.load(std::memory_order_relaxed),
-            key == "pkt_sent" ? fec_pkts_sent : fec_bytes_sent);
+            key == "pkt_sent" ? sdu_pkts_sent : sdu_bytes_sent);
         return 0;
     }
     if ("peer_udp_pkt_recv" == key || "peer_fec_pkt_recv" == key ||
@@ -1104,56 +778,25 @@ int stream_sender::query(std::string_view key, std::string *value) const
         }
         return 0;
     }
-    if ("fec_mode" == key)
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        *value = (fec_mode == fec_mode_e::none) ? "none" : "block";
-        return 0;
-    }
     if ("stats" == key)
     {
-        bool fec_on = false;
-        {
-            std::lock_guard<std::mutex> flock(fec_mu);
-            fec_on = fec.enabled() && fec.n() > fec.k();
-        }
         stream_peer_link peer {};
         {
             std::lock_guard<std::mutex> plock(peer_mu);
-            peer.have = peer_have;
-            if (peer_have)
-            {
-                peer.report = peer_report;
-            }
             peer.reports_received = peer_reports_received;
             peer.reports_lost = peer_reports_lost;
             peer.reports_rejected = peer_reports_rejected;
         }
-        std::lock_guard<std::mutex> lock(mu);
-        char buf[480];
-        if (fec_on)
-        {
-            std::snprintf(buf, sizeof(buf),
-                          "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " fec_oversized=%" PRIu64 " fec=k=%d,n=%d"
-                          " peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
-                          pkts_sent.load(std::memory_order_relaxed),
-                          bytes_sent.load(std::memory_order_relaxed),
-                          dropped.load(std::memory_order_relaxed),
-                          fec_oversized, fec_k, fec_n,
-                          peer.reports_received, peer.reports_lost, peer.reports_rejected);
-        }
-        else
-        {
-            std::snprintf(buf, sizeof(buf),
-                          "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
-                          " peer{rcv=%" PRIu64 " lost=%" PRIu64 " rej=%" PRIu64 "}",
-                          pkts_sent.load(std::memory_order_relaxed),
-                          bytes_sent.load(std::memory_order_relaxed),
-                          dropped.load(std::memory_order_relaxed),
-                          peer.reports_received,
-                          peer.reports_lost, peer.reports_rejected);
-        }
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+                      "pkts=%" PRIu64 " bytes=%" PRIu64 " dropped=%" PRIu64
+                      " oversized=%" PRIu64 " peer{rcv=%" PRIu64 " lost=%" PRIu64
+                      " rej=%" PRIu64 "}",
+                      pkts_sent.load(std::memory_order_relaxed),
+                      bytes_sent.load(std::memory_order_relaxed),
+                      dropped.load(std::memory_order_relaxed),
+                      oversized.load(std::memory_order_relaxed), peer.reports_received,
+                      peer.reports_lost, peer.reports_rejected);
         *value = buf;
         return 0;
     }
@@ -1228,31 +871,15 @@ int stream_sender::query(uint64_t key, uint64_t *value) const
         *value = peer_have ? peer_session : 0U;
         return 0;
     }
-    case query_key("fec_oversized"):
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        *value = fec_oversized;
+    case query_key("oversized"):
+        *value = oversized.load(std::memory_order_relaxed);
         return 0;
-    }
     case query_key("max_datagram"):
         *value = static_cast<uint64_t>(k_wire_datagram_bytes);
         return 0;
     case query_key("max_input"):
-        /* The same for every k/n and fec none, so a runtime FEC change never shrinks it. */
         *value = max_input_bytes();
         return 0;
-    case query_key("fec_k"):
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        *value = static_cast<uint64_t>(fec_k);
-        return 0;
-    }
-    case query_key("fec_n"):
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        *value = static_cast<uint64_t>(fec_n);
-        return 0;
-    }
     case query_key("pool_misses"):
         *value = pool.misses();
         return 0;
@@ -1268,24 +895,12 @@ int stream_sender::query(uint64_t key, uint64_t *value) const
         *value = queue_bytes;
         return 0;
     }
-    case query_key("fec_spread_ms"):
-        *value = static_cast<uint64_t>(fec_spread_ms.load(std::memory_order_relaxed));
-        return 0;
     case query_key("dropped"):
         *value = dropped.load(std::memory_order_relaxed);
         return 0;
     case query_key("queue_evicted"):
         *value = queue_evicted.load(std::memory_order_relaxed);
         return 0;
-    case query_key("fec_push_us"):
-        *value = fec_push_us.load(std::memory_order_relaxed);
-        return 0;
-    case query_key("fec_kernel_us"):
-    {
-        std::lock_guard<std::mutex> flock(fec_mu);
-        *value = fec.encode_kernel_us();
-        return 0;
-    }
     case query_key("transport_dropped"):
         *value = transport_dropped.load(std::memory_order_relaxed);
         return 0;
@@ -1325,7 +940,7 @@ int stream_sender::query(uint64_t key, double *value) const
     switch (key)
     {
     case query_key("send_late_max_ms"):
-        /* Since the previous query: how far past its release time a datagram left. */
+        /* Since the previous query: the longest a datagram waited in the send queue. */
         *value = static_cast<double>(send_late_max_us.exchange(0, std::memory_order_relaxed)) /
                  1000.0;
         return 0;

@@ -17,7 +17,6 @@ from utils import (  # noqa: E402
     Clamp,
     Console,
     Delay,
-    FecMap,
     GapLoss,
     LossRateControl,
     telemetry_stale,
@@ -98,9 +97,6 @@ def main() -> int:
     a.default("fec-loss-filter-cutoff", 0.1)
     a.default("encode-rate-filter-cutoff", 5)
     a.default("encode-rate-filter-cutoff-long", 0.1)
-    a.default("k", 6)
-    a.default("n-gain", 1.2)
-    a.default("n-max", 24)
     a.default("cbr-min", 100)
     a.default("cbr-max", 20000)
     a.default("loop-rate", 10.0)
@@ -128,12 +124,9 @@ def main() -> int:
     fec_loss = GapLoss(loop_rate, a("fec-loss-filter-cutoff"))
     lpf_encode_rate = LPF(loop_rate, a("encode-rate-filter-cutoff"))
     lpf_encode_rate_long = LPF(loop_rate, a("encode-rate-filter-cutoff-long"))
-    fec_map = FecMap(a("k"), a("n-gain"))
-    fec_clamp = Clamp(a("k"), a("n-max"))
     cbr_clamp = Clamp(a("cbr-min"), a("cbr-max"))
     tune = TuneConsole(a("tune-host"), a("tune-port"), _make_tune_handler(plot_csv))
     d_encode = Delay(1)
-    console.line(f"set_fec_k {a('k')}")
     metric.refresh()
     s_cbr0 = metric("h264_encoder.cbr_kbps")
     cbr0 = float(s_cbr0) if s_cbr0 is not None else float(a("cbr-min"))
@@ -231,11 +224,7 @@ def main() -> int:
             plot("fec_gap_delta", fec_gap_delta_)
             plot("udp_gap_delta", udp_gap_delta_)
 
-            # calculate FEC N
-            fec_n_ = fec_clamp(fec_map(udp_loss_long.loss))
-            plot("fec_n", fec_n_)
-            console.line(f"set_fec_n {int(round(fec_n_))}")
-
+            # FEC is the link's (winject-l3 upstream); only the bitrate is controlled here.
             # calculate CBR (receiver counter reset on peer restart gives a negative delta)
             cbr_kbps = rate_ctl.step(
                 max(0.0, fec_gap_delta_),

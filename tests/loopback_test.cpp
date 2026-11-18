@@ -22,6 +22,7 @@
 #include "components/stream_sender.hpp"
 #include "core/default_reactor_host.hpp"
 #include "core/stream_header.hpp"
+#include "core/stream_media_header.hpp"
 #include "core/stream_telemetry.hpp"
 #include "stream_query_test_helpers.hpp"
 #include "test_pdu_helpers.hpp"
@@ -282,7 +283,7 @@ void run_link(int n_packets,
         vstreamer::component_pdu in = vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), k_payload);
         ASSERT_EQ(0, sender.input(std::move(in)));
         drain_outputs(0);
-        /* Avoid overrunning the UDP recv path on loopback (drops look like out-of-order FEC). */
+        /* Avoid overrunning the UDP recv path on loopback (drops look like gaps). */
         std::this_thread::sleep_for(std::chrono::microseconds(200));
     }
 
@@ -305,50 +306,17 @@ void run_link(int n_packets,
 
 }  // namespace
 
-TEST(LoopbackTest, FecK6N8InOrder)
-{
-    run_link(
-        2000,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
-            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        },
-        nullptr);
-}
-
-TEST(LoopbackTest, RuntimeFecNRejectedThenAccepted)
-{
-    run_link(
-        2000,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
-            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        },
-        [](vstreamer::stream_sender &sender, int packets_sent) {
-            if (packets_sent == 500)
-            {
-                EXPECT_EQ(-EINVAL, cfg_str(sender, "fec_n", "32"));
-                EXPECT_EQ(0, cfg_str(sender, "fec_n", "10"));
-            }
-        });
-}
-
 TEST(LoopbackTest, MaxDatagram600InOrder)
 {
     run_link(
         2000,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &receiver) {
+        [](vstreamer::stream_sender &, vstreamer::stream_receiver &receiver) {
             ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "600"));
-            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
         },
         nullptr,
         [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
             std::string overs;
-            ASSERT_EQ(0, sender.query("fec_oversized", &overs));
+            ASSERT_EQ(0, sender.query("oversized", &overs));
             EXPECT_EQ("0", overs);
         });
 }
@@ -366,9 +334,6 @@ TEST(LoopbackTest, MaxInputOversizedNotSent)
     ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "600"));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
 
@@ -384,42 +349,19 @@ TEST(LoopbackTest, MaxInputOversizedNotSent)
     ASSERT_EQ(0, sender.input(std::move(big_pkt)));
 
     std::string overs;
-    ASSERT_EQ(0, sender.query("fec_oversized", &overs));
+    ASSERT_EQ(0, sender.query("oversized", &overs));
     EXPECT_NE("0", overs);
 
     sender.close();
     receiver.close();
 }
 
-TEST(LoopbackTest, FecNoneFromStart)
+TEST(LoopbackTest, PlainInOrder)
 {
     run_link(
         2000,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
-            ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
-        },
+        [](vstreamer::stream_sender &, vstreamer::stream_receiver &) {},
         nullptr);
-}
-
-TEST(LoopbackTest, FecModeSwitchMidStream)
-{
-    run_link(
-        2000,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
-            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        },
-        [](vstreamer::stream_sender &sender, int packets_sent) {
-            if (packets_sent == 600)
-            {
-                EXPECT_EQ(0, cfg_str(sender, "fec", "none"));
-            }
-            if (packets_sent == 1200)
-            {
-                EXPECT_EQ(0, cfg_str(sender, "fec", "block"));
-            }
-        });
 }
 
 TEST(LoopbackTest, SenderRestartMidStream)
@@ -457,9 +399,6 @@ TEST(LoopbackTest, SenderRestartMidStream)
         vstreamer::stream_sender sender;
         ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
         ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
-        ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-        ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-        ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
         ASSERT_EQ(0, sender.open());
         const uint32_t end_counter = static_cast<uint32_t>(start_counter + n_packets);
         for (int i = 0; i < n_packets; i++)
@@ -515,9 +454,6 @@ TEST(LoopbackTest, SenderRestartMidStream)
         vstreamer::stream_sender sender;
         ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
         ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
-        ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-        ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-        ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
         ASSERT_EQ(0, sender.open());
         t_restart = std::chrono::steady_clock::now();
         for (int i = 0; i < 400; i++)
@@ -561,9 +497,6 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
     ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "20"));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -601,58 +534,7 @@ TEST(LoopbackTest, ReverseTelemetryCountersMatch)
     relay.stop();
 }
 
-TEST(LoopbackTest, FecKn31WithDropEveryNRecovers)
-{
-    const int rcv_port = ephemeral_udp_port();
-    const int relay_port = ephemeral_udp_port();
-    ASSERT_GT(rcv_port, 0);
-    ASSERT_GT(relay_port, 0);
-
-    UdpNatRelay relay;
-    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 100));
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender   sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    vstreamer::stream_receiver receiver;
-    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
-    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
-    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_n", "31"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_k", "31"));
-
-    ASSERT_EQ(0, receiver.open());
-    ASSERT_EQ(0, sender.open());
-
-    constexpr int k_packets = 80;
-    for (int i = 0; i < k_packets; ++i)
-    {
-        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
-        std::this_thread::sleep_for(std::chrono::microseconds(800));
-    }
-    uint32_t delivered = 0;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-    while (delivered < static_cast<uint32_t>(k_packets) &&
-           std::chrono::steady_clock::now() < deadline)
-    {
-        vstreamer::component_pdu out;
-        if (receiver.output(out) == 0)
-        {
-            ++delivered;
-        }
-    }
-    EXPECT_EQ(static_cast<uint32_t>(k_packets), delivered);
-    const auto cnt = vstreamer::test_query::receiver_counters(receiver);
-    EXPECT_EQ(0U, cnt.fec_gap_count);
-
-    sender.close();
-    receiver.close();
-    relay.stop();
-}
-
-TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
+TEST(LoopbackTest, WithoutLinkCountersFecHalfMatchesUdpHalf)
 {
     const int rcv_port = ephemeral_udp_port();
     const int relay_port = ephemeral_udp_port();
@@ -670,7 +552,6 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
     const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
     ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -685,7 +566,7 @@ TEST(LoopbackTest, RawModeFecGapMatchesUdpGap)
     EXPECT_EQ(cnt.udp_gap_count, cnt.fec_gap_count);
     EXPECT_EQ(cnt.udp_packet_received, cnt.fec_packet_received);
     EXPECT_EQ(cnt.fec_packet_received * 64, cnt.fec_bytes_received);
-    EXPECT_EQ(cnt.udp_packet_received * (64 + vstreamer::rs_block_erasure::k_data_header_len),
+    EXPECT_EQ(cnt.udp_packet_received * (64 + vstreamer::k_media_header_len),
               cnt.udp_bytes_received);
 
     sender.close();
@@ -712,7 +593,6 @@ TEST(LoopbackTest, PeerReportIntervalNearTelemetryMs)
     ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
     ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
     ASSERT_EQ(0, cfg_str(receiver, "telemetry_ms", "100"));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -748,7 +628,6 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     ASSERT_EQ(0, cfg_str(sender, "udp_transport", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "listen", host_port));
     ASSERT_EQ(0, cfg_str(receiver, "max_datagram", "1476"));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "none"));
 
     ASSERT_EQ(0, receiver.open());
     ASSERT_EQ(0, sender.open());
@@ -756,7 +635,7 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     std::string max_in_s;
     ASSERT_EQ(0, sender.query("max_input", &max_in_s));
     const size_t max_in = static_cast<size_t>(std::strtoull(max_in_s.c_str(), nullptr, 10));
-    EXPECT_EQ(1470U, max_in);
+    EXPECT_EQ(1476U - vstreamer::k_media_header_len, max_in);
 
     auto send_and_expect = [&](size_t payload_len, uint32_t tag) {
         std::vector<uint8_t> storage(payload_len);
@@ -796,70 +675,3 @@ TEST(LoopbackTest, RawMaxInputPayloadDelivered)
     receiver.close();
 }
 
-TEST(LoopbackTest, FecBlockNoneBlockNoExtraGap)
-{
-    run_link(
-        400,
-        [](vstreamer::stream_sender &sender, vstreamer::stream_receiver &) {
-            ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-            ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-        },
-        [](vstreamer::stream_sender &sender, int packets_sent) {
-            if (100 == packets_sent)
-            {
-                EXPECT_EQ(0, cfg_str(sender, "fec", "none"));
-            }
-            if (200 == packets_sent)
-            {
-                EXPECT_EQ(0, cfg_str(sender, "fec", "block"));
-            }
-        },
-        [](vstreamer::stream_sender &, vstreamer::stream_receiver &receiver)
-        {
-            const auto cnt = vstreamer::test_query::receiver_counters(receiver);
-            EXPECT_EQ(0U, cnt.fec_gap_count);
-        });
-}
-
-TEST(LoopbackTest, WholeBlockLossViaBurstDrop)
-{
-    const int rcv_port = ephemeral_udp_port();
-    const int relay_port = ephemeral_udp_port();
-    ASSERT_GT(rcv_port, 0);
-    ASSERT_GT(relay_port, 0);
-
-    UdpNatRelay relay;
-    ASSERT_EQ(0, relay.start(relay_port, rcv_port, 0));
-    /* k=6 n=8 → 8 air shards per block; drop the second block wholesale. */
-    relay.set_drop_burst(8, 8);
-
-    vstreamer::default_reactor_host sender_reactor;
-    vstreamer::stream_sender   sender;
-    ASSERT_EQ(0, sender.configure("reactor", sender_reactor.name()));
-    vstreamer::stream_receiver receiver;
-    const std::string          relay_host = "127.0.0.1:" + std::to_string(relay_port);
-    const std::string          rcv_host = "127.0.0.1:" + std::to_string(rcv_port);
-    ASSERT_EQ(0, cfg_str(sender, "udp_transport", relay_host));
-    ASSERT_EQ(0, cfg_str(receiver, "listen", rcv_host));
-    ASSERT_EQ(0, cfg_str(sender, "fec", "block"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_k", "6"));
-    ASSERT_EQ(0, cfg_str(sender, "fec_n", "8"));
-
-    ASSERT_EQ(0, receiver.open());
-    ASSERT_EQ(0, sender.open());
-
-    for (int i = 0; i < 24; ++i)
-    {
-        ASSERT_EQ(0, sender.input(vstreamer::test_pdu::make_stream_dgram(static_cast<uint32_t>(i), 64)));
-        std::this_thread::sleep_for(std::chrono::microseconds(400));
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    const auto cnt = vstreamer::test_query::receiver_counters(receiver);
-    EXPECT_EQ(6U, cnt.fec_gap_count);
-
-    sender.close();
-    receiver.close();
-    relay.stop();
-}

@@ -42,13 +42,14 @@ struct live_tx_config
     kv_list src {{"buffers", "6"}, {"fps", "30"},     {"bitrate", "10000"},
                  {"gop", "30"},    {"qp_min", "20"}, {"qp_max", "51"}};
     kv_list pay {{"fps", "30"}, {"mtu", "1400"}};
-    kv_list snd {{"fec", "none"}};
+    /* stream_sender keys (no FEC here: the link runs it, e.g. a winject-l3 upstream). */
+    kv_list snd {};
 };
 
 /*
  * Live video TX on the ESP32-P4: esp32_h264_isp_ng_src (MIPI-CSI camera, ISP, hardware H.264) ->
- * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), with the P4 thread layout (FEC encode on core 0,
- * send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
+ * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), with the P4 thread layout (encode and
+ * payload on core 0, send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
  * passed (or forever) and returns 0 when the stream ran at a usable rate, -1 on failure, and 0
  * without streaming when no camera sensor answers.
  */

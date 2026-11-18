@@ -253,14 +253,6 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
     }
 #endif
 
-#if defined(ENABLE_STREAM_RECEIVER)
-    const uint64_t fec_recovered =
-        nullptr != rcv ? query_u64(*rcv, "fec_recovered") : 0;
-    const uint64_t fec_failures = nullptr != rcv ? query_u64(*rcv, "fec_failures") : 0;
-#else
-    const uint64_t fec_recovered = 0;
-    const uint64_t fec_failures = 0;
-#endif
 
 #if !defined(VSTREAMER_BENCH_RX_ONLY)
     if (nullptr != sender)
@@ -344,16 +336,8 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                 *g_pipeline_metrics.get_metric("stream_sender.in_kbps"),
                 snd_in_kbps);
         }
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_k"),
-                     static_cast<int64_t>(query_u64(*sender, "fec_k")));
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_n"),
-                     static_cast<int64_t>(query_u64(*sender, "fec_n")));
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_recovered"),
-                     fec_recovered);
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_failures"),
-                     fec_failures);
-        metric_store(*g_pipeline_metrics.get_metric("stream_sender.fec_oversized"),
-                     query_u64(*sender, "fec_oversized"));
+        metric_store(*g_pipeline_metrics.get_metric("stream_sender.oversized"),
+                     query_u64(*sender, "oversized"));
         /* Packets evicted from the send queue (or rejected) before reaching the wire. */
         metric_store(*g_pipeline_metrics.get_metric("stream_sender.dropped"),
                      query_u64(*sender, "dropped"));
@@ -406,30 +390,6 @@ void update_pipeline_metrics(const bench_diag &d, component_coder *enc, stream_s
                 *g_pipeline_metrics.get_metric("stream_receiver.out_kbps"),
                 rcv_out_kbps);
         }
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_recovered"),
-                     fec_recovered);
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_failures"),
-                     fec_failures);
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_hdr_errors"),
-                     query_u64(*rcv, "fec_hdr_errors"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_kn_mismatch"),
-                     query_u64(*rcv, "fec_kn_mismatch"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_evicted_blocks"),
-                     query_u64(*rcv, "fec_evicted_blocks"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_rs_failures"),
-                     query_u64(*rcv, "fec_rs_failures"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_missing_shards"),
-                     query_u64(*rcv, "fec_missing_shards"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_late_blocks"),
-                     query_u64(*rcv, "fec_late_blocks"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_given_up_blocks"),
-                     query_u64(*rcv, "fec_given_up_blocks"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_new_references"),
-                     query_u64(*rcv, "fec_new_references"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_spread_est_ms"),
-                     query_double(*rcv, "fec_spread_est_ms"));
-        metric_store(*g_pipeline_metrics.get_metric("stream_receiver.fec_jitter_est_ms"),
-                     query_double(*rcv, "fec_jitter_est_ms"));
     }
 #endif
 

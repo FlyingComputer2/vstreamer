@@ -18,7 +18,6 @@
  *   help | h | ?
  *   set_max_kbps <kbps>
  *   set_constant_loss <pct>
- *   set_fec none | set_fec_k <k> | set_fec_n <n>  (stream_sender RS_BLOCK_ERASURE)
  *   set_encode_cbr <kbps> | set_encode_qp <qp> | set_gop <gop> | force_idr | get_metric <name>
  *   ping / stats / metrics | get | empty line → pipeline metrics report
  *
@@ -560,33 +559,6 @@ int main(int argc, char **argv)
     /* Winject WiFi MPDU cap (1476-byte UDP payload including the stream header). */
     cfg_str(rcv, "max_datagram", "1476");
     cfg_str(rcv, "listen", listen_buf);
-    {
-        const char *fec = std::getenv("VSTREAMER_FEC");
-        const bool  fec_off =
-            nullptr != fec &&
-            (0 == std::strcmp(fec, "0") || 0 == std::strcmp(fec, "none"));
-        if (!fec_off)
-        {
-            const char *fk = std::getenv("VSTREAMER_FEC_K");
-            const char *fn = std::getenv("VSTREAMER_FEC_N");
-            if (cfg_str(sender, "fec", "block") < 0)
-            {
-                return 1;
-            }
-            if (nullptr != fk && fk[0] != '\0' && cfg_str(sender, "fec_k", fk) < 0)
-            {
-                return 1;
-            }
-            if (nullptr != fn && fn[0] != '\0' && cfg_str(sender, "fec_n", fn) < 0)
-            {
-                return 1;
-            }
-            std::fprintf(stderr,
-                         "%s: stream_sender FEC block k=%s n=%s (set VSTREAMER_FEC=none for "
-                         "plain RTP / camera upstream)\n",
-                         app_label, nullptr != fk ? fk : "10", nullptr != fn ? fn : "12");
-        }
-    }
     cfg_str(dec, "size", size_buf);
     cfg_str(dec, "fps", fps_buf);
     cfg_str(dec, "output_size_mode", "stream");
