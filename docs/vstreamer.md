@@ -765,7 +765,8 @@ again after every reopen. A key never set keeps the sensor table's or the ISP tu
 | `gain` | 0, 16–1023 | manual analog gain ×16; 0 = sensor AGC |
 | `gain_ceiling` | 16–1023 | AGC limit ×16 (default 0x1f0 = 31×) |
 | `ae_target` | 2–235 | AEC brightness target (driver default 80) |
-| `awb` | 0, 1 | 1 = sensor AWB, 0 = manual `wb_r` / `wb_g` / `wb_b` (×1024, 1–4095) |
+| `awb` | 0, 1 | 1 = sensor AWB; 0 = sensor AWB off (0x5001 bit 0) and the ISP applies `wb_r` / `wb_b` |
+| `wb_r`, `wb_b` | 1–3999 | ISP red / blue gain ×1000 relative to green (1000 = 1×), used while `awb` is 0 |
 | `brightness` | −128–127 | ISP colour brightness |
 | `contrast`, `saturation` | 0–255 | ISP colour, 128 = 1× |
 | `hue` | 0–360 | ISP hue rotation, degrees |

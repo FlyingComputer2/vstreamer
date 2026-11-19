@@ -346,9 +346,8 @@ esp32p4_csi_device::image_ctl::image_ctl()
     value[camctl::find_key("gain_ceiling")] = 0x1f0;
     value[camctl::find_key("ae_target")] = 80;
     value[camctl::find_key("awb")] = 1;
-    value[camctl::find_key("wb_r")] = 1024;
-    value[camctl::find_key("wb_g")] = 1024;
-    value[camctl::find_key("wb_b")] = 1024;
+    value[camctl::find_key("wb_r")] = V4L2_CID_RED_BALANCE_DEN;
+    value[camctl::find_key("wb_b")] = V4L2_CID_BLUE_BALANCE_DEN;
     value[camctl::find_key("contrast")] = 128;
     value[camctl::find_key("saturation")] = 128;
     value[camctl::find_key("gamma")] = 100;
@@ -543,7 +542,10 @@ int esp32p4_csi_device::image_ctl::apply(int index)
         int r = 0;
         if (n == "exposure_us")
         {
-            /* 0x3503 bit 0: manual AEC. Value first, so manual starts from it. */
+            /* 0x3503 bit 0: manual AEC. Manual first: while AEC runs it owns
+             * 0x3500..0x3502, and a value written then would be replaced by
+             * the AEC's before manual mode froze it. */
+            r |= sensor_bits(0x3503, 0x01, val > 0);
             if (val > 0)
             {
                 const uint32_t e = camctl::ov5647_exposure_reg(val, hts, vts, k_ov5647_pclk_hz);
@@ -551,17 +553,17 @@ int esp32p4_csi_device::image_ctl::apply(int index)
                 r |= sensor_write(0x3501, static_cast<uint8_t>((e >> 8) & 0xff));
                 r |= sensor_write(0x3502, static_cast<uint8_t>(e & 0xff));
             }
-            r |= sensor_bits(0x3503, 0x01, val > 0);
         }
         else if (n == "gain")
         {
-            /* 0x3503 bit 1: manual AGC; 0x350a/0x350b: gain x16, 10 bits. */
+            /* 0x3503 bit 1: manual AGC, set first for the same reason;
+             * 0x350a/0x350b: gain x16, 10 bits. */
+            r |= sensor_bits(0x3503, 0x02, val > 0);
             if (val > 0)
             {
                 r |= sensor_write(0x350a, static_cast<uint8_t>((val >> 8) & 0x03));
                 r |= sensor_write(0x350b, static_cast<uint8_t>(val & 0xff));
             }
-            r |= sensor_bits(0x3503, 0x02, val > 0);
         }
         else if (n == "gain_ceiling")
         {
@@ -578,22 +580,26 @@ int esp32p4_csi_device::image_ctl::apply(int index)
             r |= sensor_write(0x3a11, t.fast_high);
             r |= sensor_write(0x3a1f, t.fast_low);
         }
-        else if (n == "awb" || n == "wb_r" || n == "wb_g" || n == "wb_b")
+        else if (n == "awb" || n == "wb_r" || n == "wb_b")
         {
-            /* 0x3406 bit 0: manual AWB gains, 12 bits each in 0x3400..0x3405
-             * (R, G, B). The gains are written whenever AWB is manual. */
-            if (0 == v("awb"))
+            /* 0x5001 bit 0 enables the sensor's AWB gain block, as in the Linux
+             * ov5647 driver; off, the raw output is unscaled. The OV5640-style
+             * manual gains at 0x3400..0x3406 do not take on the OV5647 (0x3406
+             * reads back 0 after a write), so manual gains are the ISP's
+             * red / blue balance, which goes back to 1x when AWB is auto. */
+            const bool manual = 0 == v("awb");
+            r |= sensor_bits(0x5001, 0x01, !manual);
+            if (r < 0)
             {
-                const int g[3] = {v("wb_r"), v("wb_g"), v("wb_b")};
-                for (int c = 0; c < 3; ++c)
-                {
-                    r |= sensor_write(static_cast<uint16_t>(0x3400 + 2 * c),
-                                      static_cast<uint8_t>((g[c] >> 8) & 0x0f));
-                    r |= sensor_write(static_cast<uint16_t>(0x3401 + 2 * c),
-                                      static_cast<uint8_t>(g[c] & 0xff));
-                }
+                return -EIO;
             }
-            r |= sensor_bits(0x3406, 0x01, 0 == v("awb"));
+            const int rg = manual ? v("wb_r") : V4L2_CID_RED_BALANCE_DEN;
+            const int bg = manual ? v("wb_b") : V4L2_CID_BLUE_BALANCE_DEN;
+            if (const int e = isp_set(V4L2_CID_RED_BALANCE, rg); e < 0)
+            {
+                return e;
+            }
+            return isp_set(V4L2_CID_BLUE_BALANCE, bg);
         }
         return r < 0 ? -EIO : 0;
 #else
@@ -671,12 +677,15 @@ void esp32p4_csi_device::image_ctl::apply_set(bool isp_only)
     bool awb_group = false;
     for (int i = 0; i < camctl::k_key_count; ++i)
     {
-        if (!set[i] || (isp_only && camctl::target::isp != camctl::k_keys[i].where))
+        const std::string_view n = camctl::k_keys[i].name;
+        /* The AWB group ends in the ISP balance, which the tuning may write
+         * too, so it is part of the ISP re-write as well. */
+        const bool awb_key = n == "awb" || n == "wb_r" || n == "wb_b";
+        if (!set[i] || (isp_only && !awb_key && camctl::target::isp != camctl::k_keys[i].where))
         {
             continue;
         }
-        const std::string_view n = camctl::k_keys[i].name;
-        if (n == "awb" || n == "wb_r" || n == "wb_g" || n == "wb_b")
+        if (awb_key)
         {
             if (awb_group)
             {
@@ -706,7 +715,7 @@ int esp32p4_csi_device::image_ctl::sensor_state(std::string *out)
     if (sensor_read(0x3503, &aec) < 0 || sensor_read(0x3500, &e0) < 0 ||
         sensor_read(0x3501, &e1) < 0 || sensor_read(0x3502, &e2) < 0 ||
         sensor_read(0x350a, &g0) < 0 || sensor_read(0x350b, &g1) < 0 ||
-        sensor_read(0x3406, &wb) < 0 || sensor_read(0x3a18, &c0) < 0 ||
+        sensor_read(0x5001, &wb) < 0 || sensor_read(0x3a18, &c0) < 0 ||
         sensor_read(0x3a19, &c1) < 0 || sensor_read(0x3a0f, &t) < 0)
     {
         return -EIO;
@@ -719,7 +728,7 @@ int esp32p4_csi_device::image_ctl::sensor_state(std::string *out)
                   (aec & 0x01) ? "manual" : "auto", (aec & 0x02) ? "manual" : "auto",
                   camctl::ov5647_exposure_us(e, hts, k_ov5647_pclk_hz), e >> 4,
                   ((g0 & 0x03) << 8) | g1, ((c0 & 0x03) << 8) | c1, t,
-                  (wb & 0x01) ? "manual" : "auto", hts, vts);
+                  (wb & 0x01) ? "auto" : "off", hts, vts);
     *out = buf;
     return 0;
 #endif
@@ -731,16 +740,18 @@ int esp32p4_csi_device::image_ctl::isp_state(std::string *out)
     {
         return r;
     }
-    struct v4l2_ext_control c[4] = {};
+    struct v4l2_ext_control c[6] = {};
     c[0].id = V4L2_CID_BRIGHTNESS;
     c[1].id = V4L2_CID_CONTRAST;
     c[2].id = V4L2_CID_SATURATION;
     c[3].id = V4L2_CID_HUE;
+    c[4].id = V4L2_CID_RED_BALANCE;
+    c[5].id = V4L2_CID_BLUE_BALANCE;
     struct v4l2_ext_controls cs
     {
     };
     cs.ctrl_class = V4L2_CID_USER_CLASS;
-    cs.count = 4;
+    cs.count = 6;
     cs.controls = c;
     if (const int r = xioctl(isp_fd, VIDIOC_G_EXT_CTRLS, &cs, "ISP G_EXT_CTRLS"); r < 0)
     {
@@ -748,13 +759,18 @@ int esp32p4_csi_device::image_ctl::isp_state(std::string *out)
     }
     esp_video_isp_sharpen_t s{};
     const bool sh = isp_get_struct(V4L2_CID_USER_ESP_ISP_SHARPEN, &s, sizeof(s)) == 0;
-    char buf[192];
+    /* GAMMA_EXT: the plain GAMMA get logs a warning on every call. */
+    esp_video_isp_gamma_ext_t g{};
+    const bool gm = isp_get_struct(V4L2_CID_USER_ESP_ISP_GAMMA_EXT, &g, sizeof(g)) == 0;
+    char buf[256];
     std::snprintf(buf, sizeof(buf),
                   "brightness=%" PRId32 " contrast=%" PRId32 " saturation=%" PRId32
-                  " hue=%" PRId32 " sharpen=%s h_coeff=%.3f m_coeff=%.3f",
-                  c[0].value, c[1].value, c[2].value, c[3].value,
+                  " hue=%" PRId32 " wb_r=%" PRId32 " wb_b=%" PRId32
+                  " sharpen=%s h_coeff=%.3f m_coeff=%.3f gamma=%s y16=%u y128=%u",
+                  c[0].value, c[1].value, c[2].value, c[3].value, c[4].value, c[5].value,
                   !sh ? "?" : s.enable ? "on" : "off", static_cast<double>(s.h_coeff),
-                  static_cast<double>(s.m_coeff));
+                  static_cast<double>(s.m_coeff), !gm ? "?" : g.enable ? "on" : "off",
+                  gm ? g.green_points[0].y : 0U, gm ? g.green_points[7].y : 0U);
     *out = buf;
     return 0;
 }

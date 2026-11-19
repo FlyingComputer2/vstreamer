@@ -34,6 +34,13 @@ TEST(CameraImageCtlTest, ValueRanges)
     EXPECT_FALSE(camctl::value_ok(gamma, 10));
     EXPECT_TRUE(camctl::value_ok(gamma, 72));
 
+    /* Manual WB is the ISP's red / blue balance (x1000, below 4x). */
+    EXPECT_EQ(-1, camctl::find_key("wb_g"));
+    const int wb_r = camctl::find_key("wb_r");
+    EXPECT_TRUE(camctl::value_ok(wb_r, 1000));
+    EXPECT_TRUE(camctl::value_ok(wb_r, 3999));
+    EXPECT_FALSE(camctl::value_ok(wb_r, 4000));
+
     const int br = camctl::find_key("brightness");
     EXPECT_TRUE(camctl::value_ok(br, -128));
     EXPECT_FALSE(camctl::value_ok(br, -129));

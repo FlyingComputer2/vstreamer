@@ -12,8 +12,10 @@
  *   gain          manual analog gain x16 (16 = 1x .. 1023); 0 = sensor AGC
  *   gain_ceiling  AGC upper limit x16 (16..1023)
  *   ae_target     AEC brightness target (2..235); the driver loads 80
- *   awb           1 = sensor AWB, 0 = manual gains wb_r / wb_g / wb_b
- *   wb_r wb_g wb_b  manual sensor WB gains x1024 (1024 = 1x, 1..4095)
+ *   awb           1 = sensor AWB, 0 = sensor AWB off and the ISP applies
+ *                 wb_r / wb_b
+ *   wb_r wb_b     manual ISP red / blue gains x1000 relative to green
+ *                 (1000 = 1x, 1..3999); used while awb is 0
  *   brightness    ISP colour brightness (-128..127, 0 = none)
  *   contrast      ISP colour contrast (0..255, 128 = 1x)
  *   saturation    ISP colour saturation (0..255, 128 = 1x)
@@ -52,9 +54,8 @@ inline constexpr key_desc k_keys[] = {
     {"gain_ceiling", 16, 1023, target::sensor},
     {"ae_target", 2, 235, target::sensor},
     {"awb", 0, 1, target::sensor},
-    {"wb_r", 1, 4095, target::sensor},
-    {"wb_g", 1, 4095, target::sensor},
-    {"wb_b", 1, 4095, target::sensor},
+    {"wb_r", 1, 3999, target::sensor},
+    {"wb_b", 1, 3999, target::sensor},
     {"brightness", -128, 127, target::isp},
     {"contrast", 0, 255, target::isp},
     {"saturation", 0, 255, target::isp},
