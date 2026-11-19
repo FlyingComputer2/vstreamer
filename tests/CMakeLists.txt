@@ -1,6 +1,7 @@
 set(VSTREAMER_TEST_SOURCES
     app_console_test.cpp
     buffer_pool_test.cpp
+    camera_image_ctl_test.cpp
     component_contract_test.cpp
     link_emulator_test.cpp
     cpu_map_test.cpp

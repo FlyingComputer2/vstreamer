@@ -260,7 +260,7 @@ int esp32p4_csi_camera_src::configure(std::string_view key, std::string_view val
     {
         return pr;
     }
-    if (source_open && key != "fps")
+    if (source_open && key != "fps" && !detail::esp32p4_csi_device::live_key(key))
     {
         return -EBUSY;
     }

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cinttypes>
 #include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -19,12 +20,15 @@
 #include <utility>
 #include <vector>
 
+#include "components/camera_image_ctl.hpp"
 #include "core/key_util.hpp"
 #include "core/sdu_type.hpp"
 #include "core/time_util.hpp"
+#include "driver/i2c_master.h"
 #include "esp_video_device.h"
 #include "esp_video_init.h"
 #include "esp_video_ioctl.h"
+#include "esp_video_isp_ioctl.h"
 #include "linux/videodev2.h"
 #include "sdkconfig.h"
 #if CONFIG_CAMERA_OV5647
@@ -67,6 +71,53 @@ struct esp32p4_csi_device::ring
         --held;
         cv.notify_all();
     }
+};
+
+/*
+ * Live image controls. Sensor keys write OV5647 registers through a device
+ * handle of our own on the camera's SCCB bus (esp_video has no register
+ * ioctl; the i2c master serializes our transfers with esp_cam_sensor's). ISP
+ * keys go to the ISP video device, which esp_video lets several users open.
+ *
+ * The ISP tuning (esp_ipa) writes contrast, gamma and sharpen once its first
+ * statistics arrive, which can be after STREAMON, so the ISP keys that were set
+ * are written again a few frames into each stream.
+ */
+struct esp32p4_csi_device::image_ctl
+{
+    std::mutex mu;
+    int value[camctl::k_key_count];
+    bool set[camctl::k_key_count] = {};
+    i2c_master_dev_handle_t sccb = nullptr;
+    bool sensor_ok = false; /* chip id read back as 0x5647 */
+    int hts = 0, vts = 0;   /* read from the sensor at each stream start */
+    int isp_fd = -1;
+    bool sharpen_base_valid = false;
+    esp_video_isp_sharpen_t sharpen_base{};
+    /* Frame count of this stream and the frame at which to write the ISP keys
+     * again; 0 = done. Touched by dequeue() only. */
+    uint32_t frames = 0;
+    uint32_t reapply_at = 0;
+
+    image_ctl();
+    ~image_ctl();
+    int v(std::string_view name) const
+    {
+        return value[camctl::find_key(name)];
+    }
+    void attach_sensor(int port, int freq);
+    int sensor_read(uint16_t reg, uint8_t *out);
+    int sensor_write(uint16_t reg, uint8_t val);
+    int sensor_bits(uint16_t reg, uint8_t mask, bool on);
+    void read_timing();
+    int isp_open();
+    int isp_set(uint32_t id, int32_t val);
+    int isp_set_struct(uint32_t id, void *p, size_t size);
+    int isp_get_struct(uint32_t id, void *p, size_t size);
+    int apply(int index);
+    void apply_set(bool isp_only);
+    int sensor_state(std::string *out);
+    int isp_state(std::string *out);
 };
 
 namespace
@@ -157,8 +208,7 @@ int xioctl(int fd, unsigned long req, void *arg, const char *what)
  * table as a custom sensor format.
  */
 constexpr double k_ov5647_pclk_hz = 81666700.0 * 24.0 / 25.0;
-constexpr int k_ov5647_min_vts = 1104;       /* 1080 active lines + the Linux driver's blanking */
-constexpr int k_ov5647_gain_ceiling = 0x1f0; /* real gain x16 */
+constexpr int k_ov5647_min_vts = 1104; /* 1080 active lines + the Linux driver's blanking */
 std::vector<ov5647_reginfo_t> s_ov5647_regs;
 esp_cam_sensor_format_t s_ov5647_fmt;
 /* ISP description with the Bayer order of the flipped readout. Placement-new
@@ -187,7 +237,7 @@ void ov5647_set_bit1(std::vector<ov5647_reginfo_t> &regs, uint16_t reg, bool on)
     }
 }
 
-void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
+void ov5647_fix_format(int fd, int fps, int light_freq, int rotate, int gain_ceiling)
 {
     esp_cam_sensor_format_t cur{};
     if (ioctl(fd, VIDIOC_G_SENSOR_FMT, &cur) != 0 || nullptr == cur.name || nullptr == cur.regs ||
@@ -237,11 +287,11 @@ void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
     /* AGC ceiling 0x3a18/0x3a19: the table's 0x3ff (64x) lets the sensor's own
      * AGC flip gain between ~0x3ff and ~0x260 on alternate frames (a 15 Hz
      * brightness flicker) once exposure hits its band limit. At 0x1f0 (31x) the
-     * gain settles. */
+     * gain settles. The gain_ceiling key overrides it. */
     for (auto &r : regs)
     {
-        r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling >> 8) : r.val;
-        r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(k_ov5647_gain_ceiling & 0xff) : r.val;
+        r.val = 0x3a18 == r.reg ? static_cast<uint8_t>(gain_ceiling >> 8) : r.val;
+        r.val = 0x3a19 == r.reg ? static_cast<uint8_t>(gain_ceiling & 0xff) : r.val;
     }
     /* The table's native orientation is flip off, mirror on (0x3820 bit 1 = 0,
      * 0x3821 bit 1 = 1); 180 degrees inverts both. */
@@ -275,7 +325,464 @@ void ov5647_fix_format(int fd, int fps, int light_freq, int rotate)
 }
 #endif
 
+/* ISP frames to wait after STREAMON before writing the set ISP keys again,
+ * past the tuning's first update. */
+constexpr uint32_t k_isp_reapply_frame = 8;
+constexpr int k_sccb_timeout_ms = 50;
+constexpr uint16_t k_ov5647_addr = 0x36;
+/* The sharpen coefficients are 3.5 fixed point. */
+constexpr float k_sharpen_coeff_max = 7.96875f;
+
 }  // namespace
+
+/* ----- image controls ----- */
+
+esp32p4_csi_device::image_ctl::image_ctl()
+{
+    for (int i = 0; i < camctl::k_key_count; ++i)
+    {
+        value[i] = 0;
+    }
+    value[camctl::find_key("gain_ceiling")] = 0x1f0;
+    value[camctl::find_key("ae_target")] = 80;
+    value[camctl::find_key("awb")] = 1;
+    value[camctl::find_key("wb_r")] = V4L2_CID_RED_BALANCE_DEN;
+    value[camctl::find_key("wb_b")] = V4L2_CID_BLUE_BALANCE_DEN;
+    value[camctl::find_key("contrast")] = 128;
+    value[camctl::find_key("saturation")] = 128;
+    value[camctl::find_key("gamma")] = 100;
+    value[camctl::find_key("sharpness")] = 100;
+}
+
+esp32p4_csi_device::image_ctl::~image_ctl()
+{
+    if (nullptr != sccb)
+    {
+        (void)i2c_master_bus_rm_device(sccb);
+    }
+    if (isp_fd >= 0)
+    {
+        ::close(isp_fd);
+    }
+}
+
+void esp32p4_csi_device::image_ctl::attach_sensor(int port, int freq)
+{
+#if CONFIG_CAMERA_OV5647
+    if (nullptr != sccb)
+    {
+        return;
+    }
+    i2c_master_bus_handle_t bus = nullptr;
+    if (i2c_master_get_bus_handle(static_cast<i2c_port_num_t>(port), &bus) != ESP_OK ||
+        nullptr == bus)
+    {
+        std::fprintf(stderr, "esp32p4_csi_camera_src: no I2C%d bus for image controls\n", port);
+        return;
+    }
+    i2c_device_config_t dc{};
+    dc.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    dc.device_address = k_ov5647_addr;
+    dc.scl_speed_hz = static_cast<uint32_t>(freq);
+    if (i2c_master_bus_add_device(bus, &dc, &sccb) != ESP_OK)
+    {
+        sccb = nullptr;
+        std::fprintf(stderr, "esp32p4_csi_camera_src: SCCB device for image controls failed\n");
+        return;
+    }
+    uint8_t hi = 0;
+    uint8_t lo = 0;
+    sensor_ok = sensor_read(0x300a, &hi) == 0 && sensor_read(0x300b, &lo) == 0 && 0x56 == hi &&
+                0x47 == lo;
+    if (!sensor_ok)
+    {
+        std::fprintf(stderr,
+                     "esp32p4_csi_camera_src: chip id 0x%02x%02x is not OV5647; sensor "
+                     "image controls off\n",
+                     hi, lo);
+    }
+#else
+    (void)port;
+    (void)freq;
+#endif
+}
+
+int esp32p4_csi_device::image_ctl::sensor_read(uint16_t reg, uint8_t *out)
+{
+    if (nullptr == sccb)
+    {
+        return -ENODEV;
+    }
+    const uint8_t a[2] = {static_cast<uint8_t>(reg >> 8), static_cast<uint8_t>(reg & 0xff)};
+    return i2c_master_transmit_receive(sccb, a, sizeof(a), out, 1, k_sccb_timeout_ms) == ESP_OK
+               ? 0
+               : -EIO;
+}
+
+int esp32p4_csi_device::image_ctl::sensor_write(uint16_t reg, uint8_t val)
+{
+    if (nullptr == sccb)
+    {
+        return -ENODEV;
+    }
+    const uint8_t b[3] = {static_cast<uint8_t>(reg >> 8), static_cast<uint8_t>(reg & 0xff), val};
+    return i2c_master_transmit(sccb, b, sizeof(b), k_sccb_timeout_ms) == ESP_OK ? 0 : -EIO;
+}
+
+int esp32p4_csi_device::image_ctl::sensor_bits(uint16_t reg, uint8_t mask, bool on)
+{
+    uint8_t cur = 0;
+    if (const int r = sensor_read(reg, &cur); r < 0)
+    {
+        return r;
+    }
+    return sensor_write(reg, static_cast<uint8_t>(on ? (cur | mask) : (cur & ~mask)));
+}
+
+void esp32p4_csi_device::image_ctl::read_timing()
+{
+    uint8_t b[4] = {};
+    if (sensor_read(0x380c, &b[0]) == 0 && sensor_read(0x380d, &b[1]) == 0 &&
+        sensor_read(0x380e, &b[2]) == 0 && sensor_read(0x380f, &b[3]) == 0)
+    {
+        hts = (b[0] << 8) | b[1];
+        vts = (b[2] << 8) | b[3];
+    }
+}
+
+int esp32p4_csi_device::image_ctl::isp_open()
+{
+    if (isp_fd < 0)
+    {
+        isp_fd = ::open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
+        if (isp_fd < 0)
+        {
+            std::fprintf(stderr, "esp32p4_csi_camera_src: open %s: %s\n",
+                         ESP_VIDEO_ISP1_DEVICE_NAME, std::strerror(errno));
+            return -ENODEV;
+        }
+    }
+    return 0;
+}
+
+int esp32p4_csi_device::image_ctl::isp_set(uint32_t id, int32_t val)
+{
+    if (const int r = isp_open(); r < 0)
+    {
+        return r;
+    }
+    struct v4l2_ext_control c
+    {
+    };
+    c.id = id;
+    c.value = val;
+    struct v4l2_ext_controls cs
+    {
+    };
+    cs.ctrl_class = V4L2_CID_USER_CLASS;
+    cs.count = 1;
+    cs.controls = &c;
+    return xioctl(isp_fd, VIDIOC_S_EXT_CTRLS, &cs, "ISP S_EXT_CTRLS");
+}
+
+int esp32p4_csi_device::image_ctl::isp_set_struct(uint32_t id, void *p, size_t size)
+{
+    if (const int r = isp_open(); r < 0)
+    {
+        return r;
+    }
+    struct v4l2_ext_control c
+    {
+    };
+    c.id = id;
+    c.size = static_cast<uint32_t>(size);
+    c.p_u8 = static_cast<uint8_t *>(p);
+    struct v4l2_ext_controls cs
+    {
+    };
+    cs.ctrl_class = V4L2_CID_USER_CLASS;
+    cs.count = 1;
+    cs.controls = &c;
+    return xioctl(isp_fd, VIDIOC_S_EXT_CTRLS, &cs, "ISP S_EXT_CTRLS");
+}
+
+int esp32p4_csi_device::image_ctl::isp_get_struct(uint32_t id, void *p, size_t size)
+{
+    if (const int r = isp_open(); r < 0)
+    {
+        return r;
+    }
+    struct v4l2_ext_control c
+    {
+    };
+    c.id = id;
+    c.size = static_cast<uint32_t>(size);
+    c.p_u8 = static_cast<uint8_t *>(p);
+    struct v4l2_ext_controls cs
+    {
+    };
+    cs.ctrl_class = V4L2_CID_USER_CLASS;
+    cs.count = 1;
+    cs.controls = &c;
+    return xioctl(isp_fd, VIDIOC_G_EXT_CTRLS, &cs, "ISP G_EXT_CTRLS");
+}
+
+/* Writes one key to the hardware. Caller holds mu and the stream is on. */
+int esp32p4_csi_device::image_ctl::apply(int index)
+{
+    const std::string_view n = camctl::k_keys[index].name;
+    const int val = value[index];
+    if (camctl::target::sensor == camctl::k_keys[index].where)
+    {
+#if CONFIG_CAMERA_OV5647
+        if (!sensor_ok)
+        {
+            return -ENODEV;
+        }
+        int r = 0;
+        if (n == "exposure_us")
+        {
+            /* 0x3503 bit 0: manual AEC. Manual first: while AEC runs it owns
+             * 0x3500..0x3502, and a value written then would be replaced by
+             * the AEC's before manual mode froze it. */
+            r |= sensor_bits(0x3503, 0x01, val > 0);
+            if (val > 0)
+            {
+                const uint32_t e = camctl::ov5647_exposure_reg(val, hts, vts, k_ov5647_pclk_hz);
+                r |= sensor_write(0x3500, static_cast<uint8_t>((e >> 16) & 0x0f));
+                r |= sensor_write(0x3501, static_cast<uint8_t>((e >> 8) & 0xff));
+                r |= sensor_write(0x3502, static_cast<uint8_t>(e & 0xff));
+            }
+        }
+        else if (n == "gain")
+        {
+            /* 0x3503 bit 1: manual AGC, set first for the same reason;
+             * 0x350a/0x350b: gain x16, 10 bits. */
+            r |= sensor_bits(0x3503, 0x02, val > 0);
+            if (val > 0)
+            {
+                r |= sensor_write(0x350a, static_cast<uint8_t>((val >> 8) & 0x03));
+                r |= sensor_write(0x350b, static_cast<uint8_t>(val & 0xff));
+            }
+        }
+        else if (n == "gain_ceiling")
+        {
+            r |= sensor_write(0x3a18, static_cast<uint8_t>((val >> 8) & 0x03));
+            r |= sensor_write(0x3a19, static_cast<uint8_t>(val & 0xff));
+        }
+        else if (n == "ae_target")
+        {
+            const camctl::ae_target_regs t = camctl::ov5647_ae_target(val);
+            r |= sensor_write(0x3a0f, t.high);
+            r |= sensor_write(0x3a10, t.low);
+            r |= sensor_write(0x3a1b, t.high);
+            r |= sensor_write(0x3a1e, t.low);
+            r |= sensor_write(0x3a11, t.fast_high);
+            r |= sensor_write(0x3a1f, t.fast_low);
+        }
+        else if (n == "awb" || n == "wb_r" || n == "wb_b")
+        {
+            /* 0x5001 bit 0 enables the sensor's AWB gain block, as in the Linux
+             * ov5647 driver; off, the raw output is unscaled. The OV5640-style
+             * manual gains at 0x3400..0x3406 do not take on the OV5647 (0x3406
+             * reads back 0 after a write), so manual gains are the ISP's
+             * red / blue balance, which goes back to 1x when AWB is auto. */
+            const bool manual = 0 == v("awb");
+            r |= sensor_bits(0x5001, 0x01, !manual);
+            if (r < 0)
+            {
+                return -EIO;
+            }
+            const int rg = manual ? v("wb_r") : V4L2_CID_RED_BALANCE_DEN;
+            const int bg = manual ? v("wb_b") : V4L2_CID_BLUE_BALANCE_DEN;
+            if (const int e = isp_set(V4L2_CID_RED_BALANCE, rg); e < 0)
+            {
+                return e;
+            }
+            return isp_set(V4L2_CID_BLUE_BALANCE, bg);
+        }
+        return r < 0 ? -EIO : 0;
+#else
+        return -ENOTSUP;
+#endif
+    }
+    if (n == "brightness")
+    {
+        return isp_set(V4L2_CID_BRIGHTNESS, val);
+    }
+    if (n == "contrast")
+    {
+        return isp_set(V4L2_CID_CONTRAST, val);
+    }
+    if (n == "saturation")
+    {
+        return isp_set(V4L2_CID_SATURATION, val);
+    }
+    if (n == "hue")
+    {
+        return isp_set(V4L2_CID_HUE, val);
+    }
+    if (n == "gamma")
+    {
+        esp_video_isp_gamma_t g{};
+        g.enable = val > 0;
+        uint8_t x[camctl::k_gamma_points];
+        uint8_t y[camctl::k_gamma_points];
+        camctl::gamma_curve(val, x, y);
+        for (int i = 0; i < camctl::k_gamma_points && i < ISP_GAMMA_CURVE_POINTS_NUM; ++i)
+        {
+            g.points[i].x = x[i];
+            g.points[i].y = y[i];
+        }
+        return isp_set_struct(V4L2_CID_USER_ESP_ISP_GAMMA, &g, sizeof(g));
+    }
+    if (n == "sharpness")
+    {
+        if (!sharpen_base_valid)
+        {
+            /* The tuning's sharpen is the 100 % point. Read it once, before we
+             * overwrite it; if the tuning has not run yet use the OV5647
+             * tuning file's values. */
+            esp_video_isp_sharpen_t cur{};
+            if (isp_get_struct(V4L2_CID_USER_ESP_ISP_SHARPEN, &cur, sizeof(cur)) == 0 && cur.enable)
+            {
+                sharpen_base = cur;
+            }
+            else
+            {
+                sharpen_base = esp_video_isp_sharpen_t{};
+                sharpen_base.h_thresh = 56;
+                sharpen_base.l_thresh = 10;
+                sharpen_base.h_coeff = 0.425f;
+                sharpen_base.m_coeff = 0.625f;
+                const uint8_t m[3][3] = {{1, 2, 1}, {2, 2, 2}, {1, 2, 1}};
+                std::memcpy(sharpen_base.matrix, m, sizeof(m));
+            }
+            sharpen_base_valid = true;
+        }
+        esp_video_isp_sharpen_t s = sharpen_base;
+        s.enable = val > 0;
+        const float k = val / 100.0f;
+        s.h_coeff = std::min(sharpen_base.h_coeff * k, k_sharpen_coeff_max);
+        s.m_coeff = std::min(sharpen_base.m_coeff * k, k_sharpen_coeff_max);
+        return isp_set_struct(V4L2_CID_USER_ESP_ISP_SHARPEN, &s, sizeof(s));
+    }
+    return -ENOTSUP;
+}
+
+/* Writes every key that was set. Caller holds mu and the stream is on. The AWB
+ * group writes once, under "awb". */
+void esp32p4_csi_device::image_ctl::apply_set(bool isp_only)
+{
+    bool awb_group = false;
+    for (int i = 0; i < camctl::k_key_count; ++i)
+    {
+        const std::string_view n = camctl::k_keys[i].name;
+        /* The AWB group ends in the ISP balance, which the tuning may write
+         * too, so it is part of the ISP re-write as well. */
+        const bool awb_key = n == "awb" || n == "wb_r" || n == "wb_b";
+        if (!set[i] || (isp_only && !awb_key && camctl::target::isp != camctl::k_keys[i].where))
+        {
+            continue;
+        }
+        if (awb_key)
+        {
+            if (awb_group)
+            {
+                continue;
+            }
+            awb_group = true;
+        }
+        if (const int r = apply(i); r < 0)
+        {
+            std::fprintf(stderr, "esp32p4_csi_camera_src: %.*s %d not applied (%d)\n",
+                         static_cast<int>(n.size()), n.data(), value[i], r);
+        }
+    }
+}
+
+int esp32p4_csi_device::image_ctl::sensor_state(std::string *out)
+{
+#if !CONFIG_CAMERA_OV5647
+    (void)out;
+    return -ENOTSUP;
+#else
+    if (!sensor_ok)
+    {
+        return -ENODEV;
+    }
+    uint8_t aec = 0, e0 = 0, e1 = 0, e2 = 0, g0 = 0, g1 = 0, wb = 0, c0 = 0, c1 = 0, t = 0;
+    if (sensor_read(0x3503, &aec) < 0 || sensor_read(0x3500, &e0) < 0 ||
+        sensor_read(0x3501, &e1) < 0 || sensor_read(0x3502, &e2) < 0 ||
+        sensor_read(0x350a, &g0) < 0 || sensor_read(0x350b, &g1) < 0 ||
+        sensor_read(0x5001, &wb) < 0 || sensor_read(0x3a18, &c0) < 0 ||
+        sensor_read(0x3a19, &c1) < 0 || sensor_read(0x3a0f, &t) < 0)
+    {
+        return -EIO;
+    }
+    const uint32_t e = (static_cast<uint32_t>(e0 & 0x0f) << 16) | (e1 << 8) | e2;
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+                  "aec=%s agc=%s exposure_us=%d exposure_lines=%" PRIu32
+                  " gain=%d gain_ceiling=%d ae_high=%u awb=%s hts=%d vts=%d",
+                  (aec & 0x01) ? "manual" : "auto", (aec & 0x02) ? "manual" : "auto",
+                  camctl::ov5647_exposure_us(e, hts, k_ov5647_pclk_hz), e >> 4,
+                  ((g0 & 0x03) << 8) | g1, ((c0 & 0x03) << 8) | c1, t,
+                  (wb & 0x01) ? "auto" : "off", hts, vts);
+    *out = buf;
+    return 0;
+#endif
+}
+
+int esp32p4_csi_device::image_ctl::isp_state(std::string *out)
+{
+    if (const int r = isp_open(); r < 0)
+    {
+        return r;
+    }
+    struct v4l2_ext_control c[6] = {};
+    c[0].id = V4L2_CID_BRIGHTNESS;
+    c[1].id = V4L2_CID_CONTRAST;
+    c[2].id = V4L2_CID_SATURATION;
+    c[3].id = V4L2_CID_HUE;
+    c[4].id = V4L2_CID_RED_BALANCE;
+    c[5].id = V4L2_CID_BLUE_BALANCE;
+    struct v4l2_ext_controls cs
+    {
+    };
+    cs.ctrl_class = V4L2_CID_USER_CLASS;
+    cs.count = 6;
+    cs.controls = c;
+    if (const int r = xioctl(isp_fd, VIDIOC_G_EXT_CTRLS, &cs, "ISP G_EXT_CTRLS"); r < 0)
+    {
+        return r;
+    }
+    esp_video_isp_sharpen_t s{};
+    const bool sh = isp_get_struct(V4L2_CID_USER_ESP_ISP_SHARPEN, &s, sizeof(s)) == 0;
+    /* GAMMA_EXT: the plain GAMMA get logs a warning on every call. */
+    esp_video_isp_gamma_ext_t g{};
+    const bool gm = isp_get_struct(V4L2_CID_USER_ESP_ISP_GAMMA_EXT, &g, sizeof(g)) == 0;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "brightness=%" PRId32 " contrast=%" PRId32 " saturation=%" PRId32
+                  " hue=%" PRId32 " wb_r=%" PRId32 " wb_b=%" PRId32
+                  " sharpen=%s h_coeff=%.3f m_coeff=%.3f gamma=%s y16=%u y128=%u",
+                  c[0].value, c[1].value, c[2].value, c[3].value, c[4].value, c[5].value,
+                  !sh ? "?" : s.enable ? "on" : "off", static_cast<double>(s.h_coeff),
+                  static_cast<double>(s.m_coeff), !gm ? "?" : g.enable ? "on" : "off",
+                  gm ? g.green_points[0].y : 0U, gm ? g.green_points[7].y : 0U);
+    *out = buf;
+    return 0;
+}
+
+bool esp32p4_csi_device::live_key(std::string_view key)
+{
+    return camctl::find_key(key) >= 0;
+}
+
+esp32p4_csi_device::esp32p4_csi_device() : ctl_(std::make_unique<image_ctl>())
+{
+}
 
 int esp32p4_csi_device::open()
 {
@@ -326,6 +833,10 @@ int esp32p4_csi_device::open()
             s_video_init_done = true;
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        ctl_->attach_sensor(sccb_port, sccb_freq);
+    }
 
     const int fd = ::open(ESP_VIDEO_MIPI_CSI_DEVICE_NAME, O_RDONLY);
     if (fd < 0)
@@ -357,7 +868,10 @@ int esp32p4_csi_device::open()
         driver = reinterpret_cast<const char *>(cap.driver);
     }
 #if CONFIG_CAMERA_OV5647
-    ov5647_fix_format(fd, fps, light_freq, rotate);
+    {
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        ov5647_fix_format(fd, fps, light_freq, rotate, ctl_->v("gain_ceiling"));
+    }
 #endif
 
     struct v4l2_format fmt
@@ -502,6 +1016,15 @@ int esp32p4_csi_device::open()
     }
     r->streaming = true;
     ring_ = std::move(r);
+    {
+        /* The sensor table and the driver's AE target load at S_FMT; the keys
+         * set so far go on top. */
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        ctl_->read_timing();
+        ctl_->apply_set(false);
+        ctl_->frames = 0;
+        ctl_->reapply_at = k_isp_reapply_frame;
+    }
     return 0;
 }
 
@@ -609,6 +1132,13 @@ int esp32p4_csi_device::dequeue(component_pdu &out)
         return -EIO;
     }
 
+    if (0 != ctl_->reapply_at && ++ctl_->frames >= ctl_->reapply_at)
+    {
+        ctl_->reapply_at = 0;
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        ctl_->apply_set(true);
+    }
+
     /* No cache sync: the CPU never reads the pixels and the H.264 DMA reads
      * PSRAM. */
     const uint32_t index = b.index;
@@ -630,6 +1160,18 @@ int esp32p4_csi_device::configure(std::string_view key, std::string_view value)
     if (key == "fps")
     {
         return parse_int(value, 1, 120, &fps);
+    }
+    if (const int i = camctl::find_key(key); i >= 0)
+    {
+        int64_t n = 0;
+        if (key_parse_i64(value, &n) < 0 || !camctl::value_ok(i, n))
+        {
+            return -EINVAL;
+        }
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        ctl_->value[i] = static_cast<int>(n);
+        ctl_->set[i] = true;
+        return ring_ ? ctl_->apply(i) : 0;
     }
     if (ring_)
     {
@@ -727,6 +1269,22 @@ int esp32p4_csi_device::query(std::string_view key, std::string *value) const
     if (key == "light_freq")
     {
         return set_int(value, light_freq);
+    }
+    /* The value last set (or the default); sensor_state / isp_state read the
+     * hardware back. */
+    if (const int i = camctl::find_key(key); i >= 0)
+    {
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        return set_int(value, ctl_->value[i]);
+    }
+    if (key == "sensor_state" || key == "isp_state")
+    {
+        if (!ring_)
+        {
+            return -EAGAIN;
+        }
+        std::lock_guard<std::mutex> lock(ctl_->mu);
+        return key == "sensor_state" ? ctl_->sensor_state(value) : ctl_->isp_state(value);
     }
     if (key == "rotate")
     {

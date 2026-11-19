@@ -752,8 +752,32 @@ actual allocation is driver-dependent), `light_freq` (0, 50, 60), `rotate` (0 or
 still through sdkconfig, and SCCB setup applies on the first video initialization
 per boot. Encoder settings: `bitrate`, `gop`, `qp_min`, `qp_max`, `rc`
 (`frame` or `esp`), and `idr`. Worker placement uses `encode_cpu` / `encode_prio`;
-there is no separate capture worker. Only `bitrate`, `gop`, `idr`, and `reset_stats`
-can change while open; other configuration requires closing the source.
+there is no separate capture worker. Only `bitrate`, `gop`, `idr`, `reset_stats` and the
+image controls below can change while open; other configuration requires closing the source.
+
+Image controls (both CSI sources) apply at once while streaming, e.g. `set src exposure_us
+8000` on the vstreamer m-plane; values set before open are applied when streaming starts and
+again after every reopen. A key never set keeps the sensor table's or the ISP tuning's value.
+
+| Key | Range | Meaning |
+|---|---|---|
+| `exposure_us` | 0–1000000 | manual exposure, clamped to the frame (VTS − 4 lines); 0 = sensor AEC |
+| `gain` | 0, 16–1023 | manual analog gain ×16; 0 = sensor AGC |
+| `gain_ceiling` | 16–1023 | AGC limit ×16 (default 0x1f0 = 31×) |
+| `ae_target` | 2–235 | AEC brightness target (driver default 80) |
+| `awb` | 0, 1 | 1 = sensor AWB; 0 = sensor AWB off (0x5001 bit 0) and the ISP applies `wb_r` / `wb_b` |
+| `wb_r`, `wb_b` | 1–3999 | ISP red / blue gain ×1000 relative to green (1000 = 1×), used while `awb` is 0 |
+| `brightness` | −128–127 | ISP colour brightness |
+| `contrast`, `saturation` | 0–255 | ISP colour, 128 = 1× |
+| `hue` | 0–360 | ISP hue rotation, degrees |
+| `gamma` | 0, 20–400 | ISP curve y = x^(gamma/100); 100 = linear, 0 = gamma off |
+| `sharpness` | 0–400 | ISP sharpen in % of the tuning's; 0 = off |
+
+The sensor keys are OV5647 registers, written through a second SCCB device handle on the
+camera's bus (esp_video has no register ioctl). The ISP tuning can write contrast, gamma and
+sharpen after STREAMON, so the ISP keys that were set are written again a few frames into each
+stream. `get src <key>` returns the value last set; `get src sensor_state` (AEC/AGC mode,
+exposure, gain, AWB mode, HTS/VTS) and `get src isp_state` read the hardware back.
 
 `output()` returns coded caps followed by H.264 AUs and returns `-EAGAIN` immediately
 when empty. Use the normal component wakeup to schedule output. While coded output
