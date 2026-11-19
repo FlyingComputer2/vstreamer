@@ -621,6 +621,46 @@ TEST(MkvSinkTest, PduInputEagainWhenQueueFull)
     std::filesystem::remove_all(base, ec);
 }
 
+TEST(MkvSinkTest, QueuedDrainsAndPsramStackKeyOnlyWhileClosed)
+{
+    mkv_sink sink;
+    std::string v;
+    ASSERT_EQ(0, sink.query("mux_psram_stack", &v));
+    EXPECT_EQ("0", v);
+    EXPECT_EQ(-EINVAL, sink.configure("mux_psram_stack", "2"));
+    ASSERT_EQ(0, sink.configure("mux_psram_stack", "1"));
+    ASSERT_EQ(sink.open(), 0);
+    EXPECT_EQ(-EBUSY, sink.configure("mux_psram_stack", "0"));
+
+    const auto base = std::filesystem::temp_directory_path() / "mkv_sink_queued";
+    std::error_code ec;
+    std::filesystem::remove_all(base, ec);
+    std::filesystem::create_directories(base, ec);
+    ASSERT_EQ(0, sink.configure("output", (base / "clip.mkv").string()));
+    ASSERT_EQ(0, sink.input(make_mjpeg_caps(320, 240)));
+    for (int i = 0; i < 4; ++i)
+    {
+        ASSERT_EQ(0, sink.input(make_mjpeg_pdu(320, 240, i)));
+    }
+    /* "queued" counts queued plus in-flight frames and reaches 0 once all are written. */
+    bool drained = false;
+    for (int i = 0; i < 500 && !drained; ++i)
+    {
+        ASSERT_EQ(0, sink.query("queued", &v));
+        drained = "0" == v;
+        if (!drained)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+    EXPECT_TRUE(drained);
+    ASSERT_EQ(0, sink.query("stats", &v));
+    EXPECT_NE(std::string::npos, v.find("frames=4")) << v;
+
+    sink.close();
+    std::filesystem::remove_all(base, ec);
+}
+
 TEST(MkvSinkTest, MicrosecondTimestampsDuration)
 {
     REQUIRE_FFPROBE();

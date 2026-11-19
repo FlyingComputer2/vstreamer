@@ -44,11 +44,26 @@ struct live_tx_config
     kv_list pay {{"fps", "30"}, {"mtu", "1400"}};
     /* stream_sender keys (no FEC here: the link runs it, e.g. a winject-l3 upstream). */
     kv_list snd {};
+
+    /* Local recording of the coded AUs to Matroska (mkv_sink, a tee after the encoder), e.g.
+     * "/sdcard/rec/rov.mkv"; empty = no recorder. Each recording takes the first free
+     * "<stem>_NNNN" (rov_0001, rov_0002, ...), and mkv_sink adds "-NNN" per segment (a new one
+     * after a size change or write error): rov_0001-001.mkv. The parent directory is created.
+     * Recording runs while TX is paused too. */
+    std::string rec_output;
+    /* Whether to record; the m-plane's "set rec on 1|0" writes it, and so can the host. Like
+     * pause: null = live TX keeps its own (off), reset on every run. Not owned; must outlive
+     * run_live_tx. */
+    std::atomic<bool> *record = nullptr;
+    /* mkv_sink keys, applied after live TX's own (fps from src, queue_depth 30, mux thread on
+     * core 1 at priority 4 with a PSRAM stack). */
+    kv_list rec {};
 };
 
 /*
  * Live video TX on the ESP32-P4: esp32_h264_isp_ng_src (MIPI-CSI camera, ISP, hardware H.264) ->
- * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), with the P4 thread layout (encode and
+ * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), optionally teed to mkv_sink
+ * (cfg.rec_output), with the P4 thread layout (encode and
  * payload on core 0, send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
  * passed (or forever) and returns 0 when the stream ran at a usable rate, -1 on failure, and 0
  * without streaming when no camera sensor answers.

@@ -484,7 +484,9 @@ int mkv_sink::open()
     opened = true;
     mux_stop.store(false, std::memory_order_relaxed);
     /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
-    mux_thread = spawn_thread(mux_place.opts("vs_mkv", 8 * 1024), [this] { mux_thread_main(); });
+    thread_opts mux_opts = mux_place.opts("vs_mkv", 8 * 1024);
+    mux_opts.psram_stack = mux_psram_stack;
+    mux_thread = spawn_thread(mux_opts, [this] { mux_thread_main(); });
     return 0;
 }
 
@@ -574,6 +576,20 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         return 0;
     }
 
+    if (key == "mux_psram_stack")
+    {
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        if (v != "0" && v != "1")
+        {
+            return -EINVAL;
+        }
+        mux_psram_stack = v == "1";
+        return 0;
+    }
+
     if (key == "queue_depth")
     {
         int64_t n = 0;
@@ -606,11 +622,30 @@ int mkv_sink::query(std::string_view key, std::string *value) const
         return r;
     }
 
+    /* Frames queued or being written; takes only the queue lock, not the mux one (held
+     * across a write), so it answers while the card is slow. */
+    if (key == "queued")
+    {
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> qlock(q_mu);
+            n = queue.size() + static_cast<size_t>(mux_in_flight.load(std::memory_order_relaxed));
+        }
+        *value = std::to_string(n);
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "output")
     {
         *value = output_template;
+        return 0;
+    }
+
+    if (key == "mux_psram_stack")
+    {
+        *value = mux_psram_stack ? "1" : "0";
         return 0;
     }
 

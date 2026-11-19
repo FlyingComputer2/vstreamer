@@ -98,11 +98,15 @@ private:
     bool           caps_reject_ = false;
     video_coded_caps input_caps_ {};
 
-    std::mutex              q_mu;
+    mutable std::mutex      q_mu;
     std::condition_variable q_cv;
     std::deque<component_pdu> queue;
     std::thread             mux_thread;
     thread_place            mux_place; /* keys mux_cpu / mux_prio */
+    /* Key mux_psram_stack 0|1 (closed only): the mux thread's stack in PSRAM on ESP-IDF. Only
+     * for output on a card or other non-flash storage: a PSRAM stack is unusable while a SPI
+     * flash write has the cache off. */
+    bool                    mux_psram_stack = false;
     std::atomic<bool>       mux_stop {false};
     std::atomic<int>        mux_in_flight {0};
 
