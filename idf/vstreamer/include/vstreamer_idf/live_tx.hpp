@@ -58,12 +58,22 @@ struct live_tx_config
     /* mkv_sink keys, applied after live TX's own (fps from src, queue_depth 30, mux thread on
      * core 1 at priority 4 with a PSRAM stack). */
     kv_list rec {};
+
+    /* One-shot photos: the m-plane's "set photo take 1" sends the next camera frame (the
+     * source's raw port, "raw_out") to the hardware JPEG encoder (jpeg_encoder_esp32p4) and
+     * writes it to "<stem>_NNNN<ext>" with the first free NNNN, e.g. "/sdcard/photo/rov.jpg"
+     * -> rov_0001.jpg; the parent directory is created. Empty = no photos. Live TX keeps
+     * streaming: the H.264 encoder only runs slower while the JPEG engine works (~31 ms). */
+    std::string photo_output;
+    /* jpeg_encoder_esp32p4 keys, applied after live TX's own (quality 90, outbuf_kb 2048,
+     * worker on core 0 at priority 12); "get/set jpg <key>" on the m-plane. */
+    kv_list jpg {};
 };
 
 /*
  * Live video TX on the ESP32-P4: esp32_h264_isp_ng_src (MIPI-CSI camera, ISP, hardware H.264) ->
  * rtp_h264_pay -> stream_sender to cfg.peer (or the cfg.queue_* queues), optionally teed to mkv_sink
- * (cfg.rec_output), with the P4 thread layout (encode and
+ * (cfg.rec_output) and with one-shot JPEG photos (cfg.photo_output), with the P4 thread layout (encode and
  * payload on core 0, send thread on core 1) and an optional UDP management plane. Blocks until cfg.seconds have
  * passed (or forever) and returns 0 when the stream ran at a usable rate, -1 on failure, and 0
  * without streaming when no camera sensor answers.

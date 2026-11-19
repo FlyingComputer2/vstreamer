@@ -29,7 +29,13 @@ const std::vector<port_desc> &output_ports()
         au.sdu_type = sdu_type_e::H264_AU;
         p.caps.push_back(caps);
         p.caps.push_back(au);
-        return std::vector<port_desc>{p};
+        port_desc raw;
+        port_caps_entry raw_caps{}, frame{};
+        raw_caps.sdu_type = sdu_type_e::CAPS_VIDEO_RAW;
+        frame.sdu_type = sdu_type_e::O_UYY_E_VYY;
+        raw.caps.push_back(raw_caps);
+        raw.caps.push_back(frame);
+        return std::vector<port_desc>{p, raw};
     }();
     return ports;
 }
@@ -104,6 +110,9 @@ int esp32_h264_isp_ng_src::open()
         return r;
     }
     frames_ = backlog_drops_ = dqbuf_errors_ = encode_errors_ = 0;
+    raw_frames_ = raw_drops_ = 0;
+    raw_caps_pending_ = raw_out_.load(std::memory_order_relaxed);
+    have_raw_ = false;
     last_error_ = 0;
     latency_ms_.store(-1.0, std::memory_order_relaxed);
     stop_.store(false, std::memory_order_release);
@@ -130,6 +139,8 @@ void esp32_h264_isp_ng_src::close()
     std::lock_guard<std::mutex> lock(mu_);
     encoder_->close();
     out_q_.clear();
+    raw_ = {};
+    have_raw_ = false;
     camera_->close();
 }
 
@@ -147,6 +158,22 @@ void esp32_h264_isp_ng_src::drain_encoder()
     {
         notify_output_ready();
     }
+}
+
+void esp32_h264_isp_ng_src::offer_raw(const component_pdu &frame)
+{
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (have_raw_)
+        {
+            ++raw_drops_;  // The consumer did not take the last one in time.
+        }
+        raw_ = frame;  // Shares the camera buffer with the encode below.
+        raw_.port = 1;
+        have_raw_ = true;
+        ++raw_frames_;
+    }
+    notify_output_ready();
 }
 
 void esp32_h264_isp_ng_src::encode_main()
@@ -172,6 +199,12 @@ void esp32_h264_isp_ng_src::encode_main()
         if (stop_.load(std::memory_order_acquire))
         {
             break;
+        }
+        // Before the H.264 backlog check and the encode: the raw consumer
+        // (e.g. the JPEG engine) then works on it alongside the encoder.
+        if (raw_out_.load(std::memory_order_acquire))
+        {
+            offer_raw(frame);
         }
         {
             std::lock_guard<std::mutex> lock(mu_);
@@ -227,6 +260,26 @@ int esp32_h264_isp_ng_src::output(component_pdu &out)
     }
     if (out_q_.empty())
     {
+        if (raw_caps_pending_ && raw_out_.load(std::memory_order_acquire))
+        {
+            raw_caps_pending_ = false;
+            video_raw_caps caps{};
+            caps.width = camera_->live_width();
+            caps.height = camera_->live_height();
+            caps.hor_stride = caps.width;
+            caps.ver_stride = caps.height;
+            caps.fps_num = camera_->frame_rate();
+            caps.fps_den = 1;
+            out = make_caps_pdu(sdu_type_e::CAPS_VIDEO_RAW, caps, steady_mono_ns() / 1000, 1);
+            return 0;
+        }
+        if (have_raw_)
+        {
+            out = std::move(raw_);
+            raw_ = {};
+            have_raw_ = false;
+            return 0;
+        }
         return last_error_ ? last_error_ : -EAGAIN;
     }
     out = std::move(out_q_.front());
@@ -247,9 +300,27 @@ int esp32_h264_isp_ng_src::configure(std::string_view key, std::string_view valu
     {
         return r;
     }
+    if (key == "raw_out")
+    {
+        if (value != "0" && value != "1")
+        {
+            return -EINVAL;
+        }
+        const bool on = value == "1";
+        if (on != raw_out_.load(std::memory_order_relaxed))
+        {
+            raw_out_.store(on, std::memory_order_release);
+            // Caps go out again on every enable; off lets the waiting frame go.
+            raw_caps_pending_ = on;
+            raw_ = {};
+            have_raw_ = false;
+        }
+        return 0;
+    }
     if (key == "reset_stats")
     {
         frames_ = backlog_drops_ = dqbuf_errors_ = encode_errors_ = 0;
+        raw_frames_ = raw_drops_ = 0;
         lock.unlock();
         return encoder_->configure(key, value);
     }
@@ -317,6 +388,11 @@ int esp32_h264_isp_ng_src::query(std::string_view key, std::string *value) const
         *value = !opened_ ? "closed" : last_error_ ? "error" : "open";
         return 0;
     }
+    if (key == "raw_out")
+    {
+        *value = raw_out_.load(std::memory_order_relaxed) ? "1" : "0";
+        return 0;
+    }
     if (key == "backend")
     {
         *value = "esp_video_csi+esp_h264_hw_direct";
@@ -327,8 +403,10 @@ int esp32_h264_isp_ng_src::query(std::string_view key, std::string *value) const
         char buf[256];
         std::snprintf(buf, sizeof(buf),
                       "frames=%" PRIu64 " backlog_drops=%" PRIu64 " dqbuf_errors=%" PRIu64
-                      " encode_errors=%" PRIu64 " error=%d; enc ",
-                      frames_, backlog_drops_, dqbuf_errors_, encode_errors_, last_error_);
+                      " encode_errors=%" PRIu64 " raw_frames=%" PRIu64 " raw_drops=%" PRIu64
+                      " error=%d; enc ",
+                      frames_, backlog_drops_, dqbuf_errors_, encode_errors_, raw_frames_,
+                      raw_drops_, last_error_);
         // Snapshot our counters before waiting on the encoder's encode mutex.
         lock.unlock();
         std::string enc;

@@ -141,6 +141,7 @@ is not built returns `nullptr`.
 | `esp32_h264_isp_ng_src` | source | CSI / ISP → H264 | `esp32_h264_isp_ng_src` | ESP-IDF, esp32p4 target |
 | `esp32_h264_isp_src` | source | CSI / ISP → H264 | `esp32_h264_isp_src` (legacy wrapper) | ESP-IDF, esp32p4 target |
 | `h264_encoder_esp32p4` | coder | O_UYY_E_VYY → H264 | `h264_encoder_esp32p4`, `h264_encoder`³ | ESP-IDF, esp32p4 target |
+| `jpeg_encoder_esp32p4` | coder | O_UYY_E_VYY → MJPEG | `jpeg_encoder_esp32p4`, `jpeg_encoder` | ESP-IDF, esp32p4 target (chip rev ≥ 3.0) |
 | `h264_decoder_mpp` | coder | H264 → NV12 | `h264_decoder_mpp`, `h264_decoder` | `ENABLE_H264_DECODER_MPP` |
 | `rtp_h264_pay` | coder | H264 FRAME → SOCK | `rtp_h264_pay`, `rtp_pay` | `ENABLE_RTP_H264_PAY` |
 | `rtp_h264_depay` | coder | SOCK → H264 FRAME | `rtp_h264_depay`, `rtp_depay` | `ENABLE_RTP_H264_DEPAY` |
@@ -387,6 +388,24 @@ segment.
 | `mux_cpu`, `mux_prio` | C Q | thread placement, see Threading |
 | `segment`, `stats`, `skipped`, `dropped`, `write_errors` | Q | informational; a write error closes the segment and the next frame starts a new one |
 
+**`jpeg_encoder_esp32p4`** (ESP-IDF, esp32p4) — O_UYY_E_VYY (the ISP's YUV 4:2:0 layout) →
+JPEG on the P4's JPEG engine (`esp_driver_jpeg`; YUV420 input needs chip revision 3.0 or later).
+Input: `CAPS_VIDEO_RAW`, then frames; output: `CAPS_VIDEO_CODED`, then one `MJPEG` keyframe per
+frame in an exact-size PSRAM buffer. A worker encodes one frame at a time (about 31 ms at
+1080p); `input()` returns `-EAGAIN` while it is busy, so a producer passing camera buffers drops
+the frame instead of waiting, and the frame goes back to capture as soon as the engine has read
+it. Four frames wait for `output()` at most (then the oldest is dropped, `out_drops`). The
+engine shares PSRAM bandwidth with the H.264 encoder: while it runs, H.264 frames take longer
+(on the rover 35 → 41–54 ms).
+
+| Key | C/Q | Values |
+|-----|-----|--------|
+| `quality` | C Q | 1–100, live (default 80) |
+| `max_fps` | C Q | 0–240, live: frames closer than 0.9 / `max_fps` s to the last one encoded are skipped (`rate_skips`); 0 = every frame |
+| `outbuf_kb` | C Q | engine output buffer, while closed; 0 = width × height / 2 bytes; a larger frame is dropped (`overflows`) |
+| `encode_cpu`, `encode_prio` | C Q | worker placement |
+| `stats` | Q | `frames`, `busy_drops`, `rate_skips`, `out_drops`, `overflows`, `errors`, `enc_ms_avg`, `enc_ms_max`, `kb_avg` |
+
 **`sdl_sink`** — NV12 preview through `sdl_nv12_presenter`. `input()` creates rendering
 resources on the first frame and presents on the calling rendering thread; with vsync each
 call can block for up to one display refresh. Configure dimensions before sending frames
@@ -413,6 +432,7 @@ Components do not start pipeline threads; the app does. Threads inside component
 | `mkv_sink` | mux thread (`mkv_writer` file I/O) | `mux_*` |
 | `esp32p4_csi_camera_src` | capture thread | `capture_*` |
 | `esp32_h264_isp_ng_src` | one worker: camera dequeue + synchronous encode | `encode_*` |
+| `jpeg_encoder_esp32p4` | one worker: JPEG engine encode | `encode_*` |
 | `esp32_h264_isp_src` | encode thread (+ its camera's capture thread) | `encode_*`, `capture_*` |
 | `jpeg_decoder_multicore` | `workers` decode threads | `worker_cpu`, `worker_cpus` |
 | `noise_source` | pregenerate worker (when `pregenerate-frames > 0`) | — |
@@ -684,7 +704,13 @@ runs camera → ISP + hardware H.264 → `rtp_h264_pay` → `stream_sender` to `
 thread layout and an optional UDP management plane (`vstreamer_idf/live_mplane.hpp`;
 `get/set src|pay|snd <key>`, `set tx pause 1|0` to pause / resume sending
 without stopping camera or encoder, resuming from a fresh IDR), taking each component's settings as key/value
-lists. Per-task CPU, heap and stack placement are not vstreamer's: the firmware serves them
+lists. With `cfg.rec_output` (e.g. `/sdcard/rec/rov.mkv`) it records the H.264 AUs it sends to
+`mkv_sink`: `set rec on 1|0` starts and stops a recording, each in a new `<stem>_NNNN-001.mkv`;
+`get rec stats|file` report it. With `cfg.photo_output` (e.g. `/sdcard/photo/rov.jpg`) it takes
+one-shot photos: `set photo take 1` turns on the source's raw port (`raw_out`) for the next
+camera frame, encodes it on `jpeg_encoder_esp32p4` (`get/set jpg <key>`, `cfg.jpg`; quality 90)
+and writes `<stem>_NNNN.jpg`; `get photo stats|file` report it (`-EBUSY` while one is in
+progress). The live stream keeps running. Per-task CPU, heap and stack placement are not vstreamer's: the firmware serves them
 (for example [sys-applet-esp32p4](https://github.com/FlyingComputer2/sys-applet-esp32p4)'s
 `get sys cpu|heap|stack`). `idf/example` is an esp32p4 smoke test (UDP loopback through a pipeline, hardware encode, a
 base64 clip dump). On ESP-IDF, pipeline control must come from a pthread (`std::thread`), not
@@ -752,8 +778,14 @@ actual allocation is driver-dependent), `light_freq` (0, 50, 60), `rotate` (0 or
 still through sdkconfig, and SCCB setup applies on the first video initialization
 per boot. Encoder settings: `bitrate`, `gop`, `qp_min`, `qp_max`, `rc`
 (`frame` or `esp`), and `idr`. Worker placement uses `encode_cpu` / `encode_prio`;
-there is no separate capture worker. Only `bitrate`, `gop`, `idr`, `reset_stats` and the
-image controls below can change while open; other configuration requires closing the source.
+there is no separate capture worker. Only `bitrate`, `gop`, `idr`, `reset_stats`, `raw_out` and
+the image controls below can change while open; other configuration requires closing the source.
+
+Output port 0 carries `CAPS_VIDEO_CODED` and the AUs. Port 1 carries the camera frames while
+`raw_out` is 1 (live; default 0): `CAPS_VIDEO_RAW` on every enable, then each frame
+(O_UYY_E_VYY) as it goes to the encoder, zero-copy. The PDU holds the camera buffer until its
+last reference drops, so a consumer must let go quickly; one raw frame waits at most, a newer
+one replaces it (`raw_drops` in `stats`), and port 0 comes out first.
 
 Image controls (both CSI sources) apply at once while streaming, e.g. `set src exposure_us
 8000` on the vstreamer m-plane; values set before open are applied when streaming starts and
