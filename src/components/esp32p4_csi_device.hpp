@@ -13,11 +13,18 @@ namespace vstreamer::detail
 {
 /* Driver access only: no task, ready queue, or wakeup API. The owner serializes
  * configure/open/close and joins any dequeue caller before close(). Frame PDUs
- * retain the driver ring until their last reference returns the buffer. */
+ * retain the driver ring until their last reference returns the buffer.
+ *
+ * The image controls (camera_image_ctl.hpp) are the exception: configure()
+ * accepts them while streaming, from any thread, concurrently with dequeue(),
+ * and applies them at once. Values set before open, or before a reopen, are
+ * applied when streaming starts. */
 class esp32p4_csi_device
 {
    public:
-    esp32p4_csi_device() = default;
+    /* Keys configure() takes while streaming. */
+    static bool live_key(std::string_view key);
+    esp32p4_csi_device();
     ~esp32p4_csi_device();
     esp32p4_csi_device(const esp32p4_csi_device &) = delete;
     esp32p4_csi_device &operator=(const esp32p4_csi_device &) = delete;
@@ -41,7 +48,9 @@ class esp32p4_csi_device
 
    private:
     struct ring;
+    struct image_ctl;
     static void release_ring(std::shared_ptr<ring> r);
+    std::unique_ptr<image_ctl> ctl_;
     int sccb_port = 0, sccb_scl = 8, sccb_sda = 7, sccb_freq = 100000;
     int reset_pin = -1, pwdn_pin = -1;
     int width = 0, height = 0, fps = 30, light_freq = 60, nbufs = 4;

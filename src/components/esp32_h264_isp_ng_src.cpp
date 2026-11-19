@@ -37,7 +37,7 @@ bool camera_key(std::string_view key)
 {
     return key == "size" || key == "fps" || key == "buffers" || key == "light_freq" ||
            key == "rotate" || key == "sccb_port" || key == "sccb_scl" || key == "sccb_sda" || key == "sccb_freq" ||
-           key == "reset_pin" || key == "pwdn_pin";
+           key == "reset_pin" || key == "pwdn_pin" || detail::esp32p4_csi_device::live_key(key);
 }
 bool encoder_key(std::string_view key)
 {
@@ -256,6 +256,13 @@ int esp32_h264_isp_ng_src::configure(std::string_view key, std::string_view valu
     if (!encoder_key(key) && !camera_key(key))
     {
         return -ENOTSUP;
+    }
+    // The camera's image controls apply in place; its I2C writes run with the
+    // encode loop free (lifecycle_mu_ still holds off open/close).
+    if (detail::esp32p4_csi_device::live_key(key))
+    {
+        lock.unlock();
+        return camera_->configure(key, value);
     }
     // Reopening the encoder with live AUs can exhaust PSRAM. Only settings that
     // esp_h264 updates in place are accepted while streaming.
