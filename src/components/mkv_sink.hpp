@@ -58,6 +58,8 @@ private:
     void wait_mux_idle();
 
     [[nodiscard]] int input_pdu_locked(component_pdu &&in);
+    /* accepting_ follows opened, the input caps and output; call after changing any of them. */
+    void update_accepting_locked();
     [[nodiscard]] bool coded_caps_acceptable(const video_coded_caps &caps) const;
 
     [[nodiscard]] int try_enqueue_locked(component_pdu &&pkt);
@@ -97,6 +99,8 @@ private:
     bool           have_input_caps_ = false;
     bool           caps_reject_ = false;
     video_coded_caps input_caps_ {};
+    /* Written under mu: frames go straight to the queue (input() without mu) while true. */
+    std::atomic<bool> accepting_ {false};
 
     mutable std::mutex      q_mu;
     std::condition_variable q_cv;

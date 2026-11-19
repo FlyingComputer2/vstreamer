@@ -398,11 +398,13 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
         {
             caps_reject_ = true;
             have_input_caps_ = false;
+            update_accepting_locked();
             return -ENOTSUP;
         }
         caps_reject_ = false;
         input_caps_ = caps;
         have_input_caps_ = true;
+        update_accepting_locked();
         return 0;
     }
     if (in.sdu_type != sdu_type_e::MJPEG && in.sdu_type != sdu_type_e::H264_AU)
@@ -428,6 +430,20 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
 
 int mkv_sink::input(component_pdu &&in)
 {
+    /* Frames while a recording is set up take only q_mu: mu is held by the mux thread across
+     * each card write, and a producer (e.g. a live TX thread) must not wait on the card. */
+    if (0 == in.port &&
+        (in.sdu_type == sdu_type_e::MJPEG || in.sdu_type == sdu_type_e::H264_AU) &&
+        accepting_.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        const int                   r = try_enqueue_locked(std::move(in));
+        if (0 == r)
+        {
+            q_cv.notify_one();
+        }
+        return r;
+    }
     if (0 == in.port && in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED)
     {
         video_coded_caps caps {};
@@ -446,6 +462,7 @@ int mkv_sink::input(component_pdu &&in)
             {
                 caps_reject_ = true;
                 have_input_caps_ = false;
+                update_accepting_locked();
                 return -ENOTSUP;
             }
             resize = have_input_caps_ && (input_caps_.width != caps.width || input_caps_.height != caps.height);
@@ -462,6 +479,7 @@ int mkv_sink::input(component_pdu &&in)
             caps_reject_ = false;
             input_caps_ = caps;
             have_input_caps_ = true;
+            update_accepting_locked();
             return 0;
         }
     }
@@ -482,6 +500,7 @@ int mkv_sink::open()
         return 0;
     }
     opened = true;
+    update_accepting_locked();
     mux_stop.store(false, std::memory_order_relaxed);
     /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
     thread_opts mux_opts = mux_place.opts("vs_mkv", 8 * 1024);
@@ -492,12 +511,23 @@ int mkv_sink::open()
 
 void mkv_sink::close()
 {
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        accepting_.store(false, std::memory_order_release);
+    }
     stop_mux_thread();
     std::lock_guard<std::mutex> lock(mu);
     stop_locked();
     opened = false;
     have_input_caps_ = false;
     caps_reject_ = false;
+    update_accepting_locked();
+}
+
+void mkv_sink::update_accepting_locked()
+{
+    accepting_.store(opened && have_input_caps_ && !caps_reject_ && !output_template.empty(),
+                     std::memory_order_release);
 }
 
 
@@ -516,6 +546,7 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
     {
         if (v.empty())
         {
+            accepting_.store(false, std::memory_order_release);
             stop_locked();
             output_template.clear();
             output_stem.clear();
@@ -535,6 +566,7 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
             segment_index = 0;
             split_output_template_locked();
         }
+        update_accepting_locked();
         return 0;
     }
 
