@@ -10,14 +10,16 @@ set(ENABLE_RTP_H264_DEPAY ON)
 
 set(VSTREAMER_SOURCES)
 include(${VSTREAMER_ROOT}/cmake/vstreamer_sources.cmake)
-# The P4's hardware H.264 encoder (esp_h264) and MIPI-CSI camera (esp_video); see
-# idf_component.yml.
+# The P4's hardware H.264 encoder (esp_h264), JPEG encoder (esp_driver_jpeg) and MIPI-CSI
+# camera (esp_video); see idf_component.yml.
 if(IDF_TARGET STREQUAL "esp32p4")
     set(ENABLE_H264_ENCODER_ESP32P4 ON)
     set(ENABLE_ESP32P4_CSI_CAMERA_SRC ON)
     set(ENABLE_ESP32_H264_ISP_SRC ON)
     set(ENABLE_ESP32_H264_ISP_NG_SRC ON)
+    set(ENABLE_JPEG_ENCODER_ESP32P4 ON)
     list(APPEND VSTREAMER_SOURCES src/components/h264_encoder_esp32p4.cpp
+                                  src/components/jpeg_encoder_esp32p4.cpp
                                   src/components/esp32p4_csi_camera_src.cpp
                                   src/components/esp32_h264_isp_src.cpp
                                   src/components/esp32p4_csi_device.cpp
@@ -48,7 +50,7 @@ idf_component_register(
                  ${VSTREAMER_IDF_BFC_INCLUDES}
     PRIV_INCLUDE_DIRS compat
     REQUIRES lwip pthread
-    PRIV_REQUIRES vfs esp_timer esp_pm esp_mm
+    PRIV_REQUIRES vfs esp_timer esp_pm esp_mm esp_driver_jpeg
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE

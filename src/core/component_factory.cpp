@@ -50,6 +50,10 @@
 #include "components/h264_encoder_esp32p4.hpp"
 #endif
 
+#ifdef ENABLE_JPEG_ENCODER_ESP32P4
+#include "components/jpeg_encoder_esp32p4.hpp"
+#endif
+
 #ifdef ENABLE_MKV_SINK
 #include "components/mkv_sink.hpp"
 #endif
@@ -176,6 +180,13 @@ std::unique_ptr<component_coder> component_factory::create_coder(std::string nam
     if ("h264_encoder_esp32p4" == name || "h264_encoder" == name)
     {
         return std::make_unique<h264_encoder_esp32p4>();
+    }
+#endif
+
+#ifdef ENABLE_JPEG_ENCODER_ESP32P4
+    if ("jpeg_encoder_esp32p4" == name || "jpeg_encoder" == name)
+    {
+        return std::make_unique<jpeg_encoder_esp32p4>();
     }
 #endif
 

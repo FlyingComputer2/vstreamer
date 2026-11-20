@@ -398,11 +398,13 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
         {
             caps_reject_ = true;
             have_input_caps_ = false;
+            update_accepting_locked();
             return -ENOTSUP;
         }
         caps_reject_ = false;
         input_caps_ = caps;
         have_input_caps_ = true;
+        update_accepting_locked();
         return 0;
     }
     if (in.sdu_type != sdu_type_e::MJPEG && in.sdu_type != sdu_type_e::H264_AU)
@@ -428,6 +430,20 @@ int mkv_sink::input_pdu_locked(component_pdu &&in)
 
 int mkv_sink::input(component_pdu &&in)
 {
+    /* Frames while a recording is set up take only q_mu: mu is held by the mux thread across
+     * each card write, and a producer (e.g. a live TX thread) must not wait on the card. */
+    if (0 == in.port &&
+        (in.sdu_type == sdu_type_e::MJPEG || in.sdu_type == sdu_type_e::H264_AU) &&
+        accepting_.load(std::memory_order_acquire))
+    {
+        std::lock_guard<std::mutex> lock(q_mu);
+        const int                   r = try_enqueue_locked(std::move(in));
+        if (0 == r)
+        {
+            q_cv.notify_one();
+        }
+        return r;
+    }
     if (0 == in.port && in.sdu_type == sdu_type_e::CAPS_VIDEO_CODED)
     {
         video_coded_caps caps {};
@@ -446,6 +462,7 @@ int mkv_sink::input(component_pdu &&in)
             {
                 caps_reject_ = true;
                 have_input_caps_ = false;
+                update_accepting_locked();
                 return -ENOTSUP;
             }
             resize = have_input_caps_ && (input_caps_.width != caps.width || input_caps_.height != caps.height);
@@ -462,6 +479,7 @@ int mkv_sink::input(component_pdu &&in)
             caps_reject_ = false;
             input_caps_ = caps;
             have_input_caps_ = true;
+            update_accepting_locked();
             return 0;
         }
     }
@@ -482,20 +500,34 @@ int mkv_sink::open()
         return 0;
     }
     opened = true;
+    update_accepting_locked();
     mux_stop.store(false, std::memory_order_relaxed);
     /* Runs mkv_writer (stdio, FATFS on ESP-IDF). */
-    mux_thread = spawn_thread(mux_place.opts("vs_mkv", 8 * 1024), [this] { mux_thread_main(); });
+    thread_opts mux_opts = mux_place.opts("vs_mkv", 8 * 1024);
+    mux_opts.psram_stack = mux_psram_stack;
+    mux_thread = spawn_thread(mux_opts, [this] { mux_thread_main(); });
     return 0;
 }
 
 void mkv_sink::close()
 {
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        accepting_.store(false, std::memory_order_release);
+    }
     stop_mux_thread();
     std::lock_guard<std::mutex> lock(mu);
     stop_locked();
     opened = false;
     have_input_caps_ = false;
     caps_reject_ = false;
+    update_accepting_locked();
+}
+
+void mkv_sink::update_accepting_locked()
+{
+    accepting_.store(opened && have_input_caps_ && !caps_reject_ && !output_template.empty(),
+                     std::memory_order_release);
 }
 
 
@@ -514,6 +546,7 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
     {
         if (v.empty())
         {
+            accepting_.store(false, std::memory_order_release);
             stop_locked();
             output_template.clear();
             output_stem.clear();
@@ -533,6 +566,7 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
             segment_index = 0;
             split_output_template_locked();
         }
+        update_accepting_locked();
         return 0;
     }
 
@@ -574,6 +608,20 @@ int mkv_sink::configure(std::string_view key, std::string_view value)
         return 0;
     }
 
+    if (key == "mux_psram_stack")
+    {
+        if (opened)
+        {
+            return -EBUSY;
+        }
+        if (v != "0" && v != "1")
+        {
+            return -EINVAL;
+        }
+        mux_psram_stack = v == "1";
+        return 0;
+    }
+
     if (key == "queue_depth")
     {
         int64_t n = 0;
@@ -606,11 +654,30 @@ int mkv_sink::query(std::string_view key, std::string *value) const
         return r;
     }
 
+    /* Frames queued or being written; takes only the queue lock, not the mux one (held
+     * across a write), so it answers while the card is slow. */
+    if (key == "queued")
+    {
+        size_t n = 0;
+        {
+            std::lock_guard<std::mutex> qlock(q_mu);
+            n = queue.size() + static_cast<size_t>(mux_in_flight.load(std::memory_order_relaxed));
+        }
+        *value = std::to_string(n);
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(mu);
 
     if (key == "output")
     {
         *value = output_template;
+        return 0;
+    }
+
+    if (key == "mux_psram_stack")
+    {
+        *value = mux_psram_stack ? "1" : "0";
         return 0;
     }
 

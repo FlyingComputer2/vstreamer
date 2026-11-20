@@ -21,14 +21,20 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <sys/stat.h>
+
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -242,6 +248,508 @@ bool forward_coded_output(vstreamer::component_coder *pay, vstreamer::component_
     return true;
 }
 
+/*
+ * The MKV tee after the encoder. The TX thread hands it AUs (tee(), never blocks); the
+ * run_live_tx thread starts and stops recordings (poll()), since mkv_sink's configure() and
+ * close() wait on card writes. The m-plane only flips the request flag and reads the cached
+ * status, so it never waits on the card either (it may run on a shared reactor).
+ */
+class live_recorder
+{
+public:
+    int open(const vstreamer::idf::live_tx_config &cfg, int fps)
+    {
+        output_ = cfg.rec_output;
+        sink_ = vstreamer::component_factory::create_sink("mkv_sink");
+        if (!sink_)
+        {
+            return -ENOTSUP;
+        }
+        const std::string fps_s = std::to_string(fps > 0 ? fps : 30);
+        const vstreamer::idf::kv_list defaults {{"fps", fps_s},       {"queue_depth", "30"},
+                                                {"mux_cpu", "1"},     {"mux_prio", "4"},
+                                                {"mux_psram_stack", "1"}};
+        apply_kvs(*sink_, "rec", defaults);
+        apply_kvs(*sink_, "rec", cfg.rec);
+        const int r = sink_->open();
+        if (r < 0)
+        {
+            sink_.reset();
+            return r;
+        }
+        set_status("idle");
+        return 0;
+    }
+
+    [[nodiscard]] bool enabled() const { return sink_ != nullptr; }
+
+    /* TX thread. Caps always (mkv_sink needs them before the first AU); AUs only while a
+     * recording runs, copied: the encoder's AU buffers are a small pool, and holding them
+     * while the card is slow would stall the encoder. */
+    void tee(const vstreamer::component_pdu &in)
+    {
+        if (!sink_)
+        {
+            return;
+        }
+        if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_CODED)
+        {
+            vstreamer::component_pdu caps = in;
+            (void)sink_->input(std::move(caps));
+            return;
+        }
+        if (in.sdu_type != vstreamer::sdu_type_e::H264_AU ||
+            !active_.load(std::memory_order_acquire) || in.sdu.size() == 0)
+        {
+            return;
+        }
+        const size_t n = in.sdu.size();
+        auto *p = static_cast<std::byte *>(
+            heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (nullptr == p)
+        {
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::memcpy(p, in.sdu.u8(), n);
+        vstreamer::component_pdu copy;
+        copy.ts_us = in.ts_us;
+        copy.seq = in.seq;
+        copy.sdu_type = in.sdu_type;
+        copy.port = in.port;
+        copy.flags = in.flags;
+        copy.sdu = bfc::shared_sized_buffer::adopt(p, n, n,
+                                                   [](std::byte *b) { heap_caps_free(b); });
+        if (sink_->input(std::move(copy)) < 0)
+        {
+            /* -EAGAIN: the queue is full, the card is behind. */
+            dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /* run_live_tx thread, every loop: follows the request, refreshes the cached status. */
+    void poll(bool want, vstreamer::component &src)
+    {
+        if (!sink_)
+        {
+            return;
+        }
+        if (want && !running_)
+        {
+            start(src);
+        }
+        else if (!want && running_)
+        {
+            stop();
+        }
+        const int64_t now = esp_timer_get_time();
+        if (now - last_status_us_ >= 1000000)
+        {
+            last_status_us_ = now;
+            refresh_status();
+        }
+    }
+
+    void close()
+    {
+        if (!sink_)
+        {
+            return;
+        }
+        stop();
+        sink_->close();
+        refresh_status();
+        sink_.reset();
+    }
+
+    [[nodiscard]] std::string status() const
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        return status_;
+    }
+
+    [[nodiscard]] std::string file() const
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        return file_;
+    }
+
+private:
+    void set_status(std::string s)
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        status_ = std::move(s);
+    }
+
+    /* "<stem>_NNNN<ext>" with the first NNNN whose first segment does not exist yet. */
+    std::string next_template() const
+    {
+        std::string stem = output_;
+        std::string ext = ".mkv";
+        const auto slash = output_.find_last_of('/');
+        const auto dot = output_.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        {
+            stem = output_.substr(0, dot);
+            ext = output_.substr(dot);
+        }
+        if (slash != std::string::npos && slash > 0)
+        {
+            (void)mkdir(output_.substr(0, slash).c_str(), 0777);
+        }
+        for (int i = 1; i <= 9999; ++i)
+        {
+            char idx[16];
+            std::snprintf(idx, sizeof(idx), "_%04d", i);
+            struct stat st {};
+            if (stat((stem + idx + "-001" + ext).c_str(), &st) != 0)
+            {
+                return stem + idx + ext;
+            }
+        }
+        return {};
+    }
+
+    void start(vstreamer::component &src)
+    {
+        running_ = true;
+        const std::string tmpl = next_template();
+        if (tmpl.empty() || sink_->configure("output", tmpl) < 0)
+        {
+            std::printf("live TX rec: no free name for %s\n", output_.c_str());
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(status_mu_);
+            file_ = tmpl;
+        }
+        active_.store(true, std::memory_order_release);
+        /* The file starts at a keyframe with SPS/PPS; ask for one now instead of waiting a
+         * GOP. */
+        (void)src.configure(vstreamer::keys::idr.id, 0);
+        std::printf("live TX rec started: %s\n", tmpl.c_str());
+    }
+
+    void stop()
+    {
+        running_ = false;
+        active_.store(false, std::memory_order_release);
+        /* Write what is queued (up to ~1 s), then finish the file (cues, sizes). */
+        for (int i = 0; i < 300; ++i)
+        {
+            std::string q;
+            if (sink_->query("queued", &q) < 0 || q == "0")
+            {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        std::string seg;
+        (void)sink_->query("segment", &seg);
+        (void)sink_->configure("output", "");
+        std::printf("live TX rec stopped: %s\n", seg.c_str());
+        refresh_status();
+    }
+
+    void refresh_status()
+    {
+        std::string stats;
+        std::string seg;
+        std::string werr;
+        std::string skipped;
+        (void)sink_->query("stats", &stats);
+        (void)sink_->query("segment", &seg);
+        (void)sink_->query("write_errors", &werr);
+        (void)sink_->query("skipped", &skipped);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " dropped=%" PRIu64 " write_errors=%s skipped=%s",
+                      dropped_.load(std::memory_order_relaxed), werr.c_str(), skipped.c_str());
+        std::string s = (running_ ? "on " : "off ") + stats;
+        if (!seg.empty())
+        {
+            s += " file=" + seg;
+        }
+        set_status(s + buf);
+    }
+
+    std::string                               output_;
+    std::unique_ptr<vstreamer::component_sink> sink_;
+    std::atomic<bool>                         active_ {false};
+    std::atomic<uint64_t>                     dropped_ {0};
+    bool                                      running_ = false; // run_live_tx thread only
+    int64_t                                   last_status_us_ = 0;
+    mutable std::mutex                        status_mu_;
+    std::string                               status_;
+    std::string                               file_;
+};
+
+/*
+ * One-shot photos. The m-plane requests one (request(), never blocks); the run_live_tx thread
+ * turns the source's raw port on (poll()), the TX thread hands the first frame to the JPEG
+ * encoder and collects the JPEG (tee(), pump()), and the run_live_tx thread turns the raw port
+ * off and writes the file.
+ */
+class live_photo
+{
+public:
+    int open(const vstreamer::idf::live_tx_config &cfg)
+    {
+        output_ = cfg.photo_output;
+        jpeg_ = vstreamer::component_factory::create_coder("jpeg_encoder_esp32p4");
+        if (!jpeg_)
+        {
+            return -ENOTSUP;
+        }
+        /* outbuf_kb: a 1080p frame at quality 90 is ~0.5-1 MB. */
+        const vstreamer::idf::kv_list defaults {{"quality", "90"},
+                                                {"outbuf_kb", "2048"},
+                                                {"encode_cpu", "0"},
+                                                {"encode_prio", "12"}};
+        apply_kvs(*jpeg_, "jpg", defaults);
+        apply_kvs(*jpeg_, "jpg", cfg.jpg);
+        if (const int r = jpeg_->open(); r < 0)
+        {
+            jpeg_.reset();
+            return r;
+        }
+        set_status("idle");
+        return 0;
+    }
+
+    [[nodiscard]] bool enabled() const { return jpeg_ != nullptr; }
+    [[nodiscard]] vstreamer::component *jpeg() const { return jpeg_.get(); }
+    [[nodiscard]] bool busy() const { return state_.load(std::memory_order_acquire) != k_idle; }
+
+    /* m-plane. */
+    int request()
+    {
+        if (!jpeg_)
+        {
+            return -ENODEV;
+        }
+        int expected = k_idle;
+        return state_.compare_exchange_strong(expected, k_requested, std::memory_order_acq_rel)
+                   ? 0
+                   : -EBUSY;
+    }
+
+    /* TX thread: the source's port 1. Caps always; the first frame once armed. */
+    void tee(const vstreamer::component_pdu &in)
+    {
+        if (!jpeg_)
+        {
+            return;
+        }
+        vstreamer::component_pdu f = in;
+        f.port = 0;
+        if (in.sdu_type == vstreamer::sdu_type_e::CAPS_VIDEO_RAW)
+        {
+            if (const int r = jpeg_->input(std::move(f)); r < 0)
+            {
+                std::printf("live TX photo: jpeg encoder refused the raw caps (%d)\n", r);
+            }
+            return;
+        }
+        if (state_.load(std::memory_order_acquire) != k_armed)
+        {
+            return;
+        }
+        if (jpeg_->input(std::move(f)) == 0)
+        {
+            int expected = k_armed;
+            (void)state_.compare_exchange_strong(expected, k_encoding, std::memory_order_acq_rel);
+        }
+    }
+
+    /* TX thread, every loop: takes the JPEG. */
+    void pump()
+    {
+        if (!jpeg_)
+        {
+            return;
+        }
+        vstreamer::component_pdu out;
+        while (jpeg_->output(out) == 0)
+        {
+            if (out.sdu_type != vstreamer::sdu_type_e::MJPEG ||
+                state_.load(std::memory_order_acquire) != k_encoding)
+            {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(shot_mu_);
+                shot_ = std::move(out);
+            }
+            state_.store(k_done, std::memory_order_release);
+        }
+    }
+
+    /* run_live_tx thread, every loop. */
+    void poll(vstreamer::component &src)
+    {
+        if (!jpeg_)
+        {
+            return;
+        }
+        const int st = state_.load(std::memory_order_acquire);
+        const int64_t now = esp_timer_get_time();
+        if (k_requested == st)
+        {
+            t0_us_ = now;
+            raw_on_ = src.configure("raw_out", "1") == 0;
+            if (!raw_on_)
+            {
+                finish(src, false, "raw_out refused");
+                return;
+            }
+            state_.store(k_armed, std::memory_order_release);
+            set_status("busy");
+        }
+        else if (k_done == st)
+        {
+            vstreamer::component_pdu shot;
+            {
+                std::lock_guard<std::mutex> lock(shot_mu_);
+                shot = std::move(shot_);
+                shot_ = {};
+            }
+            raw_off(src);
+            write(shot, src);
+        }
+        else if ((k_armed == st || k_encoding == st) && now - t0_us_ > 2000000)
+        {
+            finish(src, false, "timeout");
+        }
+    }
+
+    void close(vstreamer::component &src)
+    {
+        if (!jpeg_)
+        {
+            return;
+        }
+        raw_off(src);
+        jpeg_->close();
+        jpeg_.reset();
+    }
+
+    [[nodiscard]] std::string status() const
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "taken=%" PRIu64 " failed=%" PRIu64 " ", taken_,
+                      failed_);
+        return buf + status_;
+    }
+
+    [[nodiscard]] std::string file() const
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        return file_;
+    }
+
+private:
+    static constexpr int k_idle = 0, k_requested = 1, k_armed = 2, k_encoding = 3, k_done = 4;
+
+    void set_status(std::string s)
+    {
+        std::lock_guard<std::mutex> lock(status_mu_);
+        status_ = std::move(s);
+    }
+
+    void raw_off(vstreamer::component &src)
+    {
+        if (raw_on_)
+        {
+            (void)src.configure("raw_out", "0");
+            raw_on_ = false;
+        }
+    }
+
+    void finish(vstreamer::component &src, bool ok, const std::string &what)
+    {
+        raw_off(src);
+        {
+            std::lock_guard<std::mutex> lock(status_mu_);
+            ++(ok ? taken_ : failed_);
+            status_ = (ok ? "last=ok " : "last=failed ") + what;
+        }
+        std::printf("live TX photo %s: %s\n", ok ? "taken" : "failed", what.c_str());
+        state_.store(k_idle, std::memory_order_release);
+    }
+
+    /* "<stem>_NNNN<ext>" with the first free NNNN. */
+    std::string next_name() const
+    {
+        std::string stem = output_;
+        std::string ext = ".jpg";
+        const auto slash = output_.find_last_of('/');
+        const auto dot = output_.find_last_of('.');
+        if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        {
+            stem = output_.substr(0, dot);
+            ext = output_.substr(dot);
+        }
+        if (slash != std::string::npos && slash > 0)
+        {
+            (void)mkdir(output_.substr(0, slash).c_str(), 0777);
+        }
+        for (int i = 1; i <= 9999; ++i)
+        {
+            char idx[16];
+            std::snprintf(idx, sizeof(idx), "_%04d", i);
+            struct stat st {};
+            if (stat((stem + idx + ext).c_str(), &st) != 0)
+            {
+                return stem + idx + ext;
+            }
+        }
+        return {};
+    }
+
+    void write(const vstreamer::component_pdu &shot, vstreamer::component &src)
+    {
+        const std::string name = next_name();
+        if (name.empty())
+        {
+            finish(src, false, "no free name for " + output_);
+            return;
+        }
+        FILE *f = std::fopen(name.c_str(), "wb");
+        const size_t n = shot.sdu.size();
+        const bool ok = nullptr != f && std::fwrite(shot.sdu.u8(), 1, n, f) == n;
+        const bool closed = nullptr != f && std::fclose(f) == 0;
+        if (!ok || !closed)
+        {
+            (void)std::remove(name.c_str());
+            finish(src, false, "write " + name + " failed (" + std::to_string(errno) + ")");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(status_mu_);
+            file_ = name;
+        }
+        char what[192];
+        std::snprintf(what, sizeof(what), "%s kb=%u ms=%u", name.c_str(),
+                      static_cast<unsigned>(n / 1024),
+                      static_cast<unsigned>((esp_timer_get_time() - t0_us_) / 1000));
+        finish(src, true, what);
+    }
+
+    std::string                                 output_;
+    std::unique_ptr<vstreamer::component_coder> jpeg_;
+    std::atomic<int>                            state_ {k_idle};
+    std::mutex                                  shot_mu_;
+    vstreamer::component_pdu                    shot_;
+    bool                                        raw_on_ = false; // run_live_tx thread only
+    int64_t                                     t0_us_ = 0;
+    mutable std::mutex                          status_mu_;
+    std::string                                 status_;
+    std::string                                 file_;
+    uint64_t                                    taken_ = 0;
+    uint64_t                                    failed_ = 0;
+};
+
 int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
 {
     const int k_seconds = cfg.seconds;
@@ -315,6 +823,27 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         return -1;
     }
 
+    live_recorder rec;
+    if (!cfg.rec_output.empty())
+    {
+        std::string fps_s;
+        (void)src->query("fps", &fps_s);
+        if (const int rr = rec.open(cfg, std::atoi(fps_s.c_str())); rr < 0)
+        {
+            std::printf("live TX rec: mkv_sink open failed (%d)\n", rr);
+        }
+    }
+    live_photo photo;
+    if (!cfg.photo_output.empty())
+    {
+        if (const int pr = photo.open(cfg); pr < 0)
+        {
+            std::printf("live TX photo: jpeg encoder open failed (%d)\n", pr);
+        }
+    }
+    std::atomic<bool>  own_record {false};
+    std::atomic<bool> &record_request = cfg.record ? *cfg.record : own_record;
+
     /* Runtime control (bitrate, gop, ...) for bench sweeps. */
     std::atomic<bool>  own_pause {false}; // outlives the mplane thread
     std::atomic<bool> &pause_request = cfg.pause ? *cfg.pause : own_pause;
@@ -332,9 +861,44 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
                 pause_request.store("1" == v, std::memory_order_release);
                 return 0;
             });
+        mplane.add_control(
+            "rec", "on",
+            [&record_request] {
+                return record_request.load() ? std::string("1") : std::string("0");
+            },
+            [&record_request, &rec](std::string_view v) {
+                if ("1" != v && "0" != v)
+                {
+                    return -EINVAL;
+                }
+                if (!rec.enabled())
+                {
+                    return -ENODEV;
+                }
+                record_request.store("1" == v, std::memory_order_release);
+                return 0;
+            });
+        mplane.add_control(
+            "photo", "take",
+            [&photo] { return photo.busy() ? std::string("1") : std::string("0"); },
+            [&photo](std::string_view v) {
+                if ("1" != v)
+                {
+                    return -EINVAL;
+                }
+                return photo.request();
+            });
+        mplane.add_query("photo", "stats", [&photo] { return photo.status(); });
+        mplane.add_query("photo", "file", [&photo] { return photo.file(); });
+        mplane.add_query("rec", "stats", [&rec] { return rec.status(); });
+        mplane.add_query("rec", "file", [&rec] { return rec.file(); });
         mplane.add_node("src", src.get());
         mplane.add_node("pay", pay.get());
         mplane.add_node("snd", snd.get());
+        if (nullptr != photo.jpeg())
+        {
+            mplane.add_node("jpg", photo.jpeg());
+        }
         const int mr = cfg.mplane_reactor.empty()
                            ? mplane.start(cfg.mplane_port, k_live_mplane_thread)
                            : mplane.start(cfg.mplane_port, cfg.mplane_reactor);
@@ -381,6 +945,7 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
         bool wait_key = false;
         while (!stop.load(std::memory_order_acquire))
         {
+            photo.pump();
             vstreamer::component_pdu out;
             const int              r = src->output(out);
             if (-EAGAIN == r)
@@ -393,6 +958,12 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
                 vTaskDelay(1);
                 continue;
             }
+            if (0 != out.port)
+            {
+                photo.tee(out); /* raw frames are the photo's only */
+                continue;
+            }
+            rec.tee(out);
             const bool pause = pause_request.load(std::memory_order_acquire);
             if (pause != paused)
             {
@@ -436,6 +1007,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
 
     while (!stop.load(std::memory_order_acquire) && esp_timer_get_time() < deadline)
     {
+        rec.poll(record_request.load(std::memory_order_acquire), *src);
+        photo.poll(*src);
         if (cfg.stats_interval_s > 0 &&
             esp_timer_get_time() - last_stats_us >= cfg.stats_interval_s * 1000000LL)
         {
@@ -484,13 +1057,14 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
             const uint64_t snd_eagain = g_snd_eagain.exchange(0);
             std::printf("live TX %.1f fps (enc %.1f) %.0f kbps age_ms=%.1f/%.1f (at tx %.1f) "
                         "latency_ms=%s node_latency_ms=%s; tx pay=%.1f%% snd=%.1f%% "
-                        "snd_calls=%" PRIu64 " snd_eagain=%" PRIu64 "; isp %s; snd %s\n",
+                        "snd_calls=%" PRIu64 " snd_eagain=%" PRIu64 "; isp %s; snd %s%s%s\n",
                         win_fps, enc_fps, win_kbps,
                         age_n > 0 ? age_sum / 1000.0 / age_n : 0.0, age_max / 1000.0,
                         age_n > 0 ? age_in / 1000.0 / age_n : 0.0, lat.c_str(), node_lat.c_str(),
                         stat_dt > 0 ? pay_us / (stat_dt * 1e4) : 0.0,
                         stat_dt > 0 ? snd_us / (stat_dt * 1e4) : 0.0, snd_calls, snd_eagain,
-                        isp_stats.c_str(), snd_stats.c_str());
+                        isp_stats.c_str(), snd_stats.c_str(), rec.enabled() ? "; rec " : "",
+                        rec.enabled() ? rec.status().c_str() : "");
         }
         if (!run_forever && t0_us.load(std::memory_order_relaxed) > 0 &&
             esp_timer_get_time() >= stop_at)
@@ -504,6 +1078,8 @@ int run_live_tx_impl(const vstreamer::idf::live_tx_config &cfg)
     stop.store(true, std::memory_order_release);
     tx_thread.join();
     mplane.stop();
+    rec.close();
+    photo.close(*src);
     src->close();
 
     drain_pay_to_sender(pay_c, snd_s);
